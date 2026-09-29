@@ -121,11 +121,14 @@ def _refusing_hook(counter: Path) -> str:
     )
 
 
-def _flaky_transient_hook(counter: Path) -> str:
+def _flaky_transient_hook(counter: Path, pad_bytes: int = 0) -> str:
     """Fails with the LOCK signature twice, then succeeds — the transient shape
     the retry budget exists for. Emits git's own wording so the predicate under
-    test sees exactly what a real collision produces."""
+    test sees exactly what a real collision produces. pad_bytes appends that much
+    hook chatter AFTER the signature: the shape that SIGPIPEs a pipe-fed grep -q
+    under pipefail (guard-3132)."""
     c = _to_bash_path(counter)
+    pad = f"  yes x | head -c {pad_bytes} >&2\n" if pad_bytes else ""
     return (
         "#!/bin/sh\n"
         f'echo x >> "{c}"\n'
@@ -133,6 +136,7 @@ def _flaky_transient_hook(counter: Path) -> str:
         "if [ \"$n\" -lt 3 ]; then\n"
         '  echo "fatal: Unable to create index.lock: File exists." >&2\n'
         '  echo "Another git process seems to be running in this repository" >&2\n'
+        f"{pad}"
         "  exit 1\n"
         "fi\n"
         "exit 0\n"
@@ -274,6 +278,30 @@ def test_transient_failure_still_retries_and_can_succeed():
         )
         assert r.returncode == 0, f"third attempt should have succeeded: {r.stderr}"
         assert not _signal_path(repo).exists(), "a recovered transient must write no refusal signal"
+
+
+def test_transient_failure_behind_a_large_output_still_retries():
+    """guard-3132 / . The predicate reads the WHOLE commit output, and
+    hooks can print a lot. Under pipefail a pipe-fed grep -q exits at its first
+    match while the producer is still writing; the producer dies of SIGPIPE, and
+    a real lock collision reads as not transient. The two-line fixture above can
+    never show this: the producer finishes before grep exits."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit(tmp)
+        counter = tmp / "attempts.txt"
+        _install_hook(repo, _flaky_transient_hook(counter, pad_bytes=2_000_000))
+        _stage_work(repo)
+
+        r = _run_commit(shim, repo)
+
+        assert _attempts(counter) == 3, (
+            f"a transient failure behind a large output must still be retried, got "
+            f"{_attempts(counter)} attempt(s). stderr tail:\n{r.stderr[-2000:]}"
+        )
+        assert r.returncode == 0, r.stderr[-2000:]
 
 
 def test_successful_commit_writes_no_refusal_signal():

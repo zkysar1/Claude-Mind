@@ -51,7 +51,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, List, Optional, Protocol, Union, runtime_checkable
+from typing import (Callable, List, NamedTuple, Optional, Protocol, Union,
+                    runtime_checkable)
 
 PathLike = Union[str, os.PathLike]
 
@@ -164,6 +165,57 @@ class WriteResult:
         return (f"WriteResult(version={self.version!r}, "
                 f"fallback_used={self.fallback_used}, "
                 f"retry_count={self.retry_count})")
+
+
+class ReplaceOutcome(NamedTuple):
+    """What replace_with_retry did. ``retry_count`` is the number of failed
+    attempts before success, or ``max_retries`` when exhausted; ``last_err`` is
+    the most recent retried error (None on a clean first attempt)."""
+    ok: bool
+    retry_count: int
+    wall_clock_ms: int
+    last_err: Optional[BaseException]
+
+
+def replace_with_retry(src: PathLike, dst: PathLike, *, max_retries: int = 10,
+                       retry_on: tuple = (OSError,)) -> ReplaceOutcome:
+    """``os.replace(src, dst)`` under the shared contention schedule ():
+    exponential backoff + jitter, cap 5 s per wait, ~16.7 s total at the
+    default 10 attempts, with a stderr line per retry.
+
+    The ONE copy of the retry numbers (guard-472). LocalBackend._atomic_write
+    and the own-cloud local-mirror writers (owncloud_backend._atomic_write_local,
+    owncloud_sync's runtime-file writer) all call this; each caller decides what
+    exhaustion means. LocalBackend falls back to an in-place rewrite. The mirror
+    writers raise instead, because a mirror write must stay atomic (g-115-6054).
+
+    Why the mirror writers need it (g-115-7257): Windows refuses to replace a
+    file that another handle holds open without FILE_SHARE_DELETE, and Python's
+    open() never passes that flag, so any concurrent reader turns an atomic
+    replace into PermissionError [WinError 5]. POSIX never fails this way.
+
+    An error outside ``retry_on`` propagates at once. An error inside it is
+    never raised: it is returned in ``last_err`` for the caller to act on.
+    """
+    last_err = None
+    start_ms = time.monotonic() * 1000.0
+    for attempt in range(max_retries):
+        try:
+            os.replace(str(src), str(dst))
+            return ReplaceOutcome(True, attempt,
+                                  int(time.monotonic() * 1000.0 - start_ms),
+                                  last_err)
+        except retry_on as e:
+            last_err = e
+            if attempt == max_retries - 1:
+                break
+            wait = min(0.05 * (2 ** attempt) + random.uniform(0, 0.1), 5.0)
+            print(f"_atomic_write retry {attempt + 1}/{max_retries}: {e} "
+                  f"(waiting {wait:.2f}s) target={Path(dst).name}",
+                  file=sys.stderr)
+            time.sleep(wait)
+    return ReplaceOutcome(False, max_retries,
+                          int(time.monotonic() * 1000.0 - start_ms), last_err)
 
 
 # ---------------------------------------------------------------------------
@@ -504,28 +556,18 @@ class LocalBackend:
                 pass
             raise
 
-        last_err = None
         retry_start_ms = time.monotonic() * 1000.0
-        for attempt in range(max_retries):
-            try:
-                os.replace(str(tmp), str(target))
-                return WriteResult(
-                    version=self._version(target),
-                    fallback_used=False,
-                    retry_count=attempt,
-                    wall_clock_ms=int(time.monotonic() * 1000.0 - retry_start_ms),
-                    error_class=(type(last_err).__name__ if last_err else None),
-                    error_msg=(str(last_err) if last_err else ""),
-                )
-            except (PermissionError, OSError) as e:
-                last_err = e
-                if attempt == max_retries - 1:
-                    break
-                wait = min(0.05 * (2 ** attempt) + random.uniform(0, 0.1), 5.0)
-                print(f"_atomic_write retry {attempt + 1}/{max_retries}: {e} "
-                      f"(waiting {wait:.2f}s) target={target.name}",
-                      file=sys.stderr)
-                time.sleep(wait)
+        outcome = replace_with_retry(tmp, target, max_retries=max_retries)
+        last_err = outcome.last_err
+        if outcome.ok:
+            return WriteResult(
+                version=self._version(target),
+                fallback_used=False,
+                retry_count=outcome.retry_count,
+                wall_clock_ms=outcome.wall_clock_ms,
+                error_class=(type(last_err).__name__ if last_err else None),
+                error_msg=(str(last_err) if last_err else ""),
+            )
 
         # Retries exhausted — in-place truncate-rewrite. A cloud-synced folder's
         # reparse point tolerates write-through but can refuse rename; that is

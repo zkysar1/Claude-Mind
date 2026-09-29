@@ -31,13 +31,17 @@ The LLM NEVER reads or edits `world/pattern-signatures.jsonl` directly. All oper
 | Script | Purpose | Stdin |
 |--------|---------|-------|
 | `pattern-signatures-read.sh --active` | All active signatures | — |
+| `pattern-signatures-read.sh --all` | All signatures, any status | — |
 | `pattern-signatures-read.sh --id <id>` | Single signature by ID | — |
-| `pattern-signatures-read.sh --category <cat>` | Signatures by category | — |
 | `pattern-signatures-read.sh --summary` | Compact one-liner per signature | — |
+| `pattern-signatures-read.sh --count` | Record count only, as `{"count": N}` | — |
 | `pattern-signatures-add.sh` | Validate + append new signature | JSON |
 | `pattern-signatures-update.sh <id>` | Validate + replace signature | JSON |
 | `pattern-signatures-update-field.sh <id> <field> <value>` | Update single field | — |
 | `pattern-signatures-record-outcome.sh <id> <outcome>` | Append outcome + recalculate confidence | — |
 | `pattern-signatures-set-status.sh <id> <status>` | Change signature status | — |
+
+There is no `--category` flag, and the read script refuses unknown flags (g-115-4733).
+To select by category, read `--active` and filter on `category`.
 
 All backed by `core/scripts/pattern-signatures.py` (Python 3, stdlib only).

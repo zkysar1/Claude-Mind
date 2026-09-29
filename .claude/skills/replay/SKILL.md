@@ -241,8 +241,10 @@ Read the original evaluation record (scoring, reasoning)
 # the refuted belief's reasoning — under a plausible key (guard-2615, guard-3980).
 # BARE = NULL, a verdict-only value (chars < ~40, guard-5986), or `rationale` with
 # no lesson under the unchained keys resolution_notes / lesson / reflection_summary
-# / resolution_rationale / actual_result / reflection — check those before calling
-# a `rationale` winner bare. The helper fix is owned by g-115-10108. The
+# / resolution_rationale / actual_result / reflection / notes — check those before calling
+# a `rationale` winner bare. `notes` is MIXED — 4 of its 6 corpus hits hold the outcome,
+# 2 hold a formation pre-mortem — so read it, never trust the key (readings Run 88).
+# The helper fix is owned by g-115-10108. The
 # ten-key order lives ONCE in mind_api/src/world/pipeline.py NARRATIVE_CHAIN.
 # `--narrative` alone covers the live+archive union; add `--stage resolved` to filter.
 # OUTPUT SHAPE (bravo, cc-05, 2026-08-13 — cost 2 turns to rediscover): the call

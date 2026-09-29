@@ -70,6 +70,15 @@ batch is instead the k oldest distinct goal_ids ranked by each goal's own oldest
 `_item_ts`, processing every entry that carries them. At ~2.6 entries per
 goal_id in the measured population this is a small, predictable amplification.
 
+The batch must key on the drain's OWN matcher, which since g-115-10348 is
+`goal_id or goal` (`_entry_goal` in `wm_write.py`). Keying on `goal_id` alone is
+this same sibling-subtraction defect by another route. Measured 2026-09-28
+(alpha, cc-04, g-306-284): a 25-goal batch replayed 49 entries and the drain
+reported `removed: 52`. The 3 unseen entries were `goal`-keyed rows of one batch
+goal. They were recovered from a torn WM temp snapshot and replayed by hand, and
+nothing else would have surfaced them. Compare `removed` with `len(batch)`: they
+must be equal.
+
 ## Why `wm-clear.sh` is the wrong primitive here, in two independent ways
 
 **1. The cap it relies on is INERT, not merely unenforced.** The paragraph this
@@ -151,7 +160,8 @@ machinery — no new abstraction was built for this
 goal-id set. They are excluded from the batch deliberately: the drain then makes
 monotonic progress on what it CAN subtract, and the residue stays countable
 instead of being silently re-handled every close. Their drain site is a separate
-fix.
+fix. Since g-115-10348, an entry carrying `goal` but no `goal_id` is NOT residue:
+the residue is entries carrying neither key.
 
 ## What a second box showed
 

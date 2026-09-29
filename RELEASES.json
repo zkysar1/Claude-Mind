@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.87",
+    "previous_version": "2.12.86",
+    "date": "2026-09-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Release-train time-push cut (g-115-11475): 82 framework commits since v2.12.86, 24.5h stale; preflight reconciled to nothing-to-carry",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.86",
     "previous_version": "2.12.85",
     "date": "2026-09-28",

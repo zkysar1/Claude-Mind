@@ -58,7 +58,8 @@ class FakeBackend:
             return None
         return FileStat(version='"' + _md5(b) + '"', size=len(b), mtime_ns=0)
 
-    def mirror_put(self, path, content, *, expected_version=None):
+    def mirror_put(self, path, content, *, expected_version=None,
+                   local_is_source=False):
         cur = self.s3.get(str(path))
         cur_etag = ('"' + _md5(cur) + '"') if cur is not None else None
         if expected_version is not None and expected_version != cur_etag:
@@ -91,6 +92,22 @@ class FakeBackend:
     def read_bytes(self, key):
         """Read raw bytes for a key from fake S3. Returns None if absent."""
         return self.s3.get(str(key))
+
+    def read_authoritative_bytes(self, path):
+        """Pure S3 read (/2179 contract): returns the S3 object's
+        bytes and NEVER touches the local filesystem; raises FileNotFoundError
+        when the object is absent (matches the real backend and LocalBackend).
+        Added for the g-306-534 stale-local guard, which must compare local
+        against S3 TRUTH — read_bytes here models the local-mirror read and
+        would make the guard compare local-against-local (could never fire).
+        Its absence on this double would also mask a guard regression: the
+        lane's fail-open catch would swallow the AttributeError and every
+        refuse-case test would silently pass via the admit path (guard-5501).
+        """
+        b = self.s3.get(str(path))
+        if b is None:
+            raise FileNotFoundError(str(path))
+        return b
 
     def write_bytes(self, key, data):
         """Write raw bytes to fake S3 for a key (ownership-claim path)."""
@@ -431,7 +448,8 @@ def test_sync_one_dry_run_no_write(tmp_path):
 
 def test_sync_one_conflict_counted_not_raised(tmp_path):
     class Conflicter(FakeBackend):
-        def mirror_put(self, path, content, *, expected_version=None):
+        def mirror_put(self, path, content, *, expected_version=None,
+                       local_is_source=False):
             raise ConflictError("concurrent")
     be = Conflicter([(tmp_path, "world")])
     f = tmp_path / "a.md"
@@ -995,7 +1013,8 @@ class _MultipartBackend(FakeBackend):
             return None
         return FileStat(version=self._etag(b), size=len(b), mtime_ns=0)
 
-    def mirror_put(self, path, content, *, expected_version=None):
+    def mirror_put(self, path, content, *, expected_version=None,
+                   local_is_source=False):
         cur = self.s3.get(str(path))
         cur_etag = self._etag(cur) if cur is not None else None
         if expected_version is not None and expected_version != cur_etag:

@@ -128,30 +128,27 @@ IF the slot is null or an empty list:
 ELSE:
     Output: "▸ Worker spark replay: {N} captured observation(s) from {distinct goal_ids}"
     # BOUNDED BATCH — drain k GOALS per pass, never the whole slot (g-115-10001).
-    # ⚠ "THE k OLDEST" IS NOT slot[:k]. merge_wm appends each Body's batch whole
-    # and nothing re-sorts across them, so the slot is ~41 ascending runs
-    # concatenated — measured, POSITIONAL slot[:20] overlapped the TRUE oldest-20
-    # by ZERO, so a positional drain starves the oldest cohort forever while
-    # reporting honest rising counts. SORT BY `_item_ts` defaulting to "0000" —
-    # the key wm._eviction_sort_key uses (wm.py:336-339). And the batch unit is
-    # the GOAL, not the entry, because the drain below subtracts by goal_id.
+    # ⚠ "THE k OLDEST" IS NOT slot[:k] (the slot is concatenated ascending runs):
+    # SORT BY `_item_ts` or "0000", as wm._eviction_sort_key does. The batch unit
+    # is the GOAL, keyed by gid(entry) = entry.goal_id or entry.goal: the drain's
+    # OWN matcher (g-115-10348), so no entry is drained unread.
     # Rationale (WHY bounded + WHY this sort key): core/config/rationale/worker-spark-replay-bounded-drain.md
     k = 25 at zone fresh | 10 at normal | 3 at tight   # a close-sized bound
-    batch_goal_ids = the k oldest distinct non-null entry.goal_id,
+    batch_goal_ids = the k oldest distinct non-null gid(entry),
                      ranked by min(entry._item_ts or "0000") within each goal
-    batch = every entry whose goal_id is in batch_goal_ids
+    batch = every entry whose gid(entry) is in batch_goal_ids
     IF len(batch) < len(slot):
         Output: "▸ bounded drain: {len(batch)} entr(ies) / {len(batch_goal_ids)} goal(s) this pass, {len(slot) - len(batch)} left"
     FOR EACH entry in batch:
         Run the SAME handlers below (reasoning bank, guardrails, operational
         gotcha, forge awareness, pattern outcome) over entry.observation,
-        using entry.goal_id / entry.category in place of the current goal's —
+        using gid(entry) / entry.category in place of the current goal's —
         the artifact must be attributed to the goal that PRODUCED the
         observation, not to whatever the reducer happens to be closing. Cite
         entry.sq_trigger when present. The PLACEMENT CHECK below applies to
         these too (domain observations -> domain-scoped entries).
         DEDUP BY PROVENANCE FIRST (guard-7379): if an entry sourced from
-        entry.goal_id already states the lesson, do not strengthen or re-add.
+        gid(entry) already states the lesson, do not strengthen or re-add.
         Batch it: `py -3 core/scripts/lesson-dedup-probe.py --lessons-file <f>`.
         # WORK-DISCOVERY RELAYS FILE GOALS HERE (2026-08-16, audit D1).
         # Rationale (WHY relays file goals + WHY the dedup spans terminal
@@ -160,7 +157,7 @@ ELSE:
            OR entry.observation names actionable work needing an owner
               (a defect to fix, a follow-up, a capability gap, a dependency):
             Run the sq-013 work_discovery handler (below, "Work Discovery Spark
-            Handler") over entry.observation with `discovered_by = entry.goal_id`
+            Handler") over entry.observation with `discovered_by = gid(entry)`
             and the SOURCE goal's aspiration as the default target — NOT the
             goal the reducer is closing. Dedup FIRST on BOTH axes. PHRASING
             (guard-1204, guard-2228): `--title-contains` on one stem cannot
@@ -179,7 +176,7 @@ ELSE:
             id each such row names, test it (guard-5147). rc 0 =
             no LIVE owner only (guard-5278): re-run an AGED relay at HEAD
             (guard-7398), then file with the sq-013 origin_signal mapping and put
-            "relayed by <agent> worker Body (spark_capture from <entry.goal_id>),
+            "relayed by <agent> worker Body (spark_capture from <gid(entry)>),
             filed at reducer spark replay" in the description so the provenance
             is on the record. Do NOT skip this because the observation also
             produced an rb entry — a lesson and a work item are different
@@ -198,7 +195,9 @@ ELSE:
     # (duplicate-checked by the semantic-overlap gates below), whereas
     # subtracting first would lose it outright.
     Bash: printf '%s' '<batch_goal_ids as a JSON array>' | bash core/scripts/wm-drain-goals.sh spark_capture
-    Read the {"removed":N,"kept":M} verdict. `kept` > 0 is EXPECTED — the
+    Read the {"removed":N,"kept":M} verdict. `removed` > len(batch) = rows drained
+    unread (key mismatch): replay them from the opening read, kept in a file.
+    `kept` > 0 is EXPECTED — the
     remainder for the next close, not a failure. The terminating condition is a
     RE-READ that comes back empty, NEVER exhaustion of the opening enumeration
     (guard-5718). Never re-write the remainder yourself: `wm-set` does not stamp
@@ -218,7 +217,7 @@ inert** — claimed inert here until 2026-09-22, when `wm-prune.sh` cut 3,060
 to 50 in one call, all `load_bearing` (merge restored 2,631).
 The restore signal is the drained goal_ids REAPPEARING —
 NOT a non-decreasing `kept`, which arrivals produce (guard-2997). **Residue**: entries with
-`goal_id: null` cannot appear in the drain's goal-id set and are excluded from the
+neither `goal_id` nor `goal` cannot appear in the drain's goal-id set and are excluded from the
 batch deliberately, so progress stays monotonic and the residue stays countable.
 
 Rationale (WHY not a clear, both measurements in full, the second-box reading):
@@ -528,17 +527,12 @@ doubt between framework and domain, pick domain.
         # and far less divergence-prone than skill-gaps.yaml (guard-1163 family).
         Bash: source core/scripts/_paths.sh && grep -q "gap_ref: {gap.id}" "$WORLD_DIR/forged-skills.yaml" && SKIP this gap (already forged by another agent)
 
-        Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
-        Read agents/<agent>/developmental-stage.yaml → current stage
-        # Curriculum contract gate (g-115-1801): the stricter gate /forge-skill enforces at its
-        # Step 1. Dev-stage >= EXPLOIT (competence axis) can pass while the curriculum contract
-        # (capability-unlock axis) still blocks forging — gate on BOTH so we never queue a forge
-        # goal that /forge-skill will ABORT. Exit 0 = permitted, exit 1 = blocked by curriculum stage.
-        Bash: curriculum-contract-check.sh --action allow_forge_skill
-        IF gap.times_encountered >= forge_threshold
-           AND gap.estimated_value >= "medium"
-           AND developmental stage >= EXPLOIT (developing+)
-           AND curriculum-contract-check exit code == 0:
+        # Readiness gate: the SAME script /forge-skill Step 1 runs (g-115-9042) — status,
+        # times_encountered vs forge_threshold, estimated_value, the typed capability bar, and
+        # the curriculum contract (g-115-1801: never queue a forge goal /forge-skill would ABORT).
+        # Exit 0 = PASS/WAIVED, 1 = BLOCK, 2 = could not evaluate (skip).
+        Bash: bash core/scripts/forge-gate-check.sh {gap.id}
+        IF exit code == 0:
             # Live-store dedup (g-115-2284 — replaces compact-search; the in-context compact is
             # doubly stale: context-read dedup + local-mirror render):
             Bash: aspirations-query.sh --goal-field origin_signal "idea:forge-ready-{gap.id}"
@@ -1387,7 +1381,7 @@ When sq-018 fires after goal completion:
      # NO `--since`: a TRAVERSAL CUTOFF, not a filter — one old-dated tip
      # silently empties this, and empty takes the WRONG branch (guard-4539).
      SHAS=$(git log --fixed-strings --grep "(${GID}):" --format='%ct%x09%H%x09%s' -n 50 2>/dev/null \
-              | awk -v c="$(( $(date +%s) - 172800 ))" -F'\t' '$1 >= c' \
+              | awk -v c="$(( $(date +%s) - 172800 ))" -F'\t' '$(1)>=c' \
               | grep -F "(${GID}):" | cut -f2)
      if [ -n "$SHAS" ]; then
        SCOPE=$(printf '%s\n' "$SHAS" | while IFS= read -r s; do [ -n "$s" ] && git diff-tree --no-commit-id --name-only -r "$s" 2>/dev/null; done)

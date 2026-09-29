@@ -9,24 +9,50 @@ are referenced by id, not re-told (per `.claude/rules/rationale-extraction.md`).
 
 ## Why the confidence thresholds are not free-standing
 
-The Forge-Criteria numbers (`utility` = CALIBRATE / confidence >= 0.50,
-`analytical` = EXPLOIT / confidence >= 0.75) MIRROR `core/config/tree.yaml` →
-`domain_health.competence_mapping`, which is the SSOT
-(`EXPLORE 0.25 / CALIBRATE 0.50 / EXPLOIT 0.75 / MASTER 1.00`; guard-1195 —
-capability_level/confidence travel together in `_tree.yaml`). If that mapping is
-retuned, update the two SKILL.md lines with it. Prefer reading the node's stored
-`capability_level` string over re-deriving a level from `confidence`; the
-resolver is `_graduate_from_confidence` in
-`core/scripts/backfill-tree-node-fields.py` (highest threshold whose value the
-confidence meets or exceeds).
+The gate's thresholds are READ at run time, never restated.
+`core/scripts/forge-gate-check.sh` (g-115-9042) takes each type's `forge_gate`
+from `core/config/skill-gaps.yaml` `gap_types` (utility → CALIBRATE, analytical →
+EXPLOIT) and the level scale from `core/config/tree.yaml` →
+`domain_health.competence_mapping`, the SSOT (guard-1195 — capability_level and
+confidence travel together in `_tree.yaml`), through
+`core/scripts/backfill-tree-node-fields.py`'s own loader. It prefers the node's
+stored `capability_level` string over re-deriving a level from `confidence`; for
+a missing or off-scale level it uses that file's `_graduate_from_confidence`
+(the highest threshold the confidence meets or exceeds). Retuning the mapping
+therefore needs no SKILL.md edit.
 
-There is NO automated script for this type/confidence gate — the SKILL.md text
-IS the enforcement — so a wrong number silently authorizes under-qualified
-forges. This is distinct from `curriculum-contract-check.sh --action
-allow_forge_skill` (resolved in `core/scripts/curriculum.py`), which IS
-automated: the curriculum contract gates whether forging is unlocked AT ALL for
-the agent's stage; the type/confidence gate decides whether THIS gap clears its
-bar. Only the second is text-only.
+Until g-115-9042 there was NO script for this type/confidence gate: the SKILL.md
+text WAS the enforcement, so a wrong number silently authorized under-qualified
+forges, and a small model misapplied the prose comparison in both directions
+(2026-09-05). aspirations-evolve Step 9, aspirations-spark Phase 6.5 and
+reflect-on-outcome each carried a second, untyped copy ("developmental stage >=
+EXPLOIT (developing+)") that disagreed with the skill's typed gate. All four
+sites now run the one script. It also runs the curriculum contract
+(`curriculum-contract-check.sh --action allow_forge_skill`), a separate axis: the
+contract gates whether forging is unlocked AT ALL at the agent's stage; the
+type/confidence gate decides whether THIS gap clears its bar.
+
+Gap records carry no category field, so the evolve, spark and reflect sites have
+no category key. Without `--category` the script gates on the agent's
+developmental-stage `tree_maturity`, compared on the scale that produced it
+(`_competence.COMPETENCE_MAPPING`, whose values differ from tree.yaml's). That is
+the fallback the Forge Criteria always named.
+
+Two refusals are new at `/forge-skill` Step 1, because one gate now serves all four
+sites:
+
+- **Status.** Step 1 never read `gap.status`, while evolve and spark already
+  skipped gaps whose status sets `suppresses_forge` in `gap_statuses` (forged,
+  dismissed, satisfied-by-extension, deferred-to-goal). A forge goal for such a
+  gap would re-forge a capability that is already shipped or was declined. It now
+  BLOCKs and names the status.
+- **Unrankable value.** `estimated_value` is ranked by its leading word only. A
+  value that opens with prose instead of low|medium|high BLOCKs as unrankable,
+  rather than leaving each reader to judge it. That reader-dependence is what
+  pending g-318-157 tracks. Fix the value; do not widen the match.
+
+At landing (2026-09-29, 285 gaps), 17 values were prose, and 5 live /forge-skill
+goals targeted gaps the gate refuses.
 
 Corrected 2026-07-25 (g-250-269): the parentheticals once read `>= 0.30` and
 `>= 0.60`. Both were wrong and both erred LOW — an agent trusting the gloss would

@@ -148,6 +148,26 @@ def test_known_fields_pass_the_allowlist_gate(good):
         )
 
 
+def test_worker_retrospective_marker_passes_the_allowlist_gate():
+    """ — the retrospective marker must be writable.
+
+    worker_retrospective._write_marker writes MARKER_FIELD with no override, so
+    while the name was unregistered every stamp was refused and none landed (0
+    of 4006 live goals carried it, 2026-09-28). The name comes from the WRITER's
+    own constant, never retyped here: the writer and aspiration-trajectory both
+    reach it through that constant, which is why a scan for field-name literals
+    missed it. test_unknown_field_is_refused_by_the_daemon is the control: with
+    the registration reverted this test fails while that one still passes.
+    """
+    import worker_retrospective
+    field = worker_retrospective.MARKER_FIELD
+    assert _goal_fields.is_known(field), f"{field!r} is missing from GOAL_KNOWN_FIELDS"
+    resp = update_goal(_StubCtx(field))
+    if resp is not None:
+        body = str(getattr(resp, "body", ""))
+        assert "unknown_goal_field" not in body, body[:300]
+
+
 def test_override_header_admits_a_new_field(_stub_world):
     """The escape hatch must actually open, or the gate is a wall.
 

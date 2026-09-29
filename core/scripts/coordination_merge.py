@@ -5181,9 +5181,13 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     #     load-tree-summary.sh: "Generates _summary.json from _tree.yaml if
     #     stale." Its content is a pure function of _tree.yaml (which HAS a
     #     handler, merge_tree). A union of two summaries would fabricate a
-    #     summary matching NEITHER side's tree — strictly worse than the
-    #     safe-freeze, because the freeze is repaired by regeneration on the
-    #     next stale check. Correct resolution is regenerate, never merge.
+    #     summary matching NEITHER side's tree. Correct resolution is
+    #     regenerate, never merge. CORRECTED 2026-09-28 (): this
+    #     used to say the safe-freeze "is repaired by regeneration on the next
+    #     stale check". It is not: a rebuild changes only the local bytes, so
+    #     the both-diverged freeze never cleared (93 sweeps on DESKTOP-O91DLK2,
+    #     407 on zc-09). The file is now machine-local in
+    #     owncloud_sync._EXCLUDE_NAMES, so it never syncs and never freezes.
     #   patterns/_index.yaml, strategies/_index.yaml, meta-knowledge/_index.yaml,
     #   transfer/_index.yaml -> BASENAME COLLISION, structurally unregisterable.
     #     merge_handler_for dispatches on os.path.basename, so all four collapse

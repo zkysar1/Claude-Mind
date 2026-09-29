@@ -73,7 +73,8 @@ class FakeBackend:
         s.size = len(b)
         return s
 
-    def mirror_put(self, path, content, *, expected_version=None):
+    def mirror_put(self, path, content, *, expected_version=None,
+                   local_is_source=False):
         self.s3[str(path)] = content
         self.puts.append(str(path))
 

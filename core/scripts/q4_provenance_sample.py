@@ -308,9 +308,10 @@ def retrieved_predicate(session_id: Optional[str]) -> Optional[Callable]:
 
     THE session_id IS LOAD-BEARING AND MUST BE PASSED (measured 2026-09-03,
     alpha worker Body on cc-07). `context-reads.tracker_path` routes to the
-    per-Body tracker `sessions/<sid>/body-context-reads.txt` when that Body has
-    a forked body-WM file, and to the agent-wide `session/context-reads.txt`
-    otherwise. On a worker Body the agent-wide file may not exist at all.
+    session's own tracker `sessions/<sid>/body-context-reads.txt` whenever that
+    session has a per-session dir (every bound session since g-115-11179), and
+    to the agent-wide `session/context-reads.txt` otherwise. For such a session
+    the agent-wide file may not exist at all.
     Same-turn positive control on that box: the value "framework-verification",
     written by that session's own retrieve.sh, answered rc=1 without
     --session-id and rc=0 with it. A Q4 that omitted it would report every

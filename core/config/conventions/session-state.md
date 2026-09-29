@@ -974,14 +974,21 @@ Partial reads (offset/limit/pages) ARE recorded, behind the `#partial:` marker â
 read-before-edit advisory, invisible to the blocking dedup gate (g-115-3747). They were dropped
 entirely until then, which is what the superseded "partial reads bypass tracking" line described.
 
-**Known defect: concurrent same-agent sessions (g-115-11179, open).** Every Body without a forked
-WM shares ONE tracker, `session/context-reads.txt`, and `_read_tracker_split` deletes it whenever
-the calling session id differs from the header. So two or more live sessions of one agent (for
-example, several assistant sessions on one box) keep erasing each other's read records. Measured
-2026-09-27 with three alpha sessions on one box: reads made earlier in a session were gone, and the
-file held a `#prov:retrieval` line that the session named in its header never ran. Until
-g-115-11179 lands, a pre-edit "has not been Read" or retrieval-floor "NO recorded consultation"
-advisory in a multi-session setup is a lead to check, not evidence of a miss.
+**Where each session's tracker lives (g-115-11179).** Every session with a per-session dir
+(`agents/<agent>/sessions/<SID>/`, created by its Phase 2.6 binding) owns its tracker,
+`sessions/<SID>/body-context-reads.txt`. That covers the reducer, a forked worker Body and every
+reader/assistant session. The agent-wide `session/context-reads.txt` is left for a caller with no
+session id (an operator running a wrapper by hand) and for a session with no per-session dir (a
+legacy `.active-agent-<SID>` binding). The hooks pass `--session-id` from their JSON. A caller that
+omits it, such as `load-conventions.sh` or a digest loader, falls back to `$MIND_SID`, which
+`bash-agent-inject.py` puts on every Bash-tool command (g-115-8976).
+
+The two changes are only safe together. Before them, every session without a forked WM shared the
+agent-wide file, and `_read_tracker_split` deleted it on each session-id mismatch, so concurrent
+same-agent sessions erased each other's read records. Measured 2026-09-27 with three alpha sessions
+on one box: reads were gone, and a `#prov:` line from another session sat under the header. The
+mismatch delete now fires only on the agent-wide file. Pinned by
+`core/scripts/tests/test_context_reads_session_routing.py`.
 
 **Scripts**: `core/scripts/context-reads.py`, `core/scripts/context-reads-skill-gate.sh`, `core/scripts/load-conventions.sh`.
 
@@ -1043,7 +1050,7 @@ Recording a failed lookup would authenticate a citation to a node that never res
 direction this manifest must not fail in.
 
 **Why one file.** Provenance entries inherit the tracker's session scoping, its self-healing
-session-mismatch delete, and its per-Body routing (`sessions/<unitKey>/body-context-reads.txt`)
+session-mismatch delete, and its per-session routing (`sessions/<SID>/body-context-reads.txt`)
 for free. One lifecycle, not two.
 
 **The exclusion is load-bearing.** `_read_tracker_split`'s path fork ends in

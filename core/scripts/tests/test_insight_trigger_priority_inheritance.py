@@ -139,17 +139,28 @@ def test_untagged_relay_from_a_real_post_files_at_medium():
 
 
 def test_relayed_store_writes_are_floored_at_medium():
-    for action in ("pq-close", "experience-add"):
+    # land-write: the verb NO_CLAIM_MESSAGE names. The rest: the verbs relayers
+    # used before it named one (measured 2026-09-28, see RELAY_ACTION_TYPES).
+    for action in ("land-write", "pq-close", "close-pending-questions",
+                   "experience-add", "register", "register-experience"):
         p = its._build_goal_payload(_relay(action))
         assert p["priority"] == "MEDIUM", action
         assert "Priority floor" in p["description"], action
 
 
+def test_relay_verbs_match_whatever_the_relayer_typed():
+    """action_type is free text, and some posts spell verbs with underscores."""
+    for action in ("land_write", "PQ-Close", "Register_Experience"):
+        assert its._build_goal_payload(_relay(action))["priority"] == "MEDIUM", action
+
+
 def test_other_untagged_action_types_stay_low():
-    """NEGATIVE CONTROL: the floor is for relays only."""
-    p = its._build_goal_payload(_relay("audit-orphan-census"))
-    assert p["priority"] == "LOW"
-    assert "Priority floor" not in p["description"]
+    """NEGATIVE CONTROL: the floor is for relays only. apply and execute are
+    left out on purpose: most addressed posts using them are not relays."""
+    for action in ("audit-orphan-census", "apply", "execute"):
+        p = its._build_goal_payload(_relay(action))
+        assert p["priority"] == "LOW", action
+        assert "Priority floor" not in p["description"], action
 
 
 def test_the_floor_never_lowers_a_relay():
@@ -157,7 +168,7 @@ def test_the_floor_never_lowers_a_relay():
 
 
 def test_relay_action_types_live_in_one_named_constant():
-    assert {"pq-close", "experience-add"} <= its.RELAY_ACTION_TYPES
+    assert {"land-write", "pq-close", "experience-add"} <= its.RELAY_ACTION_TYPES
 
 
 # ── anti-vacuity (mutate THIS one, guard-1793) ───────────────────────────────

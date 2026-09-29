@@ -8,6 +8,11 @@ Body (no forked WM file) this collapses to today's agent-wide tracker, so
 concurrent Bodies stop clobbering each other's session-scoped dedup state -- the
 cross-contamination the move fixes.
 
+Since g-115-11179 the discriminator is the per-session DIR, not the forked WM
+file, so every bound session (reducer, reader, assistant) gets its own tracker.
+Those cases live in test_context_reads_session_routing.py. The fork cases below
+still hold, and a session with no per-session dir keeps the agent-wide file.
+
 Subprocess tests exercise the REAL record code path (incl. _paths resolution)
 under a throwaway agent created beneath the real PROJECT_ROOT, torn down in
 finally (mirrors test_pre_edit_context_gate.py's throwaway-agent pattern).
@@ -67,6 +72,7 @@ def _agent(fork_sids=()):
     try:
         env = dict(os.environ)
         env["MIND_AGENT"] = THROWAWAY
+        env.pop("MIND_SID", None)   #  fallback: keep flagless calls bare
         yield env, adir
     finally:
         if adir.name == THROWAWAY and adir.is_dir():
@@ -81,15 +87,15 @@ def _record(env, sid, file_path):
         capture_output=True, text=True, env=env, cwd=str(PROJECT_ROOT), timeout=30)
 
 
-def test_record_without_fork_writes_agent_wide():
-    with _agent() as (env, adir):  # no Body forked
+def test_record_without_a_session_dir_writes_agent_wide():
+    with _agent() as (env, adir):  # no Body forked, no per-session dir at all
         r = _record(env, SID_A, IN_SCOPE_FILE)
         assert r.returncode == 0, r.stderr
         agent_wide = adir / "session" / "context-reads.txt"
         body = adir / "sessions" / SID_A / "body-context-reads.txt"
-        assert agent_wide.is_file(), "agent-wide tracker expected without a forked Body"
+        assert agent_wide.is_file(), "agent-wide tracker expected without a per-session dir"
         assert _norm(IN_SCOPE_FILE) in agent_wide.read_text(encoding="utf-8")
-        assert not body.exists(), "no body tracker without a forked WM file"
+        assert not body.exists(), "no session tracker without a per-session dir"
 
 
 def test_record_with_fork_writes_body_tracker():

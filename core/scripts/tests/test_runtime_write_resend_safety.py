@@ -243,6 +243,18 @@ def test_timed_out_write_is_not_resent_and_returns_2(tmp_path):
     assert "g-115-8129" in r.stderr, r.dump()
 
 
+def test_unknown_outcome_text_names_the_recheck_not_a_retry(tmp_path):
+    """: the text is read at the one moment the retry decision is
+    made, so it must carry guard-7374's procedure. Its old closing lines ('Read
+    the store back before retrying ... retry with RT_CURL_TIMEOUT=600') were
+    followed instead of the guard, and three measured retries double-landed."""
+    r = _run(tmp_path, _CALL, "POST", "timeout")
+    assert "WRITE OUTCOME UNKNOWN" in r.stderr, r.dump()
+    assert "guard-7374" in r.stderr, r.dump()
+    assert "guard-5739" in r.stderr, r.dump()
+    assert "retry with RT_CURL_TIMEOUT" not in r.stderr, r.dump()
+
+
 def test_empty_reply_write_is_not_resent(tmp_path):
     """The daemon closed the connection with no reply — the shape of a daemon
     recycled mid-request — after it may have applied the write."""

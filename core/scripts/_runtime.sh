@@ -485,6 +485,9 @@ rt_spawn() {
         # unscrubbed there, which is the half of the old claim that was true.
         # shellcheck disable=SC1091
         source "$PROJECT_ROOT/core/scripts/_daemon_env_scrub.sh"
+        # : fill the committed settings env this shell lacks, before
+        # the scrub (why: the _daemon_env_scrub.sh header).
+        daemon_overlay_settings_env "$py_cmd" >> "$RT_SPAWN_LOG" 2>&1
         daemon_scrub_inherited_env
         # guard-586: cap before the redirect creates the long-lived fd. Twin of
         # the mind-api-start.sh spawn site — the two are independent spawn paths
@@ -1159,8 +1162,9 @@ _rt_write_unknown() {
     esac
     echo "[runtime] WRITE OUTCOME UNKNOWN: $1 $2 got $how (curl exit ${_RT_CURL_RC:-?}${_RT_ELAPSED_MS:+, ${_RT_ELAPSED_MS}ms})." >&2
     echo "  The daemon may already have applied it, so it was NOT sent again (g-115-8129)." >&2
-    echo "  Read the store back before retrying: a blind re-run can write it twice." >&2
-    echo "  If the daemon is slow, retry with RT_CURL_TIMEOUT=600." >&2
+    echo "  Do NOT retry it in this turn (guard-7374): an empty read-back now cannot tell 'never landed' from 'still processing'." >&2
+    echo "  Recheck later (next turn or iteration) by a key unique to this write, e.g. origin_signal or title." >&2
+    echo "  Only if it is still absent then, send it again byte-identical; if both copies land, retire the extra (guard-5739)." >&2
 }
 
 # _rt_reply <method> <path> <rc> — hand the last captured reply to the caller

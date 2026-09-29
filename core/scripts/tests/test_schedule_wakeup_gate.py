@@ -603,3 +603,102 @@ def test_malformed_payload_approves():
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+# ---------------------------------------------------------------- class F ---
+# A worker Body an operator stopped must not re-arm its own deadman net
+# (). /stop writes the SESSION marker, agent-state stays RUNNING for the
+# agent's other Bodies, and the net's parked branch then re-armed hourly and
+# re-ran the worker loop for hours. Every outcome of _arm_on_stopped_body gets a
+# case; the deny is the positive control.
+
+STOPPED_SID = "5af0e472956d4dfc"
+
+
+def worker_net_prompt():
+    """The prompt deadman-directive.sh emits today, not a copy of it."""
+    sys.path.insert(0, str(GATE.parent))
+    from _bash_helpers import BASH  # the resolver the directive tests use (guard-580)
+    script = GATE.parent / "deadman-directive.sh"
+    env = dict(os.environ, MIND_AGENT="alpha")
+    out = subprocess.run([BASH, script.as_posix(), "--role", "worker"],
+                         capture_output=True, text=True, env=env, timeout=30,
+                         cwd=str(GATE.parents[2])).stdout
+    start = out.index("ScheduleWakeup(prompt='") + len("ScheduleWakeup(prompt='")
+    return out[start:out.index("'", start)]
+
+
+def stop_body(agent, sid=STOPPED_SID):
+    marker = agent / "sessions" / sid / "stop-requested"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+
+
+def arm_net(agent, sid=STOPPED_SID, prompt=None):
+    return run_gate({"prompt": prompt or worker_net_prompt(), "delaySeconds": 3600},
+                    agent_dir=agent, session_id=sid, harness="zakcode")
+
+
+def test_a_stopped_body_cannot_rearm_its_worker_net(agent):
+    """POSITIVE CONTROL: the exact call that kept a stopped Body calling the model."""
+    set_state(agent, "RUNNING")
+    stop_body(agent)
+    rc, decision, out = arm_net(agent)
+    assert (rc, decision) == (0, "deny")
+    assert "stopped this Body" in out and "Skill(worker-loop)" in out
+
+
+def test_a_live_body_still_rearms_its_worker_net(agent):
+    """Outcome 5: no marker, so this is the rb-4345 re-arm and must pass."""
+    set_state(agent, "RUNNING")
+    rc, decision, _ = arm_net(agent)
+    assert (rc, decision) == (0, None)
+
+
+def test_another_sessions_stop_does_not_reach_this_body(agent):
+    """The marker is per SESSION: stopping one Body leaves the others their net."""
+    set_state(agent, "RUNNING")
+    stop_body(agent, sid="0000aaaa1111bbbb")
+    rc, decision, _ = arm_net(agent)
+    assert (rc, decision) == (0, None)
+
+
+@pytest.mark.parametrize("prompt", [
+    "check GitHub PR #142 CI run status",
+    "/loop investigate flaky test",
+])
+def test_other_wakeups_on_a_stopped_body_are_left_alone(prompt, agent):
+    """Outcome 2: only the worker net resumes the loop; a person's wake-up is theirs."""
+    set_state(agent, "RUNNING")
+    stop_body(agent)
+    rc, decision, _ = arm_net(agent, prompt=prompt)
+    assert (rc, decision) == (0, None)
+
+
+def test_a_stopped_body_may_cancel_its_net(agent):
+    """Class B honours the worker's SESSION marker: cancelling is the right move."""
+    set_state(agent, "RUNNING")
+    stop_body(agent)
+    rc, decision, _ = run_gate({"stop": True}, agent_dir=agent, session_id=STOPPED_SID)
+    assert (rc, decision) == (0, None)
+
+
+def test_without_a_stop_the_cancel_is_still_refused(agent):
+    """Control for the test above: the same cancel on a live Body strands its loop."""
+    set_state(agent, "RUNNING")
+    rc, decision, _ = run_gate({"stop": True}, agent_dir=agent, session_id=STOPPED_SID)
+    assert (rc, decision) == (0, "deny")
+
+
+def test_the_gate_matches_the_prompt_the_directive_emits():
+    """Drift pin: a reworded net prompt must not silently unhook this check."""
+    mod = _load_gate_module()
+    assert worker_net_prompt().startswith(mod.WORKER_NET_HEAD)
+
+
+@pytest.mark.parametrize("sid", ["", "../../etc", "a/b", None])
+def test_an_unusable_session_id_fails_open(sid, monkeypatch, tmp_path):
+    """Outcome 3: a session id is a directory name, so anything else resolves to None."""
+    mod = _load_gate_module()
+    monkeypatch.setenv("MIND_AGENT_DIR", str(tmp_path))
+    assert mod._session_stop_marker(sid) is None

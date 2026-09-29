@@ -129,6 +129,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Local file I/O on a governed path goes through long_path (g-115-11323): the
+# walk and the store listing hand back plain paths, and on a Windows box without
+# long paths a plain path of 260+ chars cannot be read or stat'ed at all. Keys,
+# relative_to() and every backend call keep the plain path.
+from _long_path import long_path  # noqa: E402
+
 # --- machine-local exclusion policy ---------------------------------------
 # Directory names pruned from the walk entirely (never descended into).
 # NOTE: "session" (singular) is intentionally NOT excluded as of the session-
@@ -281,6 +287,23 @@ _EXCLUDE_NAMES = {
     # redesigning around it: it claimed "on a synced world it stays local",
     # which was false precisely because nothing excluded the basename here.
     "domain-suite-baseline.json",
+    # knowledge-tree summary cache (g-115-11322). SAME SHAPE as the two entries
+    # above: every box rebuilds it, it both-diverges, and the sync skips it
+    # forever. Measured on DESKTOP-O91DLK2 (93 consecutive sweeps) and zc-09
+    # (407, g-115-11193); the findings board held _summary.json wedge alerts
+    # from at least 3 boxes, and the store took a PUT every 20-90 min.
+    #
+    # WHY MACHINE-LOCAL IS THE RIGHT CLASS HERE, per guard-3018 (read the
+    # CONSUMER): the only writer and reader is load-tree-summary.sh, which
+    # rebuilds it from THIS box's _tree.yaml whenever it is missing or older.
+    # Each box's copy is a pure function of its own _tree.yaml, and _tree.yaml
+    # is the file that syncs (merge-registered). A peer's summary admitted here
+    # describes a tree this box may not have yet.
+    #
+    # NOT the guard-3018 hazard class: nothing reads it cross-box, and it has
+    # no append semantics. It is the only file of this name under world/ or
+    # meta/ (find, 2026-09-28).
+    "_summary.json",
 }
 # Basename glob patterns never synced.
 _EXCLUDE_GLOBS = ("*.lock", "*.pyc", "*.tmp", "*.swp", "*~", "*.sock",
@@ -625,6 +648,151 @@ def _claim_held_continuously(full, be, holder_since_by_agent) -> bool:
     return True
 
 
+# --- LOCAL-WINS drain-awareness guard (g-306-534) ---------------------------
+# Capture slots on the agent session working-memory.yaml: the reducer DRAINS
+# these (wm-drain-goals.sh / the spark-consume path) oldest-first AFTER
+# consuming the relays, and the drain is what the fleet has ALREADY acted on.
+# A stale local copy still holding pre-drain entries is the g-306-527
+# resurrection carrier: its mtime can be RECENT (the new box keeps appending
+# to its stale baseline — live-maintained, not frozen), so no recency check
+# can see it. The discriminating fact is entry-set SHAPE, which a drain
+# leaves: drains delete oldest-first, so the drained side holds a SUBSET of
+# the stale side whose NEWEST entry is newer than entries the stale side
+# still retains below it.
+_LOCAL_WINS_CAPTURE_SLOTS = (
+    "spark_capture", "exp_capture", "hyp_capture", "encoding_capture")
+
+
+def _local_wins_stale_reason(local_bytes: bytes, s3_bytes: bytes):
+    """Content guard for the LOCAL-WINS lane (g-306-534; mechanism g-306-527).
+
+    Answers ONE question the two existing gates cannot: of the two diverged
+    bytes, is the LOCAL side a STALE BASELINE of the S3 side? The claim-
+    continuity gate (g-306-379) answers "was the claim held continuously
+    since the local write" and FAILS OPEN when `holder_since` is 0/absent —
+    the pre-field handover residual its own docstring names. g-306-527
+    measured that residual admit a 25h-stale local file over a drained S3,
+    resurrecting every drained spark_capture id in one push.
+
+    Per capture slot, entries are keyed by content hash (the SAME keying
+    body-merge.py uses for its array union, so "the same entry" means the
+    same thing on both sides):
+
+      S3 entries ⊆ local entries (local is a superset):
+        local's EXTRA entries span an OLDER `_item_ts` than S3's newest
+        entry  -> "stale_resurrection"  (REFUSE): local retains entries a
+        drain already deleted; pushing local resurrects consumed relays.
+        All extra entries are NEWER than S3's newest  -> None (PROCEED):
+        the legitimate forward-append divergence — the exact shape of the
+        451-skip wedge g-115-2816/2820 fixed. LOCAL-WINS MUST keep
+        resolving it or the guard re-wedges the file forever.
+      S3 entries NOT ⊆ local (S3 holds entries local lacks):
+        -> "s3_unique_content" (REFUSE, conservative): pushing local would
+        DELETE S3-side content; neither side is a superset of the other,
+        which is the reconcile case, not the local-wins case.
+
+    FAIL-OPEN by contract (guard-1562 enumeration): any file that is not
+    parseable YAML, is not a mapping, or carries no capture slots at all
+    (a non-working-memory session file reaching this lane) returns None —
+    byte-for-byte the pre-g-306-534 behavior. The guard can only ADD
+    refusals to the structured working-memory shape it is designed around;
+    it cannot refuse anything else. `_item_ts` is ISO-8601 UTC and sorts
+    lexically, so max/min over strings is the correct ordering.
+
+    KNOWN RESIDUAL (named, not papered over): a slot the reducer has drained
+    to EMPTY on S3 (s_items == {}) makes `max()` raise on the empty set ->
+    caught -> fail OPEN. That is deliberate, not a gap in the catch: an
+    empty-S3-slot + non-empty-local slot is UNDISTINGUISHABLE from a
+    legitimate fresh append into an empty slot, and refusing it would risk
+    the very re-wedge this guard must not cause (guard-1562). The MEASURED
+    g-306-527 carrier was a PARTIAL drain (S3 kept 50 entries, stale local
+    held 2,853) -> S ⊆ L, extra non-empty, extra_oldest < s_newest ->
+    refused here.
+
+    Cost: two yaml.safe_load passes (multi-MB at cap) over bytes the LANE
+    ALREADY READ (local_bytes for its md5, s3_bytes for s3_md5) — no extra
+    I/O. Runs ONLY on the both-diverged single-writer session-file event —
+    rare by design (a wedge is an incident, not a steady state) — and is
+    bounded, never a loop over all files.
+    """
+    try:
+        import yaml
+        import hashlib as _hl
+
+        def _key(item):
+            blob = json.dumps(item, sort_keys=True, default=str,
+                              ensure_ascii=True)
+            return _hl.sha1(blob.encode("utf-8")).hexdigest()
+
+        def _slot_map(doc, slot):
+            if not isinstance(doc, dict):
+                return None
+            val = doc.get(slot)
+            if not isinstance(val, list):
+                return None
+            return {_key(x): x for x in val if isinstance(x, dict)}
+
+        local_doc = yaml.safe_load(local_bytes)
+        s3_doc = yaml.safe_load(s3_bytes)
+        for slot in _LOCAL_WINS_CAPTURE_SLOTS:
+            s_items = _slot_map(s3_doc, slot)
+            l_items = _slot_map(local_doc, slot)
+            if s_items is None or l_items is None:
+                continue                     # slot structurally absent -> OPEN
+            s_keys = set(s_items)
+            l_keys = set(l_items)
+            if s_keys <= l_keys:
+                extra = l_keys - s_keys
+                if extra:
+                    # s_items empty here -> max() raises -> caught -> OPEN
+                    # (the named residual above; deliberate).
+                    s_newest = max(x.get("_item_ts", "")
+                                   for x in s_items.values())
+                    extra_ts = [l_items[k].get("_item_ts", "") for k in extra]
+                    extra_ts = [t for t in extra_ts if t]
+                    if s_newest and extra_ts:
+                        extra_oldest = min(extra_ts)
+                        if extra_oldest < s_newest:
+                            return "stale_resurrection"
+            else:
+                # S3 holds entries local lacks -> pushing local would DELETE
+                # S3-side content. Neither side is a superset of the other:
+                # the reconcile case, not the local-wins case.
+                return "s3_unique_content"
+    except Exception:  # noqa: BLE001 — unreadable/unparseable -> fail OPEN
+        return None
+    return None
+
+
+# SURFACING THE REFUSAL: a refused file falls to the existing clobber-safe
+# both-diverged skip below the lane, which appends it to stats["conflict_paths"]
+# — the g-115-8027 machinery (_update_conflict_streaks / _post_conflict_alert)
+# already tracks that streak, prints CONFLICT-PERSISTENT at 3 sweeps, and posts
+# the board finding that routes to /reconcile-owncloud-conflicts at 10. A
+# parallel post mechanism here would be a second alert path for the same wedge
+# (implementation-discipline); the guard's contribution is the REFUSAL (the
+# resurrection harm is blocked) plus a COUNTED, REASONED stderr line and the
+# reason_suffix on the CONFLICT skip, so the wedge is diagnosable on sweep one
+# instead of after the threshold.
+
+
+def _local_wins_stale_probe(be, full, local_bytes):
+    """Run the g-306-534 content guard against S3 TRUTH for one admitted
+    file. Fetches the S3 object with read_authoritative_bytes (g-115-1987/
+    2179: the pure S3 read that never touches the local mirror — the lane
+    cannot use read_bytes(force_fresh=True), which in the both-diverged
+    state serves the LOCAL bytes, i.e. a local-against-local comparison that
+    could never fire). FAIL-OPEN by contract: any fetch error (method absent
+    on a backend, transport, absent object) or parse problem returns None —
+    byte-for-byte the pre-g-306-534 admission. Returns None (admit) or the
+    reason string (refuse): "stale_resurrection" | "s3_unique_content"."""
+    try:
+        s3_bytes = be.read_authoritative_bytes(full)
+    except Exception:  # noqa: BLE001 — fail OPEN (admit as before)
+        return None
+    return _local_wins_stale_reason(local_bytes, s3_bytes)
+
+
 # --- manifest (machine-local mtime cache to skip unchanged files) ----------
 def _runtime_dir() -> Path:
     rd = os.environ.get("RUNTIME_DIR")
@@ -645,51 +813,55 @@ def _load_manifest() -> dict:
         return {}
 
 
+def _write_runtime_file(p: Path, text: str) -> None:
+    """Atomically replace the machine-local runtime file `p` with `text`.
+
+    The one tmp+rename dance for this module's mind_api/state files (manifest,
+    conflict streaks, pull errors). A unique mkstemp sibling per writer, so
+    concurrent writers never share a temp; fsync before the rename (guard-1179);
+    then the publish through storage_backend.replace_with_retry, the single
+    retry policy (guard-472) for the PermissionError that os.replace raises on
+    Windows while any reader holds the target open (g-115-7257). Raises OSError
+    when the directory cannot be made or the retries run out, and never leaves
+    the temp behind.
+    """
+    from storage_backend import replace_with_retry
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(p.parent), prefix=f".{p.name}.",
+                                    suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        outcome = replace_with_retry(tmp_name, p, retry_on=(PermissionError,))
+        if not outcome.ok:
+            raise outcome.last_err
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _save_manifest(m: dict) -> None:
-    # Atomic write (unique temp in the same dir + os.replace). The manifest now
-    # has TWO concurrent in-daemon writers under own-cloud — the periodic sweep
-    # thread (__main__._start_owncloud_sync_thread) and the on-demand flush
-    # endpoint (POST /v1/admin/owncloud-flush), each on its own thread, both
-    # calling sweep()->_save_manifest. A plain write_text() is non-atomic, so a
-    # concurrent _load_manifest() could read a TRUNCATED file (corruption window)
-    # and a second writer could collide mid-write on Windows. mkstemp gives each
-    # writer a unique temp so they never clobber each other's temp; os.replace is
-    # atomic on POSIX and Windows, so readers always see a COMPLETE manifest and
-    # last-writer-wins cleanly (a few extra re-HEADs next tick at worst — the
-    # manifest is a local mtime-skip cache, never the SSOT; S3 is). Pattern per
-    # the `atomic-primitives` tree node (.tmp + replace for concurrently-read files).
+    # Atomic write via _write_runtime_file. The manifest has TWO concurrent
+    # in-daemon writers under own-cloud — the periodic sweep thread
+    # (__main__._start_owncloud_sync_thread) and the on-demand flush endpoint
+    # (POST /v1/admin/owncloud-flush), each on its own thread, both calling
+    # sweep()->_save_manifest. A plain write_text() is non-atomic, so a
+    # concurrent _load_manifest() could read a TRUNCATED file (corruption
+    # window). Readers always see a COMPLETE manifest and last-writer-wins
+    # cleanly (a few extra re-HEADs next tick at worst — the manifest is a local
+    # mtime-skip cache, never the SSOT; S3 is). Pattern per the
+    # `atomic-primitives` tree node (.tmp + replace for concurrently-read files).
     p = _manifest_path()
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        _sync_print(f"[sync] WARN: could not create manifest dir {p.parent}: {e}",
-              file=sys.stderr)
-        return
-    tmp_fd = None
-    tmp_path = None
-    try:
-        tmp_fd, tmp_name = tempfile.mkstemp(
-            dir=str(p.parent), prefix=".owncloud-sync-manifest.", suffix=".tmp")
-        tmp_path = Path(tmp_name)
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            tmp_fd = None  # fdopen owns the descriptor now
-            f.write(json.dumps(m))
-        os.replace(tmp_name, p)
-        tmp_path = None  # replaced successfully — nothing to clean up
+        _write_runtime_file(p, json.dumps(m))
     except OSError as e:
         _sync_print(f"[sync] WARN: could not persist manifest {p}: {e}",
               file=sys.stderr)
-    finally:
-        if tmp_fd is not None:
-            try:
-                os.close(tmp_fd)
-            except OSError:
-                pass
-        if tmp_path is not None and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
 
 
 # --- multi-machine ownership + freshness (H4 — machine-2 gate) -------------
@@ -1082,7 +1254,7 @@ def _try_merge_put(be, full: Path, local_bytes: bytes, stats: dict, *,
     stats.setdefault("merge_events", []).append(
         {"file": str(full), "lane": counter})
     try:
-        md5 = hashlib.md5(full.read_bytes()).hexdigest()
+        md5 = hashlib.md5(long_path(full).read_bytes()).hexdigest()
     except OSError:
         md5 = None
     # g-115-2937: ALSO append the event to a DURABLE per-file merge-events log
@@ -1132,8 +1304,9 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
           multi-machine, unregistered -> skip + warn (defer; never clobber)
           single-machine -> push (no peer to clobber)
     """
+    io_path = long_path(full)  # local I/O only; `full` stays the key path
     try:
-        local_bytes = full.read_bytes()
+        local_bytes = io_path.read_bytes()
     except OSError as e:
         _sync_print(f"[sync] WARN: unreadable {full}: {e}", file=sys.stderr)
         _record_error(stats, full, e, phase="read-local")
@@ -1219,7 +1392,7 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                 # reads in-sync (aggregate counter only — no per-file print;
                 # same flood rationale as nobaseline_reconciled, g-328-14).
                 try:
-                    return hashlib.md5(full.read_bytes()).hexdigest()
+                    return hashlib.md5(io_path.read_bytes()).hexdigest()
                 except OSError:
                     return None
             # Multi-machine but NOT own-cloud: no single authority -> keep the
@@ -1267,6 +1440,18 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # can push bytes this box authored while a PEER legitimately held the
             # claim. Counted, not silent: a gate whose refusals are invisible
             # cannot be calibrated against the 451-skip wedge it must not re-arm.
+            # g-306-534: continuity alone is NOT admission either — the continuity
+            # gate FAILS OPEN on a pre-field handover (holder_since 0/absent, the
+            # residual its own docstring names), and g-306-527 measured that
+            # residual admit a 25h-stale local file over a DRAINED S3: every
+            # drained spark_capture id resurrected in one push. The claim was
+            # held continuously (the new box holds it NOW); the CONTENT is what
+            # is stale — continuity is a gate on authorship, this one is a gate
+            # on staleness, and neither subsumes the other. The refusal is
+            # counted, reasoned, and routed to the clobber-safe skip below (the
+            # g-115-8027 streak/alert machinery then surfaces the wedge); the
+            # legitimate forward-append shape still resolves LOCAL-WINS.
+            _lw_stale_reason = None
             _lw_classified = (own_cloud_authority
                               and _is_single_writer_session_file(full, be))
             _lw_admitted = _lw_classified and _claim_held_continuously(
@@ -1277,6 +1462,19 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                 _sync_print(
                     "[sync] skip (local-wins withheld: claim changed hands after "
                     f"this file was written): {full}", file=sys.stderr)
+            elif _lw_admitted:
+                # g-306-534 drain-awareness guard (content level; fail-open by
+                # contract — see _local_wins_stale_reason's fail-open enumeration
+                # and _local_wins_stale_probe for the fetch surface).
+                _lw_stale_reason = _local_wins_stale_probe(be, full, local_bytes)
+                if _lw_stale_reason:
+                    _lw_admitted = False
+                    stats["local_wins_blocked_stale_local"] = \
+                        stats.get("local_wins_blocked_stale_local", 0) + 1
+                    _sync_print(
+                        f"[sync] skip (local-wins refused: stale local baseline, "
+                        f"reason={_lw_stale_reason}; g-306-534): {full}",
+                        file=sys.stderr)
             if _lw_admitted:
                 if dry_run:
                     stats["local_wins_would_resolve"] = \
@@ -1292,7 +1490,8 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                 except Exception:  # pragma: no cover — registry unavailable
                     ConflictError = ()  # type: ignore
                 try:
-                    be.mirror_put(full, local_bytes, expected_version=st.version)
+                    be.mirror_put(full, local_bytes, expected_version=st.version,
+                                  local_is_source=True)
                 except ConflictError:
                     # S3 moved again between our HEAD and the PUT -> the next
                     # sweep re-evaluates; never force over a just-changed remote.
@@ -1318,9 +1517,19 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # whose union-merge returned _MERGE_NA — a bug to chase) from a
             # genuinely-unregistered conflict skip. Both reached this identical
             # line before, which is why the 2026-07-20 cc-02 incident was
-            # undiagnosable from the logs.
-            reason_suffix = (f"; merge-lane NA: {diverged_merge_na_reason}"
-                             if diverged_merge_na_reason else "")
+            # undiagnosable from the logs. g-306-534 adds the same distinction
+            # for a LOCAL-WINS stale-local refusal: the lane already counted and
+            # reasoned its own line, but a CONFLICT line that cannot say WHICH
+            # gate withheld the file is the same undiagnosable class. (The two
+            # suffixes are effectively mutually exclusive — a merge-registered
+            # store returns up the merge lane before the local-wins gate — but
+            # concatenation is harmless if that ever changes.)
+            reason_suffix = ""
+            if diverged_merge_na_reason:
+                reason_suffix += f"; merge-lane NA: {diverged_merge_na_reason}"
+            if _lw_stale_reason:
+                reason_suffix += (f"; local-wins refused stale-local "
+                                  f"({_lw_stale_reason}; g-306-534)")
             _sync_print(f"[sync] skip (CONFLICT — local and S3 both changed since "
                   f"baseline{reason_suffix}): {full}", file=sys.stderr)
             return None
@@ -1411,7 +1620,7 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
                 # nobaseline_reconciled counter in the sweep summary is the durable
                 # signal, not thousands of stderr lines).
                 try:
-                    return hashlib.md5(full.read_bytes()).hexdigest()
+                    return hashlib.md5(io_path.read_bytes()).hexdigest()
                 except OSError:
                     return None
             # Multi-machine but NOT own-cloud: no single authority to defer to ->
@@ -1488,7 +1697,10 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
     except Exception:  # pragma: no cover
         ConflictError = ()  # type: ignore
     try:
-        be.mirror_put(full, local_bytes, expected_version=expected)
+        # local_is_source: local_bytes came from `full`, so the push must not
+        # rewrite it (g-115-7257 — the rewrite is what wedged an appended log).
+        be.mirror_put(full, local_bytes, expected_version=expected,
+                      local_is_source=True)
         stats["pushed"] += 1
         # g-115-8155: record WHICH object was pushed, not merely how many.
         # The `push_paths` append existed ONLY in the `if dry_run:` branch
@@ -1557,14 +1769,15 @@ _CONFLICT_ALERT_THRESHOLD = 10
 
 # Reserved key for the per-episode alert markers, stored INSIDE the streaks
 # artifact rather than in a sidecar. Two reasons, and the first is the binding
-# one: marker and streak are then written by the SAME tmp.replace, so they can
-# never disagree (a sidecar admits a torn state where the streak resets but the
-# marker survives, suppressing a real alert forever). Second, the artifact
+# one: marker and streak are then written by ONE _write_runtime_file call (one
+# atomic replace), so they can never disagree (a sidecar admits a torn state
+# where the streak resets but the marker survives, suppressing a real alert
+# forever). Second, the artifact
 # already lives in RUNTIME_DIR — structurally outside the tree this sweep
 # observes — which is exactly the placement guard-2316 prescribes for a
 # detector's own state; a sidecar would inherit that property without adding
 # anything. Safe for the two live consumers: mirror_health.classify guards BOTH
-# of its comprehensions with `isinstance(v, int)` (mirror_health.py:63,71), so a
+# of its streak comprehensions with `isinstance(v, int)`, so a
 # dict value under this key is ignored rather than mis-counted, and
 # agent-watchdog reads through mirror_health.probe(). A '#' prefix cannot
 # collide with a repo-relative path.
@@ -1722,10 +1935,7 @@ def _update_conflict_streaks(stats: dict) -> None:
     if alerted:
         new[_CONFLICT_ALERTED_KEY] = alerted
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(new, indent=0), encoding="utf-8")
-        tmp.replace(p)
+        _write_runtime_file(p, json.dumps(new, indent=0))
     except OSError as e:
         _sync_print(f"[sync] WARN: conflict-streaks persist failed: {e}",
               file=sys.stderr)
@@ -2134,12 +2344,12 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                 if _is_machine_local(fn, prefix, full_path=full_path,
                                      root_path=root_path):
                     continue
-                if full_path.is_symlink():
+                if long_path(full_path).is_symlink():
                     continue
                 stats["scanned"] += 1
                 rel_key = f"{prefix}/{full_path.relative_to(root_path).as_posix()}"
                 try:
-                    mtime_ns = full_path.stat().st_mtime_ns
+                    mtime_ns = long_path(full_path).stat().st_mtime_ns
                 except OSError:
                     mtime_ns = None
                 base_mtime, base_md5 = _manifest_entry(manifest.get(rel_key))
@@ -2163,7 +2373,7 @@ def sweep(be, *, only_root, dry_run, use_manifest, full, only_agent=None):
                     # mtime would force a spurious re-HEAD next sweep).
                     if stats.get("stale_pulled", 0) > stale_pulled_before:
                         try:
-                            mtime_ns = full_path.stat().st_mtime_ns
+                            mtime_ns = long_path(full_path).stat().st_mtime_ns
                         except OSError:
                             pass
                     new_manifest[rel_key] = {"mtime": mtime_ns, "md5": new_md5}
@@ -2508,7 +2718,7 @@ def sync_file(be, target: Path, *, dry_run, stats_out=None) -> int:
             if not (_own_carrier is not None
                     and target.resolve() == _own_carrier[0].resolve()):
                 return _skip("peer_agent")
-    if not target.exists() or target.is_dir():
+    if not long_path(target).exists() or long_path(target).is_dir():
         return _skip("missing_or_dir")
     stats = {"scanned": 1, "in_sync": 0, "pushed": 0, "would_push": 0,
              "conflicts": 0, "errors": 0, "stale_skipped": 0,
@@ -2646,9 +2856,10 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
         return None  # nothing on S3 to resume from
 
     snapshot_first = False  # g-115-1928: set only on the no-baseline pull branch
-    if full.exists():
+    io_path = long_path(full)  # local I/O only; `full` stays the key path
+    if io_path.exists():
         try:
-            local_md5 = hashlib.md5(full.read_bytes()).hexdigest()
+            local_md5 = hashlib.md5(io_path.read_bytes()).hexdigest()
         except OSError as e:
             print(f"[pull] WARN: unreadable local {full}: {e}", file=sys.stderr)
             _record_error(stats, full, e, phase="pull-read-local")
@@ -2717,7 +2928,7 @@ def _pull_one(be, full: Path, *, dry_run: bool, stats: dict, baseline_md5=None):
         return None
     stats["pulled"] += 1
     try:
-        return hashlib.md5(full.read_bytes()).hexdigest()  # new baseline
+        return hashlib.md5(io_path.read_bytes()).hexdigest()  # new baseline
     except OSError:
         return None
 
@@ -3123,7 +3334,7 @@ def _materialize_tree(be, root_path: Path, cur: Path, prefix: str, *,
             stats["pulled_files"].append(rel_key)
         if not dry_run and new_md5 is not None:
             try:
-                mtime_ns = child.stat().st_mtime_ns
+                mtime_ns = long_path(child).stat().st_mtime_ns
             except OSError:
                 mtime_ns = None
             if mtime_ns is not None:
@@ -3273,6 +3484,34 @@ def pull_bootstrap(be, *, only_root=None, dry_run=False):
 
 
 # --- periodic pull sweep (g-115-2268 Gap A) ---------------------------------
+def _pull_errors_path() -> Path:
+    return _runtime_dir() / "owncloud-pull-errors.json"
+
+
+def _save_pull_errors(stats: dict) -> None:
+    """Persist the last full pull's error count AND identities (g-115-11323).
+
+    The pull has always counted its errors, and nothing read the count: 14
+    deep tree nodes failed to pull on one box every sweep for five days while
+    mirror-health said healthy, because it reads only the conflict streaks.
+    mirror_health.probe() reads this file. It is rewritten by every full pull,
+    so a box whose errors stop clears on its next pull, and its mtime says how
+    fresh the answer is. Fail-open, like the other bookkeeping in this module.
+    """
+    doc = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "roots": stats.get("pulled_roots", []),
+           "scanned": stats.get("scanned", 0),
+           "errors": stats.get("errors", 0),
+           "error_paths": stats.get("error_paths", []),
+           "error_paths_truncated": stats.get("error_paths_truncated", 0)}
+    p = _pull_errors_path()
+    try:
+        _write_runtime_file(p, json.dumps(doc, indent=0))
+    except OSError as e:
+        _sync_print(f"[pull-sweep] WARN: pull-errors persist failed: {e}",
+                    file=sys.stderr)
+
+
 def pull_sweep(be, *, only_root=None, dry_run=False):
     """Periodic PULL half of the mirror sweep (g-115-2268 Gap A).
 
@@ -3371,7 +3610,7 @@ def pull_sweep(be, *, only_root=None, dry_run=False):
                     stats["pulled_files"].append(rel_key)
                 if not dry_run and new_md5 is not None:
                     try:
-                        mtime_ns = full.stat().st_mtime_ns
+                        mtime_ns = long_path(full).stat().st_mtime_ns
                     except OSError:
                         mtime_ns = None
                     if mtime_ns is not None:
@@ -3382,6 +3621,10 @@ def pull_sweep(be, *, only_root=None, dry_run=False):
                                                  "etag": str(etag).strip('"')}
     if not dry_run:
         _save_manifest(new_manifest)
+        # Only a FULL pull may speak for the box: a --root pull that found no
+        # errors in its one root must not clear the other root's failures.
+        if only_root is None:
+            _save_pull_errors(stats)
     return stats
 
 

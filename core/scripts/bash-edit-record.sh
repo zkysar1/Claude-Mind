@@ -19,7 +19,8 @@
 # silently drops self-authored work; completing the log is the safe prerequisite
 # and this is that step.
 #
-# SIGNAL — per-session cursor (last scan epoch). On each Bash PostToolUse,
+# SIGNAL — a cursor (last scan epoch) in the agent-wide session/ dir, shared
+# by every session of the agent. On each Bash PostToolUse,
 # record neutral framework files whose mtime is NEWER than the cursor (i.e.
 # files this agent's just-finished command touched) then advance the cursor.
 # mtime-delta (NOT a cumulative `git status`) bounds attribution to THIS
@@ -27,6 +28,12 @@
 # into this agent's OWN log and re-include it at commit time (),
 # causing the very over-inclusion this prevents. First run of a session sets
 # the cursor and records nothing (no prior window to bound the delta).
+#
+# SESSION STAMP () — each record carries `sid`, the session whose
+# Bash call observed the change; iteration-commit.sh --session-sid keys on it.
+# The cursor is shared, so a change is recorded ONCE, by the first session whose
+# command ends after it: the session that ran the writing command, unless
+# another session's command ended while that command was still running.
 #
 # NO GIT — the scan is a filesystem mtime walk, never `git status`/`git
 # ls-files`. Adding a git command to every Bash call across all agents would
@@ -102,10 +109,14 @@ printf '%s\n' "$now_epoch" > "$cursor_path" 2>/dev/null || true
 # framework files live: core/scripts/*.py|*.sh, core/config/*, .claude/skills,
 # .claude/rules). goal_id is left empty: the partner filter keys only on `file`;
 # a team-state round-trip per Bash call is not worth the hot-path latency.
-LOGP="$log_path" CUR="$cursor_epoch" NOWE="$now_epoch" PROOT="$PROJECT_ROOT" \
+LOGP="$log_path" CUR="$cursor_epoch" NOWE="$now_epoch" PROOT="$PROJECT_ROOT" SID="$session_id" \
     python3 - <<'PYEOF' 2>/dev/null || true
-import os, json, time
+import os, json, re, time
 
+# A session id is a uuid; anything else is dropped rather than written.
+sid = os.environ.get("SID", "").strip()  # a Windows python may leave a trailing \r
+if not re.fullmatch(r"[A-Za-z0-9_-]*", sid):
+    sid = ""
 proot = os.environ["PROOT"]
 logp = os.environ["LOGP"]
 cur = int(os.environ["CUR"])
@@ -152,7 +163,7 @@ for root in scan_roots:
                 continue
             seen.add(rel)
             new_entries.append(
-                {"file": rel, "mtime": m, "edit_ts": now_iso, "goal_id": ""}
+                {"file": rel, "mtime": m, "edit_ts": now_iso, "goal_id": "", "sid": sid}
             )
 
 if new_entries:

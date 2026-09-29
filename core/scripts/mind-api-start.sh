@@ -816,6 +816,9 @@ cap_log_file "$SPAWN_LOG"
 # daemon itself. `</dev/null` ensures no caller stdin is inherited (guard-4527).
 # Twin of the _runtime.sh rt_spawn site — fix both or neither.
 (
+    # : fill the committed settings env this shell lacks, before the
+    # scrub (why: the _daemon_env_scrub.sh header).
+    daemon_overlay_settings_env "$py_cmd" >> "$SPAWN_LOG" 2>&1
     #  scrub (rationale at the source line near the file head).
     if [ -n "${PYTEST_CURRENT_TEST:-}" ]; then daemon_scrub_inherited_env; fi
     cd "$PROJECT_ROOT" || exit 1

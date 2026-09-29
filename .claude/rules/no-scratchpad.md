@@ -1,6 +1,5 @@
 ---
 description: "Never write under the harness scratchpad; use agents/<agent>/sessions/<SID>/scratch/ for scratch and agents/<agent>/temp/ for queues."
-alwaysApply: true
 ---
 
 # No Harness Scratchpad

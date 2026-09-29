@@ -697,28 +697,22 @@ if [ -n "$REASONS" ]; then
     EXISTING_JSON="${COOLDOWN_JSON:-$(bash "$SCRIPT_DIR/wm-read.sh" fresh_eyes_last_fire --json 2>/dev/null || echo "null")}"
     CURRENT_SET="$CURRENT_SET" EXISTING_JSON="$EXISTING_JSON" \
     COOLDOWN_HOURS="${COOLDOWN_HOURS:-12}" \
-    PROJECT_ROOT="$PROJECT_ROOT" \
+    PROJECT_ROOT="$PROJECT_ROOT" SCRIPT_DIR="$SCRIPT_DIR" \
     python3 - <<'PYEOF' 2>/dev/null | bash "$SCRIPT_DIR/wm-set.sh" fresh_eyes_last_fire >/dev/null 2>&1 || true
-import json, os, hashlib
+import json, os, sys
 from datetime import datetime, timedelta
 
-def _file_sig(rel_path, root):
-    """sha1[:12] of file content (g-115-573 amend-detection). None if file
-    missing/unreadable — caller treats absence as no signature available, NOT
-    a coverage failure (paths in record.files without a signature entry fall
-    through to the path-only backward-compat branch in the reader)."""
-    full = os.path.join(root, rel_path) if root else rel_path
-    try:
-        with open(full, "rb") as f:
-            return hashlib.sha1(f.read()).hexdigest()[:12]
-    except (OSError, IOError):
-        return None
+#  amend-detection: the one signature algorithm, shared with the reader
+# (_fresh_eyes_coverage_check.py). None when a file is missing or unreadable;
+# the reader then falls back to path-only coverage for that path.
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+from _fresh_eyes_signatures import file_sig
 
 files = [l.strip() for l in os.environ.get("CURRENT_SET", "").splitlines() if l.strip()]
 project_root = os.environ.get("PROJECT_ROOT", "")
 content_signatures = {}
 for _p in files:
-    _sig = _file_sig(_p, project_root)
+    _sig = file_sig(_p, project_root)
     if _sig is not None:
         content_signatures[_p] = _sig
 new_record = {

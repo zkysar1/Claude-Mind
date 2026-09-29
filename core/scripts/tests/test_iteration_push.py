@@ -1331,7 +1331,7 @@ def _env_agent(name: str = "testagent") -> dict:
     return {**os.environ, "MIND_AGENT": name, "STORAGE_BACKEND": "local"}
 
 
-def _run_push_as(repo: Path, agent: str, *flags: str) -> subprocess.CompletedProcess:
+def _run_push_as_agent(repo: Path, agent: str, *flags: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         [BASH, str(PUSH_SH), "--repo", str(repo), *flags],
         capture_output=True, text=True, timeout=120, env=_env_agent(agent),
@@ -1365,7 +1365,7 @@ def test_staged_serialization_churn_unstages_instead_of_deferring(tmp_path):
     _must(a, "add", PARTNER_JSONL)                    # STAGED, churn-only
     assert _must(a, "diff", "--cached", "--name-only") == PARTNER_JSONL
 
-    r = _run_push_as(a, "testagent", *_default_flags())
+    r = _run_push_as_agent(a, "testagent", *_default_flags())
 
     assert "SEMANTICALLY identical" in r.stderr, r.stderr
     assert "guard-741, defer" not in r.stderr, r.stderr
@@ -1385,7 +1385,7 @@ def test_staged_real_partner_work_still_defers(tmp_path):
     (a / PARTNER_JSONL).write_text(REAL_EDIT, encoding="utf-8", newline="\n")
     _must(a, "add", PARTNER_JSONL)                    # STAGED, REAL change
 
-    r = _run_push_as(a, "testagent", *_default_flags())
+    r = _run_push_as_agent(a, "testagent", *_default_flags())
 
     assert "guard-741, defer" in r.stderr, r.stderr
     assert "SEMANTICALLY identical" not in r.stderr, r.stderr
@@ -1400,7 +1400,7 @@ def test_staged_unparseable_churn_still_defers(tmp_path):
                                    newline="\n")
     _must(a, "add", PARTNER_JSONL)
 
-    r = _run_push_as(a, "testagent", *_default_flags())
+    r = _run_push_as_agent(a, "testagent", *_default_flags())
     assert "guard-741, defer" in r.stderr, r.stderr
 
 
@@ -1411,6 +1411,11 @@ def test_dirty_shared_yaml_crlf_churn_does_not_block_merge(tmp_path):
     the case the goal's verification names explicitly.
     """
     origin, a, b = _clone_pair(tmp_path)
+    # A's CRLF bytes must count as a modification, as they do on Linux. Under
+    # core.autocrlf=true (Git for Windows' system default) `git diff` calls the
+    # rewrite clean while `git merge` calls it dirty, so the dirty-path arm is
+    # unreachable and the merge just defers;  owns that gap.
+    _must(a, "config", "core.autocrlf", "false")
     _commit_file(a, "shared/config.yaml", "alpha: 1\nbeta: 2\n", "seed shared")
     _must(a, "push", "-q", "origin", "main")
     _must(b, "pull", "-q", "origin", "main")
@@ -1421,7 +1426,7 @@ def test_dirty_shared_yaml_crlf_churn_does_not_block_merge(tmp_path):
     (a / "shared/config.yaml").write_text("alpha: 1\r\nbeta: 2\r\n",
                                           encoding="utf-8", newline="")
 
-    r = _run_push_as(a, "testagent", *_default_flags())
+    r = _run_push_as_agent(a, "testagent", *_default_flags())
 
     assert "only by serialization" in r.stderr, r.stderr
     assert "blocking file outside agents/*" not in r.stderr, r.stderr
@@ -2438,3 +2443,215 @@ def test_ff_only_untracked_file_in_the_way_is_refused_not_overwritten(tmp_path):
     assert "ff-only tick: merge --ff-only refused" in out, out
     assert _tip(a) == before, out
     assert (a / "incoming.txt").read_text(encoding="utf-8") == "mine, untracked\n"
+
+
+# --------------------------------------------------------------------------- #
+# : untrack-ahead of a path UPSTREAM deleted AND ignores
+# --------------------------------------------------------------------------- #
+_SPOOL = "agents/alpha/stats.spool"
+
+
+def _upstream_untracks_spool(b: Path, *, ignore: bool) -> None:
+    """B deletes the spool at origin — with an ignore rule for it when `ignore`
+    (the g-306-523 shape: `git rm` plus a .gitignore line in one change)."""
+    _must(b, "rm", "-q", "--", _SPOOL)
+    if ignore:
+        (b / ".gitignore").write_text("**/stats.spool\n", encoding="utf-8", newline="\n")
+        _must(b, "add", ".gitignore")
+    _must(b, "commit", "-q", "-m", "B: untrack the spool")
+    _must(b, "push", "-q", "origin", "main")
+
+
+def _untracked_and_ignored(a: Path, rel: str) -> bool:
+    return (rel not in _must(a, "ls-tree", "-r", "--name-only", "HEAD").splitlines()
+            and _git(a, "ls-files", "--error-unmatch", "--", rel).returncode != 0
+            and _git(a, "check-ignore", "-q", "--", rel).returncode == 0)
+
+
+def test_untrack_ahead_clears_the_modify_delete_wedge(tmp_path):
+    """Outcome 1, on the shape that wedged cc-10 (and zc-11, zc-05): this box
+    committed spool churn after the merge base, origin untracked+ignored the
+    spool, and a dirty SELF ledger makes git refuse the first merge — so the
+    churn self-heal runs before the retry. That is the path where an untracked
+    spool NOT in info/exclude gets re-staged by the self-heal (it commits every
+    untracked self-namespace file) and the modify/delete conflict comes back.
+    Pre-fix this aborts as a MERGE CONFLICT on every run, forever."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "s1\n",
+                          "agents/alpha/health.jsonl": "h1\nh2\nh3\nh4\nh5\n"})
+    _upstream_untracks_spool(b, ignore=True)
+    _commit_file(b, "agents/alpha/health.jsonl", "h1-from-b\nh2\nh3\nh4\nh5\n",
+                 "B: advance alpha health")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, _SPOOL, "s1\ns2-local\n", "A: spool churn")
+    (a / "agents/alpha/health.jsonl").write_text("h1\nh2\nh3\nh4\nh5-local\n",
+                                                 encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert "committing 1 SELF-namespace file(s) pre-merge" in r.stderr, r.stderr
+    assert "MERGE CONFLICT" not in r.stderr, r.stderr
+    assert "push OK" in r.stderr, r.stderr
+    # this box's bytes survive on disk, untracked and ignored
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "s1\ns2-local\n"
+    assert _untracked_and_ignored(a, _SPOOL)
+    _must(a, "fetch", "-q", "origin", "main")
+    counts = _must(a, "rev-list", "--left-right", "--count", "origin/main...main")
+    assert counts.split() == ["0", "0"], f"not converged: {counts}"
+    health = (a / "agents/alpha/health.jsonl").read_text(encoding="utf-8")
+    assert "h1-from-b" in health and "h5-local" in health
+    assert _must(a, "status", "--porcelain") == ""
+
+
+def test_untrack_ahead_leaves_a_deleted_but_not_ignored_path_conflicting(tmp_path):
+    """Outcome 2, the negative control: origin deleted the path but did NOT
+    ignore it, so nothing declared it machine-local. That stays a true content
+    conflict — aborted cleanly, nothing untracked, the local commit intact."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "s1\n"})
+    _upstream_untracks_spool(b, ignore=False)
+    _commit_file(a, _SPOOL, "s1\ns2-local\n", "A: spool churn")
+    a_tip = _tip(a)
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 1, r.stderr
+    assert "MERGE CONFLICT" in r.stderr, r.stderr
+    assert "untrack-ahead" not in r.stderr, r.stderr
+    assert not (a / ".git" / "MERGE_HEAD").exists()
+    assert _tip(a) == a_tip
+    assert _must(a, "show", f"HEAD:{_SPOOL}") == "s1\ns2-local"
+
+
+def test_untrack_ahead_keeps_a_clean_copy_on_disk(tmp_path):
+    """Outcome 3: this box never touched the spool since the merge base, so the
+    integrate is a plain fast-forward that pre-fix DELETES the file from disk
+    before it drained (zc-07 lost a 25-line spool at 08:27:14Z, rb-12266)."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "undrained-line\n"})
+    _upstream_untracks_spool(b, ignore=True)
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained-line\n"
+    assert _untracked_and_ignored(a, _SPOOL)
+
+
+def test_untrack_ahead_runs_in_the_loops_msys_env(tmp_path):
+    """: outcome 3 in the loop's own call shape. iteration-close.sh
+    sources _platform.sh, which on Git Bash exports MSYS_NO_PATHCONV=1 and puts
+    --repo in C:/ form. Under that variable mktemp's /tmp/... path reached
+    git.exe unconverted: git built the scratch repo under C:/tmp while bash
+    wrote the upstream .gitignore copies into %TEMP%, so nothing matched and
+    the fast-forward removed the undrained spool. Off Windows the variable is
+    inert and this is outcome 3 again."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "undrained-line\n"})
+    _upstream_untracks_spool(b, ignore=True)
+
+    r = subprocess.run(
+        [BASH, str(PUSH_SH), "--repo", a.as_posix(), *_default_flags("--strict")],
+        capture_output=True, text=True, timeout=120,
+        env={**os.environ, "MIND_AGENT": "alpha", "MSYS_NO_PATHCONV": "1"},
+    )
+    assert r.returncode == 0, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained-line\n"
+    assert _untracked_and_ignored(a, _SPOOL)
+
+
+def test_untrack_ahead_refuses_over_a_staged_index(tmp_path):
+    """guard-741: a staged entry may be a concurrent agent's work, and the
+    untrack commit is a plain `git commit` (a pathspec commit would re-add the
+    file), so it must not run over a non-empty index. It logs and steps aside;
+    the spool stays tracked and the merge behaves exactly as before."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "s1\n"})
+    _upstream_untracks_spool(b, ignore=True)
+    (a / "partner-staged.txt").write_text("partner\n", encoding="utf-8", newline="\n")
+    _must(a, "add", "partner-staged.txt")
+    a_tip = _tip(a)
+
+    r = _run_push_env(a, "alpha", *_default_flags())
+    assert "index already holds staged entries" in r.stderr, r.stderr
+    assert "untrack-ahead: untracked" not in r.stderr, r.stderr
+    excl = a / ".git" / "info" / "exclude"
+    assert "stats.spool" not in (excl.read_text(encoding="utf-8") if excl.exists() else "")
+    assert "untrack-ahead" not in _must(a, "log", "--format=%s", f"{a_tip}..HEAD")
+    assert "partner-staged.txt" in _must(a, "diff", "--cached", "--name-only")
+
+
+def test_untrack_ahead_leaves_a_path_upstream_renamed_to_the_merge(tmp_path):
+    """A path UPSTREAM renamed is not a deletion, even when upstream also ignores
+    the old name: the merge carries this box's change along the rename. Untracking
+    the old name first turns that clean merge into a rename/delete conflict, and
+    because HEAD then no longer tracks the path, every later run meets the same
+    conflict with nothing left to untrack: a new permanent wedge."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "s1\n"})
+    _must(b, "mv", _SPOOL, "agents/alpha/stats.jsonl")
+    (b / ".gitignore").write_text("**/stats.spool\n", encoding="utf-8", newline="\n")
+    _must(b, "add", ".gitignore")
+    _must(b, "commit", "-q", "-m", "B: rename the spool, ignore the old name")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, _SPOOL, "s1\ns2-local\n", "A: spool churn")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert "untrack-ahead" not in r.stderr, r.stderr
+    assert "MERGE CONFLICT" not in r.stderr, r.stderr
+    assert (a / "agents/alpha/stats.jsonl").read_text(encoding="utf-8") == "s1\ns2-local\n"
+
+
+def test_untrack_ahead_also_guards_the_push_race_recovery_merge(tmp_path):
+    """Under a throttled fetch the integrate step compares against a stale ref and
+    skips its merge, so the push-race recovery merge is the FIRST merge to see
+    upstream's commits. It must keep a clean copy on disk too, or outcome 3's
+    loss survives on every pushing box whose fetch was throttled."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "undrained-line\n"})
+    _must(a, "fetch", "origin", "main")  # fresh FETCH_HEAD: the 60-min throttle skips the pre-push fetch
+    _upstream_untracks_spool(b, ignore=True)
+    _commit_file(a, "from_a.txt", "a\n", "A: change")
+
+    r = _run_push_env(a, "alpha", "--min-commits", "1", "--fetch-interval-min", "60",
+                      "--strict")
+    assert r.returncode == 0, r.stderr
+    assert "fetch throttled" in r.stderr, r.stderr
+    assert "push-race recovery OK" in r.stderr, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained-line\n"
+    assert _untracked_and_ignored(a, _SPOOL)
+
+
+def test_untrack_ahead_keeps_an_untracked_upstream_ignored_file_out_of_the_self_heal(tmp_path):
+    """The shape cc-10 was in: upstream ignores the spool, this box holds it
+    UNTRACKED, and a dirty self ledger makes git refuse the first merge. The churn
+    self-heal lists untracked files by the LOCAL rules, which lack upstream's until
+    the merge lands them, so pre-fix it committed the spool and pushed it back to
+    origin: the very file upstream untracked (cc-10 re-added one twice in a morning)."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"agents/alpha/health.jsonl": "h1\nh2\nh3\nh4\nh5\n"})
+    (b / ".gitignore").write_text("**/stats.spool\n", encoding="utf-8", newline="\n")
+    _must(b, "add", ".gitignore")
+    _must(b, "commit", "-q", "-m", "B: ignore the spool")
+    _commit_file(b, "agents/alpha/health.jsonl", "h1-from-b\nh2\nh3\nh4\nh5\n",
+                 "B: advance alpha health")
+    _must(b, "push", "-q", "origin", "main")
+    (a / _SPOOL).write_text("undrained\n", encoding="utf-8", newline="\n")
+    (a / "agents/alpha/health.jsonl").write_text("h1\nh2\nh3\nh4\nh5-local\n",
+                                                 encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert f"untrack-ahead: excluded (untracked, kept on disk): {_SPOOL}" in r.stderr, r.stderr
+    assert "committing 1 SELF-namespace file(s) pre-merge" in r.stderr, r.stderr
+    assert "push OK" in r.stderr, r.stderr
+    assert _SPOOL not in _must(a, "ls-tree", "-r", "--name-only", "origin/main").splitlines()
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained\n"
+    assert _untracked_and_ignored(a, _SPOOL)

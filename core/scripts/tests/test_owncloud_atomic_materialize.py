@@ -87,6 +87,12 @@ def _hammer(write_one, target: Path, duration_s: float):
                 size = len(target.read_bytes())
             except FileNotFoundError:
                 size = -1
+            except PermissionError:
+                # Windows refuses an open that lands while os.replace swaps
+                # the file. No bytes were read, so it is not a torn read. Left
+                # uncaught it killed this thread on its first hit, and `bad`
+                # stopped counting for the rest of the run ().
+                continue
             observed["samples"] += 1
             if size != len(payload):
                 observed["bad"] += 1
@@ -101,6 +107,8 @@ def _hammer(write_one, target: Path, duration_s: float):
     return observed["samples"], observed["bad"]
 
 
+# A reader thread that dies stops counting, so a pass would mean nothing.
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
 def test_atomic_write_never_exposes_the_truncate_window(tmp_path):
     # POSITIVE CONTROL first: the bare idiom must be observably non-atomic on
     # this platform, or the assertion below has no resolving power.

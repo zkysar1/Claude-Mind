@@ -102,13 +102,14 @@ run_check() {
     py -3 "$CORE_ROOT/scripts/_fresh_eyes_coverage_check.py"
 }
 
-# Helper: compute sha1[:12] of TMP/<rel> (mirrors the production hash).
+# Helper: compute sha1[:12] of TMP/<rel> (mirrors the production hash, which
+# reads CRLF as LF: _fresh_eyes_signatures.file_sig).
 sig_of() {
     local rel="$1"
     py -3 -c "
 import hashlib, sys
 with open(r'$TMP/$rel','rb') as f:
-    print(hashlib.sha1(f.read()).hexdigest()[:12])
+    print(hashlib.sha1(f.read().replace(b'\r\n', b'\n')).hexdigest()[:12])
 "
 }
 

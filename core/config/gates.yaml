@@ -525,6 +525,24 @@ gates:
     tuning_notes: "FAIL-OPEN BY CONSTRUCTION at every entry point — absent slot, unparseable calendar, no phase covering now, and unreadable board ALL allow. So on a world with no world/conventions/domain-calendar.md this gate cannot fire at all and its FP rate is structurally zero; a firing count of 0 is therefore evidence about slot adoption, NOT about the gate's calibration. Never count-retire on the firing count alone — check whether any world declares the slot first. The demand half keys on post `type`, never `severity` (zero of 12,147 live posts carry that field, guard-159)."
     retirement_eligible: false
 
+  - id: lane-terminal-gate
+    script: core/scripts/lane_terminal_check.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: ".claude/skills/generate-domain-goals/SKILL.md", phase: "Phase 1 step 2 (lane floor)" }
+    dominant_risk: FN
+    asymmetry_magnitude: medium-high
+    keyword_bias: null
+    override_flag: null
+    fp_cost: low
+    fn_cost: medium
+    fp_description: "A live lane is excluded from the floor arithmetic because the reader mis-reported its status, so generation under-aims a lane that can use supply. Cheap: the next cadence re-reads the status, and only a positively-read completed/retired status can exclude — a misread that yields read_error fails open into the floor set instead."
+    fn_description: "A terminal lane is counted as starved and the batch target is aimed at a done lane. Measured 2026-09-19 (g-374-60 filing): 2 of 6 boosted lanes were completed and took 12 of the 25-goal batch target — ~48% of the batch aimed at closed lanes, diluting supply away from the live boosted lanes."
+    rb_evidence: []
+    tuning_notes: "FAIL-OPEN BY CONSTRUCTION: the only exclusion path is a positively-read terminal status (completed/retired, the CLAUDE.md aspiration status vocabulary; paused is LIVE — a paused lane still holds its pending goals and its floor still means something). A read failure, unknown id, non-JSON reader output, or a record without status all yield read_error + degraded=true and the lane STAYS in the floor set: the run degrades, the governor does not. Reads go through the sanctioned aspirations-read.sh wrapper, never the store's JSONL. The verdict's in_floor set is the only set the floor may sum over; excluded_terminal and degraded are printed beside the per-lane table so an exclusion reads as 'that lane is done', not 'nobody looked'."
+    retirement_eligible: false
+
   - id: depends-on-consistency
     script: core/scripts/gates/depends_on_consistency.py
     embedded: false

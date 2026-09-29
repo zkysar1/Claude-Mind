@@ -279,10 +279,12 @@ def _main(argv=None) -> int:
     result = decide(handoff, ref, override)
     verdict = result["verdict"]
     handoff_path = session_dir / HANDOFF_NAME
+    # as_posix(), not str(): the message names the path the same way on every
+    # platform. str() of a WindowsPath printed backslash separators ().
     try:
-        handoff_rel = str(handoff_path.resolve().relative_to(Path.cwd().resolve()))
+        handoff_rel = handoff_path.resolve().relative_to(Path.cwd().resolve()).as_posix()
     except ValueError:
-        handoff_rel = str(handoff_path)
+        handoff_rel = handoff_path.as_posix()
     payload = {"agent": agent or None, "handoff": handoff, "reference": ref}
 
     if result["decision"] == "pass":

@@ -382,6 +382,17 @@ def test_a_genuine_multiline_residue_is_still_refused(bed):
     assert stored_backups(bed) == [], "refused before the backup was taken"
 
 
+def test_a_crlf_multiline_residue_is_still_refused(bed):
+    """On Windows the tool writes its sabotage in text mode, so a multi-line
+    payload lands on disk as CRLF, and that residue must still be found. Written
+    as bytes so the case runs on every platform (measured 2026-09-28)."""
+    (bed / "target.txt").write_bytes(b"alpha = 99\r\ngamma = 3\r\nbeta = 2\r\n")
+    proc = run(bed, MULTI)
+    assert proc.returncode == 2, proc.stderr[-400:]
+    assert "already contains" in proc.stderr
+    assert stored_backups(bed) == [], "refused before the backup was taken"
+
+
 def test_multiline_residue_must_be_contiguous_and_in_order(bed):
     """Both lines present, but not as the literal payload. Still not residue."""
     (bed / "target.txt").write_text(

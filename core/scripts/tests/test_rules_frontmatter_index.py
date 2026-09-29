@@ -69,5 +69,7 @@ def test_the_pinned_set_is_small_enough_to_leave_room_for_the_index() -> None:
         meta, body = _front_matter(path.read_text(encoding="utf-8"))
         if meta.get("alwaysapply", "").lower() in ("true", "yes", "1"):
             pinned += min(len(body), MAX_RULE_FILE_CHARS) + len(path.stem) + 5
-    # 32 KB total; the 34-line index needs ~8 KB; keep pins under ~25 KB.
+    # 32 KB total render; keep pins under ~25 KB so the index fits. A ceiling, not a guarantee:
+    # at a served resident's ~136-char rule paths the index alone takes ~10.9 KB, so re-measure
+    # the render (rules-loading.md, "The always-on core") before adding a rule or a pin.
     assert pinned <= 25_000, f"pinned bodies total {pinned} chars — the index no longer fits"

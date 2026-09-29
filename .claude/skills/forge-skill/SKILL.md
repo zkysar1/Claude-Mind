@@ -95,46 +95,32 @@ false record.
 
 ### `/forge-skill skill <gap-id>` — Create a new skill from a gap
 
-**Forge Criteria** (ALL must be met):
-- **User-requested gap** (`requested_by: user`, filed by `/forge-skill request`): the
-  curriculum contract and the developmental gate in this list are WAIVED — log
-  `gate waived: user request` and continue; every other criterion still applies.
-- Curriculum contract: `Bash: curriculum-contract-check.sh --action allow_forge_skill`
-  IF exit code 1: ABORT — "Forge blocked by curriculum (stage: {stage_name}). Forging unlocks at: {unlocks_at}."
-- `times_encountered >= config.forge_threshold` (currently 2)
-- `estimated_value >= medium`
-- No existing skill covers the same procedure
-- System developmental gate (type-dependent):
-  - Read gap `type` from skill-gaps.yaml via meta-read.sh (default: `utility` —
-    see "Typeless default" below; was `analytical` until g-115-3131)
-  - Read `forge_gate` threshold from `core/config/skill-gaps.yaml` → `gap_types[type]`
-  - `utility` gaps require CALIBRATE+ (**confidence >= 0.50**)
-  - `analytical` gaps require EXPLOIT+ (**confidence >= 0.75**)
-  - Check: capability_level of related category >= forge_gate
-  node_json=$(bash core/scripts/tree-read.sh --node <category-key>)
-  (extract confidence from node_json, or fall back to `agents/<agent>/developmental-stage.yaml`)
-
-  **The confidence numbers above are NOT free-standing — they mirror
-  `core/config/tree.yaml` → `domain_health.competence_mapping`, which is the
-  SSOT (`EXPLORE 0.25 / CALIBRATE 0.50 / EXPLOIT 0.75 / MASTER 1.00`; guard-1195
-  — capability_level/confidence travel together in `_tree.yaml`). If that
-  mapping is retuned, update these two lines with it. Prefer reading the node's
-  stored `capability_level` string over re-deriving a level from `confidence`;
-  the resolver is `_graduate_from_confidence` in
-  `core/scripts/backfill-tree-node-fields.py` (highest threshold whose value the
-  confidence meets or exceeds).**
-
-  The `>= 0.30`/`>= 0.60` gloss once here was wrong and erred LOW (g-250-269). Rationale
-  (SSOT, the correction, why this gate is text-only): core/config/rationale/forge-skill-gates.md.
-
-  **Typeless default — decided g-115-3131 (2026-07-25, bravo).** A gap with no
-  `type` defaults to `utility` (CALIBRATE), not `analytical` (EXPLOIT).
-   Rationale (evidence: 20 of 22 typeless gaps classify utility; rejected alternatives;
-   safety of lowering): core/config/rationale/forge-skill-gates.md.
+**Forge Criteria** (ALL must be met). `bash core/scripts/forge-gate-check.sh <gap-id>`
+checks every one except the last, reads each threshold from its source (g-115-9042),
+and prints ONE verdict line (PASS | BLOCK | WAIVED) naming every input:
+- Status does not suppress forging (`core/config/skill-gaps.yaml` → `gap_statuses`).
+- `times_encountered >= config.forge_threshold`; `estimated_value` (its leading word) `>= medium`.
+- Curriculum contract `allow_forge_skill` permits forging (`curriculum-contract-check.sh`).
+- Developmental gate, type-dependent: gap `type` (absent → `utility`, g-115-3131) selects
+  `gap_types[type].forge_gate` — utility CALIBRATE, analytical EXPLOIT. With
+  `--category <tree-node-key>` the related node's stored `capability_level` must reach it
+  (guard-1195; scale `core/config/tree.yaml` `domain_health.competence_mapping`); without
+  it, the agent's developmental-stage `tree_maturity` must.
+- **User-requested gap** (`requested_by: user`, filed by `/forge-skill request`): verdict
+  WAIVED — the curriculum contract and the developmental gate are waived; every other
+  criterion still applies.
+- No existing skill covers the same procedure (not scripted — checked at Step 1).
+Rationale (the SSOT, the g-250-269 correction, the typeless default):
+core/config/rationale/forge-skill-gates.md.
 
 **Forge Process**:
 
-1. **Validate** — Check all forge criteria. If any fail, report which and abort.
+1. **Validate** — `Bash: bash core/scripts/forge-gate-check.sh <gap-id>`, adding
+   `--category <tree-node-key>` when the gap maps to a knowledge-tree category.
+   Exit 1 (BLOCK): report its verdict line — it names each failing criterion — and abort.
+   Exit 2: it could not evaluate; report the error and abort. Exit 0: confirm no existing
+   skill covers the same procedure, then continue (on WAIVED, log `gate waived: user
+   request` for the Step 9 report).
 
 2. **Extract Procedure** — Read the gap's `encounter_log` contexts and the
    `related_skill` SKILL.md to identify the repeated manual steps. Summarize

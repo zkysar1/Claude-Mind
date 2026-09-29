@@ -1,6 +1,5 @@
 ---
 description: "When the plan's last step is done, clear the plan and answer the user's ORIGINAL request with a verdict; never end on 'plan finished'."
-alwaysApply: true
 ---
 
 # Plan Completion: Clear the Plan, Answer the Question

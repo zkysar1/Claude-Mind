@@ -20,6 +20,7 @@ Output: JSON object with trajectory data including:
       learning has not reached the stores yet is reported, not scored 0
 """
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -203,27 +204,52 @@ def build_framework_code_attribution(root=PROJECT_ROOT):
     otherwise credited 434 files. Known limit: an iteration commit that
     sweeps other work's dirty files credits them to its own goal (1
     non-recurring such commit among 3,899 credited, 2026-09-27). Returns
-    None, with the reason on stderr, when history is unreadable (no .git on
-    a transplanted deployment, no git binary, a timeout).
+    None, with the reason on stderr, when history is unreadable (no .git,
+    no git binary, a timeout) or is not this Mind's own. `git -C` walks up
+    to an enclosing repository (guard-5267), so a Mind copied or vendored
+    below another repo's toplevel read that repo's history and credited
+    nothing: {}, which never tripped the caller's fallback (g-306-533). A
+    shallow clone's history is cut short, so it under-credits.
     """
     import subprocess
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(root), "-c", "core.quotePath=off", "log",
-             "--no-merges", "--no-renames", "--format=%x1e%s%x1f%b%x1f",
-             "--raw", "--no-abbrev", "--",
-             *(lane for lane, _ in FRAMEWORK_CODE_LANES)],
-            capture_output=True, encoding="utf-8", errors="replace",
-            timeout=30)
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"aspiration-trajectory: git log failed: {exc}", file=sys.stderr)
+
+    def git(cmd, *args):
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(root), "-c", "core.quotePath=off", cmd,
+                 *args],
+                capture_output=True, encoding="utf-8", errors="replace",
+                timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"aspiration-trajectory: git {cmd} failed: {exc}",
+                  file=sys.stderr)
+            return None
+        if proc.returncode != 0:
+            print(f"aspiration-trajectory: git {cmd} rc={proc.returncode}: "
+                  f"{proc.stderr.strip()[:200]}", file=sys.stderr)
+            return None
+        return proc.stdout
+
+    where = git("rev-parse", "--show-cdup", "--is-shallow-repository")
+    if where is None:
         return None
-    if proc.returncode != 0:
-        print(f"aspiration-trajectory: git log rc={proc.returncode}: "
-              f"{proc.stderr.strip()[:200]}", file=sys.stderr)
+    cdup, _, shallow = where.partition("\n")
+    if cdup.strip():
+        print(f"aspiration-trajectory: {root} is not the git toplevel "
+              f"(show-cdup {cdup.strip()}): git walked up to an enclosing "
+              f"repository, whose history is not this Mind's", file=sys.stderr)
+        return None
+    if shallow.strip() == "true":
+        print(f"aspiration-trajectory: {root} is a shallow clone: its "
+              f"history is cut short", file=sys.stderr)
+        return None
+    log = git("log", "--no-merges", "--no-renames",
+              "--format=%x1e%s%x1f%b%x1f", "--raw", "--no-abbrev", "--",
+              *(lane for lane, _ in FRAMEWORK_CODE_LANES))
+    if log is None:
         return None
     files_by_goal = {}
-    for record in proc.stdout.split("\x1e")[1:]:
+    for record in log.split("\x1e")[1:]:
         subject, _, rest = record.partition("\x1f")
         body, _, raw = rest.partition("\x1f")
         goals = commit_author_goal_ids(subject.strip(), body)
@@ -468,7 +494,7 @@ def load_pending_capture_goal_ids(root=PROJECT_ROOT):
     return ids
 
 
-def classify_credit(goal, total_artifacts, pending_capture_ids):
+def classify_credit(goal, total_artifacts, pending_capture_ids, capture_owner=None):
     """None when the goal's learning credit is SETTLED, else why it is pending.
 
     g-306-518. A worker Body never writes rb, guardrails or the tree: its
@@ -485,9 +511,19 @@ def classify_credit(goal, total_artifacts, pending_capture_ids):
       - no retrospective marker -> pending (its Body is unmerged, or the
         retrospective has not landed for it; either way nothing has arrived);
       - slots unreadable -> pending (cannot tell drained from unseen);
+      - slots read are not the goal owner's -> pending (g-306-537). The slots
+        are the ones wm-read.sh returned for `capture_owner`, the BOUND agent,
+        so another agent's undrained entries are invisible and "drained" reads
+        the same as "never seen" -- the unreadable case wearing a readable
+        costume. The owner is `executed_by`: the claim path writes it
+        unconditionally, so it names the Body whose WM holds the captures
+        (completed_by is first-wins and can name an earlier closer). An
+        unknown owner on either side resolves the same way;
       - id still in a capture slot -> pending (merged, not yet drained).
     A Body that dies without staging its WM leaves its goals pending for good
-    (g-306-520 owns that loss); they are listed, never counted as zeros.
+    (g-306-520 owns that loss); they are listed, never counted as zeros. The
+    same holds for another agent's worker goals: only the owner's own
+    evaluation can settle them.
     """
     if str(goal.get("completed_by_role") or "").strip().lower() != "worker":
         return None
@@ -497,6 +533,9 @@ def classify_credit(goal, total_artifacts, pending_capture_ids):
         return "no-retrospective-marker"
     if pending_capture_ids is None:
         return "capture-slots-unreadable"
+    owner = str(goal.get("executed_by") or "").strip()
+    if not owner or owner != capture_owner:
+        return "capture-slots-not-owner"
     if goal.get("id") in pending_capture_ids:
         return "capture-undrained"
     return None
@@ -596,6 +635,10 @@ def load_shared_data():
         "tree_attribution": build_tree_attribution_map(WORLD_DIR / "knowledge" / "tree"),
         "script_convention_attribution": build_script_convention_attribution_map(),
         "pending_capture_goal_ids": load_pending_capture_goal_ids(),
+        # WHOSE slots that read: wm-read.sh addresses MIND_AGENT (rt_call's
+        # X-Mind-Agent header in _runtime.sh). Unset -> None, and
+        # classify_credit then keeps every marked worker goal pending.
+        "capture_owner": os.environ.get("MIND_AGENT", "").strip() or None,
         "asp_sources": asp_sources,
     }
 
@@ -625,6 +668,8 @@ def build_trajectory(asp_id, shared=None):
     script_convention_attribution = shared.get("script_convention_attribution", {})
     # Absent key = no slot data supplied = unreadable (resolves toward pending).
     pending_capture_ids = shared.get("pending_capture_goal_ids")
+    # Absent key = whose slots is unknown = every marked worker goal pending.
+    capture_owner = shared.get("capture_owner")
 
     # Build per-goal artifact counts
     goal_artifacts = []
@@ -634,7 +679,8 @@ def build_trajectory(asp_id, shared=None):
                                             tree_attribution,
                                             script_convention_attribution)
         total = sum(artifacts.values())
-        pending_reason = classify_credit(g, total, pending_capture_ids)
+        pending_reason = classify_credit(g, total, pending_capture_ids,
+                                         capture_owner)
         goal_artifacts.append({
             "goal_id": g.get("id", "unknown"),
             "title": g.get("title", ""),
@@ -744,6 +790,7 @@ def build_trajectory(asp_id, shared=None):
         "credit_pending_count": len(pending),
         "credit_pending_goal_ids": [ga["goal_id"] for ga in pending],
         "capture_slots_readable": pending_capture_ids is not None,
+        "capture_owner": capture_owner,
         "credit_strata": credit_strata,
         "config": config,
     }

@@ -11,10 +11,10 @@ and falls back to path-only coverage (backward-compat with pre-573 records).
 
 Path resolution: PROJECT_ROOT env var, fallback to CWD.
 
-Canonical implementation. The gate writer
-(core/scripts/post-state-update-gate.sh fresh_eyes_last_fire writer) inlines
-the same algorithm to avoid a subprocess inside its PYEOF→wm-set pipe; if
-the algorithm changes here, mirror the change there.
+file_sig is the ONE signature algorithm. Both writers (this CLI and the
+post-state-update-gate.sh fresh_eyes_last_fire writer) and the reader
+(_fresh_eyes_coverage_check.py) import it, so a recorded signature is always
+compared with one computed the same way.
 
 Usage:
   py -3 core/scripts/_fresh_eyes_signatures.py --files-json '["a.sh","b.sh"]'
@@ -33,17 +33,29 @@ from _stdio import reconfigure_stdio  # noqa: E402
 reconfigure_stdio()
 
 
+def file_sig(rel_path, root):
+    """sha1[:12] of a file's content with CRLF read as LF; None if unreadable.
+
+    git checks one commit out with CRLF line endings on a Windows box
+    (core.autocrlf) and with LF elsewhere. Over raw bytes, a record written on
+    one box never matched a reading on the other, so every cross-platform
+    record read as an amend."""
+    full = os.path.join(root, rel_path) if root else rel_path
+    try:
+        with open(full, "rb") as f:
+            return hashlib.sha1(f.read().replace(b"\r\n", b"\n")).hexdigest()[:12]
+    except (OSError, IOError):
+        return None
+
+
 def compute_signatures(files, root):
     sigs = {}
     for p in files:
         if not isinstance(p, str) or not p.strip():
             continue
-        full = os.path.join(root, p) if root else p
-        try:
-            with open(full, "rb") as f:
-                sigs[p] = hashlib.sha1(f.read()).hexdigest()[:12]
-        except (OSError, IOError):
-            pass
+        sig = file_sig(p, root)
+        if sig is not None:
+            sigs[p] = sig
     return sigs
 
 

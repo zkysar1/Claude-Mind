@@ -1831,7 +1831,12 @@ class MirrorWedgeProbe(Probe):
                              f"both-diverged {self.consecutive_wedged} ticks — "
                              f"stale reads until reconciled ({goal.get('goal_id') or goal.get('error')})"),
                 ))
-        elif v == "healthy":
+        elif v in ("healthy", "pull-failing"):
+            # pull-failing () means the streaks are fresh and nothing
+            # is at the wedge threshold, so the WEDGE has cleared: without this,
+            # a pull error would hold a cleared wedge's goal open indefinitely.
+            # The pull failure itself is surfaced by mirror-health and /prime.
+            #
             # Deliberately NOT gated on self.fired. `fired` is per-episode and
             # lives in watchdog-prev-state.json, which is box-local and
             # ephemeral — a reset or a fresh box zeroes it, and a goal filed by

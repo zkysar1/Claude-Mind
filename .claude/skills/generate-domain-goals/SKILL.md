@@ -146,7 +146,23 @@ warranted when the available backlog is thin.
 2. LANE FLOOR (g-115-8699): read the boosted lane set from
    `team-state-read.sh --field strategic_focus --json` — every `asp-<digits>`
    token in `primary`; fail-open to the brief's whole lane table when the
-   field is absent. A boosted lane with available < brief.lane_floor is
+   field is absent.
+   TERMINAL GATE (g-374-60): before the floor arithmetic, check each
+   boosted lane's ASPIRATION status — the floor reads only the goal COUNT,
+   and a completed aspiration's count is 0, which reads as maximally
+   starved. Measured 2026-09-19: two of six boosted lanes were completed
+   and took 12 of the 25-goal batch target — ~48% of the batch aimed at
+   closed lanes.
+   Bash: py -3 core/scripts/lane_terminal_check.py check \
+           --lanes <comma-separated boosted set> --json
+   # exit 0 = verdict JSON (even degraded)
+   Sum the floor ONLY over the verdict's `in_floor` set; print
+   `excluded_terminal` (lanes whose aspiration read completed/retired) and
+   `degraded` (lanes whose status could not be read — they STAY in the
+   floor set: fail-open, the run degrades, the governor does not) beside
+   the per-lane table, so a lane's absence from the arithmetic reads as
+   "that lane is done", never as "nobody looked".
+   A boosted lane with available < brief.lane_floor is
    STARVED, whatever the aggregate reads.
    ⚠ `primary` ALONE IS CORRECT HERE — DO NOT "fix" it to `primary` +
    `secondary` to match the joins in goal-selector.py `load_strategic_focus`

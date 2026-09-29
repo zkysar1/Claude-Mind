@@ -193,13 +193,8 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
    Budget ~9k tokens. Neither `--active` nor `--universal` is an option:
    `--universal` measured 4123 records / 10.8 MB (~2.7M tokens) — 79% of the
    store, so it was never a budget.
-   - Bash: reasoning-bank-read.sh --recent → **10 entries, 42 KB (~12k tokens)**.
-     RE-MEASURED 2026-08-11 (foxtrot, LAPTOP-3IOFCNEO). This line read "498
-     entries, 37 KB (~9k tokens)" until then — off by 50x on the count, and the
-     shape is what changed, not just the number: 498 entries in 37 KB is ~76 B
-     each (a shallow id+title INDEX), while 10 in 42 KB is ~4.3 KB each (FULL
-     bodies). Same token cost, ~98% less recall breadth. Believed intended (the
-     bounding work in g-115-3407); the figure simply was not updated with it.
+   - Bash: reasoning-bank-read.sh --recent → **10 entries, 42 KB (~12k tokens)**,
+     full bodies (re-measured 2026-08-11; history in the rationale file above).
      `--recent N` widens it (verified 3→3, 25→25). A mistyped flag is now
      REFUSED loudly at exit 2 (g-115-4428, fixed 2026-08-20 — formerly
      swallowed rc=0), and a BOUNDED-LOAD stderr warning fires past 8192 B/entry.
@@ -213,6 +208,8 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
      category retrieval. See `memory-pipeline.yaml` → `reasoning_bank_routing`.
    - `--universal --summary` does NOT compose: `--universal` wins silently and
      returns the full ~2.7M-token load, not an index (verified 2026-07-27).
+
+4.5. Bash: bash core/scripts/commons-primer.sh show  # this env's commons primer, first 10 goals here only
 
 5. Bash: world-cat.sh knowledge/beliefs.yaml  # filter status in (active, weakened)
    IF file missing: beliefs = [] (skip silently)
@@ -244,11 +241,11 @@ token budget below, as a bounded index plus on-demand expansion, never in full.
 
 5.55. Bash: bash core/scripts/mirror-health.sh
    → Own-cloud mirror-wedge visibility (g-115-2549, display-only). Exit 0
-     (healthy): stash nothing. Exit 1 (WEDGED): stash the printed file list
-     and surface a warning line in Phase 4 output — this box is serving
-     stale world reads for those files until the g-115-2548
-     /reconcile-owncloud-conflicts repair runs (the watchdog MirrorWedgeProbe
-     files the Investigate goal; /prime only displays). Exit 2 (unknown —
+     (healthy): stash nothing. Exit 1 (WEDGED, or PULL-FAILING g-115-11323):
+     stash the printed file list and surface a warning line in Phase 4
+     output — this box serves stale world reads for those files until
+     repaired (a wedge: /reconcile-owncloud-conflicts; the watchdog
+     MirrorWedgeProbe files it; /prime only displays). Exit 2 (unknown —
      sweep not running / not own-cloud): stash the one-line reason, display
      at most one dim note. Advisory: never block priming on any exit code.
 

@@ -135,7 +135,13 @@ def _throwaway_agent(manifest_paths=None, session_id=SID, inject_agent_env=True,
         )
         if manifest_paths is not None:
             lines = [f"#session:{session_id}"] + [_norm(p) for p in manifest_paths]
-            (session_dir / "context-reads.txt").write_text(
+            # : a bound session has a per-session dir and so owns
+            # sessions/<SID>/body-context-reads.txt; only an unbound one reads
+            # the agent-wide file. Write the manifest where the gate looks.
+            manifest = (agent_dir / "sessions" / session_id / "body-context-reads.txt"
+                        if bind_session else session_dir / "context-reads.txt")
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
                 "\n".join(lines) + "\n", encoding="utf-8", newline=""
             )
         if bind_session:

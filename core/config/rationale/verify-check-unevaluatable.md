@@ -94,10 +94,11 @@ still names the artifact, which is why the result carries `artifacts_read`,
 `artifacts_missing` and `clusters_total` (guard-3489).
 
 **Trap 1 — `--session-id` on a worker Body.** It defaults to `$MIND_SID` and must
-stay defaulted. `context-reads.tracker_path` routes to the per-Body tracker
-`sessions/<sid>/body-context-reads.txt` when that Body has a forked body-WM file,
-and to the agent-wide `session/context-reads.txt` otherwise — and on a worker Body
-the agent-wide file may not exist at all. Measured 2026-09-03 (alpha worker,
+stay defaulted. `context-reads.tracker_path` routes to the session's own tracker
+`sessions/<sid>/body-context-reads.txt` whenever that session has a per-session dir
+(every bound session since g-115-11179), and to the agent-wide
+`session/context-reads.txt` otherwise — and for such a session the agent-wide file
+may not exist at all. Measured 2026-09-03 (alpha worker,
 cc-07), same turn, one query: the value `framework-verification`, written by that
 session's own `retrieve.sh`, answered rc=1 without the flag and rc=0 with it, while
 the agent-wide tracker was absent entirely. A Q4 that dropped the session id would

@@ -384,9 +384,17 @@ shared store to write through at all.** 139 posts came in because inbound is
 cheap; outbound is unmeasurable from here because for these particular peers it
 is *structurally* unavailable, not merely unconfigured.
 
+**CORRECTED 2026-09-28: one `ayoai-mind` box DOES host a peer.** The owner's
+workstation holds the production deployment's world on disk and reads it with the
+export above, set as a user-level environment variable. `.env.local` is NOT a
+substitute: none of the five `PEER_WORLD_*` consumers reads it (guard-6317). That
+box runs this deployment only in interactive sessions, so the relay-routing
+consequence below still holds — no always-on agent can resolve the peer. The
+original measurement follows.
+
 So the `export PEER_WORLD_<ENV_ID>=...` recipe above is not a setting some
 better-placed fleet box is missing — it presupposes a box that already hosts the
-peer's filesystem, and no `ayoai-mind` box does. Consequence when triaging a
+peer's filesystem, and no `ayoai-mind` fleet box does. Consequence when triaging a
 relay: for a `backend: local` peer, do NOT route the work to "an agent whose box
 can resolve the peer world" (guard-2082 warns against this and this is *why*
 there is no such agent to route to), and do NOT record the relay as pending a

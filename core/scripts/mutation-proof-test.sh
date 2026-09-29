@@ -183,9 +183,13 @@ if command -v python3 >/dev/null 2>&1; then PY="python3"; else PY="py -3"; fi
 # (guard-1760), which is the same posture `residue_check: unavailable` already
 # takes for the --sabotage-sed lane.
 contains_literal() {  # $1 = needle, $2 = file
-  local _hay
-  _hay="$(cat -- "$2" 2>/dev/null)" || return 2
-  [[ "$_hay" == *"$1"* ]]
+  local _hay _needle
+  # CRs are dropped on both sides. On Windows the sabotage is written in text
+  # mode, so a multi-line payload lands on disk as CRLF, and a raw match against
+  # the LF needle never finds that residue (measured 2026-09-28).
+  _needle=${1//$'\r'/}
+  _hay="$(tr -d '\r' 2>/dev/null < "$2")" || return 2
+  [[ "$_hay" == *"$_needle"* ]]
 }
 
 RESIDUE_CHECK="unavailable"
@@ -444,6 +448,20 @@ print(sum(1 for l in difflib.unified_diff(a, b, n=0)
 fi
 if cmp -s "$BACKUP" "$TARGET"; then
   emit "FAIL" "sabotage produced NO change (no-op mutation) — a passing test would be a false proof"
+  exit 1
+fi
+# Bytes changed but the TEXT did not. sed on Windows reads CRLF as a line break
+# and writes LF, so a sed that matches nothing still rewrites every line ending:
+# cmp saw a change, the untouched test passed, and the verdict blamed the test
+# as VACUOUS (measured 2026-09-28). Not sabotage_sites == 0, which also reads 0
+# for a sabotage that only inserts lines. An unreadable target falls through.
+if A="$BACKUP" B="$TARGET" $PY -c '
+import os, sys
+text = lambda k: open(os.environ[k], encoding="utf-8").read()
+sys.exit(0 if text("A") == text("B") else 1)
+' 2>/dev/null; then
+  restore; trap - EXIT INT TERM   # restore now so restore_status is accurate in the emitted JSON
+  emit "FAIL" "sabotage changed only line endings, not the text (no-op mutation) — a passing test would be a false proof. On a CRLF checkout, a sed that matches nothing still rewrites every line ending."
   exit 1
 fi
 SAB_APPLIED="true"

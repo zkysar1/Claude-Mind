@@ -243,7 +243,39 @@ def test_empty_query_is_a_usage_error(worlds):
         _run(worlds, "   ")
 
 
-def test_unresolvable_self_env_degrades_to_partial_not_to_a_clean_negative(tmp_path):
+def _pin_env_id_sources(monkeypatch, paths_value):
+    """Pin BOTH sources _self_env_id() reads: the process env and `_paths`.
+
+    conftest imports the real `_paths` once, and on a fleet box its
+    ENVIRONMENT_ID comes from .env.local -- so without the stub the ambient
+    box decides which branch a self_env=None call exercises (guard-2337).
+    """
+    import types
+    monkeypatch.delenv("ENVIRONMENT_ID", raising=False)
+    monkeypatch.setitem(sys.modules, "_paths", types.SimpleNamespace(ENVIRONMENT_ID=paths_value))
+
+
+def test_self_env_falls_back_to_paths_when_the_process_env_lacks_it(worlds, monkeypatch):
+    """.env.local is ENVIRONMENT_ID's documented home and is not sourced into
+    tool shells. Reading os.environ alone rendered this world as `<unknown>`
+    and listed it again as its own peer (DESKTOP-O91DLK2, 2026-09-28)."""
+    _pin_env_id_sources(monkeypatch, SELF_ENV)
+    res = pr.retrieve("widget", self_env=None, self_world=str(worlds["self"]),
+                      registry=worlds["registry"])
+    assert res["self_env"] == SELF_ENV
+    assert _world(res, SELF_ENV)["role"] == "self"
+    assert SELF_ENV not in [w["env_id"] for w in res["worlds"] if w["role"] == "peer"]
+
+
+def test_process_env_id_still_wins_over_paths(worlds, monkeypatch):
+    _pin_env_id_sources(monkeypatch, "some-other-env")
+    monkeypatch.setenv("ENVIRONMENT_ID", SELF_ENV)
+    res = pr.retrieve("widget", self_env=None, self_world=str(worlds["self"]),
+                      registry=worlds["registry"])
+    assert res["self_env"] == SELF_ENV
+
+
+def test_unresolvable_self_env_degrades_to_partial_not_to_a_clean_negative(tmp_path, monkeypatch):
     """DELIBERATE DIVERGENCE from peer_envs()'s fail-safe -- do not "align" them.
 
     `peer_envs(registry, None)` returns NO peers, which is right for its own
@@ -260,6 +292,7 @@ def test_unresolvable_self_env_degrades_to_partial_not_to_a_clean_negative(tmp_p
     its own docstring: share I/O, never share policy between consumers whose
     wrong answers cost different things.
     """
+    _pin_env_id_sources(monkeypatch, None)
     self_w = _make_world(tmp_path, "world-a")
     registry = {
         SELF_ENV: {"environment_id": SELF_ENV, "backend": "local"},

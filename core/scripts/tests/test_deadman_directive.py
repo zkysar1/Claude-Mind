@@ -116,6 +116,20 @@ def test_worker_prompt_checks_durable_closure_before_resuming():
         "a closed Body that re-arms re-fires every ~600s forever")
 
 
+def test_worker_prompt_checks_an_operator_stop_before_anything_else():
+    """: /stop writes this SESSION's stop-requested marker and parks the
+    Body. Read after the manifest, a stopped Body looked parked-awaiting-work and
+    re-armed hourly, re-running the worker loop each due re-poll. The marker is
+    read first, and its branch ends the turn without scheduling or resuming.
+    """
+    p = worker_prompt()
+    stop = p.index("sessions/<your-SID>/stop-requested")
+    assert stop < p.index("body-manifest.yaml")
+    branch = p[stop:p.index("OTHERWISE read")]
+    assert "do NOT schedule this wakeup again" in branch
+    assert "do NOT run park-due" in branch and "do NOT resume" in branch
+
+
 def test_worker_prompt_checks_closure_before_rearming():
     """The 2026-08-09 ordering fix, pinned against regression to arm-first.
 

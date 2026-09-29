@@ -17,6 +17,7 @@ not by any unit test, which is why the pid-provenance tests below are here.
 
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -24,6 +25,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tree_lock as tl  # noqa: E402
+from _bash_helpers import BASH  # noqa: E402
 
 
 MINE = "sid-mine-0001"
@@ -145,6 +147,16 @@ class TestHolderPidProvenance:
         assert tl._pid_alive("abc") is None
         assert tl._pid_alive(os.getpid()) is True
 
+    def test_pid_alive_reads_a_gone_process_as_False_not_None(self):
+        # : on Windows os.kill(pid, 0) raises a bare OSError for a pid
+        # that no longer exists, so this read None and a dead holder kept the
+        # tree for the whole TTL. A pid can be gone two ways: never allocated
+        # (999999), or a child that has exited while we still hold its handle.
+        assert tl._pid_alive(999999) is False
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        assert tl._pid_alive(child.pid) is False
+
 
 # ── acquire / release ───────────────────────────────────────────────────────
 
@@ -263,6 +275,37 @@ class TestCliContract:
         assert self._run(capsys, ["check", "--project-root", str(alias)], MINE) == tl.RC_REFUSED
         assert not (alias / "mind_api").is_symlink()  # sanity: alias is the dir link
         assert len(list(real.glob("mind_api/state/*.json"))) == 1
+
+    @pytest.mark.skipif(os.name != "nt", reason="the /c/ spelling only exists under Git Bash")
+    def test_a_git_bash_spelling_of_the_root_reaches_the_SAME_lock(self, tmp_path, capsys):
+        #  / guard-2251: in the loop's shape (MSYS_NO_PATHCONV=1) MSYS
+        # no longer rewrites argv, so a pwd-derived --project-root arrives as
+        # /c/.... Windows python read that as drive C: plus a literal c/ subdir,
+        # a lock file nobody holds, and `check` let a merge through a held tree.
+        tl.acquire(tmp_path, THEIRS, "alpha", "suite", holder_pid=os.getpid())
+        native = tmp_path.as_posix()  # C:/Users/...
+        git_bash = "/" + native[0].lower() + native[2:]
+        assert self._run(capsys, ["check", "--project-root", git_bash], MINE) == tl.RC_REFUSED
+
+
+# ── the shell wrapper, in the env shape the loop runs it in ─────────────────
+
+
+class TestShellWrapper:
+    LOCK_SH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tree-lock.sh")
+
+    def test_wrapper_runs_with_msys_path_conversion_off(self, tmp_path):
+        # : iteration-close.sh sources _platform.sh, which exports
+        # MSYS_NO_PATHCONV=1, and iteration-push.sh inherits it. With conversion
+        # off, the wrapper handed python3 its pwd path /c/... verbatim, Windows
+        # read it as drive C: plus a literal c/ subdir, and every loop-side call
+        # died rc=2 before any lock logic ran. The variable means nothing off
+        # Windows, so there this passes trivially.
+        env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+        r = subprocess.run([BASH, self.LOCK_SH, "status", "--project-root", str(tmp_path)],
+                           capture_output=True, text=True, env=env, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "[tree-lock]" in r.stdout + r.stderr
 
 
 # ── the gate wiring in iteration-push.sh ────────────────────────────────────

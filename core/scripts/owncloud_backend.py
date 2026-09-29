@@ -55,8 +55,9 @@ import boto3
 from botocore.config import Config as _BotoConfig
 from botocore.exceptions import ClientError, ParamValidationError
 
+from _long_path import long_path
 from storage_backend import (
-    FileStat, WriteResult,
+    FileStat, WriteResult, replace_with_retry,
     # Multi-tenant customer dimension (g-115-1601) — defined in the boto3-free
     # seam so the daemon (server.py) can set/reset without importing this cloud
     # backend; re-exported here so callers already importing owncloud_backend
@@ -245,7 +246,17 @@ def _atomic_write_local(local: Path, body: bytes) -> None:
     g-115-3253 mid-run suite-log truncation/NUL class. os.replace is atomic on
     the same filesystem — readers see the old bytes or the new bytes, never
     the window. Same idiom as owncloud_sync._save_manifest.
+
+    Windows (g-115-7257): os.replace raises PermissionError (WinError 5/32)
+    while another process holds the target open, as any plain open() does, so
+    the publish retries through the one shared backoff
+    (storage_backend.replace_with_retry, guard-472) and raises only when that
+    runs out. There is deliberately no in-place fallback after it: that is the
+    truncate window this function exists to close. `local` is re-spelled with
+    long_path (g-115-11323) so the mkdir and the mkstemp sibling, 13 chars
+    longer than the target, work past MAX_PATH on a box without long paths.
     """
+    local = long_path(local)
     local.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=local.name + ".", suffix=".tmp",
                                     dir=str(local.parent))
@@ -254,7 +265,9 @@ def _atomic_write_local(local: Path, body: bytes) -> None:
             fh.write(body)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_name, local)
+        outcome = replace_with_retry(tmp_name, local, retry_on=(PermissionError,))
+        if not outcome.ok:
+            raise outcome.last_err
     except BaseException:
         try:
             os.unlink(tmp_name)
@@ -301,17 +314,21 @@ class NoClaimError(Exception):
 # remedy is the delivery-first order (/encode-session NO_CLAIM BRANCH,
 # g-115-10122); it replaced "relay to the coordination board", because five
 # board relays sat undelivered 5-21h while a routed goal landed in ~3.5h.
+# action_type:land-write is the relay verb insight-trigger-sweep.py floors at
+# MEDIUM (RELAY_ACTION_TYPES); test_no_claim_error.py pins the pair together.
+# Format it with a dict, as _put does: a template that fails to format raises
+# inside _put's fail-open consult and would let the refused write through.
 NO_CLAIM_MESSAGE = (
     "no_claim: this box does not hold the live runner claim "
-    "for agent dir '%s'. The write did NOT land, and NO "
+    "for agent dir '%(agent)s'. The write did NOT land, and NO "
     "retry or refresh can EVER succeed from here -- this box "
     "is permanently behind the claim-holder's advancing "
-    "version. STRUCTURAL, not a race: do not retry, do not "
-    "refresh. Deliver it instead: (1) run the same write on the holder's box "
-    "(runner-claim.sh status names it); (2) else file a world goal with the "
-    "payload inline and intended_agent + handoff_to set to that agent. A board "
-    "post alone is not delivery; if you post one, tag it requires_action_by, "
-    "action_type, severity.")
+    "version. STRUCTURAL, not a race. Deliver it instead: (1) run the same "
+    "write on the holder's box (runner-claim.sh status --agent %(agent)s names "
+    "it); (2) else file a world goal with the payload inline and "
+    "intended_agent + handoff_to set to that agent. A board post alone is not "
+    "delivery; if you post one, tag it requires_action_by, "
+    "action_type:land-write, severity.")
 
 
 class ConflictError(Exception):
@@ -798,7 +815,10 @@ class OwnCloudBackend:
         return f"{self.machine_id}:{os.getpid()}:{threading.get_ident()}"
 
     def _local(self, path: PathLike) -> Path:
-        return Path(path)
+        # The I/O spelling of a governed path: identity below ~240 chars, the
+        # \\?\ form above it on Windows (g-115-11323). Every _cache_check key is
+        # built from this spelling too. Never feed the result to _rel/_s3_key.
+        return long_path(path)
 
     def _machine_local(self, path: PathLike) -> bool:
         """True iff this path is machine-local per owncloud_sync's exclusion
@@ -1185,9 +1205,17 @@ class OwnCloudBackend:
         return local
 
     def _stamp_manifest_baseline(self, path: PathLike, body: bytes,
-                                 etag: Optional[str] = None) -> None:
+                                 etag: Optional[str] = None,
+                                 record_mtime: bool = True) -> None:
         """Stamp the persistent sync-manifest baseline for a just-pushed key
         (g-115-1946 — root fix for the cross-box lost-update lanes).
+
+        `record_mtime=False` (g-115-7257) stamps {md5, etag} only, for a PUT
+        that did not write the local file. The file's mtime then proves nothing
+        about `body`: another writer may have changed the file since `body` was
+        read, and pairing the new mtime with the old md5 would make the sweep's
+        mtime shortcut skip that change. With no mtime the next sweep compares
+        the md5 once, which is always right.
 
         `etag` (g-358-11) records the S3 ETag the baseline was reconciled
         against. `md5` stays the PLAINTEXT md5 (it is compared against local
@@ -1228,10 +1256,9 @@ class OwnCloudBackend:
             # manifest). In-process lock; see _MANIFEST_STAMP_LOCK above.
             with _MANIFEST_STAMP_LOCK:
                 m = _load_manifest()
-                entry = {
-                    "mtime": local.stat().st_mtime_ns,
-                    "md5": hashlib.md5(body).hexdigest(),
-                }
+                entry = {"md5": hashlib.md5(body).hexdigest()}
+                if record_mtime:
+                    entry = {"mtime": local.stat().st_mtime_ns, **entry}
                 if etag:
                     entry["etag"] = str(etag).strip('"')
                 m[self._rel(path)] = entry
@@ -1726,7 +1753,10 @@ class OwnCloudBackend:
                 if self._machine_local(local):
                     stats["skipped_machine_local"] += 1
                     continue
-                if not local.exists():
+                # _refresh keys _cache_check by the _local spelling, so warm
+                # that same spelling (it differs only past ~240 chars).
+                io_path = self._local(local)
+                if not io_path.exists():
                     stats["skipped_no_local"] += 1
                     continue
                 tag = (etag or "").strip('"')
@@ -1734,7 +1764,7 @@ class OwnCloudBackend:
                     stats["skipped_multipart"] += 1
                     continue
                 h = hashlib.md5()
-                with open(local, "rb") as f:
+                with open(io_path, "rb") as f:
                     for chunk in iter(lambda: f.read(65536), b""):
                         h.update(chunk)
                 if h.hexdigest() != tag:
@@ -1745,7 +1775,7 @@ class OwnCloudBackend:
                 stats["errors"] += 1
                 continue
             self._etags[key] = etag
-            self._cache_check[str(local)] = now
+            self._cache_check[str(io_path)] = now
             stats["warmed"] += 1
         return stats
 
@@ -1778,7 +1808,12 @@ class OwnCloudBackend:
             return _codec_put_kwargs(body)
         return {"Body": body}
 
-    def _put(self, path: PathLike, body: bytes) -> WriteResult:
+    def _put(self, path: PathLike, body: bytes, *,
+             local_is_source: bool = False) -> WriteResult:
+        # local_is_source=True (mirror_put, g-115-7257): `body` was READ FROM the
+        # local file, so the file already holds it and is never rewritten here.
+        # See the post-PUT comment below for why the rewrite was not harmless.
+        #
         # g-115-1654: machine-local paths (_EXCLUDE_DIRS / _is_machine_local)
         # must NOT be pushed to S3 -- write the local file only, mirroring
         # LocalBackend, so a per-op write (e.g. jsonl_hygiene presence
@@ -1788,7 +1823,8 @@ class OwnCloudBackend:
         # through _put, so this single guard covers every write path.
         if self._machine_local(path):
             local = self._local(path)
-            _atomic_write_local(local, body)
+            if not local_is_source:
+                _atomic_write_local(local, body)
             return WriteResult(version=str(local.stat().st_mtime_ns),
                                fallback_used=False)
         # g-115-1875: UNIVERSAL test-isolation tripwire (fires below every
@@ -1869,7 +1905,7 @@ class OwnCloudBackend:
                         _own_carrier is not None
                         and Path(path).resolve() == _own_carrier[0].resolve())
                     if not _is_own_carrier:
-                        raise NoClaimError(NO_CLAIM_MESSAGE % _agent)
+                        raise NoClaimError(NO_CLAIM_MESSAGE % {"agent": _agent})
         except NoClaimError:
             raise
         except Exception as _consult_exc:
@@ -2000,12 +2036,21 @@ class OwnCloudBackend:
                     f"If-Match failed for {key}: remote changed since the in-lock "
                     "read; re-run the read-modify-write")
             raise
-        # PUT succeeded — NOW make the local cache match what S3 holds.
-        _atomic_write_local(local, body)
+        # PUT succeeded — NOW make the local cache match what S3 holds. Unless
+        # the bytes CAME from the local file (mirror_put, g-115-7257): rewriting
+        # a file with its own bytes is not a no-op. On Windows the replace
+        # raises while any other process holds the file open (a scheduled job
+        # appending to its log); the raise skipped the baseline stamp below, so
+        # S3 had moved while the baseline had not, and the file stayed
+        # both-diverged for good. On POSIX the replace swaps the inode under an
+        # appender, whose later writes land in the orphaned file.
+        if not local_is_source:
+            _atomic_write_local(local, body)
         self._etags[key] = r["ETag"]
         self._cache_check[str(local)] = time.monotonic()
         self._diverged_keys.discard(key)  # this write resolved any divergence
-        self._stamp_manifest_baseline(path, body, etag=r["ETag"])
+        self._stamp_manifest_baseline(path, body, etag=r["ETag"],
+                                      record_mtime=not local_is_source)
         return WriteResult(version=r["ETag"], fallback_used=False)
 
     def _get_remote_raw(self, key: str):
@@ -2195,7 +2240,8 @@ class OwnCloudBackend:
         return self._put(path, content)
 
     def mirror_put(self, path: PathLike, content: bytes,
-                   *, expected_version: Optional[str] = None) -> WriteResult:
+                   *, expected_version: Optional[str] = None,
+                   local_is_source: bool = False) -> WriteResult:
         """Push LOCAL-authoritative bytes to S3 with an optional If-Match fence,
         WITHOUT downloading first — so a locally-newer file is never clobbered by
         the older remote copy. (``read_bytes(force_fresh=True)`` would download
@@ -2206,8 +2252,15 @@ class OwnCloudBackend:
         the PUT is fenced on it (If-Match), so a concurrent backend write that
         moved the object underneath raises ``ConflictError`` and the caller skips
         (the next sweep reconciles). ``None`` => unconditional PUT (the object is
-        absent on S3 / brand new). The byte content passed IS the local file's
-        own bytes, so ``_put``'s local-cache rewrite is a harmless no-op-equivalent.
+        absent on S3 / brand new).
+
+        ``local_is_source=True`` says ``content`` was just READ from the local
+        file, so the local file is left alone and only S3 is written (g-115-7257).
+        The sweep passes it. Rewriting a file with its own bytes is not a no-op:
+        on Windows the rewrite fails while another process holds the file open,
+        and that failure wedged an appended-to log. The default (False) also
+        writes ``content`` to the local file, which the hand-made-union repair
+        (guard-4778, rb-9443) relies on: its bytes differ from the local file.
 
         Used by ``core/scripts/owncloud-sync.py`` (the governed-dir mirror sweep)
         and its PostToolUse single-file push. Not on the StorageBackend Protocol:
@@ -2218,7 +2271,7 @@ class OwnCloudBackend:
             self._etags[key] = expected_version  # fence on the version we observed
         else:
             self._etags.pop(key, None)            # new object — unconditional PUT
-        return self._put(path, content)
+        return self._put(path, content, local_is_source=local_is_source)
 
     def merge_put(self, path: PathLike, content: bytes) -> Optional[WriteResult]:
         """Union-merge push for a merge-REGISTERED store (g-115-2297): GET the

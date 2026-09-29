@@ -345,9 +345,10 @@ def _prefetch_tree_root(node_count, world_root=None):
 
     PATH SPELLING IS LOAD-BEARING and is why the root is resolved through the
     same `resolve_file_path` the loop uses. `prefetch` warms
-    `_cache_check[str(root / rel)]` while `_refresh` reads
-    `_cache_check[str(self._local(path))]`, and `_local` is identity — neither
-    side normalizes. Both spellings here come from `resolve_file_path`, so they
+    `_cache_check[str(self._local(root / rel))]` while `_refresh` reads
+    `_cache_check[str(self._local(path))]`; `_local` only adds the Windows
+    long-path prefix past ~240 chars (g-115-11323), identically on both sides,
+    and otherwise neither side normalizes. Both spellings here come from `resolve_file_path`, so they
     agree (measured True above). If the loop's path derivation ever changes,
     re-measure the HEAD count rather than trusting `warmed`.
 

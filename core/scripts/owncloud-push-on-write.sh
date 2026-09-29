@@ -30,10 +30,11 @@
 # genuine local write over a recorded baseline, which the next periodic sweep
 # classifies local-authored and pushes.
 #
-# TIMEOUT BUDGET: parse+filter is one python3 spawn (~1s with the shim);
-# the daemon POST is capped at 8s (curl --max-time); the CLI fallback adds an
-# S3 HEAD+PUT (~1-3s on small world files). settings.json timeout is 30s,
-# matching tree-sync-check.sh's margin rationale.
+# TIMEOUT BUDGET: two python3 spawns, parse+filter+encode and the verdict
+# (0.5-1.7s each through the shim, measured 2026-09-28 on a Windows box under
+# fleet load); the daemon POST is capped at 8s (curl --max-time); the CLI
+# fallback adds an S3 HEAD+PUT (~1-3s on small world files). settings.json
+# timeout is 30s, matching tree-sync-check.sh's margin rationale.
 #
 # Test knobs (mirrors embedding-index-freshness.py's pattern):
 #   OWNCLOUD_PUSH_HOOK_ENV_LOCAL — override the .env.local path (backend probe)
@@ -88,14 +89,17 @@ if [ -z "$backend" ]; then
 fi
 [ "$backend" = "own-cloud" ] || exit 0
 
-# Parse hook stdin + governed-root filter in ONE python3 spawn. Prints the
-# resolved absolute path when the write is governed, empty otherwise.
+# Parse hook stdin + governed-root filter in ONE python3 spawn. For a governed
+# write it prints ONE tab-separated line: the resolved path, its URL-encoded
+# form, and its repo-relative POSIX form ("" for world/meta, which live outside
+# the repo). Nothing otherwise. One line, not three: python on Windows ends
+# every line with \r\n, and $(...) strips only the last one.
 input=$(cat)
-target=$(printf '%s' "$input" | \
+parsed=$(printf '%s' "$input" | \
     WORLD_P="${WORLD_PATH:-}" META_P="${META_PATH:-}" \
     PROOT="${PROJECT_ROOT:-}" APD="${AGENTS_PARENT_DIR:-agents}" \
     python3 -c "
-import json, os, sys
+import json, os, sys, urllib.parse
 from pathlib import Path
 try:
     fp = (json.load(sys.stdin).get('tool_input') or {}).get('file_path') or ''
@@ -117,15 +121,20 @@ try:
             continue
         try:
             t.relative_to(Path(r).resolve())
-            print(t)
-            raise SystemExit
         except ValueError:
-            pass
+            continue
+        try:
+            rel = t.relative_to(Path(proot).resolve()).as_posix() if proot else ''
+        except ValueError:
+            rel = ''
+        print('\t'.join((str(t), urllib.parse.quote(str(t), safe=''), rel)))
+        raise SystemExit
 except SystemExit:
     raise
 except Exception:
     pass
 " 2>/dev/null || echo "")
+IFS=$'\t' read -r target enc rel <<< "$parsed"
 [ -n "$target" ] || exit 0
 
 if [ "${OWNCLOUD_PUSH_HOOK_DRYRUN:-}" = "1" ]; then
@@ -137,67 +146,83 @@ fi
 # daemon already carries the registry-derived STORAGE_* + MIND_AWS_* context,
 # so this works on env-config deployments where the bare CLI would see no
 # backend config. NEVER auto-spawn a daemon from a hook (30s budget, guard-141
-# fail-open) — when the daemon is down or predates the route (404 → curl -f
-# fails), fall through to the CLI with registry-derived env instead.
+# fail-open). Only "no answer" (status 000: no daemon, or none within 8s) and
+# "no route" (404: a daemon older than the route) fall through to the CLI
+# below. Every other answer is final: the CLI runs the SAME sync code and would
+# repeat it. curl runs without -f: the route reports its own failures as a 500
+# whose body names the error, and -f discards that body.
 PORT_FILE="${OWNCLOUD_PUSH_HOOK_PORT_FILE:-$PROJECT_ROOT/mind_api/state/daemon.port}"
-if [ -f "$PORT_FILE" ]; then
-    port=$(tr -d '[:space:]' < "$PORT_FILE")
-    enc=$(printf '%s' "$target" | python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=""))' 2>/dev/null || echo "")
-    if [ -n "$port" ] && [ -n "$enc" ]; then
-        resp=$(curl -sf -X POST --max-time 8 "http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=${enc}" 2>/dev/null || echo "")
-        if [ -n "$resp" ]; then
-            case "$resp" in
-                # `"ok": true` alone does NOT mean the file reached the store.
-                # The route answers ok:true with `pushed: 0` and
-                # `"reason": "missing_or_dir"` when it cannot see the path at
-                # all (measured 2026-08-31, ). Gating on ok alone
-                # therefore logs "daemon push ok" for a file that was never
-                # pushed AND suppresses the CLI fallback below — a silent
-                # local-only write, which the warning text already calls out as
-                # revert-bound. Match the did-nothing shape FIRST so it cannot
-                # be absorbed by the ok-true arm. Still exit 0: this hook is
-                # fail-open by contract (guard-141), and a path the daemon
-                # cannot see is one the CLI fallback could not push either.
-                *'"reason": "missing_or_dir"'*|*'"reason":"missing_or_dir"'*)
-                    _tell_model "[owncloud-push-on-write] daemon answered ok but pushed NOTHING for $target — the path is not visible to it — $resp — so the edit is LOCAL-ONLY and will be reverted by the next no-baseline reconcile. Most likely the write landed somewhere unintended (a literal PROJECT_ROOT/world|meta path rather than the configured external root). Confirm with core/scripts/backend-cat.sh before assuming it synced."
-                    exit 0 ;;
-                *'"ok": true'*|*'"ok":true'*)
-                    # ok:true means "no error", NOT "landed" (guard-5663). A
-                    # both-diverged skip answers ok:true pushed:0
-                    # diverged_skipped:1, and stale_pulled / nobaseline_reconciled
-                    # mean the store copy REPLACED the edit locally. Only these
-                    # counters put the edit's bytes in the store; a "reason" is a
-                    # policy skip (_skip) that was never meant to push. An
-                    # unparseable body keeps the old "ok" line (fail-open).
-                    verdict=$(printf '%s' "$resp" | python3 -c '
+port=""
+[ -f "$PORT_FILE" ] && port=$(tr -d '[:space:]' < "$PORT_FILE")
+if [ -n "$port" ]; then
+    out=$(curl -s -X POST --max-time 8 -w '\n%{http_code}' \
+        "http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=${enc}" 2>/dev/null)
+    code=${out##*$'\n'}
+    resp=${out%$'\n'*}
+    if [ -n "$code" ] && [ "$code" != 000 ] && [ "$code" != 404 ]; then
+        # ok:true means "no error", NOT "landed" (guard-5663): a both-diverged
+        # skip answers ok:true pushed:0 diverged_skipped:1. A "reason" is a
+        # sync_file _skip, which never pushes. Verdicts:
+        #   landed        a landing counter > 0: pushed, in_sync,
+        #                 local_wins_resolved, *_merged
+        #   by-design     not_governed / machine_local: the daemon's own policy
+        #                 keeps the file out of the store
+        #   peer          peer_agent: this box does not hold the agent dir's
+        #                 runner claim, so the store refuses the edit from here
+        #   invisible     missing_or_dir: the daemon cannot see the path ()
+        #   wrong-daemon  a non-own-cloud backend answered on this own-cloud box
+        #   skipped       any other reason
+        #   not-landed    ok, but no landing counter
+        #   failed        ok not true (every error status answers ok:false), or
+        #                 an unreadable body
+        # Only landed, by-design, and a git-tracked peer file stay out of the
+        # model's context: every other verdict means the edit is not in the store.
+        verdict=$(printf '%s' "$resp" | python3 -c '
 import json, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
-    raise SystemExit
-if "reason" in d:
-    raise SystemExit
-landed = any(isinstance(v, int) and not isinstance(v, bool) and v > 0
-             and (k in ("pushed", "in_sync", "local_wins_resolved")
-                  or k.endswith("_merged"))
-             for k, v in d.items())
-print("landed" if landed else "not-landed")
-' 2>/dev/null || echo "")
-                    if [ "$verdict" = "not-landed" ]; then
-                        _tell_model "[owncloud-push-on-write] daemon answered ok but did NOT land this edit in the store: $target — $resp. ok means no error, not pushed (guard-5663). diverged_skipped: local and store both changed since the baseline, so every sweep skips the file until it is reconciled (/reconcile-owncloud-conflicts). stale_pulled or nobaseline_reconciled: the store copy replaced this edit locally. Check before the next write to this file: bash core/scripts/backend-cat.sh head <path> --exit-on-drift"
-                    else
-                        echo "[owncloud-push-on-write] daemon push ok: $resp"
-                    fi
-                    exit 0 ;;
-                *)
-                    # Route reached but the sync itself failed — the CLI
-                    # fallback runs the SAME sync code and would repeat it.
-                    # Surface the warning and stop. Not "until the next sweep":
-                    # a refused merge freezes the file for the sweep too.
-                    _tell_model "[owncloud-push-on-write] daemon push FAILED for $target — $resp — this push did not land the edit. A transient transport error clears on a re-push or the next sweep; a refused merge (both sides changed since the baseline) does not, and the file stays frozen until reconciled (/reconcile-owncloud-conflicts). Check the store first (bash core/scripts/backend-cat.sh head <path> --exit-on-drift), then re-push per guard-983: curl -X POST 'http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=<urlencoded-path>'"
-                    exit 0 ;;
-            esac
-        fi
+    d = None
+if not isinstance(d, dict) or d.get("ok") is not True:
+    print("failed")
+elif "reason" in d:
+    r = str(d["reason"])
+    print("by-design" if r in ("not_governed", "machine_local") else
+          "peer" if r == "peer_agent" else
+          "invisible" if r == "missing_or_dir" else
+          "wrong-daemon" if r.startswith("non-own-cloud") else "skipped")
+elif any(isinstance(v, int) and not isinstance(v, bool) and v > 0
+         and (k in ("pushed", "in_sync", "local_wins_resolved") or k.endswith("_merged"))
+         for k, v in d.items()):
+    print("landed")
+else:
+    print("not-landed")
+' 2>/dev/null)
+        case "$verdict" in
+            landed)
+                echo "[owncloud-push-on-write] daemon push ok: $resp" ;;
+            by-design)
+                echo "[owncloud-push-on-write] not pushed, by design: $resp" ;;
+            peer)
+                agent=${rel#"${AGENTS_PARENT_DIR:-agents}"/}
+                agent=${agent%%/*}
+                if [ -n "$rel" ] && git -C "$PROJECT_ROOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1; then
+                    echo "[owncloud-push-on-write] not pushed (agent dir '$agent' is not owned here; git tracks the file, so a commit carries it): $resp"
+                else
+                    _tell_model "[owncloud-push-on-write] NOT pushed: $target is in agent dir '$agent', whose runner claim this box does not hold (peer_agent), so the store never takes this edit from here, and git does not track the file. Nothing delivers it: make the change on the claim-holder's box (bash core/scripts/runner-claim.sh status --agent $agent names it)."
+                fi ;;
+            invisible)
+                _tell_model "[owncloud-push-on-write] NOT pushed: the daemon cannot see $target (missing_or_dir) — $resp. The edit is local-only. Most likely it landed somewhere unintended, such as a literal PROJECT_ROOT/world or /meta path instead of the configured external root. Check: bash core/scripts/backend-cat.sh head <path> --exit-on-drift" ;;
+            wrong-daemon)
+                _tell_model "[owncloud-push-on-write] NOT pushed: the process on port $port answered as a non-own-cloud backend, but this box's config selects own-cloud, so it is not this box's daemon (a test daemon can hold the port). $target is local-only until the real daemon answers: check mind_api/state/daemon.port, then re-push per guard-983." ;;
+            skipped)
+                _tell_model "[owncloud-push-on-write] NOT pushed: the daemon skipped $target for a reason this hook does not know — $resp. Treat the edit as not in the store until checked: bash core/scripts/backend-cat.sh head <path> --exit-on-drift" ;;
+            not-landed)
+                _tell_model "[owncloud-push-on-write] NOT pushed: the daemon answered ok but did not land $target in the store — $resp. ok means no error, not pushed (guard-5663). diverged_skipped: local and store both changed since the baseline, so every sweep skips the file until it is reconciled (/reconcile-owncloud-conflicts). stale_pulled or nobaseline_reconciled: the store copy replaced this edit locally. Check before the next write to this file: bash core/scripts/backend-cat.sh head <path> --exit-on-drift" ;;
+            *)
+                _tell_model "[owncloud-push-on-write] push FAILED or unreadable for $target (HTTP $code) — $resp. Treat the edit as not in the store until checked: bash core/scripts/backend-cat.sh head <path> --exit-on-drift. A transient error clears on a re-push or the next sweep; a refused merge (both sides changed since the baseline) does not, and the file stays frozen until reconciled (/reconcile-owncloud-conflicts). Re-push per guard-983: curl -X POST 'http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=<urlencoded-path>'" ;;
+        esac
+        exit 0
     fi
 fi
 
@@ -238,6 +263,6 @@ fi
 if ! python3 "$SCRIPT_DIR/owncloud_sync.py" --file "$target"; then
     # The bare-CLI recipe this line used to offer silently no-ops from a shell
     # (guard-5663), so it is not handed to the model.
-    _tell_model "[owncloud-push-on-write] real-time push FAILED for $target (the daemon route was unavailable or errored, and the CLI fallback failed): this push did not land the edit. Check the store (bash core/scripts/backend-cat.sh head <path> --exit-on-drift), then re-push through the daemon once it is up, per guard-983: curl -X POST 'http://127.0.0.1:<daemon-port>/v1/admin/owncloud-sync-file?path=<urlencoded-path>' (port: mind_api/state/daemon.port)"
+    _tell_model "[owncloud-push-on-write] NOT pushed: no daemon answered (or it predates the push route), and the CLI fallback failed for $target. Check the store (bash core/scripts/backend-cat.sh head <path> --exit-on-drift), then re-push through the daemon once it is up, per guard-983: curl -X POST 'http://127.0.0.1:<daemon-port>/v1/admin/owncloud-sync-file?path=<urlencoded-path>' (port: mind_api/state/daemon.port)"
 fi
 exit 0
