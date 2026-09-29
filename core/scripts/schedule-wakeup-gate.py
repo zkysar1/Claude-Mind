@@ -78,6 +78,18 @@ Zak-Code declares `reason` optional in its ScheduleWakeup schema (Zak-Code
 origin/main 6be6925, src/zakcode/tools/builtins/schedule_wakeup.py), so the
 carve-out holds for this field too.
 
+FIFTH FAILURE THIS GATE COVERS (2026-09-28, alpha; g-375-71) -- a stopped
+worker Body re-arming its own deadman net. /stop on a worker Body writes the
+SESSION marker `sessions/<SID>/stop-requested` and parks the Body, while
+agent-state stays RUNNING because the agent's other Bodies still run, so the
+third check above cannot see the stop. The worker net's prompt then read the
+parked Body as awaiting work: every firing re-armed the net at 3600s and, when
+a re-poll was due, ran the whole worker loop only to park again. Measured on
+one stopped Body: an hourly orbit of about 20 minutes of model calls, for
+hours. This check refuses re-arming THAT net (matched by its prompt head)
+while this session's stop marker exists. Only that net: a wake-up a person
+arms after the stop, or one waiting on the world, is not the loop's business.
+
 Fail-open contract (CRITICAL — do not change without revisiting the trade):
 this gate exists to catch a known LLM mistake, not to be a critical-path
 dependency. Any parse/IO/logic error -> approve. A broken gate is recoverable
@@ -86,6 +98,7 @@ legitimate ScheduleWakeup calls and stall autonomous loops.
 """
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -194,6 +207,24 @@ REASON_DENY_REASON = (
 
 LOOP_SENTINEL = "<<autonomous-loop-dynamic>>"
 
+# The worker deadman net's prompt opens with this. deadman-directive.sh emits
+# the prompt; test_schedule_wakeup_gate.py pins the two together so a reworded
+# prompt cannot silently unhook the fifth check.
+WORKER_NET_HEAD = "Your worker Body loop may have stopped"
+
+# A session id names a directory below; anything else is not one of ours.
+_SAFE_SID = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{3,127}")
+
+STOPPED_BODY_DENY_REASON = (
+    "ScheduleWakeup rejected: an operator stopped this Body with /stop (this "
+    "session's sessions/<SID>/stop-requested marker exists), so its worker "
+    "deadman net must not be re-armed, and the worker loop must not be resumed "
+    "either -- a stopped Body stays down until someone starts it again.\n\n"
+    "What to do instead: end this turn now with one Bash echo saying the Body "
+    "is stopped. Do not run park-due and do not call Skill(worker-loop); both "
+    "only lead back to this net (measured 2026-09-28, g-375-71)."
+)
+
 
 def _session_dir(session_id):
     """The bound agent's session/ dir, or None.
@@ -230,7 +261,10 @@ def _cancel_would_strand_loop(tool_input, session_id):
       1. `stop` falsy/absent      -> False (not this branch; prompt check runs)
       2. agent unresolvable / agent-state unreadable -> False (fail-open)
       3. agent-state != RUNNING   -> False (loop already idle; cancel is fine)
-      4. RUNNING + stop-requested -> False (a real /stop is in flight)
+      4. RUNNING + stop-requested -> False (a real /stop is in flight). A worker
+         Body's /stop writes this SESSION's marker instead of the agent-wide one
+         (the reducer reads that one), and agent-state stays RUNNING for the
+         other Bodies, so either marker counts (g-375-71).
       5. RUNNING, no stop-requested -> True (DENY -- strands the loop)
     """
     if not isinstance(tool_input, dict) or not tool_input.get("stop"):
@@ -246,6 +280,9 @@ def _cancel_would_strand_loop(tool_input, session_id):
             return False                                # outcome 3
         if (session / "stop-requested").exists():
             return False                                # outcome 4
+        marker = _session_stop_marker(session_id)
+        if marker is not None and marker.exists():
+            return False                                # outcome 4 (worker Body)
         return True                                     # outcome 5
     except Exception:
         return False                                    # outcome 2 (fail-open)
@@ -290,6 +327,48 @@ def _arm_would_resurrect_nothing(tool_input, session_id):
         if not state_file.is_file():
             return False                                # outcome 3
         return state_file.read_text(encoding="utf-8").strip() != "RUNNING"
+    except Exception:
+        return False                                    # outcome 3 (fail-open)
+
+
+def _session_stop_marker(session_id):
+    """This SESSION's stop marker -- the file /stop writes on a worker Body -- or None.
+
+    It sits beside the agent-level session/ dir that `_session_dir` resolves
+    (agents/<agent>/sessions/<SID>/stop-requested), so it resolves the same way:
+    payload session_id -> agent, never the env (see `_session_dir`).
+    """
+    if not isinstance(session_id, str) or not _SAFE_SID.fullmatch(session_id):
+        return None
+    session = _session_dir(session_id)
+    if session is None:
+        return None
+    return session.parent / "sessions" / session_id / "stop-requested"
+
+
+def _arm_on_stopped_body(tool_input, session_id):
+    """True when a Body an operator stopped is re-arming its worker deadman net.
+
+    Every outcome is enumerated (guard-3328):
+      1. `stop` truthy -> False (a cancel; on a stopped Body that is exactly right)
+      2. prompt does not open with WORKER_NET_HEAD -> False (only that net resumes
+         the worker loop; any other wake-up is someone else's business)
+      3. no usable session id / agent unresolvable -> False (fail-open)
+      4. this session's stop marker exists -> True (DENY -- the orbit g-375-71
+         measured)
+      5. otherwise -> False (a live Body re-arming its own net, the rb-4345
+         re-arm the deadman design requires)
+    """
+    if not isinstance(tool_input, dict) or tool_input.get("stop"):
+        return False                                    # outcome 1
+    prompt = tool_input.get("prompt")
+    if not isinstance(prompt, str) or not prompt.lstrip().startswith(WORKER_NET_HEAD):
+        return False                                    # outcome 2
+    try:
+        marker = _session_stop_marker(session_id)
+        if marker is None:
+            return False                                # outcome 3
+        return marker.exists()                          # outcomes 4, 5
     except Exception:
         return False                                    # outcome 3 (fail-open)
 
@@ -389,6 +468,9 @@ def main():
 
     if _arm_would_resurrect_nothing(tool_input, payload.get("session_id", "")):
         emit_deny(_arm_deny_reason(payload.get("session_id", "")))
+
+    if _arm_on_stopped_body(tool_input, payload.get("session_id", "")):
+        emit_deny(STOPPED_BODY_DENY_REASON)
 
     if is_bad_slash_prefix(prompt):
         emit_deny(DENY_REASON)

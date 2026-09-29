@@ -33,21 +33,13 @@ Coverage semantics (g-115-573):
 
 Fail-open: any exception → print "no" + "[]" so the gate continues.
 """
-import hashlib
 import json
 import os
 import sys
 from datetime import datetime, timedelta
 
-
-def file_sig(rel_path, root):
-    """sha1[:12] of current file content. None if unreadable."""
-    full = os.path.join(root, rel_path) if root else rel_path
-    try:
-        with open(full, "rb") as f:
-            return hashlib.sha1(f.read()).hexdigest()[:12]
-    except (OSError, IOError):
-        return None
+# The one signature algorithm, shared with both writers of the records read here.
+from _fresh_eyes_signatures import file_sig
 
 
 def parse_own_records(raw, hours, now):

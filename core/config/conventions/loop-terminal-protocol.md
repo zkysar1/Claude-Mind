@@ -161,7 +161,7 @@ ONE owner (`core/scripts/_sleep_directive.py`, reached from shell by `sleep-dire
 and ONE text — the one Claude Code always got. **Vessel version floor**: a Mind served by
 a Zak Code older than ADR-0191 gets a foreground sleep that ignores `run_in_background`
 and `unknown tool` for `TaskOutput`; the floor is recorded in the vessel's
-CLAUDE-MIND-COMPAT and is not something the framework detects — one contract, no branch.
+HOST-FRAMEWORK-COMPAT and is not something the framework detects — one contract, no branch.
 `detect_harness` had no other reader; the provenance readers
 (`_runtime.sh::rt_judge_provenance`, `skill-evaluate.py`, `_confidence_ledger.py`) read
 the env markers themselves and only ever label a record.

@@ -669,6 +669,23 @@ if [ -n "${SOURCE:-}" ]; then
     QUERY="${QUERY}&source=$(rt_url_encode "${SOURCE}")"
 fi
 
+# ── WORKER PULL AT THE CLAIM () ──────────────────────────────────────
+# A BASH GATE, NOT A PROSE STEP (guard-399). The worker loop's Phase -0.3 pull
+# is a step the model runs, and it gets skipped: measured 2026-09-28, one worker
+# Body claimed a goal on a checkout 316 commits behind (its iteration-push.log
+# had no loop-driven run for 6 h, only cron ticks, which refuse a dirty tree)
+# and another ran a 9 h unit on the same stale code. Every unit passes through
+# this claim, BEFORE its goal executes, so pulling here is the unit boundary
+# the design already allows (rb-11769): never a merge under an executing goal.
+# Workers only (BODY_WM_PATH, the same discriminator as the role recheck above);
+# the reducer pulls and pushes through its own loop. stdout goes to stderr
+# because this script's stdout is the goal JSON its callers parse. Fail-soft:
+# iteration-push exits 0 without --strict and `|| true` covers the rest, so a
+# pull that cannot run leaves the claim exactly as it was.
+if [ -n "${BODY_WM_PATH:-}" ]; then
+    bash "$CORE_ROOT/scripts/iteration-push.sh" --no-push >&2 || true
+fi
+
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/claim --query "$QUERY" 2>&1)" || rc=$?
 

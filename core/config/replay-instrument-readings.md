@@ -2020,3 +2020,495 @@ guard-399 and guard-6482.
   - Bare check: run the exact-id search AND a title-property search, and report them apart.
   - A signature id inside a pipeline record is a resolve/reflect-time artifact, never a
     formation link.
+
+## Run 88 (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, 2026-09-28; own-cloud, g-001-05)
+
+- **Pool.** `--replay-candidates` returned 842 records (5,867,944 B). Excluded outcome-null 8
+  and test-cat 1, leaving 833 eligible.
+  - `derive_surprise` disagrees with stored `surprise` on 250 (whole pool).
+  - 0 at the rc>=5 cap and 0 encoded-chronic. The strict `>` skip excluded 0; a `>=` skip
+    would have dropped the 10 records due today.
+  - rc (eligible): rc0 444 / rc1 233 / rc2 89 / rc3 52 / rc4 15.
+  - Effective-surprise histogram: {0:1, 1:4, 2:27, 3:65, 4:287, 5:287, 6:124, None:38}.
+    Effective s>=7 is **0**, down from 8 in Run 87. Run 87's rule 2 took all 8 into its
+    batch, which it then stamped or chronic-encoded, so rotation accounts for the empty tier
+    per Run 87's own ledger. Not re-verified by id.
+- **Selection.** Run 87's method (derived surprise, strict skip, routine quota RESERVED at 2)
+  at seed 88. It was RE-IMPLEMENTED from this ledger's prose, not zeta's code, so it matches
+  by description only, not byte-for-byte.
+  - Rule 2 = 0.
+  - Band 6: 124 records (rc0 18 / rc1 71 / rc2 29 / rc3 2 / rc4 4) took all 8 non-routine
+    slots, allocated PROPORTIONALLY by largest remainder {rc0 1, rc1 5, rc2 2}.
+  - 2 routine records (effective s<5), from a routine pool of 384.
+  - Positive control: two runs at seed 88 gave byte-identical output (md5 e982aef8...).
+- **Batch.** 5 CORRECTED, 5 CONFIRMED, i.e. 5/10 (BATCH-scoped, upward-biased — guard-2129).
+  Stages: 9 archived, 1 resolved.
+- **Narratives.** 10/10 parsed, and the count was asserted against the intended ids. Winning
+  keys: outcome_detail x5, resolution_note x2, rationale x2, evidence_for x1.
+  - ohs-limit-raise: the `rationale` winner (3479 chars) holds RESOLUTION text ("MEASURED
+    2026-09-05 ... I am recording CORRECTED anyway"), written into rationale at resolve time.
+    Not bare.
+  - incomplete-dep-population: the `rationale` winner (3224 chars) is the formation premise.
+    The verdict ("RAW=2, INCOMPLETE=0 ... 100% DANGLING") sits ONLY in `notes` (1510 chars),
+    which is in neither the chain nor the SKILL's six-key unchained list. So the listed bare
+    check would have called a documented lesson bare. See the instrument correction below.
+  - roblox-ci-ayo-world-features: the `evidence_for` winner (184 chars) is the formation
+    evidence (the motivating CI error), with no unchained key. Its experience ref is
+    formation-type. BARE on its outcome.
+    - Searched the exact id on the findings board: 0 of 17,686 rows. The board starts
+      2026-04-26, after this record's 2026-04-08 formation.
+    - Searched the title property `AyoWorldFeatures`: 4 posts, none about the record's claim.
+    - Its MECHANISM lesson is carried: rb-119 (active, created 2026-04-08) — CI can update
+      existing instances but not create new ones.
+  - Experience refs: 8 of 10 carry one. All 8 sit in OTHER agents' stores (zeta 3, alpha 2,
+    bravo 2, echo 1) and all are `hypothesis_formation`. 0 are in foxtrot's store, so there
+    were 0 retrieval_stats writes (never cross-agent).
+- **Qualitative.** 3 of 5 CORRECTED were decided by the resolver adjudicating the
+  pre-registered instrument or criterion itself:
+  - incomplete-dep: the direction held, yet the result (0) fell below its own range floor
+    (1). The named control expired before the census ran, and the 100%-dangling bucket was
+    never modelled (guard-4014).
+  - ohs: the literal mean of 3.25 sat INSIDE the CONFIRMED band, but CORRECTED was recorded
+    on leave-one-out single-observation dependence (guard-6031, rb-10207).
+  - prose-dep: the pre-registered classifier was invalid (recall 31%). It would have
+    CONFIRMED, while hand classification gave 19 vs 42 (rb-11104).
+
+  The other two:
+  - deploy-restart: an unmodelled precondition — the next deploy formed no restart window at
+    all (rb-12223, created 2026-09-28);
+  - cc03-legacy-history: a false premise — a frozen CoW `.history` never drains (rb-4900).
+
+  This is the THIRD consecutive run with this shape (Run 86: defects in the runs' own
+  pre-registration; Run 87: a branch or axis the design did not model). It is
+  narrative-derived, so it is not a Step 3 marker (guard-4758) and was not tested. Carriers
+  are active: rb-6431, guard-4014, guard-6031, rb-11104.
+- **Step 1.5.** `retrieve.sh --depth medium` ran on all 8 batch categories, each rc=0
+  (229-311 KB). Lesson carriers were located by regex over the full active dumps: 7030
+  guardrails, 11645 rb.
+- **Step 3: two title markers, pre-registered in the diary at 10:19:55. No title-marker rate
+  had been computed at that point; the corpus file had been fetched earlier, for the notes
+  census only. K=2, family alpha 0.025 (guard-6582). Both REJECTED.**
+  - Corpus: resolved 49 + archived 1901 = union 1950. 1178 are scoreable with the batch
+    excluded. Title verdict-token contamination 8/1178 = 0.68%; those 8 were dropped from
+    both arms, leaving 1170. Base 42.3% CORRECTED.
+  - M1, a numeric MAGNITUDE (a digit left after stripping ids and ISO dates): the batch had
+    it 3/4 CORRECTED. Corpus n=488, 42.6% vs 42.1% (+0.5pp), exceedance 0.855, median |perm|
+    1.9pp, p95 5.8pp. The construct is noisy: sampled members include non-magnitude labels
+    (`ls20`, `v9`).
+  - M2, future-tense `\bwill\b`: the batch had it 0/2 CORRECTED. Corpus n=156, 39.7% vs 42.7%
+    (-3.0pp), exceedance 0.542, median 3.0pp, p95 8.1pp. Its members are genuine forward
+    predictions, so the construct is valid.
+  - Controls (M1 / M2):
+    - month-composition expected rate 42.9 / 44.0%, so the marker sits -0.2 / -4.2pp below it;
+    - crc(`id[11:]`) size-matched: -6.1 / -2.2pp;
+    - "the" size-matched: -3.0 / +0.7pp.
+  - **THE M1 crc CONTROL LANDED IN THE TAIL.** Its -6.1pp at n=488 has exceedance 0.039
+    against the same permutation floor. So one fixed "meaningless" split beat the p95 the
+    marker could not reach. That is the concrete reason Step 3 item 3 builds the floor by
+    permutation and never trusts a single control split.
+  - SIGN SERIES: M1 appends +0.5, giving -7.1, -5.8, -6.6, -4.5, -11.5, +5.5, +4.6, +3.1,
+    +0.5. That is 5 negative of 9; two-sided sign test p = 1.0. M2 is excluded: it was
+    batch-DEPLETED (0/2), the opposite direction from every series member.
+- **Step 3.5.** 0 procedural-gap indicators across the 5 CORRECTED lessons, `notes`
+  included. Nothing proposed.
+- **Step 3.6.** The full-pool sweep found 0 eligible (rc>=3, CORRECTED, unencoded).
+- **Instrument correction: `notes` is a 7th off-chain lesson key, and its content is MIXED.**
+  - Census over the corpus union (1950 records, 1188 scoreable):
+    - 132 records resolve to a weak winner (rationale 94, evidence_for 12, None 26);
+    - 6 of them carry non-empty `notes` and none of the six listed unchained keys;
+    - 4 of those 6 hold outcome text, 2 hold a formation pre-mortem.
+    - The pool gives 3 of 79 weak winners.
+  - So `notes` cannot join NARRATIVE_CHAIN as a bare key (guard-3970). The in-chain
+    `evidence_for` is mixed the same way. Of its 12 winners, about 5 are formation evidence
+    (the roblox-ci record is one), about 5 are outcome measurements, and 2 are ambiguous.
+  - Corrected:
+    - SKILL Step 2's bare-check list now names `notes`, with the mixed-content caveat
+      (+159 B, to 53,571 B, under the 64 KB on-demand ceiling);
+    - g-115-10108 (pending, owns the helper fix): its description now carries the census and
+      the `evidence_for` observation, appended via goal-field-append (`confirm_read` agreed).
+  - Pre-apply consultation (subject + mechanism, `--include-framework`) found no
+    contradicting entry. guard-3970, guard-4673, guard-1076 and rb-11292 reinforce the fix.
+    guard-1076 (sync the enumeration) is why the owner goal was updated in the same pass.
+- **Step 4.**
+  - 0 pattern-signature outcomes.
+    - One nested ref: prose-dep carries `context_consulted.pattern_signatures_checked =
+      ['sig-244']`.
+    - sig-244 was created 2026-09-15, eight days AFTER that record's formation (2026-09-07),
+      so it is a resolve-time artifact (Step 4 item 4c).
+  - Credits, spooled, each confirmed with `"spooled": true`:
+    - times_helpful (method rails): guard-2129, guard-4758, guard-6582, guard-2298,
+      guard-2615, guard-3980, guard-5986, guard-3970, guard-4673, guard-1076;
+    - times_active (lesson carriers, each read by id and active): rb-12223, guard-4035,
+      guard-4014, guard-6031, rb-10207, rb-4900, rb-11104, guard-6110, rb-8710, guard-3951,
+      rb-8726, rb-119, guard-2364, rb-5240.
+  - No carrier was contradicted by its record, so there were 0 revision flags.
+  - Experience retrieval_stats: 0 writes (all 8 refs are cross-agent).
+  - No tree-node strategy was referenced.
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id).
+  next_review 2026-10-05.
+  - EXPOSURE: 9 of the 10 are stage=archived, so their stamps fall in the g-115-10778 class
+    (still pending): archive_sweep prunes the tombstone without folding post-archival writes
+    into the archive copy.
+- **NEXT RUN (89).**
+  - Keep derived surprise, the strict skip and the routine reservation.
+  - Rule 2 was empty this run, so band 6 took all 8 non-routine slots. Band 6's size is
+    roughly stable: 119, 126, 124 over Runs 86-88.
+  - Do not re-test the numeric-magnitude marker or `will`.
+  - Bare check: read `notes` and weigh it; it is mixed. Treat an `evidence_for` winner with
+    the same suspicion as a `rationale` one.
+
+## Run 89 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-09-28; zeta's g-001-05 occurrence 87)
+
+- **Pool.** `--replay-candidates` returned 832 records (5,799,305 B). Excluded outcome-null 8
+  and test-cat 1, leaving 823 eligible.
+  - `derive_surprise` disagrees with stored `surprise` on 249 (whole pool).
+  - 0 at the rc>=5 cap and 0 encoded-chronic. The strict `>` skip excluded 0; a `>=` skip
+    would have dropped the 9 records due today.
+  - rc (eligible): rc0 442 / rc1 228 / rc2 87 / rc3 51 / rc4 15.
+  - Effective-surprise histogram: {0:1, 1:4, 2:27, 3:64, 4:286, 5:287, 6:116, None:38}.
+    Effective s>=7 is 0 for the second run in a row.
+- **Selection.** Run 87's own code (`select87.py`), changed only to seed 89. Runs 87 and 89
+  therefore share code, while Run 88 shares only the description.
+  - Rule 2 = 0.
+  - Band 6: 116 records (rc0 17 / rc1 66 / rc2 27 / rc3 2 / rc4 4) took the 8 non-routine
+    slots, allocated proportionally by largest remainder {rc0 1, rc1 5, rc2 2}. The band fell
+    124 -> 116, which is exactly the 8 band-6 records Run 88 stamped (next_review 10-05).
+  - 2 routine records (effective s<5), from a routine pool of 382.
+  - Positive control: a re-run at seed 89 gave byte-identical ids (md5 6ef5b23b...).
+- **Batch.** 4 CORRECTED, 6 CONFIRMED, i.e. 4/10 (BATCH-scoped, upward-biased — guard-2129).
+  All 10 are stage=archived.
+- **Narratives.** 10/10 parsed, and the count was asserted against the intended ids. Winning
+  keys: outcome_detail x7, resolution_summary x1, evidence_for x1, rationale x1.
+  - pickup-gap (CORRECTED): the `evidence_for` winner (172 chars) is a POINTER list (a goal,
+    a tree-node block, a fix goal, a PR) with no unchained key, so the record is bare
+    on-record.
+    - Exact-id findings search: 1 hit, msg-20260823-211741-zeta-5415, which carries the whole
+      mechanism. The param went out blank because the seed getter has no `ayoKey` arm, and
+      `""` is truthy in Lua. The env-server session log (levels 1-3 only) cannot observe
+      client-side execution.
+    - Title-property search (`ses-6863cd76`): 1 hit, the CONSTRAINS trigger
+      msg-20260823-195942-foxtrot-5403.
+    - Carrier: rb-9285 (the 08-23 zero was a wrong-LAYER artifact).
+  - presence-guard (CONFIRMED): the `rationale` winner (773 chars) is the formation premise.
+    It has no unchained key, and its experience ref (alpha's) is formation-type, so the record
+    is BARE on its outcome.
+    - Findings board: exact-id search 0; title-property search 1 (msg-20260804-142327-bravo-5290,
+      the ORIGIN finding, formation-side).
+    - The GUARDRAIL store holds the lesson under the exact id. guard-2969 (read) names it in
+      `source` ("g-001-08 reflection of hypothesis 2026-08-05_presence-guard-..."): a scan
+      keyed on the bare name `exists` also matched a backend's remote-authoritative `exists()`
+      override, so 24 of 25 hits were correct code. guard-2970 matches the id too; not read.
+  - **INSTRUMENT NOTE: run the exact-id search over the rb and guardrail stores (text and
+    `source`), not only the findings board.** The board alone would have called a carried
+    lesson lost. Run 88 reached rb-119 through a mechanism regex, whereas an exact id is
+    unambiguous.
+  - Experience refs: 5 of 10 carry one (zeta 3, alpha 1, bravo 1), all
+    `hypothesis_formation`.
+- **Qualitative.** 3 of 4 CORRECTED failed on an outcome class the design did not model. This
+  is the 4th consecutive run with this shape. It is narrative-derived, so it is not a Step 3
+  marker (guard-4758) and was not tested.
+  - pickup-gap: a third branch (emitted with a blank param), and an instrument blind to the
+    variable (a server log cannot observe client execution);
+  - one-conf: the falsifier fired on DEAD artifact state, a 2026-07-17 debug dir (rb-8487);
+  - step36: the registered union read 10 (claim <= 5) while the pool read 0.
+  efs-role is different: it is calibration.
+  - **SHARED CONDITION, 2 of 4 CORRECTED.**
+    - efs-role (0.57) and one-conf (0.55) each wrote a pre-mortem that NAMED the realized
+      falsifier's class, yet kept confidence above 0.5. Each counter was testable with one
+      command before filing.
+    - rb-5924, rb-5998, guard-1018(b) and guard-5319 carry the lesson. aspirations-spark
+      step 0.7 cites none of them (grep of .claude/skills + core/config: 0 hits).
+    - Relayed to g-115-11035 (pending), which owns exactly this clause change, as progress_note
+      [g00105-r89-replay-instances-zeta] (`confirm_read` agreed). No new goal: dedup found
+      g-115-11035 and g-115-8417.
+- **Step 1.5.** `retrieve.sh --depth medium` ran on 8 categories, each rc=0 (64-351 KB).
+  Carriers were located by regex over the full active dumps: 7034 guardrails, 11658 rb.
+- **Step 3: two title markers, pre-registered in the diary at 12:15:29, before the corpus
+  fetch. K=2, family alpha 0.025 (guard-6582). Both REJECTED.**
+  - Corpus: resolved 50 + archived 1901 = union 1951. 1179 are scoreable with the batch
+    excluded. Base 42.5% CORRECTED. Title verdict-token contamination 8/1179 = 0.68%; those 8
+    were dropped from both arms, leaving 1171.
+  - M1, possessive `'s` (contractions excluded): the batch had it 2/2 CORRECTED. Corpus n=103,
+    37.9% vs 42.8% (-4.9pp), exceedance 0.347, median |perm| 3.6pp, p95 9.2pp. The construct
+    is valid: sampled members are genuine possessives on nouns.
+  - M2, a code-artifact token (snake_case | file extension | `()` | letter/letter path | AWS
+    action): the batch had it 1/5 CORRECTED (DEPLETED). Corpus n=252, 40.1% vs 43.0%
+    (-2.9pp), exceedance 0.423, median 2.4pp, p95 6.9pp. The construct is NOISY on the path
+    arm: 2 of 6 sampled members were slash-joined words (`guardrail/rb`).
+  - Controls (M1 / M2):
+    - month-matched: +0.1 / +0.7pp;
+    - crc(`id[11:]`) size-matched: -1.7 / -5.4pp;
+    - "the" size-matched: -2.8 / -1.4pp.
+    The M2 crc control out-ran its own marker (-5.4 vs -2.9pp), as in Run 88.
+  - Collider path (rb-12100): INERT for both. Confidence difference on vs off: M1 +0.000,
+    M2 +0.009. Confidence-stratified lifts: M1 -4.7pp, M2 -2.6pp.
+  - SIGN SERIES (batch-ENRICHED markers only): M1 appends -4.9, giving -7.1, -5.8, -6.6, -4.5,
+    -11.5, +5.5, +4.6, +3.1, +0.5, -4.9. That is 6 negative of 10; two-sided sign test
+    p = 772/1024 = 0.75. M2 is excluded because it was batch-depleted, as Run 88 excluded
+    `will`.
+- **Step 3.5.** 0 procedural-gap indicators across the 4 CORRECTED narratives. Nothing
+  proposed.
+- **Step 3.6.** The full-pool sweep found 0 eligible.
+- **Reconsolidation (guard-1710).** rb-3332, which carries the replayed position-stray-int
+  record, got a dated head note with the original kept below. 799 -> 1712 chars, read back
+  byte-equal, `amended_fields.content` set.
+  - The writer audit rb-3332 asks for HAS LANDED: type gate g-115-3802, scoped by
+    g-115-4821, in both core/scripts/pipeline.py and mind_api/src/world/pipeline_write.py.
+  - Measured over all 2076 records (archived+resolved+active+discovered): a numeric position
+    on 48, the last formed 2026-07-29, and 0 of the 931 formed 08-01..09-28.
+  - `position: null` still passes, by design (test_null_position_behaviour_unchanged): 5
+    records, the last 2026-08-22, and 0 of 247 formed in September. No goal filed: this is a
+    documented deferral with no recent incidence.
+- **Step 4.**
+  - 0 pattern-signature outcomes. Two batch records carry
+    `context_consulted.pattern_signatures_checked`, both as empty lists.
+  - Credits, spooled, each confirmed with `"spooled": true`:
+    - times_helpful (method rails): guard-2129, guard-4758, guard-6582, guard-2615,
+      guard-1710, guard-1984;
+    - times_active (lesson carriers): guard-1600, guard-2969, rb-5514, rb-10167, rb-8786,
+      rb-9285, rb-9757, rb-8487, rb-7822, rb-3332, rb-4157, rb-4158, rb-5924, rb-5998.
+  - Experience retrieval_stats (zeta's store only, read back): one-conf useful (its pre-mortem
+    is the relay's evidence); operator-poll and seam noise. The alpha and bravo refs were read
+    only, never written.
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id).
+  next_review 2026-10-05.
+  - EXPOSURE: all 10 are stage=archived, which is the g-115-10778 class (pending per Run 88;
+    not re-verified here).
+- **NEXT RUN (90).**
+  - Keep derived surprise, the strict skip and the routine reservation.
+  - Rule 2 has been empty two runs running, so band 6 supplies all 8 non-routine slots.
+  - Do not re-test possessive `'s` or the code-artifact token.
+  - Bare check: search the exact record id over the findings board AND the rb and guardrail
+    stores, and report each surface separately.
+
+## Run 90 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-09-28; zeta's g-001-05 occurrence 88)
+
+- **Pool.** `--replay-candidates` returned 824 records (5,753,721 B). Excluded outcome-null 8
+  and test-cat 1, leaving 815 eligible.
+  - `derive_surprise` disagrees with stored `surprise` on 248 (whole pool).
+  - The strict `>` skip excluded 0; a `>=` skip would have dropped the 9 records due today.
+  - rc (eligible): rc0 442 / rc1 222 / rc2 85 / rc3 51 / rc4 15.
+  - Effective-surprise histogram: {0:1, 1:4, 2:27, 3:64, 4:285, 5:287, 6:109, None:38}.
+    Effective s>=7 is 0 for the third run in a row.
+- **Selection.** Run 89's `select89.py`, changed only to seed 90.
+  - Rule 2 = 0.
+  - Band 6: 109 records (rc0 17 / rc1 61 / rc2 25 / rc3 2 / rc4 4) took the 8 non-routine
+    slots, allocated proportionally by largest remainder {rc0 1, rc1 5, rc2 2}.
+  - The band fell 116 -> 109. Run 89 stamped 8 band-6 records, so one record entered the
+    band; that arrival was not traced.
+  - 2 routine records (effective s<5), from a routine pool of 381.
+- **Batch.** 7 CORRECTED, 3 CONFIRMED. The 7 CORRECTED are 7 of the 8 band-6 picks
+  (BATCH-scoped, upward-biased — guard-2129). 9 are archived, 1 is resolved.
+- **Narratives.** 10/10 parsed, and the count was asserted against the intended ids. Winners:
+  outcome_detail x7, rationale x2, NULL x1.
+  - wedge-fix is a `rationale` winner, but its lesson is under `resolution_notes`, so it is
+    not bare.
+  - append-heavy is a `rationale` winner whose lesson sits ONLY in `resolution_method`, so it
+    is BARE by the skill's test.
+  - operator-probe has a NULL winner, and its lesson sits ONLY in `position`.
+  - **POOL CENSUS (the instrument finding).** 70 of the pool's 748 CONFIRMED/CORRECTED
+    records have a weak winner: NULL, verdict-only under 40 chars, or `rationale` with no
+    lesson under the listed unchained keys.
+    - 20 are rescued by the listed keys.
+    - 12 carry their only outcome-bearing text in `resolution_method`.
+    - 27 carry it only in a long `position`.
+    - 11 are bare everywhere.
+    - Neither `resolution_method` nor `position` is in NARRATIVE_CHAIN or in the skill's
+      unchained list.
+    - Sampling shows BOTH keys are MIXED-use. `position` is mostly the formation stance, but
+      some records rewrite it with the outcome. `resolution_method` holds the method on some
+      records and the result on others. So 12 and 27 are UPPER bounds, not lesson counts.
+    - Relayed to g-115-10108 [g00105-r90-narrative-key-census-zeta].
+- **Carrier search, per surface (Run 89's NEXT instruction).** Exact record id searched over
+  11731 active rb, 7040 active guardrails and 17816 findings (`--since 4000h`).
+  - Hits (rb / guard / findings): vessel 2/0/0, decline 1/0/1, prod-console 2/1/2,
+    append-heavy 1/2/0, operator-probe 1/1/3, advisory 2/1/0. mechanism, backend-cache,
+    wedge-fix and visitor-chat: 0 on all three surfaces.
+  - **INSTRUMENT NOTE: an exact-id hit is a MENTION, not a carrier, and a lesson written by the
+    RESOLVING goal cites that goal's id, not the hypothesis id.**
+    - operator-probe: both rb/guard exact-id hits are non-carriers.
+      - rb-6819 is a formation-time caveat, created 08-05 16:32, before resolution.
+      - guard-2813 cites the id as an example of an attribution error.
+      - The true outcome carriers are guard-2810 ("A HOSTNAME'S LEXICAL SHAPE IS NOT ITS
+        NETWORK POSITION"; source g-335-784; created 00:12, two minutes after echo's
+        `position` rewrite) and rb-6876 (it cites g-335-770).
+      - Neither cites the hypothesis id. Only a mechanism regex found them
+        (`MIND_ALB_SELF_REG|ALB-alias|DIRECT-EC2-SHAPED`).
+    - The same miss holds for mechanism (rb-10022, a g-001-08 reflection) and backend-cache
+      (rb-8274, guard-4358).
+    - Tally over 10 records:
+      - exact id alone reached an outcome-side carrier for 5 (vessel, decline, prod-console,
+        append-heavy, advisory);
+      - it reached only non-carriers for 1 (operator-probe);
+      - it reached nothing for 4.
+      - Adding the mechanism regex located outcome-side carriers for 3 of those 5
+        (mechanism, backend-cache, operator-probe).
+      - visitor-chat's only related entry is guard-5016, a formation-day structural fact.
+      - wedge-fix: no carrier by either route.
+- **Qualitative.** In 3 of the 7 CORRECTED, the author's own filing text NAMED the realized
+  falsifier, yet confidence stayed at 0.55-0.60 (decline-beats-defer, wedge-fix,
+  append-heavy).
+  - This is the 2nd consecutive run with this shape; Run 89 had efs-role and one-conf.
+  - It is narrative-derived, so it is not a Step 3 marker (guard-4758).
+  - Relayed to g-115-11035 [g00105-r90-replay-instances-zeta]. A correction line follows it:
+    the first text said "5th consecutive", conflating it with Run 89's separate
+    unmodeled-outcome-class series.
+  - vessel (CONFIRMED) and prod-console (CORRECTED) share one shape: a fix closes one SHAPE, or
+    restores one gate, not the hazard or the chain. rb-12316, rb-10991 and guard-6726 already
+    carry it.
+- **Step 1.5.** `retrieve.sh --depth medium` ran on 7 categories, each rc=0 (264-378 KB).
+- **Step 3: two title markers, pre-registered in the diary at 21:40:48, before the corpus
+  fetch. K=2, family alpha 0.025 (guard-6582). Both REJECTED.**
+  - Corpus: resolved 53 + archived 1901 = union 1954. 1182 are scoreable with the batch
+    excluded. Base 42.1% CORRECTED. Title verdict-token contamination 8/1182 = 0.68%; those 8
+    were dropped, leaving 1174.
+  - M1, causal attribution (`explain|cause|because|due to|driven by|signature|binding
+    constraint|root cause|accounts for|responsible for|is what`): the batch had it 4/4
+    CORRECTED (ENRICHED). Corpus n=57, 42.1% vs 42.0% (+0.1pp), exceedance 1.000, median
+    |perm| 3.8pp, p95 13.0pp. The construct is valid: sampled members make genuine causal
+    claims.
+  - M2, an artifact-id anchor (a goal/rb/guard/sig/asp id, or a hex commit of 7+ chars with a
+    digit and a letter): the batch had it 2/3 CORRECTED (ENRICHED). Corpus n=160, 38.1% vs
+    42.6% (-4.5pp), exceedance 0.312, median 3.0pp, p95 8.1pp.
+  - Controls (M1 / M2):
+    - month-matched: +1.6 / +1.6pp;
+    - crc(`id[11:]`) size-matched: -5.4 / -1.6pp;
+    - "the" size-matched: -10.9 / -2.3pp.
+    At n=57 a common-word control moves 10.9pp, which is how wide the floor is at small n.
+  - Collider path (rb-12100): INERT. Confidence difference on vs off: M1 -0.009, M2 +0.020.
+    Stratified lifts: M1 -0.8pp, M2 -3.3pp.
+  - SIGN SERIES (batch-ENRICHED markers only): appends +0.1 and -4.5, giving -7.1, -5.8,
+    -6.6, -4.5, -11.5, +5.5, +4.6, +3.1, +0.5, -4.9, +0.1, -4.5. That is 7 negative of 12;
+    two-sided sign test p = 3172/4096 = 0.77.
+- **Step 3.5.** One shared-condition group had N>=2 CORRECTED (the named-falsifier three).
+  0 procedural-gap indicators across all 7 CORRECTED lesson texts (narrative +
+  resolution_method + resolution_notes + position). Nothing proposed.
+- **Step 3.6.** 0 eligible.
+- **Step 4.**
+  - 0 pattern-signature outcomes.
+  - Credits spooled, each confirmed with `"spooled": true`:
+    - times_helpful (method rails): guard-2129, guard-4758, guard-6582, guard-2615,
+      guard-5986, guard-1984;
+    - times_active (lesson carriers): guard-4358, guard-6726, guard-3975, guard-2810,
+      guard-5016, guard-2721, rb-12316, rb-10022, rb-8274, rb-8428, rb-10991, rb-9395,
+      rb-6876, rb-6772.
+  - Experience retrieval_stats (zeta's store only, read back): backend-cache, operator-probe
+    and visitor-chat were all marked useful. The echo (2) and foxtrot (1) refs were read only,
+    never written.
+    - **The server RECOMPUTES `utility_ratio` as times_useful / retrieval_count.** A
+      client-sent 0.0526 (useful/(useful+noise) = 1/19) read back as 0.0179 (1/56). Send the
+      counters; the ratio is not yours to set.
+  - No reconsolidation revision: each carrier read agrees with its record's outcome.
+- **Step 4.5.** Stamped 10, verified 10, failed 0 via `replay-stamp-verify.sh` (per-id).
+  next_review 2026-10-05.
+- **NEXT RUN (91).**
+  - Keep derived surprise, the strict skip and the routine reservation.
+  - Do not re-test causal attribution or the artifact-id anchor.
+  - Carrier search: search the hypothesis id, the resolving goal id when that goal is
+    ONE-OFF, and one outcome-mechanism regex. Read each hit's ROLE (formation, outcome, or
+    byproduct); a hit's existence proves nothing.
+    - A RECURRING resolver id is useless as a key. Measured over this run's dumps: g-001-02
+      appears in 171 rb / 89 guard entries, g-001-08 in 196 / 110.
+    - A one-off resolver id is precise but still needs the role read. g-335-784 returns
+      exactly 1 guard entry, the true operator-probe carrier (guard-2810). g-115-7460
+      (wedge-fix's resolution goal) returns 1 rb entry, rb-9226, which is a byproduct
+      ops-gotcha about batched field writes and not the outcome.
+
+## Run 91 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-09-29; zeta's g-001-05 occurrence 89)
+
+- **Selection.** Same code as Run 90 (`select90.py` copied, only `today` and the seed changed).
+  - Pool 832 (`--replay-candidates`, read 04:58). Excluded: outcome-null 8, test-cat 1.
+    Eligible 823.
+  - A `>=` skip would have dropped 15 more than the strict `>` skip.
+  - Derived surprise disagrees with stored on 248.
+  - rc histogram {0: 442, 1: 222, 2: 90, 3: 53, 4: 16}.
+  - Effective-surprise histogram {0: 1, 1: 4, 2: 27, 3: 65, 4: 285, 5: 292, 6: 107, 7: 4,
+    None: 38}.
+  - **RULE 2 (effective surprise >= 7) = 4, the first nonzero reading in 4 runs.** All 4
+    were taken.
+  - Band 6: 107 records for 4 slots. Largest-remainder quotas were {rc0: 1, rc1: 2, rc2: 1}.
+    Routine pool 382, with 2 slots.
+  - Batch outcomes: 5 CORRECTED, 4 CONFIRMED, 1 UNRESOLVABLE. Batch-scoped, so this is
+    upward-biased by construction (guard-2129).
+- **Step 2.** `--narrative` parsed 10 of the 10 ids requested, via raw_decode plus flatten.
+  - Winner keys: `outcome_detail` 7, `rationale` 3.
+  - All three `rationale` winners carry resolution text, not a formation premise ("Resolved
+    by echo", "Settled by g-335-427", "Measured 2026-09-22").
+  - Bare 0/10.
+  - experience_ref appears on 4 of 10.
+    - 1 is zeta's own (the stall record). Its anchors were read, and retrieval_stats was
+      written and read back: utility_ratio 0.5 = 2/4, consistent with Run 90's
+      server-recompute finding.
+    - 3 return not_found in zeta's store, because other agents own them. They were not read
+      cross-agent.
+- **Lessons (narrative-derived, NOT Step 3 markers, guard-4758).**
+  - **Two CONFIRMED verdicts hold only on the letter of the criterion.**
+    - non-latin-names: 6/24 = 25.0% clears the 10% bar. But the pre-widening control is
+      HIGHER, 8/24 = 33.3%, so the causal story is falsified.
+    - fence-stopword: the token class it tested closed, but a separate fence-leak class
+      surfaced (ec2/merge/review/shipped).
+  - **Three of the 5 CORRECTED failed on subject or measurement, not mechanism.**
+    - wedge-autoclose: a subject goal id exists only as a CITED string, never as a record.
+    - lane-share: missed the bar by 1.3pp, with the direction right. The one-off split (40.6%)
+      would have cleared it, and choosing that split would have picked the flattering
+      denominator.
+    - step36-resumes: the channel trap.
+  - **The stall record (the HELD encoding-queue item 3) also fits.** Its formation anchor
+    was an EBS storm on 4 of 4 prior stalls (39.38 GB per 5 min). The next stall had none
+    (0.074 and 0.374 GB), and its gc log was clean. Consistency across prior instances did
+    not transfer, because the stall class changed.
+- **Step 3: one title marker. It was NOT pre-registered in the diary, and it ran on the POOL,
+  not the corpus.** It is weaker than Run 90's protocol and is recorded as such.
+  - M, a persistence claim (`stays|still|flat|will not|won't|not move|remains|keeps|persists|
+    continues|leaves`).
+  - It was suggested by: journal-sink (CORRECTED), the chronic retire-rate record (CORRECTED)
+    and client-cap (UNRESOLVABLE). In the batch it is 1/1 scoreable, i.e. enriched at n=1.
+  - Population: the 04:58 pool, scoreable CONFIRMED/CORRECTED, excluding test-cat and the
+    10 batch ids plus the 2 chronic ids. n=735.
+  - Result: marker+ 19/101 = 18.8% vs marker- 153/634 = 24.1%, -5.3pp. Permutation floor at
+    n=101: p95 +7.3pp, p99 +10.7pp. Exceedance 0.908. **REJECTED.**
+  - Controls:
+    - slug `id[11:]` marker+ reads 12/42 = 28.6%, which is the opposite sign. It overlaps
+      title marker+ on 34 records.
+    - month-expected 24.3% vs observed 18.8%.
+  - NOT appended to Run 90's sign series. That series is corpus-scoped, and mixing a
+    pool-scoped point into it would mix populations.
+- **Step 3.6: 2 eligible, 2 strengthened, 0 nucleated.** The dormancy that
+  step36-resumes-after-three-month-dormancy predicted would end (CORRECTED at 0 on 09-05) is
+  nonzero in this pool.
+  - **ls20 episode-varying conversion (`arc`).**
+    - `guardrails-read.sh --category arc` returned `[]`. The category read is exact-match, so
+      it was widened per guard-2255 to a free-text retrieve (231 KB).
+    - The mechanism lesson is already carried by rb-3767, rb-4508 and rb-11119.
+    - guard-1269 (arc-agi-solver) was strengthened: its trigger is the ls20 coverage lever.
+    - No new guardrail, because one would duplicate those three rb entries.
+  - **Guardrail retire-rate (`framework-architecture`).**
+    - guard-3978 (count-vs-wallclock) was strengthened.
+    - The resolution's mechanism is exactly that guardrail's "name the count's driver": 55
+      retires came from episodic agent passes, while the automated slate proposed 0.
+  - Both increments were confirmed `"spooled": true`. They are recurrence counts, not
+    efficacy (guard-5492). The record's embedded block still reads 28/4, as the sidecar
+    design intends.
+  - Both records were given `encoded_via_chronic: true` by whole-object write. Read back by
+    value: VERIFIED x2.
+- **Step 4.** 0 pattern-signature outcomes (retrospective, item 4c). The batch referenced no
+  named strategy, so there was no reconsolidation revision.
+- **Step 1.5 and carrier search were NOT run for the 10 batch categories** (context budget).
+  Retrieval ran only for the 2 Step 3.6 records.
+- **Step 4.5.** `replay-stamp-verify.sh` (per-id) stamped 10, verified 10, failed 0.
+  next_review 2026-10-06.
+- **NEXT RUN (92).**
+  - This stamp moved step36-resumes, lane-share-drop and journal-sink (all CORRECTED) to
+    rc 3. **They become Step 3.6-eligible only at the first run ON OR AFTER 2026-10-06**, not
+    at Run 92. The same stamp set next_review_date = 2026-10-06, and `--replay-candidates`
+    excludes `review_date > today` (mind_api/src/world/pipeline.py ~L417-424). Step 3.6 sweeps
+    only that pool.
+    - A run before 10-06 reads them as 0, correctly.
+    - A run after 10-06 that reads fewer than 3 is also correct if another agent's run encoded
+      them first: check `encoded_via_chronic` before calling it a defect.
+    - CORRECTED in the spark of the same close. The first text said "Run 92 expects >= 3" and
+      missed guard-1755's mechanism, pointed forward: the write that makes a record chronic
+      also hides it for one review interval.
+  - Pre-register any marker in the diary, and score it on the corpus (resolved ∪ archived),
+    not the pool.
+  - Resume Run 90's carrier-search recipe for the batch.

@@ -284,9 +284,16 @@ UNMEASURED_KEY = "_unmeasured_reason"
 #      expires_at, which are run-time stamps that drift the same way between
 #      two runs of the SAME path 3 s apart).
 # So the knob stays 300 s: it is now ~100x the measured cost on this box rather
-# than ~7x, which is slack, not a claim. It is still NOT evidence about
-# LAPTOP-3IOFCNEO — nobody has measured the narrowed call there. What changed is
-# that the bound no longer has to cover work the caller throws away.
+# than ~7x, which is slack, not a claim. What changed is that the bound no
+# longer has to cover work the caller throws away.
+#
+# THE SLOW BOX, DECENSORED (, 2026-09-29). Measured by foxtrot on
+# LAPTOP-3IOFCNEO (6.18.33.2-microsoft-standard-WSL2), both with NO timeout: the
+# narrowed call above 9,120 ms / 250,605 B, and the full `goal-selector.sh
+# blocked` 143,052 ms / 1,335,733 B (lightly contended). The same day on cc-07
+# (6.8.0-142-generic) the narrowed call took 2,947 ms. So on the slowest measured
+# box the 300 s knob is ~33x the call this module issues, and ~2.1x even the full
+# view it no longer issues.
 #
 # NOT switchable to stdout=DEVNULL to make the timeout reliable on Windows
 # (guard-4375): that remedy is for callers which do not read the child's output,

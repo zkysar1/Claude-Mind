@@ -545,6 +545,8 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
   mt_del=-1
   mt_conf=-1
   mt_conf_paths=""
+  mt_retrack=-1
+  mt_retrack_paths=""
   if [ "$fw_count" -gt 0 ] || [ "$ahead" -gt 0 ]; then
     # ONE read, THEN split it three ways. The `| head -1` that extracts the tree
     # oid is correct and stays (guard-6648 clause 1) — but as the ONLY consumer
@@ -565,7 +567,11 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
     # Both discriminators are free and already in this output.
     _mtout="$(git -C "$REPO" merge-tree HEAD "$ref" 2>/dev/null)"; _mtrc=$?
     _mt="$(printf '%s\n' "$_mtout" | head -1)"
-    mt_conf_paths="$(printf '%s\n' "$_mtout" | sed -n 's/^CONFLICT ([^)]*): Merge conflict in //p')"
+    # Paths come from the conflicted-file-info section (lines 2..first blank,
+    # `<mode> <oid> <stage>\t<path>`), which lists EVERY conflict type. The
+    # CONFLICT messages are not a path source: modify/delete has no "Merge
+    # conflict in", so occ246 printed "1 conflicted path(s):" over a blank line.
+    mt_conf_paths="$(printf '%s\n' "$_mtout" | awk 'NR==1{next} /^$/{exit} {sub(/^[^\t]*\t/,""); print}' | sort -u)"
     if [ -n "$_mt" ] && git -C "$REPO" rev-parse --verify -q "$_mt^{tree}" >/dev/null 2>&1; then
       # Only inside this branch is a 0 a MEASUREMENT rather than an absence —
       # outside it the merge-tree read did not resolve, and mt_conf stays -1
@@ -587,6 +593,31 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
         [0-9]*' '[0-9]*) mt_add="${_ns% *}"; mt_del="${_ns#* }" ;;
         *) mt_add=-1; mt_del=-1 ;;
       esac
+      # RE-TRACK (, from  occ246): paths the merge result ADDS
+      # that an ignore rule excludes. A path HEAD does not track is ordinary new
+      # content; one HEAD does not track AND ignores is an untrack this merge
+      # would undo. Carrier 9c5cc235 re-added the spool  untracked,
+      # and this report called it "append-only: safe shape". --no-renames keeps
+      # a move onto an ignored path from hiding as an R; --no-index tests the
+      # RULE, not this box's index. check-ignore rc 1 = none matched; any other
+      # non-zero leaves mt_retrack at -1 (UNMEASURED), never 0.
+      if _added="$(git -C "$REPO" diff --name-only --no-renames --diff-filter=A HEAD "$_mt" 2>/dev/null)"; then
+        mt_retrack=0
+        if [ -n "$_added" ]; then
+          # Membership WITHOUT -v: under -v, check-ignore also prints, and exits
+          # 0 for, a path a later `!pattern` RE-INCLUDES, which is NOT ignored
+          # (measured git 2.43.0). -v then runs over the ignored set only, to
+          # name each path's rule.
+          _ign="$(printf '%s\n' "$_added" | git -C "$REPO" check-ignore --no-index --stdin 2>/dev/null)"
+          case "$?" in
+            0) mt_retrack="$(printf '%s\n' "$_ign" | grep -c . || true)"
+               mt_retrack_paths="$(printf '%s\n' "$_ign" | git -C "$REPO" check-ignore --no-index -v --stdin 2>/dev/null)" \
+                 || mt_retrack_paths="$(printf '%s\n' "$_ign" | awk '{print "rule unread\t" $0}')" ;;
+            1) ;;
+            *) mt_retrack=-1 ;;
+          esac
+        fi
+      fi
     fi
     # Else: old-format merge-tree, or an unresolvable tree — FAIL OPEN to
     # fw_count (set above). Under-signalling is the worse error here: a
@@ -700,6 +731,22 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
     # would have stayed silent on the exact case this closes.
     [ -n "$goal_ids" ] && echo "      carries work naming: $goal_ids"
     [ "$unreadable" = 1 ] && echo "      ⚠ UNREADABLE — rev-list failed for this ref (bad object / corrupt ref / unfetched sid); ahead-count unknown, NOT counted outstanding"
+    # RE-TRACK disclosure (), printed ahead of the branches below so
+    # the framework "merge with:" line and the agent-store shape ladder both
+    # carry it. Measured on git 2.43.0 (cc-10, 2026-09-28): the merge also
+    # writes the ref's copy over the box's live ignored file, silently and
+    # rc=0, on a fast-forward and on a true merge (ignored files are expendable
+    # to git). mt_total >= 0 separates a failed check from an unreadable
+    # merge-tree, which the branches below already disclose.
+    if [ -z "$superseded_by" ] && [ "$is_self" = 0 ]; then
+      if [ "$mt_retrack" -gt 0 ] 2>/dev/null; then
+        echo "      ⚠ RE-TRACK: merging this ref re-adds $mt_retrack path(s) that HEAD does not track and an ignore rule excludes. That undoes the untrack on main, and the merge writes the ref's copy over this box's live ignored file:"
+        printf '%s\n' "$mt_retrack_paths" | sed -n '1,20p' | awk -F'\t' '{print "          " $2 "   (ignored by " $1 ")"}'
+        echo "      Default disposition = CARRY. To merge anyway (guard-7503): back up each live file above FIRST, run --merge, then \`git rm --cached\` each path, restore the backups, cmp them, commit, and confirm git ls-files lists none of them."
+      elif [ "$mt_retrack" = -1 ] && [ "$mt_total" -ge 0 ] 2>/dev/null; then
+        echo "      ⚠ RE-TRACK check UNMEASURED (git diff or check-ignore failed): whether merging re-adds an ignored path is unknown."
+      fi
+    fi
     if [ -n "$superseded_by" ]; then
       echo "      ANCESTOR of ${superseded_by} — its commits are contained there; review the tip instead"
       echo "      once the tip is merged+pushed, retire this ref: bash core/scripts/worker-ref-consume.sh --retire $ref"
@@ -788,7 +835,13 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
           # row — with mt_total>0, and that is UNMEASURED, not append-only. `-ge 0`
           # matched mt_add=0 and stamped it "safe shape"; `-gt 0` sends the 0/0
           # state to the else below, where its own comment already says it belongs.
-          echo "      append-only (+$mt_add / -$mt_del): safe shape. Merge only if the content is wanted; the ref's Body may still be pushing."
+          # "safe" also needs the RE-TRACK check to have MEASURED zero
+          # (): a line count cannot see an untrack being undone.
+          if [ "$mt_retrack" = 0 ]; then
+            echo "      append-only (+$mt_add / -$mt_del): safe shape. Merge only if the content is wanted; the ref's Body may still be pushing."
+          else
+            echo "      append-only by line count (+$mt_add / -$mt_del), but the shape verdict is WITHHELD because of the RE-TRACK line above."
+          fi
         else
           # THREE STATES REACHED THIS `else` AND IT ASSERTED SAFETY FOR ALL THREE
           # (occ192). It fires whenever mt_del is not >0 — which is 0 (genuine

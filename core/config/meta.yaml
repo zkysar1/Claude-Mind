@@ -153,6 +153,17 @@ strategy_schemas:
     owner_mandated_fields:
       "goal-selection-strategy.yaml":
         - weights.directive_boost
+      # gh-002 (echo, , 2026-09-28). PROVENANCE: the user directive of
+      # 2026-08-29 (Program edit #10, section "Production Is Live") falsified the
+      # original "pre-launch products (zero users) ... Breaking changes are free"
+      # text, and bravo rewrote it on 2026-09-27. mc-1593 (2026-09-27T23:54:48)
+      # rolled that rewrite back on "5 consecutive goals below baseline". A
+      # generation heuristic fires only when aspirations are generated, so it could
+      # not have moved those goals (guard-5649). The revert silently restored a
+      # directive-falsified value. INDEX-BASED KEY: if generation_heuristics is
+      # reordered, re-point this at gh-002's new index.
+      "aspiration-generation-strategy.yaml":
+        - generation_heuristics[1].description
 
   self_program_backpressure:
     # Per world/conventions/self-program-evolution.md

@@ -240,11 +240,12 @@ if [ "$SOURCE" = "compact" ]; then
     # whose content genuinely IS in context.
     #
     # SESSION-SCOPED, equally load-bearing. --session-id routes through
-    # tracker_path(), so a worker Body clears its own
-    # sessions/<SID>/body-context-reads.txt and a reducer clears the agent-wide
-    # file — never each other's. Dropping the flag would make a co-resident
-    # worker's compaction wipe the reducer's manifest: a cross-session
-    # shared-state mutation, the exact thing guard-404 forbids.
+    # tracker_path(), so a compacting session clears its own
+    # sessions/<SID>/body-context-reads.txt () — never another
+    # session's. A clear that resolved no session id would hit the agent-wide
+    # file instead: a no-op for every session with a per-session dir (the
+    #  failure), and a cross-session wipe for any sessions sharing
+    # it, the exact thing guard-404 forbids.
     #
     # FIRST in the block, before postcompact-restore, so nothing restore does
     # can be undone by the wipe. Fail-open (`|| true`) and stdout suppressed —

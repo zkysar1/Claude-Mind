@@ -83,12 +83,16 @@ def test_no_claim_message_names_the_delivery_first_order():
     the tags a board relay needs, and all of it must survive server.py's
     str(e)[:600]."""
     import inspect
-    assert "NO_CLAIM_MESSAGE" in inspect.getsource(
+    # _put must raise THIS text, formatted with a dict. A template and call that
+    # disagree raise inside _put's fail-open consult, which lets the write through.
+    assert 'NO_CLAIM_MESSAGE % {"agent": ' in inspect.getsource(
         owncloud_backend.OwnCloudBackend._put), "_put must raise THIS text"
-    msg = owncloud_backend.NO_CLAIM_MESSAGE % "a-twelve-chr"
+    # Formatted exactly as _put formats it, with a long agent name for margin.
+    msg = owncloud_backend.NO_CLAIM_MESSAGE % {"agent": "a-sixteen-char-x"}
     assert msg.startswith("no_claim:")
     assert len(msg) <= 600, len(msg)   # server.py returns str(e)[:600]
-    holder = msg.index("runner-claim.sh status")
+    # --agent: the refused dir can belong to an agent other than the writer's own.
+    holder = msg.index("runner-claim.sh status --agent a-sixteen-char-x")
     goal = msg.index("world goal")
     board = msg.index("board post")
     assert holder < goal < board, "delivery-first order"
@@ -101,3 +105,20 @@ def test_no_claim_message_names_the_delivery_first_order():
                    "permanently behind the claim-holder's advancing version",
                    "STRUCTURAL, not a race"):
         assert quoted in msg, quoted
+
+
+def test_the_relay_verb_the_message_names_is_one_the_sweep_floors():
+    """. A relayer who follows the message tags the action_type it
+    names. insight-trigger-sweep.py floors a relay at MEDIUM only when its verb
+    is in RELAY_ACTION_TYPES; untagged, it files LOW and is never selected. So
+    the two files must agree."""
+    import importlib.util
+    import re
+    msg = owncloud_backend.NO_CLAIM_MESSAGE % {"agent": "x"}
+    verb = re.search(r"action_type:([a-z-]+)", msg).group(1)
+    sweep = Path(owncloud_backend.__file__).with_name("insight-trigger-sweep.py")
+    spec = importlib.util.spec_from_file_location("its_for_no_claim", sweep)
+    its = importlib.util.module_from_spec(spec)
+    sys.modules["its_for_no_claim"] = its
+    spec.loader.exec_module(its)
+    assert verb in its.RELAY_ACTION_TYPES, verb

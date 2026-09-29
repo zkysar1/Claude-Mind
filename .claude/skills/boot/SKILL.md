@@ -60,7 +60,7 @@ Idempotent — each exits immediately if its .initialized marker already exists.
 ```
 Run: bash core/scripts/init-mind.sh $MIND_AGENT
 IF exit code != 0: ABORT with error message
-IF output contains "First boot": log "First boot detected — agent is a blank slate"
+Run: bash core/scripts/commons-primer.sh birth  # never aborts; first entry per env
 ```
 
 Note: init-mind.sh includes migration detection. If world/aspirations.yaml exists

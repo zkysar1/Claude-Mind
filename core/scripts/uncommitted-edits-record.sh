@@ -8,7 +8,8 @@
 # filter has no signal and partner-authored neutral-path edits get absorbed
 # by the wrong agent's commit. This log records {file, mtime, edit_ts,
 # goal_id} per agent so iteration-commit can distinguish self-authored from
-# partner-authored neutral-path files even when in_flight is cleared.
+# partner-authored neutral-path files even when in_flight is cleared. Each
+# record also carries `sid`, the session that made the edit ().
 #
 # Invocation: hook payload JSON on stdin. tool_input.file_path is read and
 # normalized. Standard Claude Code PostToolUse[Write|Edit|MultiEdit] payload.
@@ -38,9 +39,18 @@ if [ -z "${MIND_AGENT:-}" ]; then
     exit 0
 fi
 
-# Read hook payload JSON. Extract tool_input.file_path.
+# Read hook payload JSON. Extract tool_input.file_path, and the session_id that
+# made the edit: iteration-commit.sh --session-sid commits only records carrying
+# its own id, so two sessions of one agent on one checkout never commit each
+# other's work in progress (). One parse for both fields.
 input=$(cat)
-file_path=$(echo "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tool_input',{}).get('file_path',''))" 2>/dev/null || echo "")
+parsed=$(echo "$input" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tool_input',{}).get('file_path','')); print(d.get('session_id',''))" 2>/dev/null || echo "")
+parsed="${parsed//$'\r'/}"  # a Windows python ends lines \r\n; a kept \r would blank the id below
+file_path="${parsed%%$'\n'*}"
+session_id=""
+case "$parsed" in *$'\n'*) session_id="${parsed#*$'\n'}" ;; esac
+# A session id is a uuid; anything else is dropped rather than written into JSON.
+case "$session_id" in *[!A-Za-z0-9_-]*) session_id="" ;; esac
 if [ -z "$file_path" ]; then
     exit 0
 fi
@@ -171,7 +181,7 @@ mkdir -p "$(dirname "$log_path")" 2>/dev/null || exit 0
 esc_path="${rel_path//\\/\\\\}"
 esc_path="${esc_path//\"/\\\"}"
 
-printf '{"file":"%s","mtime":%s,"edit_ts":"%s","goal_id":"%s"}\n' \
-    "$esc_path" "$mtime" "$now_iso" "$goal_id" >> "$log_path" 2>/dev/null || true
+printf '{"file":"%s","mtime":%s,"edit_ts":"%s","goal_id":"%s","sid":"%s"}\n' \
+    "$esc_path" "$mtime" "$now_iso" "$goal_id" "$session_id" >> "$log_path" 2>/dev/null || true
 
 exit 0

@@ -195,7 +195,8 @@ class FakeMergeBackend:
             return None
         return FileStat(version='"' + _md5(b) + '"', size=len(b), mtime_ns=0)
 
-    def mirror_put(self, path, content, *, expected_version=None):
+    def mirror_put(self, path, content, *, expected_version=None,
+                   local_is_source=False):
         self.s3[str(path)] = content
         self.mirror_puts.append(str(path))
 

@@ -1694,6 +1694,47 @@ def test_real_merge_conflict_is_still_called_a_conflict(conflict_repo):
     assert _has_merge_head(work), "a real conflict leaves the merge in progress"
 
 
+def test_modify_delete_conflict_names_its_path(tmp_path):
+    """ occ246 (2026-09-28, cc-04): HEAD had untracked a spool marker
+    that carrier 9c5cc235 still modified. --check printed "1 conflicted
+    path(s):" over a BLANK line, because paths were parsed from the CONFLICT
+    messages and modify/delete has no "Merge conflict in". The path must come
+    from merge-tree's conflicted-file-info section, which lists every type.
+
+    The assertion reads the line AFTER the count, not the whole block: the
+    agent-store branch also lists the changed paths above it, so a block-wide
+    `in` passes against the broken parse (measured before this test landed)."""
+    origin, work = tmp_path / "origin.git", tmp_path / "work"
+    assert _run(["git", "init", "--bare", "--initial-branch=main", str(origin)]).returncode == 0
+    assert _run(["git", "clone", str(origin), str(work)]).returncode == 0
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    store = work / "agents" / "alpha"
+    store.mkdir(parents=True)
+    (store / "spool.last-flush").write_text("t0\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base: tracked marker")
+    _git(work, "push", "origin", "main")
+    base = _git(work, "rev-parse", "HEAD")
+    (store / "spool.last-flush").write_text("t1\n")
+    _git(work, "commit", "-am", "body bumped the marker")
+    _git(work, "push", "origin", "HEAD:refs/workers/alpha/sid-moddel")
+    _git(work, "reset", "--hard", base)
+    _git(work, "rm", "-q", "agents/alpha/spool.last-flush")
+    _git(work, "commit", "-m", "head untracked the marker")
+    _git(work, "push", "origin", "main")
+
+    txt = _consume(work, "--check")
+    assert txt.returncode == 0, txt.stderr
+    lines = _ref_block(txt.stdout, "sid-moddel").splitlines()
+    at = [i for i, line in enumerate(lines) if "conflicted path(s):" in line]
+    assert at, ("a modify/delete merge must be disclosed as a conflict", lines)
+    assert "1 conflicted path(s):" in lines[at[0]], lines
+    assert lines[at[0] + 1].strip() == "agents/alpha/spool.last-flush", (
+        "the path must be NAMED under the count, not a blank line", lines)
+
+
 # ── : the all-binary carrier, occ192's remaining residue ────────────
 # occ192 added `elif [ "$mt_add" -ge 0 ] && [ "$mt_del" = 0 ]` to name the
 # genuine append-only shape, but `-ge 0` also matches mt_add=0. A carrier whose
@@ -1796,3 +1837,208 @@ def test_binary_fixture_append_sibling_is_the_positive_control(binarycarrier_rep
     assert "append-only (+2 / -0): safe shape" in block, block
     assert "UNMEASURED" not in block, (
         "a genuine text append must keep its shape verdict", block)
+
+
+# ── : a carrier merge that RE-TRACKS a gitignored path ──────────────
+#  occ246 (alpha reducer, cc-04, 2026-09-28): carrier 9c5cc235 re-added
+# agents/alpha/experience-stats.spool.jsonl, which  had untracked and
+# gitignored at HEAD, and --check called the ref "append-only (+7 / -0): safe
+# shape". Merging it re-tracks the spool on main. Measured on git 2.43.0 (cc-10,
+# 2026-09-28): the merge also writes the carrier's copy over the box's live
+# ignored file, silently and rc=0, on a fast-forward AND on a true ort merge,
+# because git treats ignored files as expendable.
+
+
+def _retrack_repo(tmp_path):
+    """HEAD untracked and gitignored an agent spool (the  shape). Four
+    carriers, all TIPs:
+      sid-retrack  branched from HEAD, force-adds the ignored spool back (the
+                   occ246 defect: a CLEAN merge, append-only by line count);
+      sid-moddel   branched from BASE, still modifies the spool (guard-7503's
+                   modify/delete case: a CONFLICT that is also a re-track);
+      sid-append   appends to a tracked store (negative control: the ordinary
+                   safe shape must survive the fix);
+      sid-newfile  adds a new path no ignore rule matches (negative control for
+                   the IGNORE half of the predicate: a path HEAD does not track is
+                   ordinary new content unless an ignore rule excludes it);
+      sid-reincluded adds a path a `!pattern` RE-INCLUDES (negative control for
+                   membership: `check-ignore -v` prints it and exits 0 although
+                   it is NOT ignored).
+    The live spool stays in the working tree, ignored, as it does on a box."""
+    origin = tmp_path / "origin.git"
+    work = tmp_path / "work"
+    r = _run(["git", "init", "--bare", "--initial-branch=main", str(origin)])
+    assert r.returncode == 0, r.stderr
+    r = _run(["git", "clone", str(origin), str(work)])
+    assert r.returncode == 0, r.stderr
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    store = work / "agents" / "alpha"
+    store.mkdir(parents=True)
+    (store / "log.jsonl").write_text('{"n": 1}\n')
+    (store / "stats.spool.jsonl").write_text('{"s": 1}\n')
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base: the spool is tracked")
+    base = _git(work, "rev-parse", "HEAD")
+    (work / ".gitignore").write_text(
+        "agents/*/*.spool.jsonl\n"
+        "agents/*/session/*\n"
+        "!agents/*/session/handoff.yaml\n")
+    _git(work, "rm", "-q", "--cached", "agents/alpha/stats.spool.jsonl")
+    _git(work, "add", ".gitignore")
+    _git(work, "commit", "-m", "head: untrack and ignore the spool")
+    _git(work, "push", "origin", "main")
+    head = _git(work, "rev-parse", "HEAD")
+
+    def carrier(sid, start, change, message):
+        _git(work, "checkout", "-q", "--detach", start)
+        change()
+        _git(work, "commit", "-m", message)
+        _git(work, "push", "origin", f"HEAD:refs/workers/alpha/{sid}")
+
+    def readd():
+        (store / "stats.spool.jsonl").write_text('{"s": 1}\n{"s": 2}\n')
+        _git(work, "add", "-f", "agents/alpha/stats.spool.jsonl")
+
+    def bump():
+        (store / "stats.spool.jsonl").write_text('{"s": 1}\n{"s": 9}\n')
+        _git(work, "add", "agents/alpha/stats.spool.jsonl")
+
+    def append():
+        (store / "log.jsonl").write_text('{"n": 1}\n{"n": 2}\n')
+        _git(work, "add", "agents/alpha/log.jsonl")
+
+    def newfile():
+        (store / "notes.md").write_text("a note\n")
+        _git(work, "add", "agents/alpha/notes.md")
+
+    def reinclude():
+        (store / "session").mkdir(exist_ok=True)
+        (store / "session" / "handoff.yaml").write_text("goal: g-1\n")
+        _git(work, "add", "agents/alpha/session/handoff.yaml")
+
+    carrier("sid-retrack", head, readd, "body re-added the ignored spool")
+    carrier("sid-moddel", base, bump, "body bumped the spool before the untrack")
+    carrier("sid-append", head, append, "body appended a record")
+    carrier("sid-newfile", head, newfile, "body added a note")
+    carrier("sid-reincluded", head, reinclude, "body wrote its handoff")
+    _git(work, "checkout", "-q", "main")
+    (store / "stats.spool.jsonl").write_text("LIVE-LOCAL\n")
+    return {"origin": origin, "work": work}
+
+
+@pytest.fixture()
+def retrack_repo(tmp_path):
+    return _retrack_repo(tmp_path)
+
+
+def test_retrack_of_an_ignored_path_is_flagged_and_not_called_safe(retrack_repo):
+    """The occ246 case. --check must name the path the merge would re-track,
+    give guard-7503's remedy, and withhold the "safe shape" verdict."""
+    work = retrack_repo["work"]
+    # Positive control on the FIXTURE (guard-2421): the ref must genuinely reach
+    # the append-only arm, or the "safe shape" absence below is vacuous.
+    row = _refs_by_sid(_consume(work, "--json").stdout)[0]["sid-retrack"]
+    assert row["merge_added_real"] == 2 and row["merge_deleted_real"] == 0, row
+    assert row["merge_conflicts_real"] == 0, row
+
+    block = _ref_block(_consume(work, "--check").stdout, "sid-retrack")
+    assert block, ("the re-tracking ref must appear in the report", block)
+    assert "RE-TRACK" in block, block
+    assert "agents/alpha/stats.spool.jsonl" in block, (
+        "the warning must NAME the path, not only count it", block)
+    assert "(ignored by .gitignore:1:agents/*/*.spool.jsonl)" in block, (
+        "the path must be named in the DETECTED form, with its rule", block)
+    assert "guard-7503" in block and "git rm --cached" in block, (
+        "the warning must carry the measured remedy", block)
+    assert "safe shape" not in block, (
+        "a merge that re-tracks an ignored path is not a safe shape", block)
+
+
+def test_modify_delete_across_an_untrack_is_flagged_as_a_retrack_too(retrack_repo):
+    """guard-7503's own case: the merge-tree result keeps the carrier's copy of
+    the path HEAD deleted, so resolving the conflict by taking theirs re-tracks
+    it. The CONFLICT disclosure stays; the RE-TRACK names why it matters."""
+    work = retrack_repo["work"]
+    block = _ref_block(_consume(work, "--check").stdout, "sid-moddel")
+    assert "CONFLICT" in block, block
+    # The DETECTED form, not the bare words: "RE-TRACK" and the path also
+    # appear in the UNMEASURED line and the conflict listing, so those two
+    # alone pass even when the check never measured.
+    assert "(ignored by .gitignore:1:agents/*/*.spool.jsonl)" in block, block
+
+
+def test_append_sibling_is_not_a_retrack_and_keeps_its_verdict(retrack_repo):
+    """Negative control (guard-4166): same fixture, same run, an ordinary append
+    to a tracked store. An always-warns bug must not read as a discriminator."""
+    work = retrack_repo["work"]
+    block = _ref_block(_consume(work, "--check").stdout, "sid-append")
+    assert "RE-TRACK" not in block, block
+    assert "append-only (+1 / -0): safe shape" in block, block
+
+
+def test_new_unignored_path_is_ordinary_content_not_a_retrack(retrack_repo):
+    """Negative control for the IGNORE half of the predicate. HEAD does not track
+    notes.md either, so a predicate keyed on "absent at HEAD" alone would flag
+    it; only the ignore match makes an added path a re-track."""
+    work = retrack_repo["work"]
+    block = _ref_block(_consume(work, "--check").stdout, "sid-newfile")
+    assert "agents/alpha/notes.md" in block, (
+        "the added path must be listed as ordinary agent-store content", block)
+    assert "RE-TRACK" not in block, block
+    assert "append-only (+1 / -0): safe shape" in block, block
+
+
+def test_reincluded_path_is_not_a_retrack(retrack_repo):
+    """Negative control for MEMBERSHIP. A later `!pattern` re-includes
+    session/handoff.yaml, so it is NOT ignored, yet `check-ignore -v` prints it
+    and exits 0. Membership read from -v output would call it a re-track."""
+    work = retrack_repo["work"]
+    # Positive control on the TRAP (guard-2421): this fixture must be one where
+    # -v reports the path, or this test cannot tell the two predicates apart.
+    path = "agents/alpha/session/handoff.yaml"
+    verbose = _run(["git", "-C", str(work), "check-ignore", "--no-index", "-v", path])
+    assert verbose.returncode == 0 and "!agents/*/session/handoff.yaml" in verbose.stdout, verbose
+    plain = _run(["git", "-C", str(work), "check-ignore", "--no-index", path])
+    assert plain.returncode == 1, plain
+
+    block = _ref_block(_consume(work, "--check").stdout, "sid-reincluded")
+    assert path in block, ("the added path must be listed as ordinary content", block)
+    assert "RE-TRACK" not in block, block
+    assert "append-only (+1 / -0): safe shape" in block, block
+
+
+def _git_check_ignore_fails_shim(tmp_path):
+    """PATH shim whose `git check-ignore` exits 128: the "any other non-zero"
+    case worker-ref-consume.sh must read as UNMEASURED. Every other subcommand
+    execs the real git unchanged (sibling of _git_merge_tree_shim)."""
+    real_git = shutil.which("git")
+    assert real_git, "no git on PATH to delegate to"
+    d = tmp_path / "gitshim-check-ignore"
+    d.mkdir(exist_ok=True)
+    p = d / "git"
+    p.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do\n'
+        '  if [ "$a" = "check-ignore" ]; then echo "fatal: shim" >&2; exit 128; fi\n'
+        "done\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    p.chmod(0o755)
+    return d
+
+
+def test_a_failed_ignore_check_reads_unmeasured_not_safe(retrack_repo, tmp_path):
+    """A check-ignore failure must never read as a measured zero (guard-5501:
+    prove the diagnostic can fire). The re-tracking ref is reported UNMEASURED,
+    names no rule, and keeps its shape verdict withheld."""
+    work = retrack_repo["work"]
+    shim = _git_check_ignore_fails_shim(tmp_path)
+    txt = _consume(work, "--check",
+                   env={"PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"})
+    assert txt.returncode == 0, txt.stderr
+    block = _ref_block(txt.stdout, "sid-retrack")
+    assert "RE-TRACK check UNMEASURED" in block, block
+    assert "(ignored by" not in block, block
+    assert "safe shape" not in block, block

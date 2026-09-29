@@ -529,6 +529,27 @@ def _aggregate(lanes):
     return status, completeness
 
 
+def _self_env_id():
+    """This world's env id, or None when no source names it.
+
+    The SSOT is `_paths.ENVIRONMENT_ID` (env var > .env.local), per
+    _peer_registry.py's docstring. Reading os.environ alone left self_env None
+    on any box that keeps ENVIRONMENT_ID only in .env.local, its documented
+    home: this world rendered as `<unknown>` and was listed again as one of its
+    own peers (measured 2026-09-28, DESKTOP-O91DLK2). The env var is still read
+    first, so an override set after `_paths` was imported keeps winning.
+    Imported lazily so the usage and --limit refusals stay hermetic.
+    """
+    env = os.environ.get("ENVIRONMENT_ID", "").strip()
+    if env:
+        return env
+    try:
+        import _paths
+    except ImportError:
+        return None
+    return str(_paths.ENVIRONMENT_ID or "").strip() or None
+
+
 def retrieve(query, self_env=None, self_world=None, registry=None,
              limit=5, include_archives=False):
     terms = _terms(query)
@@ -548,7 +569,7 @@ def retrieve(query, self_env=None, self_world=None, registry=None,
                          "any 'empty' it reported would be a negative conclusion drawn from "
                          "a search that never ran" % (limit,))
     registry = registry if registry is not None else load_env_registry()
-    self_env = self_env or os.environ.get("ENVIRONMENT_ID", "").strip() or None
+    self_env = self_env or _self_env_id()
     self_world = self_world or os.environ.get("WORLD_PATH", "").strip() or None
 
     worlds = []

@@ -16,9 +16,13 @@ Subcommands:
 
 Session scoping:
   The --session-id flag (passed by hook wrappers) scopes the tracker to the
-  current Claude Code session. A new session auto-clears stale tracker data
-  from a previous session. This prevents gating files that are NOT in the
-  current context window.
+  current Claude Code session; a caller that omits it falls back to MIND_SID
+  (g-115-8976). Every session with a per-session dir owns its tracker,
+  sessions/<sid>/body-context-reads.txt (g-115-11179), so concurrent sessions
+  of one agent never share one. The agent-wide session/context-reads.txt is
+  left for a caller with no session id or no per-session dir; there a new
+  session auto-clears the previous one's data. This prevents gating files that
+  are NOT in the current context window.
 """
 
 import argparse
@@ -51,29 +55,33 @@ CONVENTIONS_DIR = CONFIG_DIR / "conventions"
 
 
 def tracker_path(session_id=None):
-    """Effective context-reads tracker path — reducer-aware per-Body routing (Phase 1D, ).
+    """Effective context-reads tracker path: one tracker per SESSION ().
 
-    Routes to the per-Body tracker (sessions/<unitKey>/body-context-reads.txt)
-    when session_id (the unitKey) names a Body whose forked body-WM-FILE exists
-    (sessions/<unitKey>/working-memory.yaml) -- the SAME activation signal as
-    wm.py's BODY_WM routing and AgentPaths.wm_path (the 1B reducer-aware re-key,
-    rb-2297). A reducer/observer (no forked body-WM-file) stays on the agent-wide
-    singleton (session/context-reads.txt), so with one Body this collapses to
-    today's behavior -- inert until a 2nd Body forks, and concurrent Bodies then
-    no longer clobber each other's session-scoped dedup state.
+    Any session whose per-session dir exists (agents/<agent>/sessions/<sid>/,
+    created by its Phase 2.6 binding) gets sessions/<sid>/body-context-reads.txt.
+    That covers a forked worker Body (Phase 1D, g-306-64) AND the reducer and
+    every reader/assistant session. Only a caller with no session id, or a
+    session with no per-session dir (a legacy .active-agent-<SID> binding), uses
+    the agent-wide singleton session/context-reads.txt.
+
+    WHY THE DIR, NOT THE FORKED WM. Until g-115-11179 the discriminator was the
+    forked body-WM file, so only a worker Body had its own tracker. Every other
+    session of the agent shared the singleton, and _read_tracker_split unlinks
+    it on each session-id mismatch: two live same-agent sessions erased each
+    other's read records on every hook call (measured 2026-09-27, three alpha
+    sessions on one box). The file keeps its "body-" name so a worker's tracker
+    path did not move.
 
     Resolved per-call (NOT a frozen module constant — the g-306-68 PEP-562
     lesson) because session_id is only known at command dispatch, AND because
-    context-reads-record.sh / pre-edit-context-gate.sh are Read/Edit hooks where
-    bash-agent-inject.py does NOT inject BODY_WM_PATH (it only prepends env to
-    Bash-TOOL commands). The Body is therefore detected from the forked-WM-file's
-    existence directly, not the env var wm.py reads.
+    the Read/Edit hooks get no Body env from bash-agent-inject.py (it only
+    prepends env to Bash-TOOL commands). The session is detected from its dir.
     """
     if SESSION_DIR is None:
         return None
     if session_id and AGENT_NAME:
         body_dir = agent_session_dir(AGENT_NAME, session_id)
-        if (body_dir / "working-memory.yaml").exists():
+        if body_dir.is_dir():
             return body_dir / "body-context-reads.txt"
     return SESSION_DIR / "context-reads.txt"
 
@@ -107,7 +115,7 @@ PARTIAL_PREFIX = "#partial:"
 # a value may itself contain them).
 #
 # These share the tracker file to inherit its session-scoping, its self-healing
-# session-mismatch delete, and its per-Body routing — one file, one lifecycle.
+# session-mismatch delete, and its per-session routing — one file, one lifecycle.
 # But they are NOT reads of a tracked path, so `_read_tracker_split` drops them
 # on the floor before its full/partial fork. That exclusion is load-bearing for
 # the same reason PARTIAL_PREFIX's is: `full` feeds read_tracker(), and
@@ -298,8 +306,10 @@ def _read_tracker_split(session_id=None):
     """Read the tracker file, return (full_paths, partial_paths) as two sets.
 
     Side effect: if session_id doesn't match stored session, DELETES the tracker
-    file and returns empty. This self-healing behavior is the ONLY mechanism that
-    clears stale trackers across sessions — do not remove it.
+    file and returns empty. Since g-115-11179 this fires only on the agent-wide
+    singleton (a per-session tracker's header always names its own session), and
+    there it is still the ONLY mechanism that clears a previous session's
+    entries — do not remove it.
     """
     stored_sid, path_lines = _read_raw_lines(session_id)
 
@@ -570,14 +580,15 @@ def cmd_clear(args):
     """Delete the tracker file THIS session uses. Session-aware since .
 
     `--session-id` routes through tracker_path(), so the clear lands on the
-    body tracker for a forked worker Body and on the agent-wide tracker for a
-    reducer — never both, and never another session's. That scoping is the
-    point, not an optimisation: on a box where a reducer and a worker coexist,
-    clearing the agent-wide file from a worker's hook is exactly the
+    calling session's own tracker (its per-session file, or the agent-wide one
+    for a session with no per-session dir) — never another session's. That
+    scoping is the point, not an optimisation: on a box where two sessions of
+    one agent coexist, clearing the other's tracker is exactly the
     cross-session shared-state mutation guard-404 forbids.
 
-    Bare `clear` (no --session-id) keeps the agent-wide behaviour, which is
-    what an operator running the wrapper by hand means.
+    Bare `clear` (no --session-id and no MIND_SID, g-115-8976) keeps the
+    agent-wide behaviour, which is what an operator running the wrapper by hand
+    means.
 
     WHY THIS BECAME SESSION-AWARE. The docstring here used to argue an explicit
     per-Body clear was "a Phase-2 concern (worker Bodies don't run PreCompact)".
@@ -603,9 +614,10 @@ def cmd_clear(args):
 # ---------------------------------------------------------------------------
 
 def cmd_status(args):
-    """Print tracker contents for debugging."""
-    stored_sid, _path_lines = _read_raw_lines(None)
-    full, partial_set = _read_tracker_split(None)
+    """Print tracker contents for debugging — this session's tracker ()."""
+    session_id = getattr(args, "session_id", None)
+    stored_sid, _path_lines = _read_raw_lines(session_id)
+    full, partial_set = _read_tracker_split(session_id)
     if not full and not partial_set:
         print("Context reads tracker: empty (no files tracked)")
         return
@@ -741,8 +753,9 @@ def pulse_state_path(session_id=None):
     """Counter state for the zero-retrieval pulse, beside this session's tracker.
 
     Routed through tracker_path() rather than resolving a second time of its
-    own: two concurrent Bodies must not share a streak counter, for exactly the
-    reason they must not share a dedup tracker (Phase 1D per-Body routing).
+    own: two concurrent sessions must not share a streak counter, for exactly
+    the reason they must not share a dedup tracker (per-session routing,
+    g-115-11179).
     """
     t = tracker_path(session_id=session_id)
     if t is None:
@@ -904,10 +917,10 @@ def build_parser():
 
     clear_p = sub.add_parser("clear", help="Delete the tracker file")
     clear_p.add_argument("--session-id", default=None,
-                         help="Session ID (from hook JSON) — clears THAT session's tracker "
-                              "(body tracker for a forked Body, agent-wide for a reducer). "
-                              "Omit for the agent-wide tracker.")
-    sub.add_parser("status", help="Print tracker contents")
+                         help="Session ID (from hook JSON; default $MIND_SID) — clears THAT "
+                              "session's tracker. With neither, the agent-wide tracker.")
+    status_p = sub.add_parser("status", help="Print tracker contents")
+    status_p.add_argument("--session-id", default=None, help="Current session ID (default $MIND_SID)")
 
     rp_p = sub.add_parser("record-prov", help="Record a non-file retrieval (URL, node, board msg)")
     rp_p.add_argument("--session-id", default=None, help="Current session ID (from hook JSON)")
@@ -956,6 +969,13 @@ DISPATCH = {
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    # : an omitted --session-id falls back to MIND_SID, which
+    # bash-agent-inject.py puts on every Bash-tool command. Resolved once, here,
+    # so every subcommand agrees; a hook's explicit flag still wins. Without it
+    # the flagless callers (load-conventions.sh, the digest loaders) would read
+    # the agent-wide file while the session's hooks write its own ().
+    if hasattr(args, "session_id") and not args.session_id:
+        args.session_id = os.environ.get("MIND_SID") or None
     fn = DISPATCH.get(args.command)
     if fn is None:
         parser.error(f"Unknown command: {args.command}")

@@ -16,6 +16,10 @@ The pins mirror the goal's three outcomes:
 
 The subject/body forms in test_commit_author_goal_ids come from a census of
 the live history (the 4,590 commits touching these lanes, 2026-09-27).
+
+g-306-533: a Mind below an enclosing repo's toplevel, or in a shallow clone,
+reads history that is not its own. That now returns None, so the map falls
+back to the header scan instead of crediting nothing.
 """
 
 import importlib.util
@@ -185,14 +189,75 @@ def test_unreadable_history_returns_none_and_names_the_reason(
         repo, tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "missing.git"))
     assert at.build_framework_code_attribution(repo) is None
-    assert "git log rc=128" in capsys.readouterr().err
+    assert "git rev-parse rc=128" in capsys.readouterr().err
     monkeypatch.delenv("GIT_DIR")
 
     def no_git(*_a, **_k):
         raise FileNotFoundError("git")
     monkeypatch.setattr(subprocess, "run", no_git)
     assert at.build_framework_code_attribution(repo) is None
-    assert "git log failed" in capsys.readouterr().err
+    assert "git rev-parse failed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("failure,reason", [
+    (subprocess.CompletedProcess([], 128, "", "fatal: bad object"), "git log rc=128"),
+    (subprocess.TimeoutExpired("git", 30), "git log failed"),
+])
+def test_log_failure_past_the_toplevel_check_names_the_reason(
+        repo, monkeypatch, capsys, failure, reason):
+    real_run = subprocess.run
+
+    def run(cmd, *a, **k):
+        if "log" not in cmd:
+            return real_run(cmd, *a, **k)
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+    monkeypatch.setattr(subprocess, "run", run)
+    assert at.build_framework_code_attribution(repo) is None
+    assert reason in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("vendored", [False, True])
+def test_mind_below_an_enclosing_repos_toplevel_returns_none(
+        tmp_path, capsys, vendored):
+    # A transplanted Mind (untracked) or a vendored one (tracked by the
+    # enclosing repo): git reads the enclosing repo's history, which credits
+    # the Mind nothing -- {} before , so no fallback fired.
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    _git(parent, "init", "-q")
+    _commit(parent, "fix(g-900-20): the enclosing repo's own work",
+            {"core/scripts/p.py": "P = 1\n"})
+    mind = parent / "mind"
+    script = mind / "core" / "scripts" / "tool.py"
+    script.parent.mkdir(parents=True)
+    script.write_text('"""tool.py (g-900-21)."""\n', encoding="utf-8")
+    if vendored:
+        _git(parent, "add", "mind")
+        _git(parent, "commit", "-q", "-m", "feat(g-900-21): vendor the mind")
+    # the fixture reproduces the defect: from inside mind, git finds the parent
+    top = subprocess.run(["git", "-C", str(mind), "rev-parse", "--show-toplevel"],
+                         capture_output=True, text=True)
+    assert Path(top.stdout.strip()).resolve() == parent.resolve()
+
+    assert at.build_framework_code_attribution(mind) is None
+    assert "not the git toplevel" in capsys.readouterr().err
+
+
+def test_shallow_clone_returns_none(repo, tmp_path, capsys):
+    _commit(repo, "feat(g-900-22): add a", {"core/scripts/a.py": "A = 1\n"})
+    _commit(repo, "fix(g-900-23): a again", {"core/scripts/a.py": "A = 2\n"})
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", "--depth", "1", repo.as_uri(), str(clone))
+    # the fixture reproduces the defect: the clone sees 1 of the 3 commits,
+    # so 's work is invisible to it
+    count = subprocess.run(["git", "-C", str(clone), "rev-list", "--count", "HEAD"],
+                           capture_output=True, text=True)
+    assert count.stdout.strip() == "1"
+
+    assert at.build_framework_code_attribution(clone) is None
+    assert "shallow clone" in capsys.readouterr().err
 
 
 def _lanes(tmp_path, monkeypatch):
@@ -221,3 +286,17 @@ def test_map_falls_back_to_header_scan_and_says_so(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(at, "build_framework_code_attribution", lambda: None)
     assert at.build_script_convention_attribution_map() == {"g-900-15": 1, "g-900-14": 1}
     assert "git history unreadable" in capsys.readouterr().err
+
+
+def test_map_falls_back_when_the_mind_is_below_the_toplevel(tmp_path, monkeypatch, capsys):
+    _lanes(tmp_path, monkeypatch)
+    # the Mind's project root sits below this toplevel; the commit matters: on an
+    # empty repo git log itself fails, which fell back even before 
+    _git(tmp_path, "init", "-q")
+    _commit(tmp_path, "chore: init", {"README.md": "enclosing\n"})
+    real = at.build_framework_code_attribution
+    monkeypatch.setattr(at, "build_framework_code_attribution",
+                        lambda: real(at.PROJECT_ROOT))
+    assert at.build_script_convention_attribution_map() == {"g-900-15": 1, "g-900-14": 1}
+    err = capsys.readouterr().err
+    assert "not the git toplevel" in err and "git history unreadable" in err

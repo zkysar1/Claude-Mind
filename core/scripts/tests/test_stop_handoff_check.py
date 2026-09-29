@@ -72,6 +72,9 @@ def test_absent_refuses_and_prints_step9(tmp_path, capsys):
     rc, out = _run(tmp_path, capsys=capsys)
     assert rc == 1
     assert "STOP NOT FINISHED" in out and "does not exist" in out
+    # A session dir outside cwd takes the fallback branch, which prints POSIX too
+    # ().
+    assert f"{(tmp_path / shc.HANDOFF_NAME).as_posix()} does not exist" in out
     assert "## Step 9: Continuation Handoff" in out
     assert "Write agents/<agent>/session/handoff.yaml:" in out
     assert "## Step 9.5" not in out

@@ -23,7 +23,9 @@ Pipeline (in order; each step is skippable only by an explicit, recorded flag):
   3. payload           -- notify-build-payload.py (identity line, empty-body
                           guard, finding-disproof gate) unless --payload-stdin
                           carries an already-built, provenance-stamped payload.
-  4. transport slot    -- run the domain executable with the payload on stdin
+  3b. email subject    -- compose_email_subject(): '<Kind>: <Title> · #REF', a
+                          fresh ref per send, ledgered as conversation_ref.
+  4. transport slot   -- run the domain executable with the payload on stdin
                           and NOTIFY_DISPATCHED=1 in env. Missing/non-exec slot
                           -> exit 5 (caller falls back to pending question /
                           participant goal). Non-zero -> exit 6.
@@ -38,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import subprocess
 import sys
 from pathlib import Path
@@ -66,6 +69,21 @@ RC_SENT, RC_USAGE, RC_ROUTED, RC_DUP, RC_NO_TRANSPORT, RC_TRANSPORT_FAIL = 0, 2,
 # one as a duplicate of the first.
 REPLY_CITATION_PREFIX = "Replying to what you asked: "
 
+# EMAIL SUBJECT + CONVERSATION REF (user directive 2026-09-28: "make better email
+# subject lines and make them unique for each new conversation"). The domain
+# transport titles the mail from InfoType (ErrorFrom on the blocker shape), and
+# every builder puts only the KIND label there ("Decision Needed") and the
+# caller's descriptive subject in Title, which reaches the body alone. So every
+# decision-needed mail carried one subject and the mail client threaded unrelated
+# sends into one conversation. Composed at this chokepoint so every builder's
+# payload gets it, and AFTER the gates and the ledger's `subject` have read the
+# caller's text: the ref differs per send, so it must never reach a dedup key
+# (guard-3249); the ledger keeps it beside the subject as `conversation_ref`.
+# Vowel-free alphabet: a ref cannot spell a word, so it cannot trip a
+# downstream subject classifier's keyword test (guard-3251).
+CONVERSATION_REF_ALPHABET = "23456789BCDFGHJKMNPQRSTVWXZ"
+CONVERSATION_REF_LEN = 4
+
 
 def _bash_argv(script: str, *args: str) -> list:
     # guard-580/581: never a bare "bash" argv[0]; _runtime_bash resolves it.
@@ -87,6 +105,30 @@ def _subject_body_from_payload(d: dict) -> tuple:
     if not isinstance(body, str):
         body = json.dumps(body)
     return str(subj)[:300].replace("\n", " "), body
+
+
+def conversation_ref() -> str:
+    return "#" + "".join(secrets.choice(CONVERSATION_REF_ALPHABET) for _ in range(CONVERSATION_REF_LEN))
+
+
+def compose_email_subject(payload: dict, category: str, ref: str) -> dict:
+    """Copy of ``payload`` whose subject field reads '<Kind>: <Title> · <ref>'
+    (info shape) or '<ErrorFrom> · <ref>' (blocker shape, already the caller's
+    subject). The `info` kind ("Notification") says nothing, so it is dropped.
+    No Title, or a Title equal to InfoType (the HTML passthrough carries the
+    subject IN InfoType), keeps InfoType as the text."""
+    out = dict(payload)
+    if "ErrorFrom" in out:
+        out["ErrorFrom"] = f"{out['ErrorFrom']} · {ref}"
+    elif "InfoType" in out:
+        kind = str(out.get("InfoType") or "").strip()
+        title = str(out.get("Title") or "").strip()
+        if title and title != kind:
+            text = title if (not kind or (category or "").strip().lower() == "info") else f"{kind}: {title}"
+        else:
+            text = kind
+        out["InfoType"] = f"{text} · {ref}"
+    return out
 
 
 def _category_from_payload(d: dict) -> str:
@@ -288,8 +330,13 @@ def dispatch(*, agent: str, category: str, subject: str = "", message: str | Non
             _log(f"payload builder refused (rc={rc}): {err}")
             return RC_USAGE
 
+    # 3b. email subject -- after every gate, so none of them sees the per-send ref
+    ref = conversation_ref()
+    payload = compose_email_subject(payload, category, ref)
+
     if dry_run:
         print(json.dumps({"would_send": True, "category": category, "subject": subject,
+                          "email_subject": payload.get("ErrorFrom") or payload.get("InfoType") or "",
                           "transport": str(transport_path(world)), "payload_keys": sorted(payload)}))
         return RC_SENT
 
@@ -314,6 +361,7 @@ def dispatch(*, agent: str, category: str, subject: str = "", message: str | Non
                                         to=to_shape_src, override_reason=allow_duplicate)
             rec["delivery_failed"] = True
             rec["transport_note"] = note
+            rec["conversation_ref"] = ref
             outreach._append(outreach.ledger_path(world), rec)
         except Exception as exc:  # noqa: BLE001
             _log(f"ledger write for the failed send skipped: {exc}")
@@ -324,6 +372,7 @@ def dispatch(*, agent: str, category: str, subject: str = "", message: str | Non
         rec = outreach.build_record(agent=agent, category=category, subject=subject, body=body, goal_id=goal_id,
                                     transport=transport_path(world).name, rc=0, to=to_shape_src,
                                     override_reason=allow_duplicate)
+        rec["conversation_ref"] = ref
         outreach._append(outreach.ledger_path(world), rec)
         if mirror_peers:
             # Capture the per-peer result. mirror_to_peers COMPUTES a

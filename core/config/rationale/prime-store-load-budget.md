@@ -174,6 +174,15 @@ plus category-relevance is a weaker guarantee than "all universals present," and
 Phase 2 says so rather than implying continuity. A weaker guarantee that runs
 beats a stronger one that silently truncates.
 
+**The recency figure above was re-measured** (2026-08-11, foxtrot,
+LAPTOP-3IOFCNEO; moved here from prime Phase 2 step 4 by g-335-1652, to hold
+that file's hot-path budget). `--recent` returns **10 entries, 42 KB (~12k
+tokens)**, not "498 entries, 37 KB (~9k tokens)": off by 50x on the count, and
+the shape is what changed, not just the number. 498 entries in 37 KB is ~76 B
+each (a shallow id+title INDEX), while 10 in 42 KB is ~4.3 KB each (FULL
+bodies). Same token cost, ~98% less recall breadth. Believed intended (the
+bounding work in g-115-3407); the figure simply was not updated with it.
+
 **Flag footgun:** `--universal --summary` does not compose. `--universal` wins
 and `--summary` is silently ignored, so a caller reaching for a bounded universal
 index gets the full ~2.7M-token JSON load with no error and no warning (verified

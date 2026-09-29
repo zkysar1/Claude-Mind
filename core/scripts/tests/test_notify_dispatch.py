@@ -349,3 +349,63 @@ def test_board_reroute_still_posts_to_findings_outside_pytest(monkeypatch):
     assert argv[argv.index("--channel") + 1] == "findings"
     assert "suppressed-notification,blocker" in argv
     assert text.startswith("Widget service down")
+
+
+# --------------------------------------------------------------------------- #
+# Email subject + conversation ref (user directive 2026-09-28)
+# --------------------------------------------------------------------------- #
+# "make better email subject lines and make them unique for each new
+# conversation". The transport titles the mail from InfoType, which used to be
+# the bare kind label, so every decision-needed mail shared one subject and one
+# thread. The ref is per send, so the gates and the ledger `subject` must never
+# see it (guard-3249) -- asserted below, not assumed.
+
+REF_RE = "#[" + nd.CONVERSATION_REF_ALPHABET + "]{" + str(nd.CONVERSATION_REF_LEN) + "}"
+
+
+def test_email_subject_carries_the_callers_subject_and_the_ledger_does_not_carry_the_ref(world):
+    import re
+    subject = "Retire the legacy PK? (g-115-6222)"
+    p = _run(world, "--category", "decision-needed", "--subject", subject, "--message", BODY)
+    assert p.returncode == nd.RC_SENT, p.stderr
+    info_type = json.loads(_sent(world)[0].read_text())["InfoType"]
+    m = re.fullmatch(r"Decision Needed: " + re.escape(subject) + r" · (" + REF_RE + ")", info_type)
+    assert m, info_type
+    row = _ledger(world)[0]
+    assert row["subject"] == subject, "the per-send ref leaked into the dedup-keyed subject"
+    assert row["conversation_ref"] == m.group(1)
+
+
+def test_two_sends_with_the_same_subject_get_different_email_subjects(world):
+    subject = "Your call on asp-9"
+    msg = "I decided to pause asp-9 for a week because the data source is down; override if you disagree."
+    assert _run(world, "--category", "decision-needed", "--subject", subject, "--message", msg).returncode == nd.RC_SENT
+    p = _run(world, "--category", "decision-needed", "--subject", subject, "--message", msg + " The vendor now says two weeks.",
+             "--allow-duplicate", "vendor timeline changed")
+    assert p.returncode == nd.RC_SENT, p.stderr
+    subjects = [json.loads(f.read_text())["InfoType"] for f in _sent(world)]
+    assert len(subjects) == 2 and subjects[0] != subjects[1]  # 1 in 27**4 odds of a coincidental match
+    assert [r["subject"] for r in _ledger(world)] == [subject, subject]
+
+
+def test_compose_email_subject_covers_every_payload_shape():
+    ref = "#B2C3"
+    info = {"InfoType": "Notification", "Title": "Groq key removed from the vault"}
+    assert nd.compose_email_subject(info, "info", ref)["InfoType"] == "Groq key removed from the vault · #B2C3"
+    assert info["InfoType"] == "Notification", "the caller's payload must not be mutated"
+    decision = {"InfoType": "Decision Needed", "Title": "Retire the legacy PK?"}
+    assert nd.compose_email_subject(decision, "decision-needed", ref)["InfoType"] == "Decision Needed: Retire the legacy PK? · #B2C3"
+    html = {"InfoMessage": "<html></html>", "InfoType": "Fleet digest — 2026-08-17"}
+    assert nd.compose_email_subject(html, "user-digest", ref)["InfoType"] == "Fleet digest — 2026-08-17 · #B2C3"
+    blocker = {"ErrorMessage": "details", "ErrorFrom": "Blocked: need a credential only you can grant"}
+    assert nd.compose_email_subject(blocker, "blocker", ref)["ErrorFrom"] == "Blocked: need a credential only you can grant · #B2C3"
+    same = {"InfoType": "Aspiration Update", "Title": "Aspiration Update"}
+    assert nd.compose_email_subject(same, "update", ref)["InfoType"] == "Aspiration Update · #B2C3"
+
+
+def test_conversation_ref_is_drawn_per_call_from_a_vowel_free_alphabet():
+    import re
+    refs = {nd.conversation_ref() for _ in range(200)}
+    assert all(re.fullmatch(REF_RE, r) for r in refs), refs
+    assert len(refs) > 1, "the ref is constant -- every send would share one subject again"
+    assert not set("AEIOUY") & set(nd.CONVERSATION_REF_ALPHABET), "a vowel lets a ref spell a classifier keyword"

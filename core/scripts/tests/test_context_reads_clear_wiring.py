@@ -76,9 +76,9 @@ CLEAR_SH = SCRIPT_DIR / "context-reads-clear.sh"
 def _throwaway_agent(*, body_sids=(), agent_wide=True):
     """Throwaway agent with an agent-wide tracker and zero or more Body trackers.
 
-    A Body is discriminated by the presence of sessions/<sid>/working-memory.yaml
-    — that is exactly what context_reads.tracker_path() tests, so the fixture has
-    to create the fork WM file, not merely the directory.
+    Since g-115-11179 tracker_path() gives a tracker to ANY session with a
+    per-session dir, so the directory alone would do. The fixture still forks
+    the WM file so these stay faithful worker-Body cases.
     """
     agent_dir = PROJECT_ROOT / "agents" / THROWAWAY_AGENT
     try:
@@ -95,6 +95,9 @@ def _throwaway_agent(*, body_sids=(), agent_wide=True):
             _seed(bd / "body-context-reads.txt", sid)
         env = dict(os.environ)
         env["MIND_AGENT"] = THROWAWAY_AGENT
+        # : a bare clear falls back to MIND_SID, so an inherited one
+        # would stop it being bare (guard-1515).
+        env.pop("MIND_SID", None)
         yield env, agent_dir
     finally:
         if agent_dir.name == THROWAWAY_AGENT and agent_dir.is_dir():
@@ -173,12 +176,13 @@ def test_one_body_clear_never_reaches_a_PEER_body(_=None):
             "clearing one Body's tracker must never reach a peer Body's"
 
 
-def test_reducer_session_id_resolves_to_the_agent_wide_tracker():
-    """A SID with no forked WM is a reducer/observer: --session-id must still work.
+def test_a_sid_with_no_session_dir_resolves_to_the_agent_wide_tracker():
+    """A SID with no per-session dir: --session-id must still reach a tracker.
 
-    tracker_path() discriminates on the fork-WM file, so passing --session-id on a
-    reducer is correct and lands agent-wide. Without this the fix would only help
-    workers and would silently no-op on the reducer that PreCompact was written for.
+    Such a session (a legacy .active-agent-<SID> binding, say) uses the
+    agent-wide file, so the clear must land there rather than no-op. A bound
+    reducer HAS a per-session dir and, since g-115-11179, its own tracker. That
+    case is pinned in test_context_reads_session_routing.py.
     """
     with _throwaway_agent(body_sids=[]) as (env, ad):
         rc, out, _ = _clear(env, "--session-id", "a-sid-with-no-forked-wm")

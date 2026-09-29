@@ -68,9 +68,12 @@ ELIF --since <timestamp> [--author <agent>]:
     raw_list = newline-separated stdout
 
 # Bash-enforce the 20-file cap. Prose caps drift; a pipe does not. The cap
-# preserves assembled order (recency for --since, experience order for --goal,
-# argv order for explicit paths) because upstream producers already emit in
-# that order — do NOT sort here.
+# keeps the FIRST 20 in assembled order, so that order decides what is
+# reviewed. For --since it is the producer's review-priority order: code roots
+# first, then every other path, newest-first within each tier (the producer's
+# header is the contract). --goal keeps experience order; explicit paths keep
+# argv order. Do NOT sort here: sorted order put .claude/ and agents/ ahead of
+# core/ and kept 0 code files (g-115-11171).
 target_files = printf '%s\n' "$raw_list" | sed '/^$/d' | head -20
 skipped_count = (count of raw_list) - (count of target_files)
 ```

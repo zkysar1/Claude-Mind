@@ -206,13 +206,78 @@ Code's loader ignores both (its only rules key is `paths`, verified above):
 | key | who reads it | contract |
 |---|---|---|
 | `description: "<imperative>"` | Zak-Code lean index (and any Cursor-style loader) | ≤ 140 chars, one sentence, the rule's imperative — not its title. Every rule carries one; `core/scripts/tests/test_rules_frontmatter_index.py` pins length and presence. |
-| `alwaysApply: true` | Zak-Code (ADR-0105) | the FULL body rides in the prompt ahead of the index (8 KB per-file cap — the test pins that a pinned body fits) and is folded first under the full render. Budget ≈ 25 KB across pins: `return-protocol`, `verify-before-assuming`, `read-before-edit`, `no-scratchpad` today. |
+| `alwaysApply: true` | Zak-Code (ADR-0105) | the FULL body rides in the prompt ahead of the index (8 KB per-file cap — the test pins that a pinned body fits) and is folded first under the full render. Budget ≈ 25 KB across pins by the test's formula — a ceiling, not a guarantee that the index fits (see "The always-on core" below). **Pinned now: `perception-reaction`, `return-protocol`, `verify-before-assuming`** — the always-on core decided 2026-09-28 (g-374-171) and applied by g-374-160 the same day. The pins it replaced (2fa1504d78; 971fbcaead): `return-protocol`, `verify-before-assuming`, `read-before-edit`, `no-scratchpad`, `plan-completion-verdict`. |
 
 A rule that had no front matter gained a block; a rule that already had `paths:` gained
 the keys inside its block. The HTML-comment `domain-leak-exempt` marker on rules without
 front matter still sits below the block (the scanner greps the whole file). Byte cost:
 +125 lines / ~5 KB across 34 files, paid on every Claude Code turn — accepted with a
 `size-budget-override` because the alternative was 34 rules a Body never applies.
+
+### The always-on core (decided 2026-09-28, g-374-171)
+
+`perception-reaction` has to ride in full. The run grade's perception checkpoint scores
+"delivered but never reacted to" as a C and wants the rule's `perception-reaction:`
+diary line, a format its index line cannot carry (g-373-160: 0 reads of the body over a
+195-frame run). Pinning it on top of the five pins at 2fa1504d78 costs 26,272 > 25,000,
+so pins had to leave.
+
+**The binding constraint is a served resident's render, not the test.** A resident sees
+absolute workspace paths (~136 chars per rule path), so an index line averages 300 chars
+and the index for 35 unpinned rules takes 10,859 chars — not the ~8 KB the test comment
+assumed. Measured with Zak-Code's own `render_index()` (its rules module is identical at
+the vessel's build 6bbeac84) over the 37 rules at 2fa1504d78 plus the planted findings
+rule:
+
+| pin set | test formula | resident slack | index lines lost |
+|---|---|---|---|
+| HEAD as is (perception-reaction not pinned) | 21,123 | +1,234 | 0 |
+| + perception-reaction, drop none | 26,272 | -3,614 | 12 |
+| + perception-reaction, drop `no-scratchpad` | 24,320 | -1,945 | 7 |
+| + perception-reaction, drop `plan-completion-verdict` | 24,024 | -1,670 | 6 |
+| + perception-reaction, drop `read-before-edit` | 22,486 | -121 | 1 |
+| + perception-reaction, drop `no-scratchpad` + `plan-completion-verdict` | 22,072 | -1 | 1 |
+| + perception-reaction, drop `read-before-edit` + `no-scratchpad` | 20,534 | +1,548 | 0 |
+| **+ perception-reaction, drop the three below** | **18,286** | **+3,492** | **0** |
+
+Applied (g-374-160, 2026-09-28): the test formula reads 18,286, as predicted. The same
+`render_index()` (Zak-Code 750449d) at a 99-char resident workspace path, over the 37
+fleet rules WITHOUT a planted findings rule, renders 28,902 chars: slack +3,786, 34
+index lines, 0 omitted, and the perception-reaction body sits under the pinned header.
+The same measurement before the change read +1,528 and 32 lines. Each reading is about
+294 chars above the table's. That is one index line: the planted findings rule, which
+this measurement did not include.
+
+Test formula: `min(len(body), 8192) + len(stem) + 5` per pin — no-scratchpad 1,952,
+plan-completion-verdict 2,248, read-before-edit 3,786, perception-reaction 5,149,
+verify-before-assuming 6,422, return-protocol 6,715. Slack: 32,768 − 80 (the renderer's
+note reserve) − the full render length. Below zero, the renderer drops index lines from
+the alphabetical tail, `user-interaction` first.
+
+Leaving. Each keeps its index line, which carries its imperative. Claude Code ignores
+`alwaysApply`, so nothing changes there.
+- `no-scratchpad` has no referent on Zak-Code. That harness injects no scratchpad
+  directory, and there the word names the model's reasoning channel.
+- `plan-completion-verdict` is said by Zak-Code itself when the last plan step closes:
+  its verdict rail (ADR-0108, `update_plan`'s `_COMPLETE_HINT`). The rail landed 45
+  minutes after the pin (971fbcaead) for the same complaint, and it is in the vessel's
+  build.
+- `read-before-edit`'s index line is the whole imperative. Zak-Code's edit tool also
+  refuses an `old_string` that does not match exactly once, so a stale-context edit
+  fails loudly. 95699a6fe2 pinned it in a batch of four, with no measurement specific to
+  it.
+
+Staying:
+- `perception-reaction`, for the reason above.
+- `return-protocol`. An index line can name the terminal call but not which call ends
+  which turn, and a turn that ends on text ends a served run.
+- `verify-before-assuming`. It carries six distinct signal rules; its index line
+  carries one.
+
+Before adding a rule or a pin, re-measure the RENDER, not just the test: the +3,492
+margin is about eleven index lines. Printing workspace-relative paths in the index line
+would free 3,500 more chars (the path share falls from 4,790 to 1,290). That is a
+Zak-Code change and is not decided here.
 
 ## Cross-references
 

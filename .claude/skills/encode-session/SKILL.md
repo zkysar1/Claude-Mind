@@ -963,12 +963,19 @@ uncommitted until a hand-sweep (measured: the g-115-6098 edit sat 01:05 →
 08-11/12/13 are exactly this step, done manually).
 
 ```
-# 1. Commit ALL tracked churn (framework + agent) with standard attribution.
-#    iteration-commit.sh no-ops on a clean tree, filters sensitive patterns
-#    (.env*, *.key, ...) and partner WIP (cross-agent mtime filter) — run it
-#    unconditionally. --outcome deep is REQUIRED: the script no-ops on
-#    routine by design, and a session that reached this skill has learning
-#    writes worth committing.
+# 1. Commit THIS SESSION's churn with standard attribution. --session-sid
+#    scopes it (g-115-11148): outside agents/<agent>/, a path is committed
+#    only when an edit record carries this session's id, and every path left
+#    out is listed. Nothing else separates two sessions of the SAME agent on
+#    one checkout — the partner filters key on other agents, and with no
+#    in_flight goal the pre-claim mtime filter is off — so an unscoped call
+#    swept a sibling session's 23 half-done framework files (2026-09-27). A
+#    listed path that IS yours (a deletion, a command-made edit outside core/
+#    and .claude/) had no record: commit it by pathspec. A refused commit
+#    restores the index. The script no-ops on a clean tree and filters
+#    sensitive patterns (.env*, *.key, ...) — run it unconditionally.
+#    --outcome deep is REQUIRED: the script no-ops on routine by design, and a
+#    session that reached this skill has learning writes worth committing.
 #    THE `source` IS LOAD-BEARING, NOT DECORATION (measured 2026-08-19): a
 #    bare Bash tool call has $PROJECT_ROOT UNSET, so `--repo "$PROJECT_ROOT"`
 #    passes an EMPTY value and the script exits 1 with
@@ -979,7 +986,7 @@ uncommitted until a hand-sweep (measured: the g-115-6098 edit sat 01:05 →
 Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh \
         --goal-id encode-session \
         --title "session-close learning flush" --outcome deep \
-        --type chore --repo "$PROJECT_ROOT"
+        --type chore --repo "$PROJECT_ROOT" --session-sid "$MIND_SID"
 
 # 2. Integrate + push (fetch, merge --no-edit — i.e. pull --no-rebase — then
 #    push). Same shared component the loop and D6.65 use; fail-soft by

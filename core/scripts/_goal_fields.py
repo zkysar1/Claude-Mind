@@ -201,6 +201,16 @@ GOAL_KNOWN_FIELDS = frozenset({
     'requires_fresh_session',            # 0 (new)
     'resolves_by',                       # 196
     'resolves_no_earlier_than',          # 194
+    # g-306-537: WRITER is worker_retrospective._write_marker (g-306-198);
+    # READERS are its own already-marked skip and aspiration-trajectory
+    # classify_credit. Both sides reach it through the MARKER_FIELD constant,
+    # so a scan for field-name literals misses it. The 2026-08-18 census found
+    # no goal carrying it, and this module's gate has refused every write since
+    # (0 of 4006 live and 0 of 2549 archived goals carried it, 2026-09-28).
+    # As with member_writable, the zero is the finding. Registered in the same
+    # change as classify_credit's non-owner rule, without which a landed
+    # marker lets another agent score undrained worker goals as settled zeros.
+    'retrospective_encoded',             # 0 (unwritable until registered)
     'revenue_link',                      # 29
     # g-115-6721 (zeta, 2026-09-23): the async Review Gate's two fields,
     # documented in goal-schemas.md 'Review Gate Fields' (rule (b) above) and

@@ -64,6 +64,9 @@ def _throwaway_agent(session_id=SID):
         )
         env = dict(os.environ)
         env["MIND_AGENT"] = THROWAWAY_AGENT
+        # : a flagless call (_status) falls back to MIND_SID, so an
+        # inherited one would steer it off this fixture's session (guard-1515).
+        env.pop("MIND_SID", None)
         yield env
     finally:
         if agent_dir.name == THROWAWAY_AGENT and agent_dir.is_dir():

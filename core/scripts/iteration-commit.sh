@@ -50,6 +50,15 @@ Optional:
                         goal). Pass this flag for legitimate cross-agent commits
                         (rare) OR when this agent legitimately edited the file
                         more than 5s before calling team-state-update claim.
+  --session-sid <SID>   Commit ONLY the invoking session's work (g-115-11148). A
+                        path outside agents/<agent>/ is staged only when an edit
+                        record in agents/<agent>/session/uncommitted-edits.jsonl
+                        carries this session id; every other such path is left
+                        uncommitted and listed. The agent's own agents/<agent>/
+                        churn is committed as usual. A refused commit unstages
+                        what this call staged. For a caller with no in_flight
+                        goal (encode-session Final.5), where nothing else keeps
+                        two sessions of one agent from sweeping each other.
   -h, --help            Show this help.
 
 Behavior:
@@ -92,6 +101,8 @@ EXTRA_MSG=""
 DRY_RUN=0
 NO_NAMESPACE_FILTER=0
 INCLUDE_UNTRACKED=0
+SESSION_SID=""
+SESSION_SCOPE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -104,6 +115,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; shift ;;
     --no-namespace-filter) NO_NAMESPACE_FILTER=1; shift ;;
     --include-untracked) INCLUDE_UNTRACKED=1; shift ;;
+    --session-sid) SESSION_SID="${2:-}"; SESSION_SCOPE=1; shift $(( $# >= 2 ? 2 : 1 )) ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[$SCRIPT_NAME] ERROR: unknown arg '$1'" >&2; usage >&2; exit 1 ;;
   esac
@@ -119,6 +131,20 @@ fi
 if [[ "$OUTCOME" != "routine" && "$OUTCOME" != "deep" ]]; then
   echo "[$SCRIPT_NAME] ERROR: --outcome must be 'routine' or 'deep' (got '$OUTCOME')" >&2
   exit 1
+fi
+
+# --session-sid must never degrade to a whole-tree commit: that sweep is the
+# defect it exists to prevent (). An empty id or an unbound agent is
+# an error, not a fallback.
+if [[ $SESSION_SCOPE -eq 1 ]]; then
+  if [[ -z "$SESSION_SID" ]]; then
+    echo "[$SCRIPT_NAME] ERROR: --session-sid was given an empty session id (is \$MIND_SID set in this shell?). Refusing to fall back to a whole-tree commit, which would sweep other sessions' uncommitted edits (g-115-11148)." >&2
+    exit 1
+  fi
+  if [[ -z "${MIND_AGENT:-}" ]]; then
+    echo "[$SCRIPT_NAME] ERROR: --session-sid needs MIND_AGENT to find this agent's edit records (agents/<agent>/session/uncommitted-edits.jsonl)." >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -d "$REPO" ]]; then
@@ -500,6 +526,60 @@ PYEOF
   fi
 fi
 
+# --- Session scope () ---------------------------------------------
+# Every filter here keys on OTHER agents, and the pre-claim mtime filter needs an
+# in_flight row naming this goal. A caller with no such row (encode-session
+# Final.5 runs as --goal-id encode-session) had NOTHING separating two sessions
+# of the SAME agent on one checkout: measured 2026-09-27, one Final.5 staged 25
+# paths, 23 of them a sibling session's half-done framework edits. The own log
+# above is AGENT-keyed, so it cannot separate them either. Both edit recorders
+# stamp each record with the session that made it (`sid`), and under
+# --session-sid a path outside agents/<agent>/ is staged ONLY when a record
+# carries that id — an ALLOWLIST, where every partner filter here is a denylist.
+# The incident needed an allowlist: the sibling's bulk edit was made by a command
+# and CLAUDE.md sits outside the Bash recorder's scan, so no record existed for a
+# denylist to act on. Its cost, disclosed: a change no recorder sees (a deletion,
+# a command-made edit outside core/ and .claude/, a record written before records
+# carried `sid`) is left uncommitted even when it IS this session's — listed,
+# never silently dropped ().
+declare -A session_authored_paths=()
+if [[ $SESSION_SCOPE -eq 1 ]]; then
+  session_log="$REPO/agents/$MIND_AGENT/session/uncommitted-edits.jsonl"
+  if [[ -f "$session_log" ]]; then
+    while IFS= read -r recorded_path; do
+      recorded_path="${recorded_path%$'\r'}"
+      [[ -z "$recorded_path" ]] && continue
+      session_authored_paths["$recorded_path"]=1
+    done < <(LOG_PATH="$session_log" SESSION_SID_E="$SESSION_SID" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - <<'PYEOF' || true
+import json, os, sys
+# Same path normalizer as the two log consumers above (rb-1405 SSOT).
+sys.path.insert(0, os.environ.get("XAGENT_SCRIPTS", ""))
+try:
+    from _cross_agent_attribution_filter import _normalize_rel_path
+except Exception:
+    def _normalize_rel_path(p, root):  # fail-open: identity if import fails
+        return p
+proot = os.environ.get("XAGENT_ROOT", "")
+sid = os.environ.get("SESSION_SID_E", "")
+try:
+    with open(os.environ.get("LOG_PATH", ""), "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict) and entry.get("sid") == sid and entry.get("file"):
+                print(_normalize_rel_path(entry["file"], proot))
+except OSError:
+    pass
+PYEOF
+)
+  fi
+fi
+
 # --- Committer own-log membership test () -------------------------
 # ONE predicate shared by all THREE committer_authored_paths consumers (the
 #  concurrent-partner filter, the  own-log check inside the
@@ -558,7 +638,15 @@ _committer_authored_hit() {
 # Filter our own lock dir from status output so its presence never influences
 # the empty-status decision or downstream parse (). .gitignore handles
 # this in real repos; defense-in-depth covers test repos without .gitignore.
-status_output=$(git -C "$REPO" status --porcelain 2>&1 | grep -vE '^.. \.iteration-commit-lock(/|$)' || true)
+# Session scope lists untracked files ONE BY ONE (): porcelain
+# otherwise collapses a new directory to one entry while the edit records name
+# files, so a directory two sessions wrote into would be staged whole on the
+# strength of one session's record. Default mode stays byte-identical.
+if [[ $SESSION_SCOPE -eq 1 ]]; then
+  status_output=$(git -C "$REPO" status --porcelain --untracked-files=all 2>&1 | grep -vE '^.. \.iteration-commit-lock(/|$)' || true)
+else
+  status_output=$(git -C "$REPO" status --porcelain 2>&1 | grep -vE '^.. \.iteration-commit-lock(/|$)' || true)
+fi
 if [[ -z "$status_output" ]]; then
   echo "[$SCRIPT_NAME] skip: no uncommitted changes in $REPO"
   exit 0
@@ -647,6 +735,7 @@ declare -a cross_agent_concurrent_partner=()  # : files edited DURING a partner'
 declare -a cross_agent_partner_uncommitted_log=()  # : files recorded in OTHER agent's uncommitted-edits.jsonl (between-claim gap)
 declare -a committer_authored_exempt=()  # : files retained despite partner in_flight because committer's OWN uncommitted-edits.jsonl proves first-person authorship
 declare -a committer_authored_log_exempt=()  # : files retained despite a partner ALSO recording them in uncommitted-edits.jsonl, because the committer's OWN log proves first-person authorship (the own-log check the  partner-log filter previously lacked — asymmetry with the  concurrent-partner filter)
+declare -a session_excluded=()  # : under --session-sid, paths outside agents/<agent>/ that no record ties to this session
 
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
@@ -783,6 +872,16 @@ while IFS= read -r line; do
     done
     if [[ $is_other_agent -eq 1 ]]; then
       cross_agent_files+=("$path")
+      continue
+    fi
+  fi
+
+  # Session scope (; the map and why are above the loop). It runs
+  # BEFORE the deletion routing so deletions are judged too: a deleted file
+  # leaves no record, so outside the agent's own dir it is listed, not staged.
+  if [[ $SESSION_SCOPE -eq 1 && "$path" != agents/"$MIND_AGENT"/* ]]; then
+    if [[ -z "${session_authored_paths["$path"]:-}" ]]; then
+      session_excluded+=("$path")
       continue
     fi
   fi
@@ -1049,11 +1148,11 @@ if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 && ${#staged_del_f
   # AND aggregate the totals. Replaces the prior mutually-exclusive branches
   # which dropped the partner-uncommitted-log message when other filters also
   # fired ().
-  total=$(( ${#cross_agent_uncommitted[@]} + ${#cross_agent_concurrent_partner[@]} + ${#cross_agent_partner_uncommitted_log[@]} + ${#cross_agent_files[@]} + ${#skipped_files[@]} ))
+  total=$(( ${#cross_agent_uncommitted[@]} + ${#cross_agent_concurrent_partner[@]} + ${#cross_agent_partner_uncommitted_log[@]} + ${#cross_agent_files[@]} + ${#skipped_files[@]} + ${#session_excluded[@]} ))
   if [[ $total -eq 0 ]]; then
     echo "[$SCRIPT_NAME] skip: no uncommitted changes for $MIND_AGENT (after filters)"
   else
-    echo "[$SCRIPT_NAME] skip: all uncommitted files filtered (total=$total: ${#cross_agent_uncommitted[@]} pre-claim, ${#cross_agent_concurrent_partner[@]} concurrent-partner, ${#cross_agent_partner_uncommitted_log[@]} partner-log, ${#cross_agent_files[@]} namespace, ${#skipped_files[@]} sensitive; committer=$MIND_AGENT)" >&2
+    echo "[$SCRIPT_NAME] skip: all uncommitted files filtered (total=$total: ${#cross_agent_uncommitted[@]} pre-claim, ${#cross_agent_concurrent_partner[@]} concurrent-partner, ${#cross_agent_partner_uncommitted_log[@]} partner-log, ${#cross_agent_files[@]} namespace, ${#skipped_files[@]} sensitive, ${#session_excluded[@]} not-this-session; committer=$MIND_AGENT)" >&2
     for f in "${cross_agent_uncommitted[@]}"; do echo "  filtered (cross-agent-uncommitted): $f" >&2; done
     for entry in "${cross_agent_concurrent_partner[@]}"; do
       IFS='|' read -r cp_path cp_partner cp_iso <<< "$entry"
@@ -1065,6 +1164,7 @@ if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 && ${#staged_del_f
     done
     for f in "${cross_agent_files[@]}"; do echo "  filtered (cross-agent): $f" >&2; done
     for f in "${skipped_files[@]}"; do echo "  filtered (sensitive): $f" >&2; done
+    for f in "${session_excluded[@]}"; do echo "  filtered (not-this-session): $f" >&2; done
   fi
   exit 0
 fi
@@ -1127,6 +1227,12 @@ if [[ ${#cross_agent_partner_uncommitted_log[@]} -gt 0 ]]; then
     echo "  filtered (partner-uncommitted-log): $pl_path (partner=$pl_partner)" >&2
   done
   echo "[$SCRIPT_NAME] HINT: pass --include-untracked to override the filter (rare; only when committer legitimately authored these files during the partner's between-claim window)" >&2
+fi
+
+if [[ ${#session_excluded[@]} -gt 0 ]]; then
+  echo "[$SCRIPT_NAME] WARN: session scope left ${#session_excluded[@]} path(s) UNCOMMITTED — no edit record ties them to session $SESSION_SID (committer=$MIND_AGENT). Each is another session's work in progress, or a change no recorder sees (a deletion, a command-made edit outside core/ and .claude/):" >&2
+  for f in "${session_excluded[@]}"; do echo "  filtered (not-this-session): $f" >&2; done
+  echo "[$SCRIPT_NAME] HINT: if one IS yours, confirm \`git diff -- <path>\` shows only your change, then commit it by pathspec: git commit -m MSG -- <path> (guard-836)." >&2
 fi
 
 # --- Stash-overlap filter () ---------------------------------------
@@ -1324,8 +1430,14 @@ fi
 # recovery already used () -- that was this script's existing encoded
 # belief about the one transient failure mode a commit hits here; the fix is to
 # stop retrying everything ELSE, not to widen this.
+#
+# The shape is load-bearing twice over (). It is an -E alternation,
+# not -i with two -e patterns: Git for Windows' grep 3.0 aborts on that shape
+# (rc=134), which read as "not transient" on every box that ships it. And it
+# reads a here-string, not a pipe: under pipefail, a large output SIGPIPEs the
+# producer once grep -q has matched, which is a false negative (guard-3132).
 _commit_failure_is_transient() {
-  printf '%s' "${1:-}" | grep -qi -e "index\.lock" -e "Another git process"
+  grep -qiE "index\.lock|Another git process" <<< "${1:-}"
 }
 
 # Persistent, machine-readable record of a DETERMINISTIC commit refusal
@@ -1412,12 +1524,25 @@ clear_stale_git_lock_if_dead() {
   return 0
 }
 
+# --- Session scope: pre-stage snapshot () -------------------------
+# What the index held BEFORE this call stages anything, so a refused commit can
+# undo exactly this call's staging and leave everyone else's alone (guard-741:
+# never discard another session's staged work).
+declare -A pre_staged_paths=()
+if [[ $SESSION_SCOPE -eq 1 ]]; then
+  while IFS= read -r _ps; do
+    [[ -n "$_ps" ]] && pre_staged_paths["$_ps"]=1
+  done < <(git -C "$REPO" diff --cached --name-only || true)
+fi
+
 # --- Stage + commit ----------------------------------------------------------
 if [[ ${#staged_files[@]} -gt 0 ]]; then
   add_output=$(git -C "$REPO" add -A -- "${staged_files[@]}" 2>&1) || {
     # Stale-lock auto-recovery (): if the add failed on an index.lock
-    # collision and the lock is verifiably stale, clear it and retry ONCE.
-    if printf '%s' "$add_output" | grep -qi -e "index.lock" -e "Another git process" \
+    # collision and the lock is verifiably stale, clear it and retry ONCE. The
+    # commit retry's own predicate decides what a collision is, so the two paths
+    # cannot disagree ().
+    if _commit_failure_is_transient "$add_output" \
        && clear_stale_git_lock_if_dead; then
       git -C "$REPO" add -A -- "${staged_files[@]}" 2>&1 || {
         echo "[$SCRIPT_NAME] ERROR: git add failed in $REPO (after stale-lock clear+retry)" >&2
@@ -1584,6 +1709,31 @@ done
 
 if [[ $commit_success -eq 0 ]]; then
   if [[ $commit_deterministic -eq 1 ]]; then
+    # Session scope (): undo THIS call's staging, so nothing is left in
+    # the shared index for another session's commit or merge to absorb
+    # (guard-5824 harm 1) and no push wedges on it (guard-6555). Pathspec form
+    # only: it rewrites index entries and never moves HEAD, and the working tree
+    # keeps every change, so nothing is discarded. Stderr stays visible and the
+    # result is READ BACK, never taken from the rc (guard-3799); a failed restore
+    # falls through to the default branch below, which records the refusal.
+    if [[ $SESSION_SCOPE -eq 1 ]]; then
+      declare -a _restore=()
+      for _sf in "${staged_files[@]}"; do
+        if [[ -z "${pre_staged_paths["$_sf"]:-}" ]]; then _restore+=("$_sf"); fi
+      done
+      _left=""
+      if [[ ${#_restore[@]} -gt 0 ]]; then
+        git -C "$REPO" reset -q -- "${_restore[@]}" >&2 || true
+        _left=$(git -C "$REPO" diff --cached --name-only -- "${_restore[@]}" || echo "read-back failed")
+      fi
+      if [[ -z "$_left" ]]; then
+        echo "[$SCRIPT_NAME] ERROR: git commit was REFUSED in $REPO (rc=$commit_rc) after 1 attempt — NOT retried (g-115-9807)." >&2
+        echo "[$SCRIPT_NAME] This is a policy refusal (a commit-msg or pre-commit hook), not an infrastructure fault." >&2
+        echo "[$SCRIPT_NAME] session scope: the index is RESTORED — the ${#_restore[@]} path(s) this call staged are unstaged again (HEAD unmoved, working-tree changes intact), so nothing is left staged for another session to absorb and no push defers on it; no commit-refused.json is written. Re-run the commit once the refusing hook passes (g-115-11148)." >&2
+        echo "[$SCRIPT_NAME] refusal output: $commit_last_output" >&2
+        exit 2
+      fi
+    fi
     _record_commit_refusal "$commit_rc" "$commit_last_output"
     echo "[$SCRIPT_NAME] ERROR: git commit was REFUSED in $REPO (rc=$commit_rc) after 1 attempt — NOT retried (g-115-9807)." >&2
     echo "[$SCRIPT_NAME] This is a deterministic policy refusal (a commit-msg/pre-commit hook), not an infrastructure fault; retrying can never clear it." >&2

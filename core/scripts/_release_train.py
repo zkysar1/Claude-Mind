@@ -27,14 +27,21 @@ counting all of them
 would fire on every tag the moment it turned stale_hours old — and a finding
 that always fires trains its reader to skip it (guard-5202).
 
-THE BASIS. measure() reads local refs; measure_with_basis() is what every
-consumer acts on. The loop's fetch refreshes origin/main but never the tags,
-so a box that did not cut the newest tag reads the previous one as newest.
+THE BASIS. measure() reads refs as they stand; measure_with_basis() is what
+every consumer acts on. The loop's fetch refreshes origin/main but never the
+tags, so a box that did not cut the newest tag reads the previous one as newest.
 Measured 2026-09-27 (g-115-11144): the check read DUE on v2.12.84 hours after
 v2.12.85 was cut and promoted. Driven through the probe, that basis files a
 false stall and retires the cutter's correct lease. So a refresh (origin/main
-plus the v* tags) precedes any DUE verdict, and a lease is retired only for a
-tag strictly older than a newer one the basis can see.
+plus origin's v* tags) precedes any DUE verdict, and a lease is retired only for
+a tag strictly older than a newer one the basis can see.
+
+The tags are read from TAG_NAMESPACE, never refs/tags (g-115-11173). refs/tags
+is this box's own: a tag cut here and not pushed sat there and read as origin's
+newest (g-115-11172), and a local tag that differed from origin's made the
+refresh refuse the clobber, so the train went unmeasured or was measured on the
+local tag. Only refresh_basis() writes the namespace, by a forced, pruned fetch
+of origin's v* tags, so it holds origin's tag set as of the last refresh.
 
 FRONTIER ONLY. Releases are cut at the frontier role of the promotion chain
 (core/config/compatibility.yaml). A deployment's role is the world overlay's
@@ -74,14 +81,19 @@ SIGNAL_PREFIX = "investigate:release-train-stalled-past-"
 _CONFIG_FLOOR = {"stale_hours": 24, "ticks_to_file": 1, "ticks_to_revalidate": 50,
                  "skip_hold_hours": 24}
 
+# Where the basis reads origin's v* tags. Nothing but refresh_basis() writes
+# here, so this box's own tags (a cut not pushed yet, a re-cut that differs
+# from origin's) can neither pass for origin's nor block the refresh.
+TAG_NAMESPACE = "refs/release-train/tags"
 # The refresh that makes a basis tag-bearing. `git fetch origin <branch>`
 # brings NO tags: measured 2026-09-27 on git 2.45, not even when the tagged
-# commit is new to the clone. Tags come in WITHOUT '+': a local v* tag that
-# differs from origin's is refused ("would clobber existing tag") and the
-# reading goes unmeasured, rather than silently rewriting a tag someone may be
-# half-way through cutting.
+# commit is new to the clone. The tags come in with '+' and are pruned, so the
+# namespace follows origin's tag set: a tag moved there moves here, a tag
+# deleted there goes here. refs/tags is never written, and neither is a tag
+# someone may be half-way through cutting: --no-tags stops the main refspec
+# auto-following tags into refs/tags (measured on git 2.43).
 _REFRESH_REFSPECS = ("+refs/heads/main:refs/remotes/origin/main",
-                     "refs/tags/v*:refs/tags/v*")
+                     f"+refs/tags/v*:{TAG_NAMESPACE}/v*")
 # Anything but "" or "0" disables the refresh. A test that reaches this path
 # on a real remote sets it rather than touch the network (guard-4582).
 NO_FETCH_ENV = "RELEASE_TRAIN_NO_FETCH"
@@ -151,16 +163,17 @@ def _iso(ts: float) -> str:
 
 def measure(root: Path, paths: list, *, now: Optional[float] = None, sample: int = 5) -> dict:
     """The newest v* tag reachable from origin/main, its age, and the
-    framework commits past it — on LOCAL refs, as they stand.
+    framework commits past it — on the refs as they stand: origin/main, and
+    origin's tags in TAG_NAMESPACE as the last refresh_basis() left them.
 
-    Local refs alone are not a basis to act on: a reducer's iteration-push
-    refreshes origin/main but never the tags, so on every box that did not cut
-    the newest tag this names the PREVIOUS one (g-115-11144). A missing tag can
-    only make the reading look MORE due. Anything that acts on a verdict goes
-    through measure_with_basis(). `fetch_age_minutes` says how old the
-    origin/main basis is (guard-2311); `tags_merged` lists every v* tag merged
-    into origin/main, newest first by version. Never raises: a git failure sets
-    `error` and leaves the numeric fields None.
+    That is not yet a basis to act on: a reducer's iteration-push refreshes
+    origin/main but never the namespace, so it can lack the newest tag and name
+    the PREVIOUS one (g-115-11144), and a box that never refreshed reads no tag
+    at all. A missing tag can only make the reading look MORE due. Anything that
+    acts on a verdict goes through measure_with_basis(). `fetch_age_minutes`
+    says how old the origin/main basis is (guard-2311); `tags_merged` lists every
+    namespace tag merged into origin/main, newest first by version. Never
+    raises: a git failure sets `error` and leaves the numeric fields None.
     """
     now = time.time() if now is None else now
     out = {"newest_tag": None, "tag_created": None, "tag_age_hours": None,
@@ -173,20 +186,23 @@ def measure(root: Path, paths: list, *, now: Optional[float] = None, sample: int
             out["fetch_age_minutes"] = round((now - fetch_head.stat().st_mtime) / 60.0, 1)
         except OSError:
             pass
-    rc, tags, err = _git(root, "tag", "--merged", "origin/main", "--list", "v*",
-                         "--sort=-v:refname")
+    prefix = f"{TAG_NAMESPACE}/"
+    rc, refs, err = _git(root, "for-each-ref", "--merged", "origin/main",
+                         "--sort=-v:refname", "--format=%(refname)", f"{prefix}v*")
     if rc != 0:
-        out["error"] = f"git tag --merged origin/main rc={rc}: {err[:160]}"
+        out["error"] = f"git for-each-ref --merged origin/main rc={rc}: {err[:160]}"
         return out
-    merged = [t.strip() for t in tags.splitlines() if t.strip()]
+    merged = [r.strip()[len(prefix):] for r in refs.splitlines() if r.strip().startswith(prefix)]
     out["tags_merged"] = merged
     if not merged:
-        out["error"] = "no v* tag is reachable from origin/main"
+        out["error"] = f"no v* tag in {TAG_NAMESPACE} is reachable from origin/main"
         return out
     tag = merged[0]
     out["newest_tag"] = tag
-    rc, created, err = _git(root, "for-each-ref", "--format=%(creatordate:unix)",
-                            f"refs/tags/{tag}")
+    # Always the full refname: a bare tag name resolves to refs/tags first,
+    # which is this box's own and may differ from origin's, or be absent.
+    ref = f"{prefix}{tag}"
+    rc, created, err = _git(root, "for-each-ref", "--format=%(creatordate:unix)", ref)
     try:
         ts = float(created.split()[0])
     except (IndexError, ValueError):
@@ -195,14 +211,14 @@ def measure(root: Path, paths: list, *, now: Optional[float] = None, sample: int
     out["tag_created"] = _iso(ts)
     out["tag_age_hours"] = round((now - ts) / 3600.0, 1)
     rc, count, err = _git(root, "rev-list", "--count", "--no-merges",
-                          f"{tag}..origin/main", "--", *paths)
+                          f"{ref}..origin/main", "--", *paths)
     if rc != 0 or not count.isdigit():
         out["error"] = f"rev-list {tag}..origin/main rc={rc}: {err[:160]}"
         return out
     out["commits_past"] = int(count)
     if out["commits_past"] and sample > 0:
         rc, log, _ = _git(root, "log", "--no-merges", f"--max-count={sample}",
-                          "--format=%h %s", f"{tag}..origin/main", "--", *paths)
+                          "--format=%h %s", f"{ref}..origin/main", "--", *paths)
         if rc == 0:
             out["commit_sample"] = [ln[:120] for ln in log.splitlines() if ln.strip()]
     return out
@@ -224,19 +240,29 @@ def decide(m: dict, stale_hours: float) -> dict:
 
 
 def refresh_basis(root: Path, *, timeout: float = 30.0) -> Optional[str]:
-    """Fetch origin/main AND the v* tags into `root`. None on success, else why not.
+    """Fetch origin/main, and origin's v* tags into TAG_NAMESPACE. None on
+    success, else why not.
 
-    Writes refs only (origin/main, v* tags), never the working tree or the
-    index. It also writes FETCH_HEAD, which the loop's fetch throttles
+    Writes refs only (origin/main and the namespace), never refs/tags, the
+    working tree or the index. --prune acts on these refspecs alone: a namespace
+    tag origin no longer has goes, other remote-tracking refs stay (measured on
+    git 2.43). It also writes FETCH_HEAD, which the loop's fetch throttles
     correctly read as "fetched just now". GIT_TERMINAL_PROMPT=0 makes an
     unattended loop fail fast instead of waiting on a credential prompt
-    (rb-3231).
+    (rb-3231). No --quiet: under it git printed NOTHING when it refused a ref,
+    so the reason came back as a bare rc. Now it carries git's per-ref
+    refusal lines, which name the ref and why.
     """
     if os.environ.get(NO_FETCH_ENV, "").strip() not in ("", "0"):
         return f"basis refresh disabled ({NO_FETCH_ENV} is set)"
-    rc, _, err = _git(root, "fetch", "--quiet", "origin", *_REFRESH_REFSPECS,
+    rc, _, err = _git(root, "fetch", "--prune", "--no-tags", "origin", *_REFRESH_REFSPECS,
                       timeout=timeout, env={"GIT_TERMINAL_PROMPT": "0"})
-    return None if rc == 0 else f"git fetch origin rc={rc}: {err[:160]}"
+    if rc == 0:
+        return None
+    lines = [" ".join(ln.split()) for ln in err.splitlines()]
+    refused = ([ln for ln in lines if ln.startswith("!")]
+               + [ln for ln in lines if ln.startswith(("error:", "fatal:"))])
+    return f"git fetch origin rc={rc}: {'; '.join(refused)[:300] or err[:160]}"
 
 
 def measure_with_basis(root: Path, paths: list, stale_hours: float, *,
@@ -246,9 +272,11 @@ def measure_with_basis(root: Path, paths: list, stale_hours: float, *,
     always=False is for the per-iteration callers (the probe, --nudge). It
     refreshes only when the local reading is DUE or unmeasured. A local
     not-due reading needs no network, because a missing tag can only make a
-    reading look MORE due. Each refresh also writes the tags, so a box pays
-    once per tag it did not cut, plus once per tick while the train is truly
-    stalled.
+    reading look MORE due. Each refresh also writes the namespace, so a box pays
+    once for its first reading (an unrefreshed box reads no tag), once per new
+    tag, and once per tick while the train is truly stalled. The one staleness
+    this lets through: a tag DELETED from origin since the last refresh still
+    reads as newest until a due reading, or always=True, prunes it.
 
     always=True is for a reader re-measuring by hand. It refreshes first, so
     the tag it names is origin's newest.
@@ -272,8 +300,8 @@ def measure_with_basis(root: Path, paths: list, stale_hours: float, *,
         m["error"] = f"{m['error']}; the basis refresh also failed: {why}"
     elif decide(m, stale_hours)["due"]:
         m["error"] = (f"basis refresh failed ({why}), so the local reading ({m['newest_tag']} "
-                      f"due) is unconfirmed: local refs name the previous tag on any box "
-                      f"that did not cut the newest one")
+                      f"due) is unconfirmed: its tags are only as new as the last refresh, "
+                      f"which may predate the newest one")
     return m
 
 

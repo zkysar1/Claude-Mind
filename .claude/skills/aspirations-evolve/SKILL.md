@@ -879,11 +879,9 @@ Trigger evolution check — the system evaluates its own strategy and generates 
        authoritative cross-agent registry; skill-gaps.yaml status is per-store and can lag.
        (guard-1163 family: never act on a single possibly-stale read when the authoritative
        registry is one grep away.)
-     - Read `core/config/skill-gaps.yaml` → `forge_threshold` (default: 2)
-     - Read `agents/<agent>/developmental-stage.yaml` → current stage
-     - IF `gap.times_encountered >= forge_threshold`
-          AND `gap.estimated_value >= "medium"`
-          AND developmental stage >= EXPLOIT (developing+):
+     - Readiness gate, the one `/forge-skill` Step 1 runs (g-115-9042): ONCE per pass, after
+       the re-checks above, `Bash: bash core/scripts/forge-gate-check.sh --all` (exit 2: skip).
+       IF this gap has a PASS or WAIVED line in its output:
        - **Live-store dedup (g-115-2284 — replaces compact-search)**: the in-context compact is
          doubly stale (context-read dedup serves an hours-old copy, and the compact renders from
          the box's local mirror). Probe the live store instead:

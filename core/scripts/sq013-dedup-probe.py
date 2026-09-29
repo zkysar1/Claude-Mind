@@ -83,6 +83,17 @@ I/O. Coverage is exactly what the caller passes: on 2026-09-28 (cc-09)
 `aspirations-read.sh --source world --active-compact` held 11,879 evicted ids,
 `--source world --archive` 957 more and `--source agent --active-compact` 115.
 
+PROVENANCE BEFORE SIMILARITY (g-115-11192). A re-delivered relay read FILE
+against the replay bundle that already carried it (6 of the 8 FILEs at the
+2026-09-27 17:40 replay). Not by dilution: the bundle's weight cleared its
+floor, and the coverage floor, which reads only an owner's first
+OWNER_HEAD_CHARS, never reached a relay carried deeper in. Two EXACT keys
+therefore run before any token is scored: the record's (goal_id, _item_ts)
+against a line that carries it, and the relay's "Suggested title:" line
+against goal titles (rb-9493). A hit is a DECLINE. The measurement, the
+grammar, the two exclusions and what stays uncovered are in the
+provenance-keys block above decide().
+
 3 rather than 1 for DECLINE is deliberate, mirroring deploy-hold-check.sh:
 collapsing "an owner exists" and "the probe broke" onto one non-zero code makes
 each readable as the other, and the caller cannot tell which. 4 is distinct from
@@ -461,6 +472,23 @@ def window_start(now, session_start=None, window_hours=DEFAULT_WINDOW_HOURS):
     return min(fixed, session_start)
 
 
+def _owner_window(goal, start):
+    """(status, when) when `goal` can own a relay at all, else None. ONE rule
+    for the token path and the provenance keys (g-115-11192). An OPEN goal owns
+    its work however old it is; a TERMINAL one counts only inside the window.
+    An undated terminal goal is AMBIGUOUS, not old. Counting it in is the safe
+    direction: the cost is a cited decline, and the cost of counting it out is
+    the trap this probe exists to stop."""
+    status = (goal.get("status") or "").strip().lower()
+    if status in OPEN_STATUSES:
+        return status, _goal_time(goal)
+    if status in TERMINAL_STATUSES:
+        when = _goal_time(goal)
+        if when is None or when >= start:
+            return status, when
+    return None
+
+
 # ── eviction horizon () ─────────────────────────────────────────────
 # Goal ids a relay cites. Word-bounded, so a board id like "msg-2026..." never
 # reads as one.
@@ -545,10 +573,212 @@ def terminal_horizon(now, block, error=None):
                        "owner'" % (h.isoformat(), age))}
 
 
+# ── provenance keys () ────────────────────────────────────────────
+# Token scoring cannot see a replay BUNDLE as the owner of a relay it carries
+# verbatim. At the 2026-09-27 17:40 replay (alpha reducer, cc-04), 6 of 8 FILE
+# verdicts were relays that pending  carries as its [4] [5] [6] [9]
+# [10] [16]. The cause is NOT dilution, as this block first said. Measured at
+# this goal's verify (cc-09, 2026-09-28 corpus of 4088 goals): the bundle holds
+# every headline token of all six, and its length-normalised weight clears
+# WEIGHT_THRESHOLD (3.76 to 5.60 against 1.5, at length_norm 8.03). What
+# rejects it is the coverage floor, which reads only an owner's first
+# OWNER_HEAD_CHARS: the six items start at characters 6,788 to 17,424, so head
+# coverage is 0.00 to 0.09 against a floor of 0.30 or 0.40, while the whole
+# description covers 1.00. Two of the six, [9] and [16], have no rare headline
+# token and fall at the rare gate first. That cap is the sponge guard above and
+# must stay; do not widen it to reach a carried relay. The conclusion survives
+# the correction: two EXACT keys run before any token is scored, the
+# goal-store twin of guard-7379's provenance-before-similarity rule for
+# lessons:
+#
+#   relay-header     the record's own (goal_id, _item_ts) against a line that
+#                    CARRIES it. An LLM writes the bundles, not a script, so
+#                    the grammar is the union of the forms measured on the
+#                    eight live bundles (2026-09-28, cc-09):
+#                      --- [4] RELAY from  (sq=sq-013, ..., 2026-09-02T08:54, box=None) ---
+#                      [W1] WORK RELAY from  (2026-09-04T05:53:53):
+#                      --- [W1a] from  (sq=sq-013, ..., 2026-09-05T08:00:44) ---
+#                      F1. <title> [from , captured 2026-08-28T19:28:29].
+#                    It found 97 carried items, 71 work and 26 lesson: every
+#                    item the eight bundles enumerate, addenda included, and
+#                    no line of any other goal.
+#                    The line must OPEN with an item label: a header quoted
+#                    mid-line is prose ABOUT a relay ('s own
+#                    description quotes one), not a carried copy of it.
+#   suggested-title  the relay's "Suggested title:" line against goal TITLES
+#                    (rb-9493). An owner filed on its own carries no header:
+#                    ..8091 each hold a relay's suggested title
+#                    verbatim, and all three of those relays read FILE.
+#
+# Two exclusions keep a bundle from owning what it only CITES. Each errs toward
+# FILE, the visible failure (a duplicate), never toward a false DECLINE, the
+# permanent one (guard-5147):
+#   - NOT-carried lists ("ALREADY DISPOSED IN THIS PASS, NOT carried below:",
+#     "DECLINED BY THE PROBE (owner exists), NOT carried:", "(do NOT
+#     re-relay)"): an item there resolves to its stated disposition, never to
+#     the bundle. A marker covers its own line through the next BLANK line; on
+#     every live bundle a carried list resumes only after one. No live bundle
+#     yet lists a disposed item in header form, so today this guards a hazard
+#     rather than removing a measured match.
+#   - LESSON carries ("LESSON from", "LESSON CANDIDATE from", an L-numbered
+#     label, sq=None): the bundle owns that capture for ENCODING, not for work.
+# Still token-scored, so still able to read FILE on a true owner: a bundle that
+# carries a relay without its capture time ( lists "[2] :
+# ..."), and an owner whose title differs from the relay's suggestion.
+_ITEM_LABEL_RE = re.compile(
+    r"[ \t]*(?:-{3,}[ \t]*)?(\[[^\]\n]{1,120}\]|[A-Za-z]{1,2}\d{1,3}[a-z]?\.)")
+# `from <goal id>`, then the capture time within 80 chars, with no OTHER goal
+# id in between (so a time that belongs to a different id is never borrowed).
+_CARRIED_FROM_RE = re.compile(
+    r"\bfrom[ \t]+(g-\d+-\d+)((?:(?!g-\d+-\d+)[^\n]){0,80}?)"
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)")
+_NOT_CARRIED_RE = re.compile(
+    r"\bNOT[ \t]+carried\b|\bNOT[ \t]+re-relay\b"
+    r"|^[ \t]*(?:\(\w{1,3}\)[ \t]*|[-*][ \t]+)?(?:ALREADY[ \t]+)?"
+    r"(?:DISPOSED|DECLINED[ \t]+BY[ \t]+THE[ \t]+PROBE)\b", re.I)
+_LESSON_LABEL_RE = re.compile(r"\[?L\d")
+_SUGGESTED_TITLE_RE = re.compile(r"suggested[ \t]+title[ \t]*:[ \t]*", re.I)
+_TITLE_QUOTES = {"'": "'", '"': '"', "‘": "’", "“": "”",
+                 "`": "`"}
+# A suggested title shorter than this collides with a goal title by chance.
+SUGGESTED_TITLE_MIN_WORDS = 4
+
+
+def carried_captures(description):
+    """Pure. [(label, source_goal_id, capture_ts)] for every capture a goal
+    description CARRIES as work: a line opening with an item label that names
+    `from <goal id>` and its capture time, outside a NOT-carried list, and not
+    a LESSON carry (see the provenance-keys block). Never raises."""
+    out, not_carried = [], False
+    for line in str(description or "").split("\n"):
+        if not line.strip():
+            not_carried = False
+            continue
+        if _NOT_CARRIED_RE.search(line):
+            not_carried = True
+        item = _ITEM_LABEL_RE.match(line)
+        if not_carried or not item:
+            continue
+        label = item.group(1)
+        for m in _CARRIED_FROM_RE.finditer(line, item.end()):
+            if (_LESSON_LABEL_RE.match(label)
+                    or "lesson" in line[item.end():m.start()].lower()
+                    or "sq=none" in m.group(2).lower()):
+                continue
+            out.append((label, m.group(1), m.group(3)))
+    return out
+
+
+def _same_capture(carried_ts, item_ts):
+    """The carried capture time equals the record's, at the finer precision
+    BOTH print. A header may print only the minute; a minute is the floor."""
+    n = min(len(carried_ts), len(item_ts), 19)
+    return n >= 16 and carried_ts[:n] == item_ts[:n]
+
+
+def _norm_title(text):
+    """Whitespace, case, surrounding quotes and a trailing period are the only
+    differences a copied title is allowed; anything else is another title."""
+    t = " ".join(str(text or "").split())
+    while (len(t) > 1 and t[0] in _TITLE_QUOTES
+           and t[-1] == _TITLE_QUOTES[t[0]]):
+        t = t[1:-1].strip()
+    return t.rstrip(".").strip().casefold()
+
+
+def suggested_titles(text):
+    """Pure. The normalised titles a relay proposes on "Suggested title:" lines
+    (rb-9493). Quoted: the quoted span. Unquoted: the rest of the line, and its
+    first sentence too, because relays often run on past the title (28 live
+    captures read on 2026-09-28 used both shapes). Titles under
+    SUGGESTED_TITLE_MIN_WORDS words are dropped."""
+    text = str(text or "")
+    out = []
+    for m in _SUGGESTED_TITLE_RE.finditer(text):
+        rest = text[m.end():].split("\n", 1)[0].strip()
+        if not rest:
+            continue
+        close = _TITLE_QUOTES.get(rest[0])
+        if close:
+            end = re.search(re.escape(close) + r"(?=$|[\s.,;:)])", rest[1:])
+            cands = [rest[1:1 + end.start()] if end else rest[1:]]
+        else:
+            cands = [rest]
+            stop = re.search(r"\.\s", rest)
+            if stop:
+                cands.append(rest[:stop.start()])
+        for cand in cands:
+            norm = _norm_title(cand)
+            if len(norm.split()) >= SUGGESTED_TITLE_MIN_WORDS and norm not in out:
+                out.append(norm)
+    return out
+
+
+def provenance_matches(subject, goals, start, source_goal_id=None,
+                       item_ts=None):
+    """Pure. Owners found by an EXACT key before any token is scored
+    (g-115-11192): a goal whose description CARRIES this capture as work
+    (relay-header), or whose title IS the relay's suggested title
+    (suggested-title). The status/window rule is the token path's own
+    (_owner_window). Ranked header before title, open before terminal, done
+    before not-done, then newest, so the citation is the live owner when one
+    exists."""
+    ts = str(item_ts or "").strip()
+    gid = (source_goal_id
+           if isinstance(source_goal_id, str) and len(ts) >= 16 else None)
+    titles = set(suggested_titles(subject))
+    out = []
+    if not gid and not titles:
+        return out
+    for g in goals or []:
+        if not isinstance(g, dict):
+            continue
+        by = evidence = None
+        desc = str(g.get("description") or "")
+        if gid and gid in desc:      # a cheap filter; the parse below decides
+            for label, cgid, cts in carried_captures(desc):
+                if cgid == gid and _same_capture(cts, ts):
+                    by = "relay-header"
+                    evidence = ("its description carries this capture as item "
+                                "%s: from %s at %s" % (label, cgid, cts))
+                    break
+        if by is None and titles and _norm_title(g.get("title")) in titles:
+            by = "suggested-title"
+            evidence = "its title IS the relay's Suggested title line"
+        if by is None:
+            continue
+        owned = _owner_window(g, start)
+        if owned is None:
+            continue
+        status, when = owned
+        out.append({
+            "goal_id": g.get("id"),
+            "status": status,
+            "when": when.isoformat() if when else None,
+            "matched_by": by,
+            "evidence": evidence,
+            "weak": False,
+            "title": (g.get("title") or "")[:120],
+        })
+    out.sort(key=lambda m: (m["matched_by"] == "relay-header",
+                            m["status"] in OPEN_STATUSES,
+                            m["status"] not in MUST_READ_STATUSES,
+                            m["when"] or ""), reverse=True)
+    return out
+
+
 def decide(subject, goals, now, session_start=None,
            window_hours=DEFAULT_WINDOW_HOURS, min_overlap=2,
-           reference_time=None):
+           reference_time=None, source_goal_id=None, item_ts=None):
     """Pure decision. Returns a dict; never raises on odd goal records.
+
+    EXACT KEYS FIRST (g-115-11192). `source_goal_id` and `item_ts` are the
+    capture record's own goal_id and raw `_item_ts`. With them, a goal whose
+    description CARRIES this capture as work owns it; a goal whose title IS the
+    relay's "Suggested title:" line owns it too, and that key needs only the
+    subject. A hit is a DECLINE and nothing is token-scored. Both default to
+    None, so a caller passing neither is scored as before, apart from the title
+    key (see the provenance-keys block).
 
     An OPEN owner is disqualifying whenever it overlaps, with no time bound —
     an open goal owns its work however old it is. A TERMINAL owner counts only
@@ -590,6 +820,23 @@ def decide(subject, goals, now, session_start=None,
     matches = []
 
     records = [g for g in (goals or []) if isinstance(g, dict)]
+    # Provenance before similarity (): an exact key outranks every
+    # token score, so a hit decides here.
+    exact = provenance_matches(subject, records, start, source_goal_id, item_ts)
+    if exact:
+        top = exact[0]
+        return {
+            "decision": "DECLINE",
+            "reason": ("owner exists: %s (%s%s): %s"
+                       % (top["goal_id"], top["status"],
+                          ", " + top["when"] if top["when"] else "",
+                          top["evidence"])),
+            "cited_goal_id": top["goal_id"],
+            "cited_status": top["status"],
+            "matches": exact[:10],
+            "window_start": start.isoformat(),
+            "scanned": len(goals or []),
+        }
     docs = [_tokens(" ".join(str(g.get(f) or "")
                              for f in ("title", "description")))
             for g in records]
@@ -606,7 +853,6 @@ def decide(subject, goals, now, session_start=None,
     subj_idf_total = 0.0 if inert else sum(idf[t][1] for t in subj)
 
     for g, blob_tokens, cand_title in zip(records, docs, titles):
-        status = (g.get("status") or "").strip().lower()
         overlap = subj & blob_tokens
         if len(overlap) < min_overlap:
             continue
@@ -663,19 +909,10 @@ def decide(subject, goals, now, session_start=None,
         # same defect (). Live-IDF only, like the floors themselves.
         weak = (not inert) and coverage < SUBJECT_COVERAGE_MIN
 
-        if status in OPEN_STATUSES:
-            when, in_window = _goal_time(g), True
-        elif status in TERMINAL_STATUSES:
-            when = _goal_time(g)
-            # An undated terminal goal is AMBIGUOUS, not old. Counting it in is
-            # the safe direction: the cost is a cited decline, and the cost of
-            # counting it out is the trap this probe exists to stop.
-            in_window = (when is None) or (when >= start)
-        else:
+        owned = _owner_window(g, start)
+        if owned is None:
             continue
-
-        if not in_window:
-            continue
+        status, when = owned
         matches.append({
             "goal_id": g.get("id"),
             "status": status,
@@ -867,8 +1104,13 @@ def batch_decide(records, goals, now, session_start=None,
         ref = (_parse_ts(record.get("_item_ts"))
                if isinstance(record, dict) else None)
         try:
+            # The record's own provenance keys the exact pass ().
             res = decide(subject, goals, now, session_start,
-                         window_hours, min_overlap, reference_time=ref)
+                         window_hours, min_overlap, reference_time=ref,
+                         source_goal_id=(record.get("goal_id")
+                                         if isinstance(record, dict) else None),
+                         item_ts=(record.get("_item_ts")
+                                  if isinstance(record, dict) else None))
         except Exception as exc:                       # never fatal (guard-1512)
             unreadable += 1
             rows.append({
@@ -965,12 +1207,16 @@ def render_batch(result):
                                                        r["cited_status"]))
             out.append("      title: %s" % (r["cited_title"] or "(none)"))
             top = (r.get("matches") or [{}])[0]
-            out.append("      matched on: rare %s; owner TITLE shares %s; "
-                       "restates %s of the relay"
-                       % (", ".join(top.get("rare_tokens") or []) or "none",
-                          ", ".join(top.get("title_overlap") or [])
-                          or "NOTHING (description only)",
-                          top.get("coverage")))
+            if top.get("matched_by"):
+                out.append("      matched on: PROVENANCE (%s): %s"
+                           % (top["matched_by"], top.get("evidence")))
+            else:
+                out.append("      matched on: rare %s; owner TITLE shares %s; "
+                           "restates %s of the relay"
+                           % (", ".join(top.get("rare_tokens") or []) or "none",
+                              ", ".join(top.get("title_overlap") or [])
+                              or "NOTHING (description only)",
+                              top.get("coverage")))
         if r.get("evicted_citations"):
             out.append("      cites EVICTED: %s"
                        % _fmt_cites(r["evicted_citations"]))
@@ -984,7 +1230,7 @@ def render_batch(result):
         elif r["must_read"] and r["cited_goal_id"]:
             out.append("      ^^ TERMINAL-BUT-NOT-DONE owner. Read its "
                        "outcome_note before accepting this as a decline: a "
-                       "skipped/expired goal can assert the OPPOSITE of the "
+                       "skipped or expired goal can assert the OPPOSITE of the "
                        "observation it suppresses (guard-5147).")
         elif r["must_read"]:
             out.append("      ^^ NO SCORED OWNER, NOT NO OWNER: a cited goal was "

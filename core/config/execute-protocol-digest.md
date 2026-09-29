@@ -275,6 +275,12 @@ Bash: bash core/scripts/pre-apply-consult-gate.sh {goal.id}
 
 Execute primary goal: `result = invoke goal.skill with goal.args`
 
+PLAN FROM AN EMPTY BOARD (g-375-65): a plan tool (update_plan, TodoWrite) holds ONE goal's
+steps. If a plan from an earlier goal is still there, clear it (send an empty plan) in this
+goal's first response, before this goal's own plan if it needs one. Leaving old steps out is
+not enough: a harness may restore done steps it had folded, and the plan then grows every goal.
+# Rationale (WHY clear first, and the measurement): core/config/rationale/plan-per-goal.md
+
 ## Outcome Classification (Binary)
 
 ```

@@ -1223,11 +1223,9 @@ If YES:
   # GUARD: skip already-forged gaps (Phase 9.2 also checks this)
   IF gap.status == "forged": skip forge criteria check
 
-  Read core/config/skill-gaps.yaml → forge_threshold (default: 2)
-  Read agents/<agent>/developmental-stage.yaml → current stage
-  IF gap.times_encountered >= forge_threshold
-     AND gap.estimated_value >= "medium"
-     AND developmental stage >= EXPLOIT (developing+):
+  # Readiness gate shared with /forge-skill Step 1 (g-115-9042). Exit 0 = PASS/WAIVED.
+  Bash: bash core/scripts/forge-gate-check.sh {gap.id}
+  IF exit code == 0:
 
     # Check no pending forge goal already exists for this gap
     Bash: load-aspirations-compact.sh → IF path returned: Read it

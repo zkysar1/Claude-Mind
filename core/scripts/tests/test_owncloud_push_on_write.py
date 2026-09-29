@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -247,14 +248,15 @@ def test_unknown_environment_id_fast_exits(tmp_path):
 # ok". A fake daemon on a tmp port file (OWNCLOUD_PUSH_HOOK_PORT_FILE) drives
 # the REAL curl + verdict path, never the live daemon.
 
-def _fake_daemon_run(tmp_path, body):
+def _fake_daemon_run(tmp_path, body, *, status=200, target=None):
+    """target defaults to a governed world file; pass one to aim elsewhere."""
     hits = []
 
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             hits.append(self.path)
             data = json.dumps(body).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
@@ -265,8 +267,9 @@ def _fake_daemon_run(tmp_path, body):
 
     world = tmp_path / "world"
     (world / "conventions").mkdir(parents=True)
-    target = world / "conventions" / "x.md"
-    target.write_text("x\n", encoding="utf-8")
+    if target is None:
+        target = world / "conventions" / "x.md"
+        target.write_text("x\n", encoding="utf-8")
     srv = HTTPServer(("127.0.0.1", 0), _Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     port_file = tmp_path / "daemon.port"
@@ -292,22 +295,31 @@ def _model_context(r):
     return hso["additionalContext"]
 
 
-@pytest.mark.parametrize("body, reaches_model", [
-    ({"ok": True, "pushed": 1, "in_sync": 0, "diverged_skipped": 0, "errors": 0}, False),
-    ({"ok": True, "pushed": 0, "in_sync": 1}, False),
-    ({"ok": True, "pushed": 0, "diverged_merged": 1}, False),
-    ({"ok": True, "pushed": 0, "reason": "machine_local"}, False),
-    ({"ok": True, "pushed": 0, "in_sync": 0, "diverged_skipped": 1, "errors": 0}, True),
-    ({"ok": True, "pushed": 0, "stale_pulled": 1}, True),
-    ({"ok": True, "pushed": 0, "reason": "missing_or_dir"}, True),
+# silent_line: the transcript-only line a push that needs no action prints.
+# None: the push did not land, so the verdict must reach the model.
+@pytest.mark.parametrize("body, silent_line", [
+    ({"ok": True, "pushed": 1, "in_sync": 0, "diverged_skipped": 0, "errors": 0},
+     "daemon push ok"),
+    ({"ok": True, "pushed": 0, "in_sync": 1}, "daemon push ok"),
+    ({"ok": True, "pushed": 0, "diverged_merged": 1}, "daemon push ok"),
+    ({"ok": True, "pushed": 0, "reason": "machine_local"}, "by design"),
+    ({"ok": True, "pushed": 0, "reason": "not_governed"}, "by design"),
+    ({"ok": True, "pushed": 0, "in_sync": 0, "diverged_skipped": 1, "errors": 0}, None),
+    ({"ok": True, "pushed": 0, "stale_pulled": 1}, None),
+    ({"ok": True, "pushed": 0, "reason": "missing_or_dir"}, None),
+    # admin.py's non-own-cloud answer: on an own-cloud box, a stray daemon.
+    ({"ok": True, "pushed": 0,
+      "reason": "non-own-cloud backend — local files are the store"}, None),
+    # A skip reason this hook does not know yet: reach the model, never trust it.
+    ({"ok": True, "pushed": 0, "reason": "some_future_skip"}, None),
     ({"ok": False, "pushed": 0, "errors": 1,
-      "error_paths": [{"phase": "union-merge-push"}]}, True),
+      "error_paths": [{"phase": "union-merge-push"}]}, None),
 ])
 def test_push_verdict_reaches_the_model_only_when_it_did_not_land(
-        tmp_path, body, reaches_model):
+        tmp_path, body, silent_line):
     r = _fake_daemon_run(tmp_path, body)
     ctx = _model_context(r)
-    if reaches_model:
+    if silent_line is None:
         assert ctx and "x.md" in ctx, (r.stdout, r.stderr)
         assert "until the next sweep" not in ctx
         # The terminal keeps its copy. ASCII probe only: stderr is decoded by
@@ -315,7 +327,26 @@ def test_push_verdict_reaches_the_model_only_when_it_did_not_land(
         assert "[owncloud-push-on-write]" in r.stderr and "x.md" in r.stderr
     else:
         assert ctx is None, ctx
-        assert "daemon push ok" in r.stdout
+        assert silent_line in r.stdout
+
+
+def test_route_error_body_reaches_the_model_and_the_cli_does_not_repeat_it(tmp_path):
+    """The route reports a failed sync as a 500 whose body names the error.
+    curl -f used to discard that body and fall through to the CLI, which runs
+    the same sync code again. Now the body reaches the model, and the hook
+    stops there."""
+    r = _fake_daemon_run(tmp_path, {"ok": False, "error": "sync failed: boom"},
+                         status=500)
+    ctx = _model_context(r)
+    assert ctx and "sync failed: boom" in ctx and "HTTP 500" in ctx, (r.stdout, r.stderr)
+    assert "no daemon answered" not in r.stderr   # the CLI fallback never ran
+
+
+def test_route_missing_404_falls_through_to_the_cli(tmp_path):
+    """A daemon older than the route answers 404. That, and no answer at all,
+    are the only answers that hand the push to the CLI fallback."""
+    r = _fake_daemon_run(tmp_path, {"error": "not found"}, status=404)
+    assert "no daemon answered" in (_model_context(r) or ""), (r.stdout, r.stderr)
 
 
 # --- : PostToolUse wiring invariant ----------------------------------
@@ -374,3 +405,34 @@ def test_push_on_write_wired_in_all_governed_write_chains():
         assert occurrences == 1, (
             f"PostToolUse[{matcher}]: {PUSH_HOOK_BASENAME} must be wired exactly "
             f"once (found {occurrences})")
+
+
+# --- peer_agent: the store refuses the edit from this box ----------------------
+# sync_file skips a file in an agent dir whose runner claim this box does not
+# hold. A git-tracked file still travels by commit, so it stays out of the
+# model's context. An untracked one has no carrier at all: the model must hear
+# it, and learn where the claim lives.
+
+PEER_BODY = {"ok": True, "pushed": 0, "reason": "peer_agent"}
+
+
+def test_peer_agent_untracked_file_reaches_the_model(tmp_path):
+    from _paths import agent_dir
+    agent = "_fec-probe-untracked"
+    target = agent_dir(agent) / "session" / "x.yaml"   # never created
+    r = _fake_daemon_run(tmp_path, PEER_BODY, target=target)
+    ctx = _model_context(r)
+    assert ctx and f"runner-claim.sh status --agent {agent}" in ctx, (r.stdout, r.stderr)
+
+
+def test_peer_agent_git_tracked_file_stays_silent(tmp_path):
+    from _paths import agents_root
+    git = shutil.which("git")
+    listed = subprocess.run(
+        [git, "-C", str(REPO_ROOT), "ls-files", "--", str(agents_root())],
+        capture_output=True, text=True, timeout=60).stdout.splitlines() if git else []
+    if not listed:
+        pytest.skip("no git-tracked agent file in this checkout")
+    r = _fake_daemon_run(tmp_path, PEER_BODY, target=REPO_ROOT / listed[0])
+    assert _model_context(r) is None, (r.stdout, r.stderr)
+    assert "git tracks the file" in r.stdout

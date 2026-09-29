@@ -95,7 +95,13 @@ fresh-context reviewer per the independence order above rather than proceeding.
 ### 1. Requirements traceability — judgment, plus a MECHANISED citations-MATCH probe
 Every entry in `verification.outcomes` maps to concrete produced evidence.
 **Quote the evidence.** An outcome you cannot quote evidence for is unmet, not
-"probably fine", and a partially-met bar may not be narrated away (`guard-2541`).
+"probably fine", and a partially-met bar may not be narrated away (`guard-7517`).
+An outcome the close DECLARES as `OUTCOME n: NOT MET — <gap>; deferred to <goal-id>`
+is not narration. It is the sanctioned close when the remainder is that goal's own
+work (`goal-schemas.md` § Closure Evidence Table, g-375-05; `guard-7517`, which
+supersedes `guard-2541`). Pass it once the carrier is live and owns the gap. Fail it only when
+the carrier is not live, does not own the gap, or THIS goal still has a step of its
+own left, in which case it should have closed `blocked`.
 
 Quoting a citation is citations-EXIST. This check is also citations-MATCH: for
 each sampled claim, diff what the claim asserts against what the FETCHED source

@@ -12,8 +12,21 @@
 # caller — a hook-install hiccup must not prevent a session from starting.
 set -euo pipefail
 
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+# The repo to configure is the one this script LIVES in, never the caller's
+# cwd. A SessionStart hook runs in the session's current directory: on
+# 2026-09-28 a session cd-ed into a scratch clone under the project, so
+# `git rev-parse --show-toplevel` answered with the CLONE. Its core.hooksPath
+# got set, its post-commit hook then recycled a daemon rooted in the clone, and
+# that stray daemon synced the real world store for ~8 hours.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || exit 0
 cd "$REPO_ROOT"
+# git searches ANCESTORS (guard-5267): a copy that is not itself a repo top
+# level would configure whatever repo encloses it. --show-cdup is empty only at
+# the top level, and compares no path strings (C:/ vs /c/ on Windows).
+if [ -n "$(git rev-parse --show-cdup 2>/dev/null || echo x)" ]; then
+    echo "[install-git-hooks] $REPO_ROOT is not a git top level — nothing installed" >&2
+    exit 0
+fi
 
 WANT="core/githooks"
 CUR="$(git config --local --get core.hooksPath 2>/dev/null || echo "")"

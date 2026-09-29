@@ -54,3 +54,39 @@ def open_long_path(path, mode="r", encoding="utf-8"):
             return open(ext_path, mode, encoding=encoding)
         except OSError:
             raise
+
+
+# A writer needs headroom BELOW the 260-char file limit, not just at it: a
+# same-directory mkstemp sibling adds ".XXXXXXXX.tmp" (13 chars) to the name,
+# and CreateDirectoryW stops at 248 (MAX_PATH - 12). Prefixing from 240 keeps
+# the parent dir and the tmp sibling inside both limits whenever the path
+# itself is below the threshold, and every derived path is prefixed above it.
+# Measured 2026-09-28 on DESKTOP-O91DLK2 (LongPathsEnabled=0, ): a
+# 250-char target reads fine but its mkstemp sibling fails errno 2, which is
+# the failure that kept 11 of 14 deep tree nodes (248-259 chars) off the box.
+_PREFIX_FROM = 240
+
+
+def long_path(path):
+    """`path` as a Path every Win32 file API accepts at any length.
+
+    For read AND write, including the mkdir/mkstemp/os.replace dance of an
+    atomic writer. Returns an absolute, backslashed, `\\\\?\\`-prefixed Path on
+    Windows once the path reaches _PREFIX_FROM chars (UNC maps to
+    `\\\\?\\UNC\\`), and `Path(path)` unchanged below it and everywhere else,
+    so the common case is byte-identical to not calling it. Idempotent.
+
+    Use the result ONLY for file I/O. A prefixed path is not `relative_to()`
+    its unprefixed root, so never hand it to code that maps a path to a key.
+    """
+    if os.name != "nt":
+        return Path(path)
+    s = os.fspath(path)
+    if s.startswith("\\\\?\\"):
+        return Path(s)
+    full = os.path.abspath(s)
+    if len(full) < _PREFIX_FROM:
+        return Path(path)
+    if full.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + full[2:])
+    return Path("\\\\?\\" + full)

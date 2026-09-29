@@ -48,10 +48,16 @@ def _make_repo(root: Path, name: str, child: int, parent=None,
     return root / name
 
 
-def _print_keepset(local_state: Path, deploy_parent: Path, *extra_args) -> dict:
+def _print_keepset(local_state: Path, deploy_parent: Path, *extra_args,
+                   deploy_grandparent=None) -> dict:
     env = dict(os.environ)
     env["RUNTIME_DIR"] = _fwd(local_state)
     env["ORPHAN_SWEEP_DEPLOY_PARENT"] = _fwd(deploy_parent)
+    # Unset unless a test asks for it: the parent override alone turns the
+    # grandparent root off, so no test reads pytest's shared basetemp.
+    env.pop("ORPHAN_SWEEP_DEPLOY_GRANDPARENT", None)
+    if deploy_grandparent is not None:
+        env["ORPHAN_SWEEP_DEPLOY_GRANDPARENT"] = _fwd(deploy_grandparent)
     cmd = [BASH, _fwd(SWEEP_SH), "--print-keepset", *extra_args]
     proc = subprocess.run(
         cmd, capture_output=True, text=True, timeout=30,
@@ -108,6 +114,44 @@ def test_repo_nested_under_org_dir_is_protected(tmp_path):
         f"nested repo NOT protected — --clean would kill it: {pids}"
     )
     assert {"5151", "6161"} <= pids, f"nested .mind-data repo NOT protected: {pids}"
+
+
+def test_nested_repo_protects_shallower_sibling(tmp_path):
+    """The reverse of the test above (): run FROM the nested repo, a
+    shallower sibling (<root>/<repo>) and a cousin under another org folder
+    (<root>/<org2>/<repo>) MUST be in the keep-set. Measured 2026-09-28: from a
+    production Mind nested under an org folder the keep-set held only its own
+    pair, so --clean would have killed a shallower sibling's live daemon."""
+    ws = tmp_path / "ws"
+    local = _make_repo(ws / "org", "repo_local", 1111, 2222)
+    _make_repo(ws, "repo_top", 7171, 8181)
+    _make_repo(ws / "org2", "repo_cousin", 9191, 1212,
+               layout=".mind-data/mind_api/state")
+    res = _print_keepset(local / "mind_api" / "state", ws / "org",
+                         deploy_grandparent=ws)
+    assert res["_rc"] == 0, res
+    pids = _pids(res.get("KEEPSET_PIDS"))
+    assert {"7171", "8181"} <= pids, (
+        f"shallower sibling NOT protected — --clean from the nested repo would kill it: {pids}"
+    )
+    assert {"9191", "1212"} <= pids, f"cousin repo NOT protected: {pids}"
+
+
+def test_parent_override_alone_keeps_grandparent_off(tmp_path):
+    """Setting only ORPHAN_SWEEP_DEPLOY_PARENT must NOT search its parent: a
+    tmp_path override would otherwise reach pytest's shared basetemp and collect
+    other tests' fake pidfiles (test_vanished_pidfile_not_in_keepset asserts an
+    ABSENCE)."""
+    ws = tmp_path / "ws"
+    local = _make_repo(ws / "org", "repo_local", 1111, 2222)
+    _make_repo(ws, "repo_top", 7171, 8181)
+    res = _print_keepset(local / "mind_api" / "state", ws / "org")
+    assert res["_rc"] == 0, res
+    assert res.get("DEPLOY_GRANDPARENT") == "", res
+    pids = _pids(res.get("KEEPSET_PIDS"))
+    assert "7171" not in pids and "8181" not in pids, (
+        f"grandparent searched although only the parent override was set: {pids}"
+    )
 
 
 def test_keep_repo_flag_adds_out_of_tree_repo(tmp_path):

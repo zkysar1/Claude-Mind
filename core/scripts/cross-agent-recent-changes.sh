@@ -19,7 +19,11 @@
 # "what is this goal's review window start" lives in this script, not in
 # goal-description prose that re-interprets every 48h.
 #
-# Output: newline-separated, deduplicated, sorted paths on stdout.
+# Output: newline-separated, deduplicated paths on stdout, in REVIEW-PRIORITY
+# order (): code roots (core/scripts/, .claude/skills/, mind_api/)
+# first, then every other path; newest-first within each tier, a path ranking
+# by the newest commit that touched it. Callers cap this list (/fresh-eyes-code
+# keeps the first 20), so the order decides what gets reviewed. NOT sorted.
 # Empty output = "no matching changes" — NOT an error. Exit 0 on success,
 # 2 on argument error. Fail-open on git/python failure (empty output, exit 0).
 
@@ -39,7 +43,7 @@ while [ $# -gt 0 ]; do
     --agent) AGENT="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
     --scope) SCOPE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
     -h|--help)
-      sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+      sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
       exit 0 ;;
     *)
       echo "cross-agent-recent-changes.sh: unknown arg: $1" >&2
@@ -133,24 +137,39 @@ except Exception:
     sys.exit(2)
 PYEOF
 )
+# Dedup is ORDER-PRESERVING (`!seen[$0]++`), never `sort -u`: git log walks
+# newest commit first, so each path keeps the position of its newest touch.
 if [ -n "$SINCE_EPOCH" ]; then
   GIT_FILES=$(git log --name-only --pretty=format:"%x01%ct" 2>/dev/null \
     | awk -v c="$SINCE_EPOCH" '
         /^\x01/ { keep = (substr($0,2) + 0) >= c; next }
-        keep && length($0) { print }
-      ' | sed '/^$/d' | sort -u || true)
+        keep && length($0) && !seen[$0]++ { print }
+      ' || true)
 else
   # Unparseable $SINCE: fail OPEN to the whole history rather than to empty.
   # This probe scopes a review, so an over-broad target list costs reading time
   # while an empty one silently cancels the review.
   echo "cross-agent-recent-changes.sh: could not parse --since '$SINCE' to epoch; scanning full history" >&2
-  GIT_FILES=$(git log --name-only --pretty=format: 2>/dev/null | sed '/^$/d' | sort -u || true)
+  GIT_FILES=$(git log --name-only --pretty=format: 2>/dev/null | awk 'length($0) && !seen[$0]++' || true)
 fi
 
 # Optional scope filter. SCOPE is a plain prefix (e.g. "core/"), not a regex.
 if [ -n "$SCOPE" ]; then
   GIT_FILES=$(printf '%s\n' "$GIT_FILES" | grep "^${SCOPE}" || true)
 fi
+
+# Review-priority order (): a stable partition that moves the code
+# roots ahead of every other path, keeping newest-first within each tier.
+# Recency alone is not enough: agent-state churn commits are the newest commits
+# in an active window. Measured 2026-09-28 on a 48h window of 525 paths (178
+# of them under the code roots): newest-first put 19 agents/ paths and 1 code
+# file in the first 20, and the old `sort -u` put 20 .claude/rules paths there.
+# Step 4's `grep -Fx` keeps this order, so --agent output is ranked the same.
+GIT_FILES=$(printf '%s\n' "$GIT_FILES" | awk '
+    /^(core\/scripts|\.claude\/skills|mind_api)\// { print; next }
+    length($0) { rest[++n] = $0 }
+    END { for (i = 1; i <= n; i++) print rest[i] }
+  ' || true)
 
 # ── Step 2: no --agent → emit the git-changed superset ───────────────────────
 if [ -z "$AGENT" ]; then

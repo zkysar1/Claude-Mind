@@ -50,10 +50,11 @@ sid, AND whose holder process is still alive. Absent, unreadable, malformed,
 expired, mine, or dead-holder all return 0.
 
 THE DEAD-HOLDER PROBE IS WHY THE TTL CAN BE GENEROUS. Because the lock is
-per-checkout, the holder is by construction a process on THIS box, so
-`os.kill(pid, 0)` is a real liveness test rather than a guess. A killed suite
-therefore frees the tree immediately instead of after the TTL, and the TTL is
-only the backstop for a holder whose pid was recycled or never recorded.
+per-checkout, the holder is by construction a process on THIS box, so a pid
+probe is a real liveness test rather than a guess: `os.kill(pid, 0)` on POSIX,
+OpenProcess on Windows, where os.kill cannot say "gone" (g-115-8549). A killed
+suite therefore frees the tree immediately instead of after the TTL, and the TTL
+is only the backstop for a holder whose pid was recycled or never recorded.
 """
 from __future__ import annotations
 
@@ -101,6 +102,8 @@ def _pid_alive(pid) -> bool | None:
     """
     if not isinstance(pid, int) or pid <= 0:
         return None
+    if os.name == "nt":
+        return _win_pid_alive(pid)
     try:
         os.kill(pid, 0)
         return True
@@ -111,6 +114,40 @@ def _pid_alive(pid) -> bool | None:
         # we are entitled to act on, but the process demonstrably exists.
         return True
     except OSError:
+        return None
+
+
+def _win_pid_alive(pid: int) -> bool | None:
+    """_pid_alive's Windows answer (; guard-5988, guard-668).
+
+    os.kill(pid, 0) is not a liveness probe on Windows. For a pid that no longer
+    exists it raises a bare OSError (winerror 87, measured 2026-09-28), which
+    _pid_alive has to read as None, so a dead holder kept the tree for the whole
+    TTL. OpenProcess + GetExitCodeProcess can answer. Only
+    ERROR_INVALID_PARAMETER, which is Windows for "no such pid", is False.
+    Access denied and every other failure stay None, so the fail direction is
+    unchanged wherever Windows cannot tell. run-full-suite.py's
+    _pid_alive_platform fixed its run lock the same way (g-115-8876).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERROR_INVALID_PARAMETER = 87
+        STILL_ACTIVE = 259
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not h:
+            return False if ctypes.get_last_error() == ERROR_INVALID_PARAMETER else None
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return None
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001 -- cannot tell is not the same as dead
         return None
 
 
@@ -289,7 +326,14 @@ def main(argv=None) -> int:
     # inert while every hand-test passed. Same failure mode as the holder-pid bug
     # this module already carries a regression test for, arriving by a different
     # door. Normalising here means any spelling of a root maps to one lock.
-    root = Path(args.project_root) if args.project_root else Path(
+    #
+    # That includes Git Bash's /c/... spelling, which .resolve() alone cannot
+    # map. Under MSYS_NO_PATHCONV=1 MSYS stops rewriting argv, and Windows python
+    # reads /c/... as drive C: plus a literal c/ subdir: a lock file nobody holds,
+    # so `check` let a merge through a held tree. The argument is therefore
+    # normalized here, where it arrives (guard-2251, ).
+    from _path_helpers import normalize_msys_path
+    root = Path(normalize_msys_path(args.project_root)) if args.project_root else Path(
         os.environ.get("MIND_PROJECT_ROOT") or Path(__file__).resolve().parent.parent.parent)
     root = root.resolve()
     sid = os.environ.get("MIND_SID", "")

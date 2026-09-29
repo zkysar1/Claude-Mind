@@ -4,8 +4,9 @@
 # and from SessionStart source=compact (sessionstart-orchestrator.sh).
 #
 # Args are passed through — pass `--session-id "$SID"` to clear the tracker THAT
-# session actually uses. Without it the clear targets the AGENT-WIDE tracker, and
-# on a worker Body that is a file which does not exist: measured 2026-08-22 on
+# session actually uses. Without it (and without $MIND_SID, ) the clear
+# targets the AGENT-WIDE tracker, which no session with a per-session dir uses
+# (). On a worker Body that file may not exist at all: measured 2026-08-22 on
 # cc-08, every live tracker on the box was sessions/<SID>/body-context-reads.txt
 # and agents/*/session/context-reads.txt matched nothing at all. A bare clear
 # there succeeds, reports nothing, and leaves the manifest intact ().

@@ -90,13 +90,20 @@ class Repo:
         _git(self.work, "push", "--quiet", "origin", "main", "--follow-tags")
         _git(self.work, "fetch", "--quiet", "origin")
 
+    def refresh(self) -> None:
+        """The basis refresh: the only writer of the release-train tag namespace."""
+        why = rt.refresh_basis(self.work)
+        assert why is None, why
+
 
 @pytest.fixture
 def repo(tmp_path):
+    """A clone whose basis was refreshed once, at v1.0.0."""
     r = Repo(tmp_path)
     r.commit("core/scripts/a.py", "base")
     r.tag("v1.0.0")
     r.push()
+    r.refresh()
     return r
 
 
@@ -208,24 +215,36 @@ def test_newest_is_by_version_and_must_be_merged_into_origin_main(repo):
     repo.commit("core/scripts/d.py", "d")
     repo.tag("v1.10.0")
     repo.push()
-    # A higher tag that origin/main does not contain must not count.
+    # A higher tag that origin/main does not contain must not count, even with
+    # origin carrying it and the refresh bringing it.
     _git(repo.work, "checkout", "-b", "unmerged")
     repo.commit("core/scripts/e.py", "e")
     repo.tag("v9.0.0")
+    _git(repo.work, "push", "--quiet", "origin", "v9.0.0")
     _git(repo.work, "checkout", "main")
+    repo.refresh()
+    assert f"{rt.TAG_NAMESPACE}/v9.0.0" in _git(repo.work, "for-each-ref", "--format=%(refname)",
+                                                  rt.TAG_NAMESPACE)
     m = rt.measure(repo.work, PATHS, now=OLD_TS)
     assert m["newest_tag"] == "v1.10.0"
     assert m["commits_past"] == 0
 
 
 def test_measure_reports_errors_instead_of_raising(tmp_path):
+    no_tag_error = f"no v* tag in {rt.TAG_NAMESPACE} is reachable from origin/main"
     r = Repo(tmp_path)
     r.commit("core/scripts/a.py", "untagged")
     no_origin = rt.measure(r.work, PATHS)
     assert no_origin["error"] and no_origin["newest_tag"] is None
     r.push()
-    no_tag = rt.measure(r.work, PATHS)
-    assert no_tag["error"] == "no v* tag is reachable from origin/main"
+    r.refresh()
+    assert rt.measure(r.work, PATHS)["error"] == no_tag_error
+    # refs/tags is never read: a tag there that no refresh has brought reads as
+    # no tag at all, so measure_with_basis refreshes before acting.
+    r.tag("v1.0.0")
+    r.push()
+    assert _git(r.work, "tag", "-l") == "v1.0.0"
+    assert rt.measure(r.work, PATHS)["error"] == no_tag_error
     assert rt.measure(tmp_path / "not-a-repo", PATHS)["error"]
 
 
@@ -362,12 +381,63 @@ def test_cli_and_nudge_see_the_true_newest_tag_after_a_tagless_fetch(repo, tmp_p
         {"id": "g-115-77777", "status": "pending", "origin_signal": rt.signal_for("v1.0.0")}])
     rc, out, _ = _cli(repo.work, world)
     assert rc == 0 and out.startswith("release-train: ok - no framework commits past v1.1.0"), out
-    # That run fetched the tag. Drop it again, so the nudge starts from the
-    # loop's own tagless basis and must fetch for itself.
-    _git(repo.work, "tag", "-d", "v1.1.0")
+    # That run fetched the tag. Drop it again, so the nudge starts from a basis
+    # without it and must fetch for itself.
+    ref = f"{rt.TAG_NAMESPACE}/v1.1.0"
+    _git(repo.work, "update-ref", "-d", ref)
     rc, out, _ = _cli(repo.work, world, "--nudge")
     assert rc == 0 and out == ""
-    assert _git(repo.work, "tag", "-l", "v1.1.0") == "v1.1.0"
+    assert _git(repo.work, "for-each-ref", "--format=%(refname)", ref) == ref
+    assert _git(repo.work, "tag", "-l", "v1.1.0") == ""      # refs/tags is never written
+
+
+def test_a_tag_cut_here_and_never_pushed_is_not_origins_newest(repo):
+    """, replayed on real git: this box cuts v1.1.0 in its OWN
+    refs/tags and pushes main WITHOUT it. Origin's newest is still v1.0.0, but
+    read from refs/tags the local-only tag was named newest, and the v1.0.0
+    lease read as superseded by a tag no other box can see."""
+    repo.commit("core/scripts/late.py", "framework change")
+    repo.tag("v1.1.0", date=_now_iso())
+    _git(repo.work, "push", "--quiet", "origin", "main")        # main only, no tag
+    assert _git(repo.origin, "tag", "-l", "v1.1.0") == ""
+    m = rt.measure_with_basis(repo.work, PATHS, 24, always=True)
+    assert m["error"] is None and m["tag_basis"] == "fetched"
+    assert m["newest_tag"] == "v1.0.0" and m["tags_merged"] == ["v1.0.0"]
+    lease = {"id": "g-origin-newest", "origin_signal": rt.signal_for("v1.0.0")}
+    assert rt.superseded_leases([lease], m["tags_merged"]) == []
+    assert _git(repo.work, "tag", "-l", "v1.1.0") == "v1.1.0"   # the local cut is untouched
+
+
+def test_a_local_tag_that_differs_from_origins_does_not_stop_the_measurement(repo):
+    """A local v1.0.0 that is not origin's (re-cut here, or a cut half done).
+    Fetched into refs/tags without '+', git refused the clobber, and --quiet
+    hid the refusal: the reading stayed on the local tag, whose fresh date read
+    a stalled train as not due. The namespace refresh measures origin's tag and
+    leaves the local one as it was."""
+    repo.commit("core/scripts/late.py", "framework change past the old tag")
+    repo.push()                                          # origin: v1.0.0 old + 1 commit = due
+    _git(repo.work, "tag", "-d", "v1.0.0")
+    _git(repo.work, "tag", "-a", "v1.0.0", "-m", "not origin's", date=_now_iso())
+    m = rt.measure_with_basis(repo.work, PATHS, 24, always=True)
+    assert m["error"] is None and m["tag_basis"] == "fetched"
+    assert m["newest_tag"] == "v1.0.0" and m["tag_created"] == OLD   # origin's tag
+    assert rt.decide(m, 24)["due"] is True
+    assert _git(repo.work, "for-each-ref", "--format=%(contents:subject)",
+                "refs/tags/v1.0.0") == "not origin's"
+
+
+def test_a_refused_refresh_names_the_ref_git_refused(repo, tmp_path):
+    """--quiet made git print nothing when it refused a ref, so the recorded
+    reason was a bare rc. Git's per-ref status line names the ref and why."""
+    _cut_elsewhere(repo, tmp_path, "v1.1.0")
+    lock = repo.work / ".git" / Path(f"{rt.TAG_NAMESPACE}/v1.1.0.lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    lock.write_text("", encoding="utf-8")                # a concurrent writer holds the ref
+    why = rt.refresh_basis(repo.work)
+    assert why and f"v1.1.0 -> {rt.TAG_NAMESPACE}/v1.1.0" in why, why
+    m = rt.measure_with_basis(repo.work, PATHS, 24)
+    assert m["tag_basis"].startswith("local (refresh failed") and f"{rt.TAG_NAMESPACE}/v1.1.0" in m["error"]
+    assert rt.decide(m, 24)["reason"].startswith("unmeasured:")
 
 
 def _load_watchdog():
@@ -427,6 +497,7 @@ def test_a_local_not_due_reading_needs_no_fetch(tmp_path):
     r.tag("v2.0.0", date=_now_iso())
     r.commit("core/scripts/b.py", "past a fresh tag")
     r.push()
+    r.refresh()
     _git(r.work, "remote", "set-url", "origin", str(tmp_path / "gone.git"))  # any fetch fails
     m = rt.measure_with_basis(r.work, PATHS, 24)
     assert m["error"] is None and m["tag_basis"] == "local" and m["newest_tag"] == "v2.0.0"

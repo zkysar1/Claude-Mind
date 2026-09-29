@@ -41,6 +41,7 @@ cannot produce.
 """
 
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -84,7 +85,14 @@ def run(harness, *args):
         text=True,
         cwd=str(harness),
         env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            # Append the running interpreter's dir: Git Bash's /usr/bin holds no
+            # Python, so without it the wrapper exits 4 before the write path
+            # (). Appending adds a missing binary and cannot shadow one
+            # (guard-4445). os.pathsep because MSYS converts a ;-separated Windows
+            # list at startup; as_posix() keeps backslashes from bash (guard-581).
+            "PATH": os.pathsep.join(
+                ["/usr/bin:/bin:/usr/local/bin", Path(sys.executable).parent.as_posix()]
+            ),
             "HOME": str(harness),
             "MIND_AGENT": "alpha",
             "STORAGE_BACKEND": "local",

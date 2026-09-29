@@ -1578,6 +1578,151 @@ _ip_defer_exit() {
   soft_exit 1
 }
 
+# --- Untrack-ahead of an upstream delete+ignore (, rb-12266) -------
+# When UPSTREAM deletes a tracked path AND its own .gitignore ignores it, the
+# path has been declared machine-local. A box whose HEAD still tracks it has two
+# outcomes at its next integrate, both measured 2026-09-28 (rb-12266):
+#   (a) the box wrote the file since the merge base: a modify/delete conflict
+#       that no retry clears, because the box keeps writing the file (zc-11
+#       wedged 15h; cc-10 on agents/alpha/experience-stats.spool.last-flush);
+#   (b) the file was clean: the merge deletes it from disk before it drained
+#       (zc-07 lost a 25-line spool).
+# Untracking it HERE, before the first merge, makes both sides deletions.
+# `git rm --cached` touches the index only, so the file stays on disk, (a)
+# cannot conflict and (b) cannot remove anything. This automates rb-12266's
+# remedy, which was applied by hand on 8 boxes. What each step guards against:
+#   - UPSTREAM's OWN ignore rules decide. They are evaluated in a scratch repo,
+#     so this box's info/exclude and core.excludesFile cannot vouch for a path
+#     upstream never ignored. A path upstream deleted but does NOT ignore is left
+#     alone, and still conflicts as a true conflict.
+#   - Each path also goes into info/exclude. The local .gitignore lacks the new
+#     rule until the merge lands it, and the churn self-heal commits every
+#     UNTRACKED self-namespace file it lists (ls-files --others
+#     --exclude-standard). Without the exclude, the self-heal re-tracks the file
+#     in this same run and the conflict returns.
+#   - The commit is a plain `git commit`, over an index verified to hold ONLY
+#     these deletions (guard-741). A pathspec commit is wrong here: its --only
+#     mode re-reads the working tree, so `git rm --cached f && git commit -- f`
+#     re-adds f instead of deleting it (measured on a scratch repo, 2026-09-28).
+# Fail-soft: every refusal logs and returns 0, and the merge then runs exactly
+# as it did before this helper existed.
+_ip_upstream_ignored_subset() {  # NUL-separated paths in -> the subset UPSTREAM's .gitignore files ignore, NUL-separated out
+  local _tmp _up _p _rest _dir
+  local -A _seen=()
+  local -a _paths=()
+  while IFS= read -r -d '' _p; do _paths+=("$_p"); done
+  [ "${#_paths[@]}" -eq 0 ] && return 0
+  # Git Bash rewrites git's argv two ways, and both failures are silent here
+  # (stderr is dropped), so the subset came back empty and untrack-ahead never
+  # ran on Windows ():
+  #  - `origin/main:.gitignore` reads as a POSIX path list and reaches git as
+  #    `origin\main;.gitignore` (guard-3456). A bare SHA before the ':' does not.
+  #  - under MSYS_NO_PATHCONV=1, which _platform.sh exports for the loop's call,
+  #    mktemp's /tmp/... reaches git.exe unconverted and names C:\tmp\..., not
+  #    the directory bash writes to. cygpath -m is one path both read alike.
+  _up="$(git -C "$REPO" rev-parse -q --verify "$UPSTREAM" 2>/dev/null)" || return 0
+  _tmp="$(mktemp -d 2>/dev/null)" || return 0
+  command -v cygpath >/dev/null 2>&1 && _tmp="$(cygpath -m "$_tmp")"
+  if git init -q "$_tmp" >/dev/null 2>&1; then
+    : > "$_tmp/.git/info/exclude" 2>/dev/null
+    : > "$_tmp/.no-global-excludes"
+    git -C "$REPO" show "$_up:.gitignore" > "$_tmp/.gitignore" 2>/dev/null || rm -f "$_tmp/.gitignore"
+    for _p in "${_paths[@]}"; do
+      _rest="$_p"; _dir=""
+      while [ "${_rest#*/}" != "$_rest" ]; do
+        _dir="${_dir:+$_dir/}${_rest%%/*}"; _rest="${_rest#*/}"
+        [ -n "${_seen[$_dir]:-}" ] && continue
+        _seen[$_dir]=1
+        mkdir -p "$_tmp/$_dir" 2>/dev/null
+        git -C "$REPO" show "$_up:$_dir/.gitignore" > "$_tmp/$_dir/.gitignore" 2>/dev/null || rm -f "$_tmp/$_dir/.gitignore"
+      done
+    done
+    printf '%s\0' "${_paths[@]}" \
+      | git -C "$_tmp" -c core.excludesFile="$_tmp/.no-global-excludes" check-ignore --no-index -z --stdin 2>/dev/null
+  fi
+  rm -rf "$_tmp"
+  return 0
+}
+
+_ip_exclude_locally() {  # paths as args -> one anchored, glob-escaped line each in this repo's info/exclude
+  local _excl _p
+  _excl="$(git -C "$REPO" rev-parse --git-path info/exclude 2>/dev/null)"
+  case "$_excl" in /*|[A-Za-z]:*|'') ;; *) _excl="$REPO/$_excl";; esac
+  { [ -n "$_excl" ] && mkdir -p "$(dirname "$_excl")" 2>/dev/null; } || return 0
+  for _p in "$@"; do
+    _p="/$(printf '%s' "$_p" | sed 's/[][*?\\]/\\&/g')"
+    grep -qxF -- "$_p" "$_excl" 2>/dev/null || printf '%s\n' "$_p" >> "$_excl"
+  done
+  return 0
+}
+
+_ip_untrack_upstream_ignored_deletions() {
+  local _base _p _out _rc _staged_now _want
+  local -A _gone_here=()
+  local -a _deleted=() _cands=() _untracked=() _ign=()
+  [ -f "$GITDIR/MERGE_HEAD" ] && return 0
+  # UNTRACKED files UPSTREAM ignores are excluded first (no index write). The churn
+  # self-heal commits untracked self-namespace files by the LOCAL rules, which lack
+  # UPSTREAM's until this merge lands them, so a box lagging behind an untrack
+  # re-tracks the very file upstream untracked (measured on cc-10, 2026-09-28:
+  # 782624ecb1 and 790c1000df each re-added an ignored spool).
+  while IFS= read -r -d '' _p; do _untracked+=("$_p"); done \
+    < <(git -C "$REPO" ls-files --others --exclude-standard -z 2>/dev/null)
+  if [ "${#_untracked[@]}" -gt 0 ]; then
+    while IFS= read -r -d '' _p; do _ign+=("$_p"); done \
+      < <(printf '%s\0' "${_untracked[@]}" | _ip_upstream_ignored_subset)
+    if [ "${#_ign[@]}" -gt 0 ]; then
+      _ip_exclude_locally "${_ign[@]}"
+      for _p in "${_ign[@]}"; do
+        log "untrack-ahead: excluded (untracked, kept on disk): $_p — $UPSTREAM ignores it, so the self-heal must not commit it (g-306-536)"
+      done
+    fi
+  fi
+  _base="$(git -C "$REPO" merge-base HEAD "$UPSTREAM" 2>/dev/null)" || return 0
+  [ -n "$_base" ] || return 0
+  # Deleted upstream and still tracked here: two diffs and a set difference, so no
+  # pathspec list can hit an argv limit. -M on the UPSTREAM side: a path upstream
+  # RENAMED is the merge's to carry, and untracking its old name first would turn
+  # that into a rename/delete conflict that no later run could clear.
+  while IFS= read -r -d '' _p; do _gone_here[$_p]=1; done \
+    < <(git -C "$REPO" diff -z --no-renames --name-only --diff-filter=D "$_base" HEAD 2>/dev/null)
+  while IFS= read -r -d '' _p; do
+    [ -n "${_gone_here[$_p]:-}" ] || _deleted+=("$_p")
+  done < <(git -C "$REPO" diff -z -M --name-only --diff-filter=D "$_base" "$UPSTREAM" 2>/dev/null)
+  [ "${#_deleted[@]}" -eq 0 ] && return 0
+  while IFS= read -r -d '' _p; do _cands+=("$_p"); done \
+    < <(printf '%s\0' "${_deleted[@]}" | _ip_upstream_ignored_subset)
+  [ "${#_cands[@]}" -eq 0 ] && return 0
+  if [ -n "$(git -C "$REPO" diff --cached --name-only 2>/dev/null)" ]; then
+    log "untrack-ahead: ${#_cands[@]} path(s) $UPSTREAM deleted AND ignores are still tracked here, but the index already holds staged entries — not committing over them (guard-741); the merge proceeds as before"
+    return 0
+  fi
+  _ip_exclude_locally "${_cands[@]}"
+  if ! git -C "$REPO" --literal-pathspecs rm -q --cached -- "${_cands[@]}" >/dev/null 2>&1; then
+    log "untrack-ahead: git rm --cached failed — the merge proceeds as before"
+    return 0
+  fi
+  _staged_now="$(git -C "$REPO" diff --cached --name-only -z 2>/dev/null | tr '\0' '\n' | LC_ALL=C sort)"
+  _want="$(printf '%s\n' "${_cands[@]}" | LC_ALL=C sort)"
+  if [ "$_staged_now" != "$_want" ]; then
+    git -C "$REPO" --literal-pathspecs reset -q -- "${_cands[@]}" >/dev/null 2>&1 || true
+    log "untrack-ahead: the index held more than the untrack — restored it; the merge proceeds as before (guard-741)"
+    return 0
+  fi
+  _out="$(git -C "$REPO" commit -q -m "chore(${MIND_AGENT:-iteration-push}): untrack ${#_cands[@]} path(s) $UPSTREAM deleted and ignores, kept on disk (iteration-push untrack-ahead, g-306-536)" 2>&1)"
+  _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    git -C "$REPO" --literal-pathspecs reset -q -- "${_cands[@]}" >/dev/null 2>&1 || true
+    log "untrack-ahead: commit refused (rc=${_rc}) — restored the index; the merge proceeds as before"
+    [ -n "$_out" ] && printf '%s\n' "$_out" | while IFS= read -r _p; do log "untrack-ahead:   | ${_p}"; done
+    return 0
+  fi
+  for _p in "${_cands[@]}"; do
+    log "untrack-ahead: untracked (kept on disk, now in info/exclude): $_p — $UPSTREAM deleted it and ignores it (g-306-536)"
+  done
+  return 0
+}
+
 # --- Integrate (merge origin-ahead commits; never rebase, never force) -------
 # Without this, the first push from a SECOND machine leaves this machine
 # non-fast-forward forever (the 2026-07-03 divergence wedge).
@@ -1602,6 +1747,9 @@ if [ "$BEHIND" -gt 0 ]; then
     # ITERATION_PUSH_REPO and can differ from PROJECT_ROOT, and a check that
     # asserted the wrong tree would report OK about a repo it never looked at.
     bash "$SCRIPT_DIR/check-merge-driver-registered.sh" --repo "$REPO" >&2 2>&1 || true
+    # : before the FIRST merge, so both it and the self-heal retry see
+    # every path UPSTREAM deleted-and-ignores as deleted on both sides.
+    _ip_untrack_upstream_ignored_deletions
     MERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
     MERGE_RC=$?
     if [ "$MERGE_RC" -ne 0 ]; then
@@ -1822,6 +1970,8 @@ if [ "$NO_FETCH" -eq 0 ] && printf '%s' "$PUSH_OUT" | grep -qiE 'non-fast-forwar
   RBEHIND="$(git -C "$REPO" rev-list --count "$BRANCH..$UPSTREAM" 2>/dev/null || echo 0)"
   case "$RBEHIND" in ''|*[!0-9]*) RBEHIND=0;; esac
   if [ "$RBEHIND" -gt 0 ]; then
+    # : under a throttled fetch this is the FIRST merge to see UPSTREAM.
+    _ip_untrack_upstream_ignored_deletions
     RMERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
     RMERGE_RC=$?
     if [ "$RMERGE_RC" -ne 0 ]; then

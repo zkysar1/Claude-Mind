@@ -56,7 +56,12 @@ MH="$(bash "$SCRIPT_DIR/mirror-health.sh" 2>&1)"; MHRC=$?
 echo "$MH" | head -20
 case "$MHRC" in
     0) ;;
-    1) echo "mirror-integrity: WEDGED — tree edits from this box are NOT reaching the fleet; repair before claiming anything is ENCODED (rb-9443, guard-4778)"; RC=1 ;;
+    1) case "$MH" in
+           "mirror-health: pull-failing"*)
+               echo "mirror-integrity: PULL-FAILING — fleet edits to the files listed above are NOT reaching this box; its copies are stale or missing (g-115-11323)" ;;
+           *)
+               echo "mirror-integrity: WEDGED — tree edits from this box are NOT reaching the fleet; repair before claiming anything is ENCODED (rb-9443, guard-4778)" ;;
+       esac; RC=1 ;;
     *) echo "mirror-integrity: streak verdict INDETERMINATE (rc=$MHRC) — not evidence of health"; [ "$RC" = 0 ] && RC=2 ;;
 esac
 

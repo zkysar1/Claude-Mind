@@ -158,6 +158,24 @@ def test_basis_is_unmeasured_when_sabotage_never_applied(workdir):
     assert v["sabotage_sites_basis"] == "unmeasured"
 
 
+def test_a_sabotage_that_only_rewrites_line_endings_is_a_no_op(workdir):
+    """Bytes changed but the text did not: a no-op, not a VACUOUS test.
+
+    sed on Windows reads CRLF as a line break and writes LF, so a sed that
+    matches nothing still rewrites every line ending. The byte compare missed
+    that, the untouched test passed, and the verdict blamed the test (measured
+    2026-09-28). This sed strips the CRs itself, so the case runs everywhere.
+    """
+    target = workdir / "target.txt"
+    target.write_bytes(TARGET_BODY.replace("\n", "\r\n").encode("utf-8"))
+    before = target.read_bytes()
+    v = run(workdir, "anchored.sh", ["--sabotage-sed", "s/\\r$//"])
+    assert v["verdict"] == "FAIL"
+    assert "no-op mutation" in v["reason"]
+    assert "VACUOUS" not in v["reason"]
+    assert target.read_bytes() == before
+
+
 def test_restore_leaves_target_byte_identical(workdir):
     """Breadth reporting must not weaken the guaranteed restore."""
     before = (workdir / "target.txt").read_bytes()

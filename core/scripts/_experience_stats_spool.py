@@ -200,7 +200,7 @@ def record(exp_path, rec_id, counter, delta=1):
     Returns True when a line was written. False tells the caller to fall back
     to its legacy in-record write, so a failure here never loses a counter.
     O(1): one lockless O_APPEND of a short line, the idiom
-    `_utilization_store.record_increment` uses and documents.
+    `_utilization_store.record_increment` (g-358-05) uses and documents.
     """
     try:
         if not exp_path or not rec_id or not counter:

@@ -19,6 +19,7 @@ mode a decline-only test cannot distinguish from a working fix.
 
 import json
 import math
+import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -680,7 +681,7 @@ def test_key_widening_is_proven_not_assumed():
 
 ENVELOPE = ("Two NEW defects found while resolving outcome 3. Worker Body "
             "cannot file (Case B, observable by any Body) -- relaying for "
-            "the reducer to file.")
+            "the reducer to file.")   # guard-7119 record shape ()
 
 
 def test_envelope_observation_no_longer_shadows_proposed_work():
@@ -1060,7 +1061,7 @@ def test_backlog_relay_without_item_ts_falls_back_to_now():
     """BACKWARD COMPAT. A record with no _item_ts is anchored on `now` exactly as
     before the fix, so every batch test above (whose records carry no _item_ts)
     is preserved: the same old owner that DECLINEd WITH the anchor FILEs
-    without it."""
+    without it (g-306-512)."""
     no_ts = {"observation": RELAY}                       # no _item_ts key
     row = sq.batch_decide([no_ts], [BACKLOG_OWNER], BACKLOG_NOW)["rows"][0]
     assert row["verdict"] == "FILE", row
@@ -1356,7 +1357,7 @@ def test_batch_row_names_the_same_topic_reading_and_the_matched_span(
     """Batch shape: the S1 row is MUST-READ with its own instruction (not the
     skipped-owner text) and counts toward rc 4; the T1 row DECLINEs, and every
     cited owner's row says what the match rested on -- T1's is description
-    only, which is why the band, not the title, decides."""
+    only, which is why the band, not the title, decides (g-115-11127)."""
     _live_idf(monkeypatch, _TOPIC)
     s1, t1 = _TOPIC_PAIRS["S1"], _TOPIC_PAIRS["T1"]
     corpus = (_owner_corpus(s1["owner_id"], fixture=_TOPIC)
@@ -1377,3 +1378,311 @@ def test_batch_row_names_the_same_topic_reading_and_the_matched_span(
     assert "TERMINAL-BUT-NOT-DONE" not in text, text
     assert text.count("matched on:") == 2, text
     assert "owner TITLE shares NOTHING (description only)" in text, text
+
+
+# --- provenance before similarity () -----------------------------
+#
+# A re-delivered relay read FILE against the replay bundle that already
+# carried it: 6 of the 8 FILEs at the 2026-09-27 17:40 replay were relays
+# pending  carries. The token path's coverage floor reads only an
+# owner's first OWNER_HEAD_CHARS, and the carried items sit far past them (the
+# measurement is in the probe's provenance-keys block). Two EXACT keys now run
+# before any token is scored. guard-4166 governs here as everywhere in this
+# file: each DECLINE sits beside a FILE control on the SAME corpus, and each
+# key has a mutation proof that it, and not the token path, produced the
+# DECLINE.
+
+_PROV_NOW = datetime(2026, 9, 27, 17, 40, 0)     # the replay that measured it
+
+# Laid out the way  is: NOT-carried lists first, then the carried
+# items. Its words avoid UNOWNED's, so no token path can decline on them.
+BUNDLE = {
+    "id": "g-115-99001",
+    "status": "pending",
+    "title": "Investigate: re-probe 1 dated work relay drained from spark_capture",
+    "description": "\n".join([
+        "Relayed by worker Bodies via spark_capture; filed at replay.",
+        "",
+        "ALREADY DISPOSED IN THIS PASS, NOT carried below:",
+        "--- [7] RELAY from g-326-516 (sq=sq-013, cat=hygiene, "
+        "2026-09-02T08:50, box=None) --- is ADDRESSED.",
+        "",
+        "DECLINED BY THE PROBE (owner exists), NOT carried:",
+        "--- [8] RELAY from g-115-3398 (sq=sq-013, cat=hygiene, "
+        "2026-08-26T05:10, box=None) --- -> g-115-3399",
+        "",
+        "WORK RELAYS (1):",
+        "--- [4] RELAY from g-326-516 (sq=sq-013, cat=cost, "
+        "2026-09-02T08:54, box=None) ---",
+        "(the carried body, elided in this fixture)",
+        "",
+        "LESSON CANDIDATES (1):",
+        "--- [2] LESSON from g-115-7847 (sq=None, cat=architecture, "
+        "2026-08-26T02:43, box=None) ---",
+        "(the carried lesson, elided in this fixture)",
+    ]),
+}
+CARRIED = {"goal_id": "g-326-516", "_item_ts": "2026-09-02T08:54:12",
+           "observation": UNOWNED}
+
+
+def test_a_capture_the_bundle_carries_declines_citing_it_while_control_files():
+    """Outcome 1's shape. The control is the SAME source goal one minute
+    later, a minute no header carries: the key is the capture, not the source
+    goal, so it must FILE."""
+    control = dict(CARRIED, _item_ts="2026-09-02T08:55:12")
+    res = sq.batch_decide([CARRIED, control], [BUNDLE], _PROV_NOW)
+    hit, ctl = res["rows"]
+    assert (hit["verdict"], hit["cited_goal_id"]) == ("DECLINE",
+                                                      BUNDLE["id"]), hit
+    assert hit["matches"][0]["matched_by"] == "relay-header", hit
+    assert "item [4]" in hit["matches"][0]["evidence"], hit
+    assert ctl["verdict"] == "FILE" and ctl["cited_goal_id"] is None, ctl
+    text = sq.render_batch(res)
+    assert "matched on: PROVENANCE (relay-header)" in text, text
+
+
+def test_the_carried_decline_is_the_header_key_not_a_green_default(
+        monkeypatch):
+    """MUTATION PROOF (guard-2903): with no carried captures parsed, the same
+    record FILEs -- so the header key, not the token path, declined it."""
+    monkeypatch.setattr(sq, "carried_captures", lambda description: [])
+    row = sq.batch_decide([CARRIED], [BUNDLE], _PROV_NOW)["rows"][0]
+    assert row["verdict"] == "FILE", row
+
+
+def test_a_capture_listed_only_as_not_carried_does_not_resolve_to_the_bundle():
+    """Outcome 2, the HAZARD in the remedy: bundles also cite relays they did
+    NOT carry, and those must resolve to their stated disposition, never to
+    the bundle. Both lists carry a full header here -- the worst case, since no
+    live bundle yet does -- and [4], carried in the SAME bundle, still
+    declines."""
+    disposed = {"goal_id": "g-326-516", "_item_ts": "2026-09-02T08:50:40",
+                "observation": UNOWNED}
+    declined = {"goal_id": "g-115-3398", "_item_ts": "2026-08-26T05:10:03",
+                "observation": UNOWNED}
+    rows = sq.batch_decide([disposed, declined, CARRIED], [BUNDLE],
+                           _PROV_NOW)["rows"]
+    for row in rows[:2]:
+        assert row["verdict"] == "FILE" and row["cited_goal_id"] is None, row
+    assert (rows[2]["verdict"], rows[2]["cited_goal_id"]) == ("DECLINE",
+                                                              BUNDLE["id"])
+
+
+def test_the_not_carried_exclusion_is_what_holds_them(monkeypatch):
+    """MUTATION PROOF: disarm the NOT-carried marker and both cited-only
+    captures resolve to the bundle, which is the defect outcome 2 forbids."""
+    monkeypatch.setattr(sq, "_NOT_CARRIED_RE", re.compile(r"(?!)"))
+    rows = sq.batch_decide([
+        {"goal_id": "g-326-516", "_item_ts": "2026-09-02T08:50:40",
+         "observation": UNOWNED},
+        {"goal_id": "g-115-3398", "_item_ts": "2026-08-26T05:10:03",
+         "observation": UNOWNED}], [BUNDLE], _PROV_NOW)["rows"]
+    assert [r["cited_goal_id"] for r in rows] == [BUNDLE["id"]] * 2, rows
+
+
+def test_a_lesson_carry_does_not_own_a_work_relay():
+    """The bundle owns a LESSON capture for encoding, not for work, so the
+    same capture run as a work relay must still FILE beside a carried one."""
+    lesson = {"goal_id": "g-115-7847", "_item_ts": "2026-08-26T02:43:30",
+              "observation": UNOWNED}
+    rows = sq.batch_decide([lesson, CARRIED], [BUNDLE], _PROV_NOW)["rows"]
+    assert rows[0]["verdict"] == "FILE", rows[0]
+    assert rows[1]["verdict"] == "DECLINE", rows[1]
+
+
+# One line per header form measured on the eight live bundles (2026-09-28).
+MEASURED_HEADERS = [
+    ("--- [4] RELAY from g-326-516 (sq=sq-013, cat=cost-observability, "
+     "2026-09-02T08:54, box=None) ---", "g-326-516", "2026-09-02T08:54"),
+    ("--- [e8] ADDENDUM to [d6] above, RELAY from g-364-06 (2026-08-26T10:23, "
+     "alpha worker Body, cc-08). Drained at the reducer spark replay",
+     "g-364-06", "2026-08-26T10:23"),
+    ("[W1] WORK RELAY from g-115-760 (2026-09-04T05:53:53):",
+     "g-115-760", "2026-09-04T05:53:53"),
+    ("[W8] from g-115-7319 (2026-08-24T12:47). mirror-health reports "
+     "'healthy' while files persistently fail to push",
+     "g-115-7319", "2026-08-24T12:47"),
+    ("--- [W1a] from g-326-609 (sq=sq-013, cat=ayoai-platform-services, "
+     "2026-09-05T08:00:44) ---", "g-326-609", "2026-09-05T08:00:44"),
+    ("[A] RELAY from g-250-107 (sq=sq-013, cat=npc-cognition, "
+     "2026-08-27T03:56:01, box=cc-07)", "g-250-107", "2026-08-27T03:56:01"),
+    ("W1. STRUCTURED DEFER vs SEPARABLE SUB-WORK (class; its instance "
+     "g-369-72 is no longer in the live corpus) [from g-369-04, captured "
+     "2026-08-30T15:50:03]: A STRUCTURED DEFER", "g-369-04",
+     "2026-08-30T15:50:03"),
+    ("F2. The recurring-starvation Unblock template's remedy raises the bar "
+     "[from g-115-8213, 2026-08-28T21:06:52]. overdue_exemption",
+     "g-115-8213", "2026-08-28T21:06:52"),
+]
+MEASURED_LESSONS = [
+    "--- [2] LESSON from g-115-7847 (sq=None, cat=framework-architecture, "
+    "2026-08-26T02:43, box=None) ---",
+    "[L1] LESSON CANDIDATE from g-326-627 (2026-08-24T14:41:02):",
+    "--- [L3] from g-326-698 (sq=None, cat=deployment-lifecycle, "
+    "2026-08-26T14:09:32) ---",
+    "L2. [from g-115-4287, 2026-08-28T06:09:53; nearest guard-7379, "
+    "rb-10505] A RATIONALE WRITTEN IN A DOCSTRING IS NOT COVERAGE",
+]
+NOT_HEADERS = [
+    # quoted MID-LINE -- 's own description does exactly this
+    "names each by source goal id and capture timestamp in a fixed header, "
+    "for example 'RELAY from g-326-516 (sq=sq-013, cat=cost-observability, "
+    "2026-09-02T08:54, box=None)'.",
+    # a date only, no capture time ('s disposed list)
+    "(b) [12] g-115-3965 'merge wedge on cc-08' (2026-08-26) is STALE.",
+    # the only time on the line belongs to ANOTHER goal id
+    "[W4] from g-115-7807, see g-115-7392 (2026-08-25T21:10:16)",
+]
+# Every NOT-carried heading form measured on the live bundles.
+MEASURED_NOT_CARRIED = [
+    "ALREADY DISPOSED IN THIS PASS, NOT carried below:",
+    "DECLINED BY THE PROBE (owner exists), NOT carried:",
+    "DISPOSED in this pass, NOT carried:",
+    "ALREADY DISPOSED IN THIS PASS (do NOT re-relay):",
+    "(d) Declined by the probe because an owner exists:",
+]
+
+
+def test_carried_captures_reads_every_measured_header_form():
+    for line, gid, ts in MEASURED_HEADERS:
+        assert [c[1:] for c in sq.carried_captures(line)] == [(gid, ts)], line
+
+
+def test_lessons_and_prose_are_not_carried_work():
+    for line in MEASURED_LESSONS + NOT_HEADERS:
+        assert sq.carried_captures(line) == [], line
+
+
+def test_a_not_carried_heading_covers_its_list_up_to_the_next_blank_line():
+    """Every measured heading hides the header under it; the SAME header after
+    a blank line counts again -- on every live bundle a carried list resumes
+    only after one (g-115-10987's ADDENDUM 2, g-115-11107's [R1])."""
+    header, gid, ts = MEASURED_HEADERS[0]
+    for marker in MEASURED_NOT_CARRIED:
+        assert sq.carried_captures(marker + "\n" + header) == [], marker
+        assert ([c[1:] for c in sq.carried_captures(
+            marker + "\n\n" + header)] == [(gid, ts)]), marker
+
+
+def test_capture_time_matches_at_the_finer_precision_both_sides_print():
+    assert sq._same_capture("2026-09-02T08:54", "2026-09-02T08:54:12")
+    assert sq._same_capture("2026-09-05T08:00:44", "2026-09-05T08:00:44")
+    assert not sq._same_capture("2026-09-05T08:00:44", "2026-09-05T08:00:45")
+    assert not sq._same_capture("2026-09-02T08:54", "2026-09-02T08:55:12")
+    assert not sq._same_capture("2026-09-02", "2026-09-02T08:54:12")
+
+
+# THE THIRD SPECIMEN (occ238): owners filed one at a time carry no header, and
+# ..8091 each hold a relay's suggested title verbatim (rb-9493).
+TITLE_OWNER = {"id": "g-115-8090", "status": "pending",
+               "title": "Detect a lost claim race at CLAIM time, not at "
+                        "commit time",
+               "description": "Two Bodies of one agent overlapped by seconds."}
+TITLED_RELAY = (sq.POSITIVE_CONTROL_SUBJECT
+                + ". Suggested title: " + TITLE_OWNER["title"])
+TRUNCATED_RELAY = (sq.POSITIVE_CONTROL_SUBJECT
+                   + ". Suggested title: Detect a lost claim race at CLAIM time")
+
+
+def _title_corpus():
+    """The owner plus fillers carrying its title words, so IDF is LIVE and
+    those words are common: the token path cannot decline on them, and any
+    DECLINE below is the title key's."""
+    return [TITLE_OWNER] + [
+        {"id": "g-999-%03d" % i, "status": "pending", "title": "filler",
+         "description": "detect claim commit lost race time routine"}
+        for i in range(sq.MIN_IDF_CORPUS)]
+
+
+def test_an_owner_whose_title_is_the_suggested_title_declines_control_files():
+    res = sq.batch_decide([{"goal_id": "g-115-7953",
+                            "observation": TITLED_RELAY},
+                           {"goal_id": "g-115-7953",
+                            "observation": TRUNCATED_RELAY}],
+                          _title_corpus(), _PROV_NOW)
+    hit, ctl = res["rows"]
+    assert (hit["verdict"], hit["cited_goal_id"]) == ("DECLINE",
+                                                      "g-115-8090"), hit
+    assert hit["matches"][0]["matched_by"] == "suggested-title", hit
+    assert ctl["verdict"] == "FILE", ctl
+
+
+def test_the_title_decline_is_the_title_key_not_a_green_default(monkeypatch):
+    monkeypatch.setattr(sq, "suggested_titles", lambda text: [])
+    r = sq.decide(TITLED_RELAY, _title_corpus(), _PROV_NOW)
+    assert r["decision"] == "FILE", r
+
+
+def test_single_subject_mode_applies_the_title_key(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(json.dumps(_title_corpus())))
+    assert sq.main(["--subject", TITLED_RELAY, "--positive-control",
+                    "--now", _PROV_NOW.isoformat()]) == 3
+    assert "alien-token subject -> FILE" in capsys.readouterr().err
+
+
+def test_suggested_titles_reads_the_measured_shapes():
+    """Quoted spans end at their closing quote; an unquoted title also yields
+    its first sentence, since relays run on past it; short titles are
+    dropped, because they collide with a goal title by chance."""
+    assert sq.suggested_titles(
+        "x. SUGGESTED TITLE: 'Fix: a Body never publishes its carrier'. "
+        "Board post msg-1 carries it.") == [
+        "fix: a body never publishes its carrier"]
+    assert sq.suggested_titles(
+        'Suggested title: "Idea: say the vault key is an API". More.') == [
+        "idea: say the vault key is an api"]
+    assert sq.suggested_titles(
+        "Suggested title: Provision the key on every box. Then print it") == [
+        "provision the key on every box. then print it",
+        "provision the key on every box"]
+    assert sq.suggested_titles(
+        "SUGGESTED TITLE: Fix: Q4 misreports absolute-path citations.") == [
+        "fix: q4 misreports absolute-path citations"]
+    assert sq.suggested_titles("Suggested title: Fix it") == []
+    assert sq.suggested_titles(UNOWNED) == []
+
+
+def test_positive_control_still_files_against_bundle_and_title_owner():
+    """Outcome 3: the alien-token control still FILEs, on a corpus where both
+    exact keys have an owner to find."""
+    r = sq.decide(sq.POSITIVE_CONTROL_SUBJECT, [BUNDLE] + _title_corpus(),
+                  _PROV_NOW)
+    assert r["decision"] == "FILE", r
+
+
+# --- the measured incident, replayed at live IDF -----------------------------
+#
+# sq013_bundle_carry.json holds  as it read on 2026-09-28 (one
+# account id redacted), the six captures it carries as [4] [5] [6] [9] [10]
+# [16] rebuilt from its own verbatim carry, a one-minute-off control, and the
+# live document frequencies of every token those records' headlines carry.
+
+_CARRY = json.loads((SCRIPT_DIR / "fixtures" / "sq013_bundle_carry.json")
+                    .read_text(encoding="utf-8"))
+
+
+def _carry_rows(monkeypatch):
+    _live_idf(monkeypatch, _CARRY)
+    corpus = _owner_corpus("g-115-11038", fixture=_CARRY)
+    return sq.batch_decide(_CARRY["records"] + [_CARRY["control"]], corpus,
+                           _PROV_NOW)["rows"]
+
+
+def test_real_bundle_replay_declines_its_six_relays_while_control_files(
+        monkeypatch):
+    rows = _carry_rows(monkeypatch)
+    assert len(rows) == 7, rows
+    for row in rows[:6]:
+        assert (row["verdict"], row["cited_goal_id"]) == ("DECLINE",
+                                                          "g-115-11038"), row
+        assert row["matches"][0]["matched_by"] == "relay-header", row
+    assert rows[6]["verdict"] == "FILE", rows[6]
+
+
+def test_real_bundle_replay_is_the_measured_incident_not_a_green_default(
+        monkeypatch):
+    """Without the header key the same seven records FILE at live IDF, which
+    is the 17:40 incident reproduced in-fixture."""
+    monkeypatch.setattr(sq, "carried_captures", lambda description: [])
+    assert [r["verdict"] for r in _carry_rows(monkeypatch)] == ["FILE"] * 7

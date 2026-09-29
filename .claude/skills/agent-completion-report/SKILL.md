@@ -330,7 +330,10 @@ All data comes from framework scripts — no direct JSONL reads.
     → If file missing: reflection_roi = "not initialized"
 
     # 11d. Routine-to-productive ratio (from loop_state if available)
-    → If loop_state exists: routine_ratio = loop_state.signals.routine_count_total / loop_state.goals_completed
+    → If loop_state exists: routine_ratio = loop_state.signals.routine_count_total / loop_state.goals_completed_this_session
+      # Both terms count CLOSES. loop_state.goals_completed counts DISTINCT goals (the g-115-664
+      # gate bumps it once per goal_id per session), so dividing by it inflates the ratio whenever
+      # recurring goals re-fire: zeta 2026-09-28 read 21/25 = 84% against 21/60 = 35% per close.
     → Else: routine_ratio = "N/A"
 
     # 11e. Knowledge debt items (aggregate + per-entry detail)

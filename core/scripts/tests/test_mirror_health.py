@@ -374,5 +374,86 @@ def test_revalidation_does_not_respam_while_goal_still_open(wd, tmp_path):
     assert probe.fired is True
 
 
+# ── pull errors () ─────────────────────────────────────────────
+# The pull counted its errors from its first sweep and nothing read the count:
+# 14 deep tree nodes failed on DESKTOP-O91DLK2 every pull for five days while
+# this probe said healthy. PRE-FIX every assertion below on `pull-failing` or
+# `pull_errors` failed: classify() had no pull input at all.
+
+_PULL = {"errors": 2, "error_paths": [
+    {"path": "C:/w/knowledge/tree/a/deep.md", "phase": "pull-refresh",
+     "exc": "FileNotFoundError", "msg": "[Errno 2] No such file or directory"},
+    {"path": "C:/w/knowledge/tree/b/deeper.md", "phase": "pull-refresh",
+     "exc": "FileNotFoundError", "msg": "[Errno 2] No such file or directory"}]}
+
+
+def test_classify_fresh_pull_errors_are_pull_failing():
+    v = mirror_health.classify({}, age_min=1.0, pull=_PULL, pull_age_min=5.0)
+    assert v["verdict"] == "pull-failing"
+    assert v["pull_error_count"] == 2
+    assert [e["path"] for e in v["pull_errors"]] == [
+        "C:/w/knowledge/tree/a/deep.md", "C:/w/knowledge/tree/b/deeper.md"]
+    assert mirror_health._EXIT["pull-failing"] == 1
+
+
+def test_classify_clean_pull_is_healthy():
+    v = mirror_health.classify({}, age_min=1.0,
+                               pull={"errors": 0, "error_paths": []},
+                               pull_age_min=5.0)
+    assert v["verdict"] == "healthy" and v["pull_error_count"] == 0
+
+
+def test_classify_ignores_a_pull_file_nobody_is_rewriting():
+    """Old failures are not current ones: the pull that wrote them stopped."""
+    v = mirror_health.classify(
+        {}, age_min=1.0, pull=_PULL,
+        pull_age_min=mirror_health.DEFAULT_PULL_MAX_AGE_MIN + 1)
+    assert v["verdict"] == "healthy" and v["pull_errors"] == []
+
+
+def test_classify_wedge_outranks_pull_errors_but_keeps_them():
+    v = mirror_health.classify({"a": 5}, age_min=1.0, pull=_PULL,
+                               pull_age_min=5.0)
+    assert v["verdict"] == "wedged" and v["pull_error_count"] == 2
+
+
+def test_classify_unknown_streaks_stay_unknown_with_pull_errors():
+    """The pull runs on the sweep thread: stale streaks mean it is not running
+    either, so its file cannot be current enough to overrule `unknown`."""
+    v = mirror_health.classify({"a": 9}, age_min=120.0, pull=_PULL,
+                               pull_age_min=5.0)
+    assert v["verdict"] == "unknown"
+
+
+def test_probe_and_cli_report_the_failing_paths(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_BACKEND", "own-cloud")
+    (tmp_path / "owncloud-conflict-streaks.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "owncloud-pull-errors.json").write_text(
+        json.dumps(_PULL), encoding="utf-8")
+    assert mirror_health.probe()["verdict"] == "pull-failing"
+    rc = mirror_health.main([])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert out.startswith("mirror-health: pull-failing")
+    assert "knowledge/tree/a/deep.md" in out and "knowledge/tree/b/deeper.md" in out
+
+
+P = {"verdict": "pull-failing", "wedged_count": 0, "files": {},
+     "pull_error_count": 1, "pull_errors": [{"path": "world/deep.md"}]}
+
+
+def test_pull_failing_clears_a_fired_wedge(wd, tmp_path):
+    """pull-failing means nothing is at the wedge threshold. Treating it like
+    `unknown` (hold state) would keep a cleared wedge's goal open for as long
+    as any pull error persists."""
+    filed = []
+    probe, fake = _mk_probe(wd, tmp_path, [W, W, P], filed)
+    ticks = _run_ticks(probe, fake, 3)
+    assert ticks[1][0].event == "mirror_wedged"
+    assert ticks[2] and ticks[2][0].event == "mirror_wedge_cleared"
+    assert probe.consecutive_wedged == 0 and probe.fired is False
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -128,15 +128,30 @@ _collect_pair "$RT_DIR"
 #    --clean would have killed it (measured 2026-09-28; guard-725 records the same
 #    misread on 2026-07-27). Widening only ever ADDS pids to the keep-set, and a
 #    stale pidfile can spare a process but never condemn one.
+#    The GRANDPARENT is searched the same way, so the view is the same whichever
+#    repo runs the sweep: run from the nested repo, the parent alone missed a
+#    shallower sibling's live daemon (; worktree-teardown.sh runs
+#    --clean automatically). Setting ORPHAN_SWEEP_DEPLOY_PARENT without
+#    ORPHAN_SWEEP_DEPLOY_GRANDPARENT turns the grandparent OFF, so a tmp_path
+#    override never reaches pytest's shared basetemp and other tests' pidfiles.
 DEPLOY_PARENT="${ORPHAN_SWEEP_DEPLOY_PARENT:-$(dirname "$PROJECT_ROOT")}"
-for _pidf in "$DEPLOY_PARENT"/*/mind_api/state/daemon.pid \
-             "$DEPLOY_PARENT"/*/.mind-data/mind_api/state/daemon.pid \
-             "$DEPLOY_PARENT"/*/*/mind_api/state/daemon.pid \
-             "$DEPLOY_PARENT"/*/*/.mind-data/mind_api/state/daemon.pid; do
-    [ -f "$_pidf" ] || continue              # unmatched glob expands to literal — skip
-    _sdir="$(dirname "$_pidf")"
-    [ "$_sdir" = "$RT_DIR" ] && continue      # this repo, already collected
-    _collect_pair "$_sdir"
+if [ -n "${ORPHAN_SWEEP_DEPLOY_GRANDPARENT+set}" ]; then
+    DEPLOY_GRANDPARENT="$ORPHAN_SWEEP_DEPLOY_GRANDPARENT"
+elif [ -n "${ORPHAN_SWEEP_DEPLOY_PARENT:-}" ]; then
+    DEPLOY_GRANDPARENT=""
+else
+    DEPLOY_GRANDPARENT="$(dirname "$DEPLOY_PARENT")"
+fi
+for _root in "$DEPLOY_PARENT" ${DEPLOY_GRANDPARENT:+"$DEPLOY_GRANDPARENT"}; do
+    for _pidf in "$_root"/*/mind_api/state/daemon.pid \
+                 "$_root"/*/.mind-data/mind_api/state/daemon.pid \
+                 "$_root"/*/*/mind_api/state/daemon.pid \
+                 "$_root"/*/*/.mind-data/mind_api/state/daemon.pid; do
+        [ -f "$_pidf" ] || continue          # unmatched glob expands to literal — skip
+        _sdir="$(dirname "$_pidf")"
+        [ "$_sdir" = "$RT_DIR" ] && continue  # this repo, already collected
+        _collect_pair "$_sdir"                # a repo seen from both roots is de-duplicated below
+    done
 done
 
 # 3. Explicit --keep-repo paths (both layouts).
@@ -159,6 +174,7 @@ if [ "$PRINT_KEEPSET" = "1" ]; then
     echo "KEEPSET_PIDS=$(IFS=,; echo "${KEEP_PIDS[*]:-}")"
     echo "KEEPSET_CHILDREN=$(IFS=,; echo "${KEEP_CHILDREN[*]:-}")"
     echo "DEPLOY_PARENT=$DEPLOY_PARENT"
+    echo "DEPLOY_GRANDPARENT=$DEPLOY_GRANDPARENT"
     exit 0
 fi
 

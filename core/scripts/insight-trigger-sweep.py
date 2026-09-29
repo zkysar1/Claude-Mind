@@ -189,9 +189,19 @@ SEVERITY_PRIORITY = {
 # posts carry no severity tag, so they parsed as informs -> LOW and were never
 # selected:  (pq-close) and  (experience-add) sat pending
 # 12h+ with the addressee alive. _build_goal_payload floors these at MEDIUM; a
-# severity tag can raise them, never lower them. The values are the verbs the
-# relayers actually used, not a guessed vocabulary (guard-6006).
-RELAY_ACTION_TYPES = frozenset({"pq-close", "experience-add"})
+# severity tag can raise them, never lower them.
+# land-write is the verb NO_CLAIM_MESSAGE tells a relayer to use. The rest are
+# the verbs relayers used before it named one, measured 2026-09-28 over every
+# board channel and archive, not guessed (guard-6006): of 14 claim-fenced
+# relays these cover 12, and every addressed post carrying one of them was a
+# relay. Left out on purpose: apply (1 relay in 15 addressed posts) and execute
+# (1 in 2), generic verbs that would floor ordinary findings too (guard-1923).
+# Matched lowercased with "_" read as "-": 30 of 911 action_type tags use "_".
+RELAY_ACTION_TYPES = frozenset({
+    "land-write",
+    "pq-close", "close-pending-questions",
+    "experience-add", "register", "register-experience",
+})
 
 REQ_ACTION_RE = re.compile(r"^requires_action_by:(.+)$")
 ACTION_TYPE_RE = re.compile(r"^action_type:(.+)$")
@@ -1274,7 +1284,7 @@ def _build_goal_payload(trigger):
     # . A relayed store write is floored at MEDIUM (RELAY_ACTION_TYPES).
     # Applied after inheritance, so each description note below names its own raise.
     floored = False
-    if trigger["action"] in RELAY_ACTION_TYPES:
+    if trigger["action"].lower().replace("_", "-") in RELAY_ACTION_TYPES:
         raised = inherit_priority(priority, "MEDIUM")
         floored = raised != priority
         priority = raised
