@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -21,6 +23,7 @@ SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
 import mirror_health  # noqa: E402
+from _runtime_bash import bash_cmd  # noqa: E402
 
 
 # ── classify() ────────────────────────────────────────────────────────────
@@ -437,6 +440,32 @@ def test_probe_and_cli_report_the_failing_paths(tmp_path, monkeypatch, capsys):
     assert rc == 1
     assert out.startswith("mirror-health: pull-failing")
     assert "knowledge/tree/a/deep.md" in out and "knowledge/tree/b/deeper.md" in out
+
+
+@pytest.mark.parametrize("streaks,pull,want_rc,marker", [
+    ({}, {"errors": 0, "error_paths": []}, 0, "mirror-integrity: OK"),
+    ({"world/x.jsonl": 5}, {"errors": 0, "error_paths": []}, 1,
+     "mirror-integrity: WEDGED"),
+    ({}, _PULL, 3, "mirror-integrity: PULL-FAILING"),
+])
+def test_mirror_integrity_check_gives_pull_failing_its_own_exit_code(
+        tmp_path, streaks, pull, want_rc, marker):
+    """Fresh-eyes finding (). mirror-integrity-check.sh returned 1 for
+    PULL-FAILING as well as WEDGED, and encode-session maps rc=1 to the wedge
+    repair, which does not touch a pull failure. Runs the REAL script and the
+    REAL mirror-health against induced state files (guard-7053), not a stub;
+    the three arms must differ or the test proves nothing (guard-1793)."""
+    (tmp_path / "owncloud-conflict-streaks.json").write_text(
+        json.dumps(streaks), encoding="utf-8")
+    (tmp_path / "owncloud-pull-errors.json").write_text(
+        json.dumps(pull), encoding="utf-8")
+    env = dict(os.environ, RUNTIME_DIR=str(tmp_path), STORAGE_BACKEND="own-cloud")
+    proc = subprocess.run(
+        bash_cmd(SCRIPTS / "mirror-integrity-check.sh", "--no-drift"),
+        capture_output=True, text=True, env=env, cwd=str(SCRIPTS.parents[1]),
+        timeout=120)
+    assert proc.returncode == want_rc, proc.stdout + proc.stderr
+    assert marker in proc.stdout, proc.stdout
 
 
 P = {"verdict": "pull-failing", "wedged_count": 0, "files": {},

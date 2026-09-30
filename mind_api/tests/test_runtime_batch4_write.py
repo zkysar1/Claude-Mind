@@ -8,7 +8,9 @@ recompute or a record-shape transition):
   POST /v1/aspirations/evolution-append        (meta/evolution-log.jsonl append)
   POST /v1/pipeline/recompute-meta             (pipeline-meta.json full recount)
   POST /v1/spark-questions/increment           (counter + yield_rate recompute)
+  POST /v1/spark-questions/increment-batch     (many increments, one rewrite)
   POST /v1/spark-questions/promote             (candidate -> active question)
+      (the three spark routes: mind_api/src/meta/spark_questions_write.py)
   POST /v1/pattern-signatures/record-outcome   (outcome counter + accuracy + date)
 
 Two layers per endpoint:
@@ -185,6 +187,165 @@ def test_byte_compat_spark_increment(tmp_path):
 
     assert ((dae_meta / "spark-questions.jsonl").read_bytes()
             == (cli_meta / "spark-questions.jsonl").read_bytes())
+
+
+# ===========================================================================
+# spark-questions increment-batch ()
+# ===========================================================================
+
+WRAPPER = REPO_ROOT / "core" / "scripts" / "spark-questions-increment.sh"
+
+
+def _batch_body(*pairs):
+    return json.dumps({"increments": [{"rec_id": r, "field": f} for r, f in pairs]})
+
+
+def test_spark_increment_batch_roundtrip(running_daemon):
+    project_root, port = running_daemon
+    meta = project_root / "meta"
+    status, body = _post(port, "/v1/spark-questions/increment-batch",
+                         body=_batch_body(("sq-001", "times_asked"),
+                                          ("sq-001", "sparks_generated"),
+                                          ("sq-001", "times_asked")))
+    assert status == 200, body
+    resp = json.loads(body)
+    assert resp["applied"] == 3 and resp["skipped"] == []
+    [rec] = resp["records"]
+    assert (rec["times_asked"], rec["sparks_generated"]) == (6, 3)
+    assert rec["yield_rate"] == round(3 / 6, 4)
+    on_disk = {r["id"]: r for r in _read_jsonl(meta / "spark-questions.jsonl")}
+    assert (on_disk["sq-001"]["times_asked"],
+            on_disk["sq-001"]["sparks_generated"]) == (6, 3)
+
+
+def test_spark_increment_batch_skips_non_question_applies_rest(running_daemon):
+    project_root, port = running_daemon
+    meta = project_root / "meta"
+    status, body = _post(port, "/v1/spark-questions/increment-batch",
+                         body=_batch_body(("sq-c01", "times_asked"),
+                                          ("sq-001", "times_asked"),
+                                          ("sq-404", "sparks_generated")))
+    assert status == 200, body
+    resp = json.loads(body)
+    assert resp["applied"] == 1
+    assert [s["rec_id"] for s in resp["skipped"]] == ["sq-c01", "sq-404"]
+    on_disk = {r["id"]: r for r in _read_jsonl(meta / "spark-questions.jsonl")}
+    assert on_disk["sq-001"]["times_asked"] == 5
+    assert "times_asked" not in on_disk["sq-c01"]
+
+
+@pytest.mark.parametrize("payload, error", [
+    ("not json", "invalid_body"),
+    (json.dumps({"increments": []}), "invalid_body"),
+    (_batch_body(("sq-001", "times_asked"), ("sq-001", "bogus")), "invalid_field"),
+    (_batch_body(("", "times_asked")), "missing_param"),
+    (_batch_body(("sq-c01", "times_asked")), "modify_failed"),  # nothing applies
+])
+def test_spark_increment_batch_refusal_writes_nothing(running_daemon, payload, error):
+    project_root, port = running_daemon
+    store = project_root / "meta" / "spark-questions.jsonl"
+    before = store.read_bytes()
+    try:
+        _post(port, "/v1/spark-questions/increment-batch", body=payload)
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        assert json.loads(e.read())["error"] == error
+    else:
+        raise AssertionError(f"expected 400 {error}")
+    assert store.read_bytes() == before
+
+
+def test_byte_compat_spark_increment_batch_is_one_write(tmp_path, monkeypatch):
+    """A batch leaves the file byte-identical to the same increments made one
+    call at a time, and writes it ONCE where those calls wrote it once each:
+    one object version per spark phase instead of one per bump."""
+    from mind_api.src.meta import spark_questions_write
+
+    pairs = [("sq-001", "times_asked"), ("sq-001", "sparks_generated"),
+             ("sq-c01", "times_asked"), ("sq-001", "times_asked")]
+    single_meta = tmp_path / "single-meta"
+    batch_meta = tmp_path / "batch-meta"
+    for d in (single_meta, batch_meta):
+        d.mkdir()
+        (d / "spark-questions.jsonl").write_text(_SQ_SEED, encoding="utf-8")
+
+    writes = []
+    real_write = spark_questions_write._atomic_write_jsonl
+
+    def counting_write(path, items):
+        writes.append(path.parent)
+        real_write(path, items)
+
+    monkeypatch.setattr(spark_questions_write, "_atomic_write_jsonl", counting_write)
+
+    for rec_id, field in pairs:
+        spark_questions_write.increment(_FakeCtx(
+            meta=single_meta, world=tmp_path / "single-world",
+            query={"rec_id": rec_id, "field": field}))
+    spark_questions_write.increment_batch(_FakeCtx(
+        meta=batch_meta, world=tmp_path / "batch-world",
+        body=_batch_body(*pairs).encode("utf-8")))
+
+    assert ((batch_meta / "spark-questions.jsonl").read_bytes()
+            == (single_meta / "spark-questions.jsonl").read_bytes())
+    assert writes.count(single_meta) == 3  # the sq-c01 call is refused unwritten
+    assert writes.count(batch_meta) == 1
+
+
+def _run_wrapper(project_root, *args):
+    """Run the wrapper against the FIXTURE daemon only: the runtime dir and
+    port file are pinned to the fixture's and auto-spawn is off, so a
+    mis-resolved port fails instead of reaching this box's live daemon."""
+    from _bash_helpers import resolve_bash
+    from mind_api.src import lifecycle
+
+    rt_dir = lifecycle.runtime_dir(project_root)
+    port_file = rt_dir / "daemon.port"
+    assert port_file.is_file(), f"fixture port file missing: {port_file}"
+    env = dict(os.environ, RT_DIR=str(rt_dir), RT_PORT_FILE=str(port_file),
+               RT_PID_FILE=str(rt_dir / "daemon.pid"), RT_NO_AUTOSPAWN="1",
+               MIND_AGENT="alpha")
+    return subprocess.run([resolve_bash(), str(WRAPPER), *args], env=env,
+                          cwd=str(REPO_ROOT), capture_output=True, text=True,
+                          timeout=60)
+
+
+def test_wrapper_sends_several_pairs_as_one_batch(running_daemon):
+    project_root, _ = running_daemon
+    proc = _run_wrapper(project_root, "sq-001", "times_asked",
+                        "sq-001", "sparks_generated")
+    assert proc.returncode == 0, proc.stderr
+    records = json.loads(proc.stdout)  # the batch route prints a LIST
+    assert [(r["id"], r["times_asked"], r["sparks_generated"]) for r in records] \
+        == [("sq-001", 5, 3)]
+    on_disk = {r["id"]: r for r in _read_jsonl(project_root / "meta" / "spark-questions.jsonl")}
+    assert (on_disk["sq-001"]["times_asked"], on_disk["sq-001"]["sparks_generated"]) == (5, 3)
+
+
+def test_wrapper_names_skipped_entry_and_exits_1(running_daemon):
+    project_root, _ = running_daemon
+    proc = _run_wrapper(project_root, "sq-001", "times_asked", "sq-c01", "times_asked")
+    assert proc.returncode == 1
+    assert "skipped sq-c01 times_asked" in proc.stderr
+    on_disk = {r["id"]: r for r in _read_jsonl(project_root / "meta" / "spark-questions.jsonl")}
+    assert on_disk["sq-001"]["times_asked"] == 5
+
+
+def test_wrapper_single_pair_keeps_single_route(running_daemon):
+    project_root, _ = running_daemon
+    proc = _run_wrapper(project_root, "sq-001", "sparks_generated")
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["sparks_generated"] == 3  # a dict, not a list
+
+
+def test_wrapper_refuses_odd_argument_count(running_daemon):
+    project_root, _ = running_daemon
+    store = project_root / "meta" / "spark-questions.jsonl"
+    before = store.read_bytes()
+    proc = _run_wrapper(project_root, "sq-001", "times_asked", "sq-001")
+    assert proc.returncode == 1
+    assert "pairs" in proc.stderr
+    assert store.read_bytes() == before
 
 
 # ===========================================================================

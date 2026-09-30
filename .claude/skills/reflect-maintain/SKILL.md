@@ -45,6 +45,15 @@ Bash: world-cat.sh knowledge/strategies/extracted-strategies.md
 For each strategy with status: active:
   stale = (today - last_reinforced).days > 30 AND times_applied == 0
   If stale: add to candidates with reason "unused for 30+ days"
+# THE FIELDS ARE MARKDOWN-BOLD LIST ITEMS: `- **status**: active`, not
+# `status: active`. A regex written from the line above (`status:\s*active`)
+# matches 0 of 5 and reports a confident "0 stale". Measured 2026-09-30 (zeta,
+# cc-02, g-001-01 fire #118): 0 by that regex, 3 stale by the real syntax
+# (strategies 2-4). Positive-control the parse before reading a zero (guard-2750).
+# DO NOT RETIRE ON times_applied ALONE: it read 0 on ALL 5 strategies that day,
+# including one reinforced 2 days earlier. The counter is not moving, so it
+# cannot separate dead guidance from unrecorded use (guard-841). Fire #118 KEPT
+# all 3 on that basis.
 ```
 
 ### 1b: Low-Utilization Guardrails

@@ -147,6 +147,19 @@ GOAL_KNOWN_FIELDS = frozenset({
     'last_substantive_at',               # 65
     'longestStreak',                     # 82
     'longestWindowStreak',               # 81
+    # g-369-150 (bravo, 2026-09-29): the two keys the Planned-board WRITER
+    # planned_verbs.plan_verb() sets: _plan_comment writes member_comment, and
+    # _plan_suppress writes member_directive, which the agent reads back as the
+    # member's recorded intent. The writer shipped 2026-09-04 (g-369-30,
+    # 7a5bbccf76) without registering either key, so this gate refused every
+    # comment, pause and not-this write, and the census could only count zero.
+    # Measured 2026-09-29 as g-369-150 outcome 2 NOT MET: the vessel loop
+    # drained the verb and update-goal refused member_comment. Same shape as
+    # member_writable below; the class (a census-derived allowlist cannot see a
+    # writer that ships later) is g-115-7350's. Pinned by test_planned_verbs.py
+    # TestEveryPlannedWriteIsAKnownGoalField.
+    'member_comment',                    # 0 (unwritable until registered)
+    'member_directive',                  # 0 (unwritable until registered)
     # 0 observed — and the zero is the POINT, not a reason to omit it. The
     # reader shipped without the field ever being registered, so every attempt
     # to opt a goal in was refused by this very gate and the census could only

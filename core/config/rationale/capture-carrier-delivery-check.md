@@ -38,11 +38,21 @@ DRIFT on identical content (guard-2245, amended with four stores measured 2026-0
 
 So the check reads the store copy through `read_authoritative_bytes`, which
 decodes the transform and never touches the local mirror. It matches each entry
-by `body-merge._content_hash`, the same identity `capture_fast_lane` and
-`generalize_down` dedup on. The check and the consumer therefore cannot
-disagree about whether an entry is present. This is guard-3221: gate on the
-artifact the consumer receives, not on the store the producer wrote. The match
-key is (slot, hash), because the consumer merges per slot.
+by `capture_identity`: `body-merge._content_hash`, the identity
+`capture_fast_lane` and `generalize_down` dedup on, minus the `_item_ts` stamp.
+The check and the consumer therefore agree on every entry's CONTENT and can
+differ only on that stamp. This is guard-3221: gate on the artifact the consumer
+receives, not on the store the producer wrote. The match key is (slot, identity),
+because the consumer merges per slot.
+
+The stamp is left out on purpose (g-306-554). wm-append stamps `_item_ts` at
+write time, so an entry corrected in place keeps its old stamp while its
+re-delivery gets a new one. With the stamp in the key, a corrected capture stayed
+"undelivered" on every later unit of its Body even after its text reached the
+store. Measured on Body e494793d (cc-10, 2026-09-28): "undelivered: 3 of 32 ... the
+local carrier holds 0 of them" after three verbatim re-appends. A check that
+cannot clear gets ignored, like one that cannot fail. Only the match drops the
+stamp. The carrier still holds, and the consumer still dedups, the verbatim entry.
 
 ## Why the fork baseline is subtracted
 

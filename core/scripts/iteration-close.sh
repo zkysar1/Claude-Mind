@@ -2067,6 +2067,20 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
     fi
     # ── End Gate D OUTCOME telemetry ──────────────────────────────────────────
 
+    # ── post-verify executable slot (g-335-1709) ─────────────────────────────
+    # Pattern B executable slot (domain-hooks.md): once a completed or blocked
+    # close has written status, verify_verdict and outcome_class, the world may
+    # act on the verify RESULT, e.g. record the execution's outcome in a shared
+    # ledger. The post-execution slot cannot: it runs at execute Phase 4.2,
+    # before verify. Both roles reach this line. Existence-gated and fail-open,
+    # like pipeline-reconcile-gate.sh: a world without the slot pays one stat,
+    # and the slot can never fail the close.
+    if [[ ( "$GOAL_STATUS" == "completed" || "$GOAL_STATUS" == "blocked" ) \
+          && -n "${WORLD_DIR:-}" && -f "$WORLD_DIR/scripts/post-verify.sh" ]]; then
+        bash "$WORLD_DIR/scripts/post-verify.sh" --goal "$GOAL_ID" --status "$GOAL_STATUS" \
+            --outcome "$OUTCOME" --source "$SOURCE" || true
+    fi
+
     # ── Phase-6 spark imperative for NON-recurring deep closes (g-115-2416) ──
     # recurring-close.sh emits an outcome-aware imperative + the
     # pending_phase_6_spark WM sentinel for recurring deep closes (g-115-977 /

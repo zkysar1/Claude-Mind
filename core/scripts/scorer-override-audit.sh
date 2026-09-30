@@ -7,7 +7,10 @@
 # The recurring goal (interval 24h, ) invokes THIS wrapper — the script IS
 # the offload (the LLM only reads the report the filed Investigate goal carries).
 #
-# Usage: scorer-override-audit.sh [since_hours]                    (default 24)
+# Usage: scorer-override-audit.sh [since_hours]                    (default 36:
+#        the 24h counting window + 12h delivery-lag headroom,  —
+#        a worker Body's rows ride the world/body-diaries carrier, and a
+#        window with no headroom reads 'clean' over the lag)
 #        scorer-override-audit.sh --derive-from <goal-id> [floor_hours]
 #
 # --derive-from (): a FIXED lookback silently stops covering its own
@@ -31,7 +34,7 @@ while [ $# -gt 0 ]; do
         *)             POSITIONAL="$1";      shift ;;
     esac
 done
-SINCE="${POSITIONAL:-24}"
+SINCE="${POSITIONAL:-36}"
 
 if [ -n "$DERIVE_FROM" ]; then
     # derive-lookback.py is fail-open by contract: on any error it prints

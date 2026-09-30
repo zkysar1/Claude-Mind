@@ -2446,6 +2446,170 @@ def test_ff_only_untracked_file_in_the_way_is_refused_not_overwritten(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# --ff-only hands a dirty or non-fast-forward tree to the loop's --no-push
+# integrate when this box's worker Body holds no claim ()
+# --------------------------------------------------------------------------- #
+# tick_claim_probe.py answers from this box's own team-state row, which a hermetic
+# clone does not have (for a foreign --repo it answers `unknown`, which is why the
+# log-only tests above still hold). These tests put a stub in its place through the
+# tests-only ITERATION_PUSH_CLAIM_PROBE seam; the stub prints the probe's one line.
+# Every log-only assertion is paired with a `none` run on the SAME tree that does
+# integrate (guard-4166), so none of them can pass on a tree that could never merge.
+_NONE = "none alpha no in-flight row for this box's 1 Body session(s)"
+
+
+def _claim_probe(tmp_path: Path, name: str, answer: str) -> dict:
+    """env_extra for _ff: a stub in tick_claim_probe.py's place that prints `answer`."""
+    stub = tmp_path / f"claim-probe-{name}.sh"
+    stub.write_text("#!/usr/bin/env bash\ncat <<'EOF'\n" + answer + "\nEOF\n",
+                    encoding="utf-8", newline="\n")
+    return {"ITERATION_PUSH_CLAIM_PROBE": str(stub)}
+
+
+def _non_ff_tree(tmp_path: Path):
+    """origin one commit ahead of A, and A one local commit ahead: a clean non-FF."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "up.txt", "up\n", "B: up")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "local.txt", "l\n", "A: local")
+    return origin, a
+
+
+def test_ff_only_no_claim_hands_a_non_fast_forward_to_the_loop_integrate(tmp_path):
+    origin, a = _non_ff_tree(tmp_path)
+    origin_before = _origin_tip(origin)
+    r = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "none", _NONE))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("ff-only tick: NOT a fast-forward (ahead 1, behind 1); claim probe: " + _NONE
+            + " — running the loop's --no-push integrate (g-375-96)") in out, out
+    assert "integrated 1 origin commit(s) into main" in out, out
+    assert _git(a, "merge-base", "--is-ancestor", origin_before, "HEAD").returncode == 0, out
+    assert (a / "up.txt").exists() and (a / "local.txt").exists(), out
+    assert not (a / ".git" / "MERGE_HEAD").exists(), out
+    assert _origin_tip(origin) == origin_before, "the tick pushed"
+
+
+@pytest.mark.parametrize("answer", [
+    "held alpha row c2503cad names g-1-1 (pending)",
+    # A real `unknown` can carry a valid agent, so only the verdict check refuses it.
+    "unknown alpha row c2503cad names g-9-9, which does not resolve",
+    "",                      # the probe printed nothing: it crashed or was absent
+    "none",                  # no agent, so the self-heal could not scope 'self'
+    "none - no agent",
+    "none al/pha evidence",  # not an agent name
+], ids=["held", "unknown", "no-answer", "bare-none", "dash-agent", "bad-agent"])
+def test_ff_only_any_answer_but_none_keeps_the_log_only_line(tmp_path, answer):
+    origin, a = _non_ff_tree(tmp_path)
+    before, origin_before = _tip(a), _origin_tip(origin)
+    r = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "answer", answer))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("ff-only tick: NOT a fast-forward (ahead 1, behind 1) — log only, the merge is "
+            "the loop's (claim probe: " + (answer or "no answer") + ")") in out, out
+    assert "running the loop's --no-push integrate" not in out, out
+    assert _tip(a) == before and _origin_tip(origin) == origin_before, out
+    # CONTROL: the same tree integrates once the probe answers `none`.
+    r2 = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "none", _NONE))
+    assert "running the loop's --no-push integrate (g-375-96)" in (r2.stdout + r2.stderr), r2.stderr
+    assert _tip(a) != before, r2.stderr
+
+
+def test_ff_only_no_claim_hands_an_own_store_dirty_tree_to_the_self_heal(tmp_path):
+    """The measured zc-02 shape: every tick refused on the Body's own store file."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(a, ".gitattributes", "agents/*/health/*.jsonl merge=union\n", "attrs")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+    _seed_and_sync(a, b, {"agents/alpha/health/day.jsonl": "base\n"})
+    _commit_file(b, "agents/alpha/health/day.jsonl", "base\nfrom-b\n", "advance alpha ledger")
+    _must(b, "push", "-q", "origin", "main")
+    ledger = a / "agents/alpha/health/day.jsonl"
+    ledger.write_text("base\nlocal-append\n", encoding="utf-8", newline="\n")
+    before, origin_before = _tip(a), _origin_tip(origin)
+    # A held claim: log only, the Body's uncommitted write untouched.
+    r = _ff(a, "--strict", env_extra=_claim_probe(
+        tmp_path, "held", "held alpha row c2503cad names g-1-1 (pending)"))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "ff-only tick: tree dirty (1 tracked path(s): agents/alpha/health/day.jsonl" in out, out
+    assert "— log only, the merge is the loop's (claim probe: held alpha" in out, out
+    assert _tip(a) == before and ledger.read_text(encoding="utf-8") == "base\nlocal-append\n"
+    # No claim: the loop's self-heal commits the Body's own file and the merge lands.
+    r2 = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "none", _NONE))
+    out2 = r2.stdout + r2.stderr
+    assert r2.returncode == 0, out2
+    assert "running the loop's --no-push integrate (g-375-96)" in out2, out2
+    assert "committing 1 SELF-namespace file(s) pre-merge" in out2, out2
+    merged = ledger.read_text(encoding="utf-8")
+    assert "local-append" in merged and "from-b" in merged, merged
+    assert _git(a, "merge-base", "--is-ancestor", origin_before, "HEAD").returncode == 0, out2
+    assert _must(a, "status", "--porcelain", "--untracked-files=no") == "", out2
+    assert _origin_tip(origin) == origin_before, "the tick pushed"
+
+
+def test_ff_only_tick_driven_defer_leaves_the_streak_to_the_loop(tmp_path):
+    """A dirty shared file the merge needs defers, and the tick must not count it: the
+    once-per-streak escalation belongs to the loop, which is the reader that acts on it."""
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "base.txt", "theirs\n", "B: edits base")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "base.txt").write_text("local edit\n", encoding="utf-8", newline="\n")
+    before = _tip(a)
+    streak = a / ".git" / "iteration-push-defer-streak"
+    r = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "none", _NONE))
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "running the loop's --no-push integrate (g-375-96)" in out, out
+    assert "merge DEFERRED" in out, out
+    assert ("tick-driven integrate did not land (dirty-defer); the defer streak is left "
+            "to the loop's own integrate") in out, out
+    assert not streak.exists() and "ESCALATION REQUIRED" not in out, out
+    assert _tip(a) == before and not (a / ".git" / "MERGE_HEAD").exists(), out
+    assert (a / "base.txt").read_text(encoding="utf-8") == "local edit\n"
+    # CONTROL: the loop's own call on the same tree counts the same defer.
+    r2 = _run_push_env(a, "alpha", "--no-push", "--fetch-interval-min", "0")
+    assert streak.exists() and streak.read_text(encoding="utf-8").split()[0] == "1", r2.stderr
+
+
+def test_ff_only_tick_driven_conflict_aborts_cleanly_and_leaves_the_streak(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    _commit_file(b, "base.txt", "theirs\n", "B: edits base")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "base.txt", "mine\n", "A: edits base")
+    before = _tip(a)
+    streak = a / ".git" / "iteration-push-defer-streak"
+    r = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "none", _NONE))
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "running the loop's --no-push integrate (g-375-96)" in out, out
+    assert "MERGE CONFLICT with origin/main — aborted cleanly" in out, out
+    assert "tick-driven integrate did not land (conflict-abort)" in out, out
+    assert not (a / ".git" / "MERGE_HEAD").exists() and _tip(a) == before, out
+    assert not streak.exists(), out
+    # CONTROL: the loop's own call counts the conflict.
+    r2 = _run_push_env(a, "alpha", "--no-push", "--fetch-interval-min", "0")
+    assert streak.exists() and "conflict-abort" in streak.read_text(encoding="utf-8"), r2.stderr
+
+
+def test_ff_only_dirty_tree_with_nothing_to_integrate_never_asks_the_probe(tmp_path):
+    origin, a, b = _clone_pair(tmp_path)
+    (a / "base.txt").write_text("local edit\n", encoding="utf-8", newline="\n")
+    probe = _claim_probe(tmp_path, "none", _NONE)
+    r = _ff(a, "--strict", env_extra=probe)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("ff-only tick: tree dirty (1 tracked path(s): base.txt ) — log only, "
+            "the merge is the loop's\n") in out, out
+    assert "claim probe" not in out, out
+    # CONTROL: once origin moves, the same dirty tree does ask the probe.
+    _commit_file(b, "up.txt", "up\n", "B: up")
+    _must(b, "push", "-q", "origin", "main")
+    r2 = _ff(a, "--strict", env_extra=probe)
+    assert "claim probe: " + _NONE in (r2.stdout + r2.stderr), r2.stderr
+
+
+# --------------------------------------------------------------------------- #
 # : untrack-ahead of a path UPSTREAM deleted AND ignores
 # --------------------------------------------------------------------------- #
 _SPOOL = "agents/alpha/stats.spool"

@@ -1341,6 +1341,63 @@ def test_sync_file_pushes_session_continuity(tmp_path):
     assert be.puts == [str(f.resolve())]
 
 
+# --- sync_file dir-exclusion () -----------------------------------
+# The single-file lane must skip every path the sweep walk-prunes via
+# _EXCLUDE_DIRS, answering machine_local (the push hook's by-design verdict).
+@pytest.mark.parametrize("root_name,rel", [
+    ("agents", "alpha/sessions/sid-1/scratch/f.txt"),
+    ("world", "presence/alpha.jsonl"),
+    ("world", ".history/knowledge/node.md"),
+    ("world", ".history.pre-move/knowledge/node.md"),   #  prefix form
+])
+def test_sync_file_skips_excluded_dir_as_machine_local(tmp_path, monkeypatch,
+                                                       root_name, rel):
+    monkeypatch.setattr(_mod, "_owned_agents", lambda be=None: {"alpha"})
+    root = tmp_path / root_name
+    f = root / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"box-local")
+    be = FakeBackend([(root, root_name)])
+    stats = {}
+    rc = _mod.sync_file(be, f, dry_run=False, stats_out=stats)
+    assert rc == 0 and be.puts == []
+    assert stats.get("reason") == "machine_local"
+
+
+def test_sync_file_pushes_world_file_outside_excluded_dirs(tmp_path):
+    # Control for the world rows above: the same root pushes an ordinary file,
+    # so their skips come from the dir check, not from the fixture.
+    world = tmp_path / "world"
+    f = world / "knowledge" / "node.md"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"shared")
+    be = FakeBackend([(world, "world")])
+    _mod.sync_file(be, f, dry_run=False)
+    assert be.puts == [str(f.resolve())]
+
+
+def test_sync_file_peer_session_scratch_is_machine_local_not_peer_agent(tmp_path,
+                                                                        monkeypatch):
+    # On a box that does not own bravo, bravo's session scratch must answer
+    # machine_local (quiet, by design), not peer_agent (the hook's "Nothing
+    # delivers it" advisory). The self.md arm keeps H4a itself pinned.
+    monkeypatch.setattr(_mod, "_owned_agents", lambda be=None: {"alpha"})
+    agents = tmp_path / "agents"
+    scratch = agents / "bravo" / "sessions" / "sid-9" / "scratch" / "f.txt"
+    peer = agents / "bravo" / "self.md"
+    for p in (scratch, peer):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+    be = FakeBackend([(agents, "agents")])
+    reasons = {}
+    for p in (scratch, peer):
+        stats = {}
+        _mod.sync_file(be, p, dry_run=False, stats_out=stats)
+        reasons[p.name] = stats.get("reason")
+    assert reasons == {"f.txt": "machine_local", "self.md": "peer_agent"}
+    assert be.puts == []
+
+
 # === Phase 7: end-to-end capstone — flush -> machine-move -> pull ===========
 # The push-side (sweep) and pull-side (pull_continuity) are each unit-tested
 # above in isolation. These two capstone tests chain them through ONE

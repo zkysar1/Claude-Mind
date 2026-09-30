@@ -107,6 +107,12 @@ include:
     type: file
     required: true
 
+  # The framework's Zak-Code-only hook declarations: ObservationReceived, the
+  # vessel's early wake. Claude Code never reads this file.
+  - path: ".zakcode/settings.json"
+    type: file
+    required: true
+
   - path: ".env.example"
     type: file
     required: true

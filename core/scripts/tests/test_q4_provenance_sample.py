@@ -688,3 +688,197 @@ def test_CONTROL_a_world_path_that_resolves_to_NOTHING_still_blocks(
     _stub_world(tmp_path, monkeypatch)
     pred = expressible_predicate("any-sid")
     assert pred("node-key", "world/telemetry/no-such-file.jsonl") is True
+
+
+# ---------------------------------------------------------------------------
+# ABSOLUTE-PATH CITATIONS () — the tokenizer drops the leading slash
+# ---------------------------------------------------------------------------
+#
+# `_NODE_KEY` starts at a `\b`, so a citation written as
+# `<repo>/core/githooks/commit-msg` (absolute paths are what the Read tool
+# emits) is tokenized WITHOUT its leading slash:
+# `opt/<repo>/core/githooks/commit-msg`. Pre-fix, `_candidates` tried only
+# root/tok, root/.tok and the world forms — none exists — so the token fell
+# through to the default-True fail-safe: a correctly cited, genuinely READ
+# out-of-scope file reported `decorative-citation` (a blocking FAIL) when
+# cited absolutely, and was demoted to `unadjudicable-citation` when cited
+# repo-relative. Measured at HEAD 2026-09-29 ( description): the
+# same file answered False relative / True absolute, and the end-to-end
+# verify-preflight on  flipped from rc 3 (FAIL decorative on three
+# clusters) to rc 0 (SKIPPED, 4 unadjudicable) the moment the same citations
+# were rewritten repo-relative. The verdict depended on the author's path
+# STYLE, not on what the session actually read.
+#
+# The fix restores the dropped slash in `_candidates`, guarded to tokens that
+# start with THIS box's repo root (or the world root). The prefix is DERIVED
+# from the live root in every assertion below — never hardcoded to one box's
+# path — because the defect is shape-relative to wherever the repo lives.
+
+def _repo_root_prefix() -> str:
+    """`str(root).lstrip('/')` — the shape the tokenizer leaves behind after
+    dropping the leading slash of an absolute path under the repo root."""
+    return SCRIPTS.parent.parent.as_posix().lstrip("/")
+
+
+def test_OUTCOME_1_an_absolute_path_citation_gets_the_same_verdict_as_relative():
+    """Goal outcome 1, against the live repo: the same file, cited
+    repo-relative and cited as the absolute path the Read tool emits, must
+    receive the SAME Q4 verdict.
+
+    The RELATIVE arm is the positive control (guard-2421): it proves this box
+    can answer False at all, which makes the absolute arm's False meaningful
+    instead of a uniform-True read. The ABSOLUTE arm is False against the
+    pre-fix `_candidates` (the token resolves to nothing and the default-True
+    fail-safe answers True) — this is the pin the goal names.
+    """
+    pred = expressible_predicate("any-sid")
+    assert pred is not None
+    prefix = _repo_root_prefix()
+    # One real file OUTSIDE the recorder's advisory scope, both styles.
+    assert pred("node-key", "core/githooks/commit-msg") is False
+    # THE OUTCOME: identical verdict for the same file, path style removed
+    # as a variable.
+    assert pred("node-key", f"{prefix}/core/githooks/commit-msg") is False
+
+
+def test_OUTCOME_1_an_in_scope_absolute_path_stays_ADJUDICABLE():
+    """The no-suppression half of outcome 1: an in-scope file cited
+    absolutely still resolves to an IN-scope hit and stays expressible — the
+    restored slash must not demote a citation whose source the manifest
+    genuinely tracks, or the decorative alarm would be suppressed (guard-1901)
+    for the very path style the Read tool emits. Without this arm the fix is
+    indistinguishable from 'demote anything that resolves to a path'."""
+    pred = expressible_predicate("any-sid")
+    assert pred is not None
+    prefix = _repo_root_prefix()
+    # Positive control first: the repo-relative form is expressible.
+    assert pred("node-key", "core/scripts/retrieve") is True
+    # The absolute form of the SAME in-scope file answers the same.
+    assert pred("node-key", f"{prefix}/core/scripts/retrieve") is True
+
+
+def test_OUTCOME_1_an_absolute_world_root_path_gets_the_same_verdict_as_relative():
+    """Symmetric to the repo-root OUTCOME_1 pin, for the WORLD half of the
+    fix. `world/` is an EXTERNAL path (not under the repo), so a world
+    citation written as the absolute the Read tool emits arrives with ITS
+    leading slash dropped too, and the world-root prefix guard is what
+    restores it. The probe this pin codifies (measured 2026-09-30, live box):
+    `world/audit-reports/README.md` answered False in BOTH the repo-relative
+    and the absolute forms, and an absolute world path naming NO file stayed
+    True — the two roots must be pinned, not just resolved.
+
+    Skipped on an UNINITIALIZED box: `WORLD_DIR` is None then and `_candidates`
+    skips the world forms entirely (the fix's own docstring), so there is no
+    world file to cite and the pin would be testing nothing. The repo-root pin
+    does not have this problem because the repo root always exists.
+    """
+    import pytest
+
+    from _context_reads_helper import load_context_reads
+
+    cr = load_context_reads()
+    world = getattr(cr, "WORLD_DIR", None)
+    if world is None:
+        pytest.skip("WORLD_DIR unset (uninitialized box) — world forms are skipped")
+    pred = expressible_predicate("any-sid")
+    assert pred is not None
+    world_files = sorted(
+        p for p in Path(world).rglob("*.md")
+        if p.is_file()
+    )
+    if not world_files:
+        pytest.skip("no .md files under WORLD_DIR to cite")
+    # Out-of-scope arm — the pin: the same file, repo-relative and absolute
+    # (leading slash dropped), must draw the SAME verdict.
+    wf = next(
+        (p for p in world_files
+         if not cr.is_in_scope_advisory(p.as_posix())),
+        None,
+    )
+    if wf is not None:
+        rel = "world/" + wf.relative_to(world).as_posix()
+        abs_form = str(world).lstrip("/") + "/" + wf.relative_to(world).as_posix()
+        # Positive control first (guard-2421): the relative form answers
+        # False at all on this box.
+        assert pred("node-key", rel) is False
+        # THE OUTCOME: identical verdict for the same file, path style
+        # removed as a variable — the world-root half of outcome 1.
+        assert pred("node-key", abs_form) is False
+    # In-scope arm — the no-suppression half: an in-scope world file cited
+    # absolutely must stay ADJUDICABLE.
+    wf_in = next(
+        (p for p in world_files
+         if cr.is_in_scope_advisory(p.as_posix())),
+        None,
+    )
+    if wf_in is not None:
+        rel_in = "world/" + wf_in.relative_to(world).as_posix()
+        abs_in = str(world).lstrip("/") + "/" + wf_in.relative_to(world).as_posix()
+        assert pred("node-key", rel_in) is True
+        assert pred("node-key", abs_in) is True
+    # Nothing arm: an absolute world-shaped token naming NO file keeps the
+    # check ON — the root-prefix guard is not a way to switch off an alarm
+    # (guard-1760), for the world root exactly as for the repo root.
+    assert pred("node-key",
+                str(world).lstrip("/") + "/does/not/exist-xyz") is True
+
+
+def test_CONTROL_an_absolute_path_that_resolves_to_NOTHING_still_blocks():
+    """The stated invariant survives the new candidate: demote ONLY where the
+    token POSITIVELY resolves to a real file the scope predicate excludes. An
+    absolute-shaped token naming NO file must keep the check ON — otherwise
+    the root-prefix guard itself becomes a way to switch off a real alarm
+    (guard-1760). The bare-node-key control g-115-9266 preserves is re-asserted
+    here because the fix and that goal touch the same function."""
+    pred = expressible_predicate("any-sid")
+    assert pred is not None
+    prefix = _repo_root_prefix()
+    # Starts with the repo-root prefix, so the restored-slash candidate IS
+    # tried — and names no file.
+    assert pred("node-key", f"{prefix}/system/daemon-only-architecture") is True
+    # Bare tree node key: resolves to nothing, stays adjudicable, unchanged.
+    assert pred("node-key", "system/daemon-only-architecture") is True
+
+
+def test_REGRESSION_analyze_reports_unadjudicable_for_both_citation_styles():
+    """End-to-end at the `analyze` level, the way the goal measured it: one
+    cluster citing the out-of-scope file repo-relative, a SIBLING cluster
+    citing the SAME file as the absolute path the Read tool emits. Post-fix
+    both clusters draw `unadjudicable-citation`; pre-fix the absolute one drew
+    the blocking `decorative-citation` (its absolute token fell through the
+    default-True fail-safe while its relative twin demoted) — the g-306-541
+    specimen, where rewriting the same citations repo-relative flipped
+    verify-preflight from rc 3 to rc 0.
+
+    Two clusters, not one, because `analyze` reports ONE finding per cluster
+    and demotes a cluster only when NO checkable citation in it is
+    expressible: with both styles in one cluster the pre-fix code would still
+    demote it (the relative token carries the cluster), and the pin would not
+    fail on the reverted code. The two paragraphs are the g-306-541 shape:
+    independent claims, independent citation styles, one per cluster.
+
+    LIVE repo, like the other predicate tests in this file: the absolute
+    prefix is shape-relative to wherever the repo lives, so it is DERIVED from
+    the live root here too, and a stub would only pin the box's tmp_path
+    shape — pytest's tmp_path parents carry uppercase/underscored test names,
+    which the tokenizer cannot even cross, so a stubbed root would leave root
+    fragments that resolve to nothing and default to True. That would turn
+    this pin into a test of the fail-safe instead of the fix (guard-1866: a
+    control that cannot reach the code under test has no resolving power)."""
+    from ground_truth_citation import analyze, source_tokens
+    prefix = _repo_root_prefix()
+    text = ("Widget Industries employs 12,000 people across its plants, per "
+            "core/githooks/commit-msg.\n\n"
+            "Widget Industries operates 37 refineries worldwide, per "
+            f"/{prefix}/core/githooks/commit-msg.\n")
+    # What the tokenizer MUST see for this test to be the pin it claims to be:
+    # both shapes present, the absolute one WITH the leading slash still
+    # dropped (the defect's input shape, re-asserted so a tokenizer change
+    # fails here loudly instead of silently unpinning the fix).
+    toks = source_tokens(text)
+    assert ("node-key", "core/githooks/commit-msg") in toks
+    assert ("node-key", f"{prefix}/core/githooks/commit-msg") in toks
+    kinds = sorted(f.kind for f in analyze(
+        text, retrieved=lambda k, v: False,
+        expressible=expressible_predicate("any-sid")))
+    assert kinds == ["unadjudicable-citation", "unadjudicable-citation"], kinds

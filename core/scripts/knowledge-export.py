@@ -45,9 +45,12 @@ from knowledge_projection import (  # noqa: E402
     KNOWLEDGE_COUNT_KEYS,
     ProjectedBundle,
     Redactor,
+    _node_key,
+    _record_id,
     is_domain_tree_node,
     project,
     resolve_goal_handle,
+    resolve_item_handle,
 )
 
 #: Env var name suffixes whose VALUES are stripped from exposed text (never their names).
@@ -140,23 +143,35 @@ def _strip_front_matter(text: str) -> str:
     return text  # unterminated fence → treat the whole file as body (malformed front matter)
 
 
-def _read_node_body(tree_dir: Path, file_rel: str) -> str:
-    """Read a node's ``.md`` body (front matter stripped, capped) for the export bundle.
+def node_body_path(tree_dir: Path, file_rel: str) -> Path | None:
+    """Where a node's ``.md`` lives on disk, or ``None`` for an empty ``file`` field.
 
     ``file_rel`` is the node ``file`` field — a repo-relative path shaped like
     ``world/knowledge/tree/<cat>/<node>.md``. Resolve it under ``tree_dir`` by dropping the
-    ``world/knowledge/tree`` prefix. Any read failure → ``""`` (a missing/unreadable body
-    must never fail the export; the node still carries its summary).
+    ``world/knowledge/tree`` prefix. Shared by the export and the member-edit applier
+    (g-335-1726), so an edit writes the same file the export publishes the body from.
     """
     if not file_rel:
-        return ""
+        return None
     parts = file_rel.strip("/").split("/")
     if parts[:3] == ["world", "knowledge", "tree"]:
         parts = parts[3:]
     if not parts:
+        return None
+    return tree_dir.joinpath(*parts)
+
+
+def _read_node_body(tree_dir: Path, file_rel: str) -> str:
+    """Read a node's ``.md`` body (front matter stripped, capped) for the export bundle.
+
+    Any read failure → ``""`` (a missing/unreadable body must never fail the export; the
+    node still carries its summary).
+    """
+    path = node_body_path(tree_dir, file_rel)
+    if path is None:
         return ""
     try:
-        text = tree_dir.joinpath(*parts).read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return ""
     return _strip_front_matter(text)[:_NODE_BODY_CAP]
@@ -546,34 +561,39 @@ def build_bundle(
     redactor = _build_redactor(world_path, project_root, extra_paths, env)
     self_fm, self_body = _read_self(project_root, env)
     program_fm, program_body = _read_program(world_path)
+    # Read from the env, never from a store: the value is a secret and the projection
+    # is the one place it may be used (as an HMAC KEY, never as output). "" when
+    # unprovisioned, which suppresses the handle field entirely — see
+    # :data:`_GOAL_HANDLE_SECRET_VAR`.
+    # An empty ENVIRONMENT_ID is as disqualifying as an empty secret. It is a MESSAGE
+    # component of the handle (guard-6312), not a decoration: publishing with it empty
+    # keys every environment's handles on the same empty string, retiring the
+    # no-cross-environment-correlation property goal_handle's own docstring promises —
+    # and it fails OPEN, with nothing logged. Suppressing the SECRET here reuses the
+    # existing fail-closed path (project_goals omits the handle key entirely, leaving
+    # the documented unaddressable-board shape) instead of adding a second one.
+    handle_secret = (
+        env.get(_GOAL_HANDLE_SECRET_VAR, "")
+        if env.get("ENVIRONMENT_ID", "").strip()
+        else ""
+    )
+    tree_nodes, hypotheses, guardrails = _read_item_stores(world_path, tree_status=tree_status)
     return project(
-        tree_nodes=read_tree_nodes(world_path, status=tree_status),
+        tree_nodes=tree_nodes,
         reasoning=_read_jsonl(world_path / "reasoning-bank.jsonl"),
-        guardrails=_read_jsonl(world_path / "guardrails.jsonl"),
-        hypotheses=_read_jsonl(world_path / "pipeline.jsonl"),
+        guardrails=guardrails,
+        hypotheses=hypotheses,
         redactor=redactor,
         self_front_matter=self_fm,
         self_body=self_body,
         program_front_matter=program_fm,
         program_body=program_body,
         goals=_read_goals(world_path),
-        # Read from the env, never from a store: the value is a secret and the projection
-        # is the one place it may be used (as an HMAC KEY, never as output). "" when
-        # unprovisioned, which suppresses the handle field entirely — see
-        # :data:`_GOAL_HANDLE_SECRET_VAR`.
-        # An empty ENVIRONMENT_ID is as disqualifying as an empty secret. It is a MESSAGE
-        # component of the handle (guard-6312), not a decoration: publishing with it empty
-        # keys every environment's handles on the same empty string, retiring the
-        # no-cross-environment-correlation property goal_handle's own docstring promises —
-        # and it fails OPEN, with nothing logged. Suppressing the SECRET here reuses the
-        # existing fail-closed path (project_goals omits the handle key entirely, leaving
-        # the documented unaddressable-board shape) instead of adding a second one.
-        goal_handle_secret=(
-            env.get(_GOAL_HANDLE_SECRET_VAR, "")
-            if env.get("ENVIRONMENT_ID", "").strip()
-            else ""
-        ),
+        goal_handle_secret=handle_secret,
         environment_id=env.get("ENVIRONMENT_ID", ""),
+        # The same guarded secret keys the per-item handles (g-335-1726); item_handle's
+        # kind component keeps item handles and goal handles apart.
+        item_handle_secret=handle_secret,
     )
 
 
@@ -607,6 +627,61 @@ def resolve_handle(
         _build_redactor(world_path, project_root, extra_paths, env),
         env.get("ENVIRONMENT_ID", ""),
     )
+
+
+def _read_item_stores(
+    world_path: Path, *, tree_status: dict[str, object] | None = None
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    """The three member-addressable stores ``(tree_nodes, hypotheses, guardrails)``.
+
+    ONE reader for the export and for :func:`resolve_item`, so an item handle resolves
+    over exactly the records the bundle published it from (rb-10157).
+    """
+    return (
+        read_tree_nodes(world_path, status=tree_status),
+        _read_jsonl(world_path / "pipeline.jsonl"),
+        _read_jsonl(world_path / "guardrails.jsonl"),
+    )
+
+
+def resolve_item(
+    world_path: Path,
+    handle: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, str, dict[str, object]] | None:
+    """Box-side resolve: a published ITEM handle -> ``(kind, id, raw record)``, or ``None``.
+
+    The store-I/O half of :func:`knowledge_projection.resolve_item_handle` (g-335-1726),
+    and the item sibling of :func:`resolve_handle`: the member-edit applier calls it before
+    touching a wiki node, hypothesis or guardrail. ``None`` carries every miss the pure
+    resolver refuses — unknown, ambiguous, no longer exposed, unprovisioned secret or
+    ``ENVIRONMENT_ID`` — and the caller MUST treat it as "do nothing".
+    """
+    env = dict(os.environ if env is None else env)
+    nodes, hypotheses, guardrails = _read_item_stores(world_path)
+    hit = resolve_item_handle(
+        handle,
+        tree_nodes=nodes,
+        hypotheses=hypotheses,
+        guardrails=guardrails,
+        secret=env.get(_GOAL_HANDLE_SECRET_VAR, ""),
+        environment_id=env.get("ENVIRONMENT_ID", ""),
+    )
+    if hit is None:
+        return None
+    kind, item_id = hit
+    # The SAME id readers the resolver matched on, so the record returned is the one the
+    # handle named.
+    records, id_of = {
+        "node": (nodes, _node_key),
+        "hypothesis": (hypotheses, _record_id),
+        "guardrail": (guardrails, _record_id),
+    }[kind]
+    for record in records:
+        if id_of(record) == item_id:
+            return kind, item_id, record
+    return None
 
 
 # ── OKF markdown bundle (PEARL §10.5) ────────────────────────────────────────

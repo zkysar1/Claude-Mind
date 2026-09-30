@@ -213,7 +213,7 @@ files:
       an approved quiescence sleep. Never written on a heartbeat envelope, and
       never in assistant mode, where no loop sleeps and nothing reads it
       (guard-1806).
-    writer: vessel /observe on kind='change' (session-signal-set.sh)
+    writer: observation-received-hook.sh, the vessel's ObservationReceived hook, on kind='change' (session-signal-set.sh)
     recovery_action: clear
     sync_tier: machine_local
     required_when_idle: false

@@ -974,3 +974,151 @@ def test_project_wires_the_handle_secret_through_and_defaults_it_off() -> None:
                     redactor=redactor, goals=[_g(id="g-369-119")],
                     goal_handle_secret=_HANDLE_SECRET, environment_id="env-a")
     assert wired.goals[0]["handle"] == goal_handle("g-369-119", _HANDLE_SECRET, "env-a")
+
+
+# ── per-item knowledge handles () ─────────────────────────────────
+# The address a member-facing edit or forget carries for ONE wiki node, hypothesis or
+# guardrail. Same rules as the goal handle above: fail closed, visible == addressable.
+
+
+def _item_stores() -> dict[str, list[dict[str, object]]]:
+    """One exposed and one hidden record per store, each carrying the id the store has."""
+    return {
+        "tree_nodes": [
+            {"key": "reefs", "category": "marine-biology/reefs", "title": "Coral reefs"},
+            {"key": "hooks", "category": "system/hooks", "title": "Hook internals"},
+        ],
+        "hypotheses": [
+            {"id": "2026-09-30_reef-heat", "category": "marine-biology/reefs",
+             "claim": "Warmer water bleaches reefs faster.", "stage": "active"},
+            {"id": "2026-09-30_loop-veto", "category": "system/loop",
+             "claim": "The veto budget bounds continuations.", "stage": "active"},
+        ],
+        "guardrails": [
+            {"id": "guard-9001", "category": "marine-biology/method",
+             "rule": "Verify every claim against two sources."},
+            {"id": "guard-9002", "category": "framework-architecture",
+             "rule": "Never critical() in a handler."},
+        ],
+    }
+
+
+def _project_items(secret: str = "", env: str = "") -> ProjectedBundle:
+    s = _item_stores()
+    return project(tree_nodes=s["tree_nodes"], reasoning=[], guardrails=s["guardrails"],
+                   hypotheses=s["hypotheses"], redactor=Redactor(),
+                   item_handle_secret=secret, environment_id=env)
+
+
+def _resolve(handle: str, secret: str = _HANDLE_SECRET, env: str = _ENV):
+    s = _item_stores()
+    return kp.resolve_item_handle(handle, tree_nodes=s["tree_nodes"],
+                                  hypotheses=s["hypotheses"], guardrails=s["guardrails"],
+                                  secret=secret, environment_id=env)
+
+
+def test_item_handle_fails_closed_on_every_message_component() -> None:
+    """guard-6312: an empty or forged component yields "", never a guessable token."""
+    assert kp.item_handle("node", "reefs", _HANDLE_SECRET, _ENV)
+    assert kp.item_handle("lesson", "reefs", _HANDLE_SECRET, _ENV) == ""
+    assert kp.item_handle("", "reefs", _HANDLE_SECRET, _ENV) == ""
+    assert kp.item_handle("node", "  ", _HANDLE_SECRET, _ENV) == ""
+    assert kp.item_handle("node", "reefs", "", _ENV) == ""
+    assert kp.item_handle("node", "reefs", _HANDLE_SECRET, "") == ""
+    assert kp.item_handle("node", "re\x00efs", _HANDLE_SECRET, _ENV) == ""
+    assert kp.item_handle("node", "reefs", _HANDLE_SECRET, "env\x00a") == ""
+
+
+def test_item_handle_separates_kinds_environments_and_goal_handles() -> None:
+    """One id under three kinds, two environments and the goal scheme: all distinct."""
+    handles = {kp.item_handle(k, "x-1", _HANDLE_SECRET, _ENV) for k in kp.KNOWLEDGE_ITEM_KINDS}
+    handles.add(kp.item_handle("node", "x-1", _HANDLE_SECRET, "env-b"))
+    handles.add(goal_handle("x-1", _HANDLE_SECRET, _ENV))
+    assert len(handles) == 5 and "" not in handles
+    assert all(len(h) == 16 for h in handles)
+
+
+def test_project_adds_item_handles_only_under_a_secret_and_an_environment() -> None:
+    """The seam defaults OFF: no secret, or no environment, keeps every row's shape."""
+    for bundle in (_project_items(), _project_items(_HANDLE_SECRET, ""),
+                   _project_items("", _ENV)):
+        rows = bundle.tree + bundle.hypotheses + bundle.guardrails
+        assert len(rows) == 3 and all("handle" not in r for r in rows), rows
+    wired = _project_items(_HANDLE_SECRET, _ENV)
+    assert wired.tree[0]["handle"] == kp.item_handle("node", "reefs", _HANDLE_SECRET, _ENV)
+    assert wired.hypotheses[0]["handle"] == kp.item_handle(
+        "hypothesis", "2026-09-30_reef-heat", _HANDLE_SECRET, _ENV)
+    assert wired.guardrails[0]["handle"] == kp.item_handle(
+        "guardrail", "guard-9001", _HANDLE_SECRET, _ENV)
+    # The handle replaces nothing: the hidden ids stay hidden.
+    assert "guard-9001" not in str(wired.guardrails)
+    assert "reef-heat" not in str(wired.hypotheses)
+
+
+def test_resolve_item_round_trips_the_handles_the_projection_published() -> None:
+    """Resolve the PUBLISHED values, so a projection/resolver drift cannot pass."""
+    wired = _project_items(_HANDLE_SECRET, _ENV)
+    assert _resolve(str(wired.tree[0]["handle"])) == ("node", "reefs")
+    assert _resolve(str(wired.hypotheses[0]["handle"])) == ("hypothesis", "2026-09-30_reef-heat")
+    assert _resolve(str(wired.guardrails[0]["handle"])) == ("guardrail", "guard-9001")
+    # An inbound handle crosses a URL/JSON boundary before it gets here.
+    assert _resolve(f"  {str(wired.tree[0]['handle']).upper()} ") == ("node", "reefs")
+
+
+def test_resolve_item_refuses_every_item_the_projection_hides() -> None:
+    """Visible == addressable: a well-formed handle for a hidden item resolves to nothing."""
+    for kind, iid in (("node", "hooks"), ("hypothesis", "2026-09-30_loop-veto"),
+                      ("guardrail", "guard-9002")):
+        handle = kp.item_handle(kind, iid, _HANDLE_SECRET, _ENV)
+        # Non-empty by construction, so the None below tests the exposure predicate and
+        # not an empty handle.
+        assert handle, (kind, iid)
+        assert _resolve(handle) is None, (kind, iid)
+
+
+def test_resolve_item_returns_none_for_every_miss() -> None:
+    handle = kp.item_handle("node", "reefs", _HANDLE_SECRET, _ENV)
+    assert _resolve(handle) == ("node", "reefs")  # positive control for the misses below
+    assert _resolve("deadbeefdeadbeef") is None
+    assert _resolve("") is None
+    assert _resolve(handle, secret=_OTHER_SECRET) is None
+    assert _resolve(handle, secret="") is None
+    assert _resolve(handle, env="env-b") is None
+    assert _resolve(handle, env="") is None
+    # A goal handle over the same id is a different namespace, never an item address.
+    assert _resolve(goal_handle("reefs", _HANDLE_SECRET, _ENV)) is None
+
+
+def test_resolve_item_returns_none_when_two_exposed_items_share_a_handle(monkeypatch) -> None:
+    """A collision resolves to NOTHING. Forced with real digests at one hex character."""
+    monkeypatch.setattr(kp, "_GOAL_HANDLE_HEX", 1)
+    seen: dict[str, str] = {}
+    pair = None
+    for n in range(200):
+        key = f"reef-{n}"
+        h = kp.item_handle("node", key, _HANDLE_SECRET, _ENV)
+        if h in seen:
+            pair = (seen[h], key, h)
+            break
+        seen[h] = key
+    assert pair is not None, "no collision at 1 hex char over 200 keys — widen the search"
+    first, second, handle = pair
+    nodes = [{"key": first, "category": "marine-biology/reefs"},
+             {"key": second, "category": "marine-biology/reefs"}]
+    assert kp.resolve_item_handle(handle, tree_nodes=nodes, hypotheses=[], guardrails=[],
+                                  secret=_HANDLE_SECRET, environment_id=_ENV) is None
+    # The same node listed twice is duplication, not ambiguity: it still resolves.
+    assert kp.resolve_item_handle(handle, tree_nodes=nodes[:1] * 2, hypotheses=[],
+                                  guardrails=[], secret=_HANDLE_SECRET,
+                                  environment_id=_ENV) == ("node", first)
+
+
+def test_project_publishes_an_id_less_record_without_a_handle() -> None:
+    """A store line with no id still shows; it just cannot be addressed."""
+    bundle = project(tree_nodes=[{"key": "reefs", "category": "marine-biology/reefs"}],
+                     reasoning=[], hypotheses=[{"category": "marine-biology/reefs",
+                                                "claim": "No id on this line."}],
+                     guardrails=[], redactor=Redactor(),
+                     item_handle_secret=_HANDLE_SECRET, environment_id=_ENV)
+    assert len(bundle.hypotheses) == 1 and "handle" not in bundle.hypotheses[0]
+    assert "handle" in bundle.tree[0]

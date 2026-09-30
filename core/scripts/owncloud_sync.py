@@ -793,6 +793,43 @@ def _local_wins_stale_probe(be, full, local_bytes):
     return _local_wins_stale_reason(local_bytes, s3_bytes)
 
 
+def _own_carrier_stale_probe(be, full, local_bytes):
+    """The LOCAL-WINS staleness guard for THIS session's own body-heartbeat
+    carrier (g-375-80). It stands in for _local_wins_stale_probe, whose
+    capture-slot test has nothing to read in a carrier.
+
+    Returns None (admit) or the refusal reason. Push only a local copy whose
+    `ts` is strictly NEWER than the store copy's. The carrier's writers stamp
+    `ts` from this box's clock (heartbeat-tick.sh, and the birth carrier in
+    team-state-in-flight.sh), while orphan_carrier_repair.py and body-manifest's
+    orphan reconcile change `body_state` and keep `ts` by design. So an equal
+    `ts` with different bytes is a store-side repair: it is refused, and the
+    session's next tick, which restamps `ts`, publishes over it. A session that
+    no longer ticks leaves the repair standing.
+
+    The local side fails CLOSED ("carrier_local_unreadable"): never publish a
+    carrier this box cannot read. The store side fails OPEN: a store copy that
+    cannot be read or parsed is no evidence of a newer one, and the PUT that
+    follows stays fenced on the version just HEADed. A `ts` without an offset is
+    read as UTC, the framework's timestamp posture."""
+    from datetime import datetime, timezone
+
+    def _ts(raw):
+        stamp = datetime.fromisoformat(
+            str(json.loads(raw)["ts"]).replace("Z", "+00:00"))
+        return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+    try:
+        local_ts = _ts(local_bytes)
+    except Exception:  # noqa: BLE001 — unreadable local carrier: fail CLOSED
+        return "carrier_local_unreadable"
+    try:
+        store_ts = _ts(be.read_authoritative_bytes(full))
+    except Exception:  # noqa: BLE001 — unreadable store copy: fail OPEN
+        return None
+    return None if local_ts > store_ts else "carrier_not_newer"
+
+
 # --- manifest (machine-local mtime cache to skip unchanged files) ----------
 def _runtime_dir() -> Path:
     rd = os.environ.get("RUNTIME_DIR")
@@ -1451,11 +1488,28 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             # counted, reasoned, and routed to the clobber-safe skip below (the
             # g-115-8027 streak/alert machinery then surfaces the wedge); the
             # legitimate forward-append shape still resolves LOCAL-WINS.
+            # g-375-80: THIS session's OWN body-heartbeat carrier is admitted
+            # without the authority and claim-continuity gates. Both ask whether
+            # this box was the one writer of a per-AGENT file; a sid-keyed
+            # carrier has one writer by construction (see _own_sid_carrier_path,
+            # g-306-235), and its staleness guard is its `ts`
+            # (_own_carrier_stale_probe). Without this nothing could clear the
+            # carrier's both-diverged state: sync_file never passes own-cloud
+            # authority, and the periodic sweep reaches only the carrier of the
+            # session its daemon was spawned in (g-375-40). Measured 2026-09-30
+            # on a worker box: after one lost baseline stamp the store copy
+            # stayed at one ts for over two hours while the local copy advanced,
+            # every publish was a CONFLICT skip, and the stranded-claim sweep
+            # released the live Body's claim.
             _lw_stale_reason = None
-            _lw_classified = (own_cloud_authority
-                              and _is_single_writer_session_file(full, be))
-            _lw_admitted = _lw_classified and _claim_held_continuously(
-                full, be, holder_since_by_agent)
+            _own_carrier = _own_sid_carrier_path(be)
+            _lw_own_carrier = (_own_carrier is not None
+                               and Path(full).resolve() == _own_carrier[0].resolve())
+            _lw_classified = _lw_own_carrier or (
+                own_cloud_authority and _is_single_writer_session_file(full, be))
+            _lw_admitted = _lw_classified and (
+                _lw_own_carrier
+                or _claim_held_continuously(full, be, holder_since_by_agent))
             if _lw_classified and not _lw_admitted:
                 stats["local_wins_blocked_claim_gap"] = \
                     stats.get("local_wins_blocked_claim_gap", 0) + 1
@@ -1465,8 +1519,12 @@ def _sync_one(be, full: Path, *, dry_run: bool, stats: dict,
             elif _lw_admitted:
                 # g-306-534 drain-awareness guard (content level; fail-open by
                 # contract — see _local_wins_stale_reason's fail-open enumeration
-                # and _local_wins_stale_probe for the fetch surface).
-                _lw_stale_reason = _local_wins_stale_probe(be, full, local_bytes)
+                # and _local_wins_stale_probe for the fetch surface). The own
+                # carrier's guard is its ts instead (g-375-80).
+                _lw_stale_reason = (
+                    _own_carrier_stale_probe(be, full, local_bytes)
+                    if _lw_own_carrier
+                    else _local_wins_stale_probe(be, full, local_bytes))
                 if _lw_stale_reason:
                     _lw_admitted = False
                     stats["local_wins_blocked_stale_local"] = \
@@ -2700,6 +2758,12 @@ def sync_file(be, target: Path, *, dry_run, stats_out=None) -> int:
     if prefix is None:
         # Not governed (core/, .claude/, product repos are git-synced, not S3).
         return _skip("not_governed")
+    # g-115-11378: the dir half of the never-pushed set. The sweep walk-prunes
+    # _EXCLUDE_DIRS before _is_machine_local ever sees a file (as
+    # refresh_would_clobber does); checked before H4a so a peer box's session
+    # scratch answers machine_local (by design), not peer_agent.
+    if any(_is_excluded_dir(seg) for seg in target.relative_to(matched_root).parts[:-1]):
+        return _skip("machine_local")
     if _is_machine_local(target.name, prefix, full_path=target, root_path=matched_root):
         return _skip("machine_local")
     # H4a: never push a PEER agent's file — its local copy is a stale cache of

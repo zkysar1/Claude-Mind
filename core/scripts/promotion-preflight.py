@@ -74,6 +74,10 @@ FRAMEWORK_PATHS = [
     ".claude/skills",
     ".claude/rules",
     ".claude/settings.json",
+    # The framework's Zak-Code-only hook declarations (ObservationReceived, the
+    # vessel's early wake). Claude Code never reads this file, so these hooks
+    # cannot live in .claude/settings.json; the file travels the way that one does.
+    ".zakcode/settings.json",
     "mind_api/src",
     "mind_api/tests",
 ]

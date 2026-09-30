@@ -334,7 +334,11 @@ logs.log
 # (`say_inbox.py` BUSY_FILENAME) and its session/config dir. Both were being
 # committed by a `git add -A` on a Body-run deployment (2026-08-30, coach).
 /.busy
-/.zakcode/
+# Everything under .zakcode/ stays ignored except settings.json, which declares the
+# framework's Zak-Code-only hooks (ObservationReceived). The pattern names the dir's
+# CONTENTS, not the dir: git cannot re-include a file whose parent dir is excluded.
+/.zakcode/*
+!/.zakcode/settings.json
 
 # Same memo as core/scripts/.platform-memo.sh (line 110), but SCRIPT_DIR can
 # resolve to the repo root for some callers, dropping a second copy here that the

@@ -424,6 +424,132 @@ def test_a_routing_failure_is_LOUD_and_never_crashes_the_verdict(monkeypatch, ca
     assert "NOTHING ROUTED" in err and "no findings" in err
 
 
+# --------------------- : a failed routing is retried safely ---------------------
+
+LOCK_STDERR = ("write failed (rc=1) and an independent store read does not show it "
+               "landed: Could not acquire lock: ayoai-mind/world/aspirations.lock. Re-run "
+               "the identical command — the marker keeps the retry idempotent.")
+
+
+def _fake_append(notes: dict, calls: list, fail_first: int):
+    """Stand-in for goal-field-append.sh with its marker idempotency: an append whose
+    marker already stands changes nothing. The first `fail_first` calls fail the way
+    a lock timeout does. Anything that is not that writer fails the test loudly."""
+    def run(cmd, **kw):
+        assert str(cmd[1]).endswith("goal-field-append.sh"), cmd[:2]
+        calls.append(cmd)
+        if len(calls) <= fail_first:
+            return subprocess.CompletedProcess(cmd, 6, "", LOCK_STDERR)
+        goal, marker, text = cmd[4], cmd[6], cmd[7]
+        if marker not in notes.get(goal, ""):
+            notes[goal] = notes.get(goal, "") + f"\n[{marker}]\n{text}"
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+    return run
+
+
+def _entries(tmp_path: Path, goal_id: str) -> list:
+    return json.loads(_verdict_file(tmp_path, goal_id).read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def isolated_producer(tmp_path, monkeypatch):
+    """The producer against a tmp ledger, with no goal-store read and no real sleep."""
+    import types
+    m = _producer_module()
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    monkeypatch.setattr(m._gate(), "load_goal", lambda gid, source: {})
+    slept = []
+    monkeypatch.setattr(m, "time", types.SimpleNamespace(sleep=slept.append))
+    return m, slept
+
+
+def test_a_lock_failure_is_retried_and_lands_the_note_once(tmp_path, monkeypatch, capsys,
+                                                           isolated_producer):
+    """Measured in the  cycle: a lock timeout on the shared goal store failed 2
+    of 3 routings. The retry must land the note exactly once and add no verdict entry."""
+    m, slept = isolated_producer
+    notes, calls = {}, []
+    monkeypatch.setattr(m.subprocess, "run", _fake_append(notes, calls, fail_first=1))
+    argv = ["--goal", "g-9-9", "--reviewer", "peer", "--source-file", str(_source(tmp_path)),
+            "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)), "--reject",
+            "--write", "--route-to-goal", "world"]
+    assert m.main(argv) == 3
+    out, err = capsys.readouterr()
+    assert len(calls) == 2 and slept == [m.ROUTE_BACKOFF_S[0]]
+    assert "routing attempt 1 failed (rc=6)" in err and "ROUTING FAILED" not in err
+    marker = calls[0][6]
+    assert f"({marker})" in out and notes["g-9-9"].count(marker) == 1
+    assert len(_entries(tmp_path, "g-9-9")) == 1
+
+    # POSITIVE CONTROL (guard-2903): the old advice, re-running the verdict command,
+    # adds a second entry while the marker keeps the note single. So the one-entry
+    # check above can see a duplicate, and the note count alone could not.
+    assert m.main(argv) == 3
+    assert len(_entries(tmp_path, "g-9-9")) == 2 and notes["g-9-9"].count(marker) == 1
+
+
+def test_a_routing_that_keeps_failing_names_route_only_and_route_only_lands_it(
+        tmp_path, monkeypatch, capsys, isolated_producer):
+    """The retry the failure names must route the RECORDED verdict and write no entry,
+    and the message must not repeat the writer's "Re-run the identical command"."""
+    m, slept = isolated_producer
+    notes, calls = {}, []
+    monkeypatch.setattr(m.subprocess, "run", _fake_append(notes, calls, fail_first=99))
+    assert m.main(["--goal", "g-9-9", "--reviewer", "peer",
+                   "--source-file", str(_source(tmp_path)),
+                   "--artifact-file", str(_fixture(tmp_path, ARTIFACT_ENTITIES)),
+                   "--reject", "--write", "--route-to-goal", "world"]) == 3
+    err = capsys.readouterr().err
+    tries = 1 + len(m.ROUTE_BACKOFF_S)
+    assert len(calls) == tries and slept == list(m.ROUTE_BACKOFF_S)
+    assert f"ROUTING FAILED (rc=6) after {tries} attempts" in err
+    assert "Could not acquire lock" in err and "--route-only" in err
+    assert "Re-run the identical command" not in err
+    failed_marker = calls[0][6]
+
+    monkeypatch.setattr(m.subprocess, "run", _fake_append(notes, calls, fail_first=0))
+    route = ["--goal", "g-9-9", "--route-to-goal", "world", "--route-only"]
+    assert m.main(["--reviewer", "peer"] + route) == 0
+    assert calls[-1][6] == failed_marker, "route-only must route the same findings"
+    assert notes["g-9-9"].count(failed_marker) == 1
+    assert len(_entries(tmp_path, "g-9-9")) == 1, "route-only wrote a verdict entry"
+
+    # Refusals, none of which may call the writer.
+    before = len(calls)
+    assert m.main(["--reviewer", "someone-else"] + route) == 1
+    assert "superseded" in capsys.readouterr().err
+    assert m.main(["--goal", "g-9-1", "--reviewer", "peer", "--route-to-goal", "world",
+                   "--route-only"]) == 1
+    assert "no verdict is recorded" in capsys.readouterr().err
+    assert m.main(["--goal", "g-9-7", "--reviewer", "peer",
+                   "--source-file", str(_source(tmp_path)),
+                   "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)),
+                   "--approve", "--write"]) == 0
+    assert m.main(["--goal", "g-9-7", "--reviewer", "peer", "--route-to-goal", "world",
+                   "--route-only"]) == 1
+    assert "plain APPROVE" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as usage:
+        m.main(["--reviewer", "peer", "--write"] + route)
+    assert usage.value.code == 2
+    assert len(calls) == before
+
+
+def test_only_the_writers_rerun_sentence_is_cut_from_the_failure(monkeypatch, capsys):
+    """A verify failure (rc 7, not retried) carries a warning after the re-run advice.
+    Cutting from the advice to the end dropped that warning with it."""
+    m = _producer_module()
+    text = ("write verification FAILED (confirmed): marker absent. Re-run the identical "
+            "command — the marker keeps the retry idempotent. To inspect this one "
+            "field's history use history.py list; DO NOT run history.py restore.")
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 7, "", text))
+    assert m.route_findings("g-9-9", "world", "peer", ["x"]) is False
+    err = capsys.readouterr().err
+    assert "ROUTING FAILED (rc=7) —" in err and "Re-run the identical" not in err
+    assert "marker absent." in err and "DO NOT run history.py restore" in err
+
+
 # ---------------------  re-review: F2, F3, F5 ---------------------
 
 def test_reviewed_at_is_stamped_on_every_written_verdict(tmp_path):
@@ -438,6 +564,32 @@ def test_reviewed_at_is_stamped_on_every_written_verdict(tmp_path):
     rec = _latest_verdict(tmp_path, "g-9-9")
     # naive ISO-8601 to the second, the repo-wide stamp shape
     assert len(rec["reviewed_at"]) == 19 and rec["reviewed_at"][10] == "T"
+
+
+def test_a_written_verdict_names_its_closer_from_the_goal_record(tmp_path, monkeypatch,
+                                                                 capsys):
+    """. Stats attributed a verdict to its closer's role by joining the goal
+    record, and a goal leaves the live store when its aspiration is archived or it is
+    evicted, so the verdict fell out of its role's rate. The verdict now copies the
+    closer at write time; a goal with no live record leaves the fields absent, loudly."""
+    m = _producer_module()
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    record = {"id": "g-9-9", "title": "not copied", "completed_by": "alpha",
+              "completed_by_role": "worker", "completed_by_sid": "5af0e472-0000"}
+    monkeypatch.setattr(m._gate(), "load_goal",
+                        lambda gid, source: record if gid == "g-9-9" else {})
+    base = ["--reviewer", "peer", "--source-file", str(_source(tmp_path)),
+            "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)), "--approve", "--write"]
+    assert m.main(["--goal", "g-9-9"] + base) == 0
+    rec = _latest_verdict(tmp_path, "g-9-9")
+    assert {k: rec.get(k) for k in m.CLOSER_FIELDS} == {
+        "completed_by": "alpha", "completed_by_role": "worker",
+        "completed_by_sid": "5af0e472-0000"}
+    assert "title" not in rec
+    assert m.main(["--goal", "g-9-8"] + base) == 0
+    assert not any(k in _latest_verdict(tmp_path, "g-9-8") for k in m.CLOSER_FIELDS)
+    assert "does not name its closer" in capsys.readouterr().err
 
 
 def test_approve_with_notes_releases_the_close_AND_routes_its_notes(tmp_path, monkeypatch):

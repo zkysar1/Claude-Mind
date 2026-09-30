@@ -737,11 +737,12 @@ IF outcome_class == "routine_spark":
         "self_evolution"               # sq-012 — does this outcome change my core purpose?
     )]
     Log: "▸ Routine spark: evaluating {len(creative_routine_questions)} creative+hypothesis questions"
+    pairs = []
     For each question in creative_routine_questions:
         Ask the question about the just-completed goal
-        Bash: spark-questions-increment.sh <question.id> times_asked
+        pairs += [question.id, "times_asked"]
         If spark generated:
-            Bash: spark-questions-increment.sh <question.id> sparks_generated
+            pairs += [question.id, "sparks_generated"]
             Execute the spark action (hypothesis creation via sq-009 handler,
             or first-principles via sq-016 handler, or transfer insight log)
     If any spark fires → log via:
@@ -765,11 +766,12 @@ IF outcome_class == "routine_spark":
         For each question in generative_questions:
             Ask the question about the just-completed goal
             (include scan signal context from working memory if available)
-            Bash: spark-questions-increment.sh <question.id> times_asked
+            pairs += [question.id, "times_asked"]
             If spark generated:
-                Bash: spark-questions-increment.sh <question.id> sparks_generated
+                pairs += [question.id, "sparks_generated"]
                 Execute the spark action (sq-007 handler creates aspiration,
                 sq-013 handler creates goals or aspiration)
+    Bash: spark-questions-increment.sh <all pairs>  # ONE write, not one per pair
 
     RETURN  # Skip full spark evaluation and Phase 6.5
 ```
@@ -778,8 +780,8 @@ IF outcome_class == "routine_spark":
 Read active spark questions via script instead of using hardcoded spark questions.
 1. `bash core/scripts/spark-questions-read.sh --active` → get active questions as JSON
 2. Ask each active question about the just-completed goal
-3. If a spark is generated: `bash core/scripts/spark-questions-increment.sh <id> sparks_generated`
-4. Always: `bash core/scripts/spark-questions-increment.sh <id> times_asked` (script auto-recomputes yield_rate)
+3. If a spark is generated: record `<id> sparks_generated`
+4. Always: record `<id> times_asked`; after the last question, ONE `bash core/scripts/spark-questions-increment.sh <id> <field> ...` (auto-recomputes yield_rate)
 
 Every `evolution_rules.review_interval_sessions` sessions:
 - Retire questions with yield_rate < retire_threshold AND times_asked >= min_asks_before_retire
@@ -791,13 +793,14 @@ Bash: spark-questions-read.sh --active
 # ALL active spark questions evaluated for deep outcomes.
 # No question count gating — full treatment regardless of outcome tier.
 Log: "▸ Spark: evaluating ALL {len(result)} questions (outcome: {outcome_class})"
+pairs = []
 For each question in result:
     Ask the question about the just-completed goal
-    Bash: spark-questions-increment.sh <question.id> times_asked
+    pairs += [question.id, "times_asked"]
     If spark generated:
-        Bash: spark-questions-increment.sh <question.id> sparks_generated
+        pairs += [question.id, "sparks_generated"]
         Execute the spark action (add source, create article, log gap, etc.)
-    # yield_rate is auto-recomputed by the increment script — no manual update needed
+Bash: spark-questions-increment.sh <all pairs>  # ONE write; recomputes yield_rate
 
 If any spark fires → log via:
   echo '{"event":"spark","details":"Goal {id} sparked: {description of change}","date":"<today>"}' | bash core/scripts/evolution-log-append.sh

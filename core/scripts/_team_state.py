@@ -545,6 +545,46 @@ def stamp_row_metadata(row: dict, author: str, now: str) -> dict:
     return row
 
 
+# : the write floor under a row's `last_active` heartbeat. Under
+# own-cloud every shard rewrite is a new store version, and a bump of a few
+# seconds is a whole version that no gate can use: the gates reading
+# last_active use windows of 60 min or more (claim-holder liveness 60 min,
+# which adds this floor to its window; claim corroboration 60 min; peer
+# liveness 3 h; liveness-check 6 h). The one shorter reader is a soft score:
+# the selector's handoff take-back penalty (full under 30 min of partner
+# silence), which the floor can move by at most about 0.4 of its 2.5.
+# 600 s is the cadence the tool-call hook already enforces
+# (_shared_tick.SHARED_HEARTBEAT_INTERVAL_S), so a live agent's last_active
+# trails its latest heartbeat by under 600 s. Keep it far below 60 min.
+LAST_ACTIVE_WRITE_FLOOR_S = 600
+
+
+def _naive_ts(value):
+    try:
+        return datetime.strptime(str(value).strip()[:19], "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+
+
+def last_active_write_is_floored(row, subpath: str, operation: str, value,
+                                 floor_s: int = LAST_ACTIVE_WRITE_FLOOR_S) -> bool:
+    """True when a row write is a `set` of last_active that would move the
+    stored value forward by less than floor_s. The caller then returns the row
+    as read, so locked_modify_yaml(skip_if_unchanged=True) writes nothing.
+
+    Only that one shape is floored. Any other field, a whole-row set, and a
+    stamp that is unparseable or OLDER than the stored one write exactly as
+    before: the floor can only drop a write, so a stored stamp from a clock
+    running ahead is still overwritten, never frozen until real time passes it.
+    """
+    if subpath != "last_active" or operation != "set" or not isinstance(row, dict):
+        return False
+    stored, new = _naive_ts(row.get("last_active")), _naive_ts(value)
+    if stored is None or new is None:
+        return False
+    return 0 <= (new - stored).total_seconds() < floor_s
+
+
 def make_clear_in_flight_modifier(agent_author: str, now_fn=None,
                                   if_goal: str = None, status: dict = None):
     """Build the `locked_modify_yaml` modifier that clears a row's in_flight.

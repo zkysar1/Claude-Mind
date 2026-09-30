@@ -244,6 +244,9 @@ Read the original evaluation record (scoring, reasoning)
 # / resolution_rationale / actual_result / reflection / notes — check those before calling
 # a `rationale` winner bare. `notes` is MIXED — 4 of its 6 corpus hits hold the outcome,
 # 2 hold a formation pre-mortem — so read it, never trust the key (readings Run 88).
+# Three more off-chain keys are MIXED the same way, so read them before calling a record bare:
+# `resolution_method` and `position` (Run 90: 12 and 27 of 70 pool weak winners), and
+# `evidence` (Run 92: 13 of 49; unrelated to the in-chain `evidence_for`).
 # The helper fix is owned by g-115-10108. The
 # ten-key order lives ONCE in mind_api/src/world/pipeline.py NARRATIVE_CHAIN.
 # `--narrative` alone covers the live+archive union; add `--stage resolved` to filter.

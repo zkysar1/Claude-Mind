@@ -246,11 +246,19 @@ def check_q4(goal_id: str, paths: List[str], source_file: Optional[str], run: Ru
     if v == "fail":
         found = [f"L{f.get('start_line')}-{f.get('end_line')} {f.get('kind')}: {f.get('detail')}"
                  for f in d.get("findings") or []]
+        # One remedy per finding kind, because missing- and decorative-citation are
+        # fixed in opposite ways (guard-6180) and one shared line produced repeat
+        # FAILs (). Only a whole-file Read counts: read_tracker credits no
+        # ranged read. A curl fetch IS recorded since , so it is not named.
         return verdict("q4", FAIL, f"sampled {counts}, {len(found)} finding(s)", found + extra,
-                       "for each named claim: cite a source this session fetched, mark it "
-                       "[UNVERIFIED -- <why>], or correct it where its source says otherwise. A "
-                       "source read with cat or curl is invisible to the manifest: re-read it with "
-                       "the Read tool. No override, by design", verdict=v, counts=counts)
+                       "missing-citation: put a source token (a goal id, guard or rb id, URL, "
+                       "board msg id or tree node key) INSIDE the flagged lines, or tag them "
+                       "[UNVERIFIED -- <why>]. decorative-citation: Read the cited file whole with "
+                       "the Read tool, with no offset or limit, or fetch a cited URL; a ranged Read, "
+                       "or cat, sed or head in Bash, never counts. For a file too big to Read whole, "
+                       "a slash-joined word that is not a citation, or a source you never opened: "
+                       "tag the line, reword it, or drop it. direction-contradiction: correct the "
+                       "claim to what its source says. No override, by design", verdict=v, counts=counts)
     if v == "skipped":
         return verdict("q4", SKIPPED, f"skipped, NOT a pass: {d.get('skip_reason')}", extra,
                        verdict=v, counts=counts)

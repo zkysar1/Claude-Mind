@@ -275,6 +275,53 @@ def record_local(wm_path, slot: str, item, world_dir=None) -> Path | None:
         return None
 
 
+def record_slot_replace(wm_path, slot: str, before, after,
+                        world_dir=None) -> Path | None:
+    """Mirror a WHOLE-SLOT replace (wm-set) of a capture slot into this Body's
+    carrier (g-306-554). Returns the carrier path when a line was written, else
+    None.
+
+    `record_local` runs on APPEND only, so an in-place correction — read the
+    slot, fix an entry, wm-set the whole array back — never reached the carrier:
+    the fast lane kept offering the SUPERSEDED text, and the corrected text
+    reached the reducer only at the close-time merge.
+
+    Records exactly what the replace CHANGED: each flagged entry of `after`
+    whose content hash is not among `before`'s. An untouched entry writes
+    nothing, and that is load-bearing rather than an optimisation — a Body's
+    slot also holds the flagged entries it INHERITED at the fork, which were
+    never its to carry, and re-offering them would hand the reducer its own
+    entries back. A corrected entry is written exactly as it now sits in the WM,
+    its original `_item_ts` included, so the close-time merge dedups it
+    (VERBATIM IS LOAD-BEARING, module docstring).
+
+    APPEND-ONLY, like `record_local`: the superseded row stays. The consumer may
+    already have merged it, and removing the row could not retract it.
+
+    Caller-gated like `record_local` (the caller holds `CAPTURE_SLOTS` and its
+    WM lock); the store push is `push()`, after the lock. Never raises: the WM
+    write this backs has already succeeded.
+    """
+    try:
+        if not isinstance(after, list) or split_body_wm_path(wm_path)[0] is None:
+            return None
+        content_hash = _body_merge()._content_hash
+        prior = ({content_hash(e) for e in before}
+                 if isinstance(before, list) else set())
+        wrote = None
+        for entry in after:
+            if not (isinstance(entry, dict) and entry.get("load_bearing")):
+                continue
+            h = content_hash(entry)
+            if h in prior:
+                continue
+            prior.add(h)
+            wrote = record_local(wm_path, slot, entry, world_dir) or wrote
+        return wrote
+    except Exception:  # noqa: BLE001 — never fail the WM set this backs
+        return None
+
+
 _PUSH_FAILURE_REPORTED = False
 
 # : the plain PUT plus up to three re-fenced PUTs. Worst case adds
@@ -545,6 +592,23 @@ def read_carriers(state_dir, backend, world_dir=None, skipped=None) -> dict:
     return out
 
 
+# : wm-append stamps `_item_ts` at write time, and it is not part of
+# what a capture SAYS. An in-place correction keeps the original stamp while any
+# re-delivery through wm-append gets a new one, so an identity that hashes the
+# stamp can never match the two.
+_VOLATILE_CAPTURE_KEYS = ("_item_ts",)
+
+
+def capture_identity(entry, content_hash) -> str:
+    """`content_hash` of a capture minus its volatile stamp: what DELIVERED
+    means to `verify_delivery` (g-306-554). Not a dedup key — the carrier still
+    stores, and the consumer still dedups, the VERBATIM entry."""
+    if isinstance(entry, dict):
+        entry = {k: v for k, v in entry.items()
+                 if k not in _VOLATILE_CAPTURE_KEYS}
+    return content_hash(entry)
+
+
 def _carrier_pairs(raw: bytes, unit_key: str, content_hash) -> set:
     """{(slot, content hash)} for one Body's rows in a carrier's bytes.
 
@@ -587,7 +651,10 @@ def verify_delivery(wm_path, backend=None, world_dir=None) -> "tuple[str, str]":
     copy, so its mtime proves nothing. A size or ETag comparison with the store
     can show DRIFT on identical content (guard-2245). So the store copy is read
     through `read_authoritative_bytes`, which decodes, and entries are matched on
-    `body-merge._content_hash`, the identity the consumer dedups on.
+    `capture_identity`: `body-merge._content_hash`, the identity the consumer
+    dedups on, minus the `_item_ts` stamp. With the stamp in, an entry corrected
+    in place (old stamp) never matched its re-delivery (new stamp), so the check
+    stayed "undelivered" for the rest of the Body's life (g-306-554).
 
     It subtracts the fork BASELINE. A Body's WM starts as a byte copy of the
     agent-wide WM, flagged entries included, and none of those were this Body's
@@ -623,6 +690,9 @@ def verify_delivery(wm_path, backend=None, world_dir=None) -> "tuple[str, str]":
         bmg = _body_merge()
         loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
+        def ident(entry) -> str:
+            return capture_identity(entry, bmg._content_hash)
+
         def _captures(path: Path, flagged_only: bool) -> set:
             data = yaml.load(path.read_text(encoding="utf-8"), Loader=loader)
             slots = data.get("slots") if isinstance(data, dict) else None
@@ -632,7 +702,7 @@ def verify_delivery(wm_path, backend=None, world_dir=None) -> "tuple[str, str]":
                 for e in arr if isinstance(arr, list) else ():
                     if isinstance(e, dict) and (e.get("load_bearing")
                                                 or not flagged_only):
-                        found.add((slot, bmg._content_hash(e)))
+                        found.add((slot, ident(e)))
             return found
 
         inherited = _captures(baseline, flagged_only=False)
@@ -657,14 +727,14 @@ def verify_delivery(wm_path, backend=None, world_dir=None) -> "tuple[str, str]":
         return "unverified", (f"store read of {path.name} failed "
                               f"({type(exc).__name__}: {exc})")
 
-    stored = (_carrier_pairs(raw, unit_key, bmg._content_hash)
+    stored = (_carrier_pairs(raw, unit_key, ident)
               if raw is not None else set())
     missing = [k for k in own if k not in stored]
     if not missing:
         return "delivered", (f"all {len(own)} capture(s) flagged since the fork "
                              f"are in the store copy of {path.name}")
     try:
-        local = (_carrier_pairs(path.read_bytes(), unit_key, bmg._content_hash)
+        local = (_carrier_pairs(path.read_bytes(), unit_key, ident)
                  if path.is_file() else set())
     except OSError:
         local = set()

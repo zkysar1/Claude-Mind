@@ -32,7 +32,7 @@ The LLM NEVER reads or edits `meta/spark-questions.jsonl` directly. All operatio
 | `spark-questions-read.sh --summary` | Compact one-liner per question | — |
 | `spark-questions-add.sh` | Validate + append new question or candidate | JSON |
 | `spark-questions-update-field.sh <id> <field> <value>` | Update single field | — |
-| `spark-questions-increment.sh <id> <field>` | Atomic increment (times_asked, sparks_generated) | — |
+| `spark-questions-increment.sh <id> <field> [<id> <field> ...]` | Atomic increment (times_asked, sparks_generated). Several pairs are ONE locked rewrite (`/v1/spark-questions/increment-batch`); a missing or non-question id is skipped and named, exit 1 | — |
 | `spark-questions-retire.sh <id>` | Set status to retired | — |
 | `spark-questions-promote.sh <id> <new-id>` | Promote candidate to active question | — |
 

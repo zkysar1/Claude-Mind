@@ -567,6 +567,9 @@ def test_live_write_is_atomic_not_a_truncate_rewrite(tmp_path):
     assert "os.fsync(" in body, "the temp file is replaced without an fsync"
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="no POSIX file mode on Windows: os.chmod sets only the read-only "
+                           "flag, so the 0644 fixture reads back 0666 (guard-4529)")
 def test_live_write_preserves_the_peer_stores_file_mode(tmp_path):
     """BEHAVIOURAL, because the structural sibling above is satisfied BY the defect.
 

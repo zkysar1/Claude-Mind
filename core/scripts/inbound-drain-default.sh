@@ -32,7 +32,13 @@ set -uo pipefail
 _SELF="$(cd "$(dirname "$0")" && pwd)"
 _ENGINE="$_SELF/inbound_drain.py"
 
-_emit_skip() { printf '{"not_a_vessel":true,"reason":"%s"}\n' "$1"; exit 0; }
+# The reason can carry the spool root, and a Windows one is full of backslashes:
+# escape backslash and double quote, or the caller's json.loads rejects the line.
+_emit_skip() {
+    local r="${1//\\/\\\\}"
+    r="${r//\"/\\\"}"
+    printf '{"not_a_vessel":true,"reason":"%s"}\n' "$r"; exit 0
+}
 
 if [ ! -f "$_ENGINE" ]; then _emit_skip "drain engine absent"; fi
 

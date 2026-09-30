@@ -6,6 +6,10 @@ PostToolUse hook companion. Reads JSON payload from stdin
 appends one ~140-byte record to world/presence/<agent>.jsonl via
 locked_append_jsonl.
 
+Also bound to PreToolUse '*' (g-375-80). There it only ticks a worker Body's
+liveness carrier and returns, so a long call is ticked when it starts and the
+presence log still records each call once, when it ends.
+
 Visibility-only: fail-silent on ALL errors (sys.exit 0 every path).
 Visibility hook MUST NEVER block tool execution.
 
@@ -118,6 +122,14 @@ def main() -> int:
     session_id = payload.get("session_id", "")
     if not tool_name:
         return 0
+    # Both hosts name the event in the payload. PreToolUse runs this hook only to
+    # tick at the start of a call (Step 3b); PostToolUse, the default, also records it.
+    pre_tool = payload.get("hook_event_name") == "PreToolUse"
+    if pre_tool and tool_name == "Bash":
+        # bash-agent-inject ticks a Bash call's start. One emitter per event: a host
+        # may run matching hooks in parallel, and two ticks racing through the
+        # carrier's shared .tmp can leave it empty.
+        return 0
 
     # Step 2: Resolve framework paths
     try:
@@ -175,14 +187,21 @@ def main() -> int:
     # reducer's full tick was not built for it, so the reducer keeps its
     # diary-write and Bash-call cadences. Fail-open: a tick must never delay
     # or break the presence record below.
+    # At PreToolUse the same decision ticks a call's START. A tick only after a
+    # call left a long non-Bash call unticked from its first second to its last:
+    # on zc-02 (2026-09-30) a 10-min model call chose deep_think, which ran about
+    # 28.5 min, and the carrier aged 38.6 min while the Body worked.
     try:
         import _shared_tick
         from _paths import agent_dir
         _shared_tick.maybe_tick(agent, session_id, agent_dir(agent) / "session",
                                 Path(PROJECT_ROOT), SCRIPT_DIR,
-                                full_allowed=False, via="post-tool")
+                                full_allowed=False,
+                                via="pre-tool" if pre_tool else "post-tool")
     except Exception:
         pass
+    if pre_tool:
+        return 0  # tick only: the presence record is written once, when the call ends
 
     # Step 4: Optional goal_id from the agent's team-state row (
     # sharding: row file first, core-file residual fallback).

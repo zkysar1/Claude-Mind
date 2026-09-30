@@ -20,6 +20,7 @@ Subcommands:
 """
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -39,6 +40,7 @@ from _team_state import (
     body_row_shard_present,
     compose_state,
     core_residual,
+    last_active_write_is_floored,
     make_clear_body_row_modifier,
     make_clear_in_flight_modifier,
     retire_agent,
@@ -130,6 +132,11 @@ def cmd_update(args):
         def _row_modifier(row):
             if not isinstance(row, dict):
                 row = {}
+            if last_active_write_is_floored(row, subpath, args.operation, parsed):
+                # : a heartbeat inside the floor returns the row as
+                # read, so skip_if_unchanged writes no new store version.
+                return row
+            before = copy.deepcopy(row)
             if subpath == "":
                 # Whole-row set (e.g. consolidate's session-end snapshot).
                 # append/remove make no sense against a whole row.
@@ -145,10 +152,15 @@ def cmd_update(args):
                 _append_nested(row, subpath, parsed)
             elif args.operation == "remove":
                 _remove_nested(row, subpath, parsed)
+            if row == before:
+                # No field changed: leave the stamp alone so the write is
+                # skipped ( — each rewrite is a store version).
+                return row
             return stamp_row_metadata(row, agent, now)
 
         locked_modify_yaml(row_path(WORLD_DIR, row_agent), _row_modifier,
-                           initial=core_residual(TEAM_STATE_PATH, row_agent))
+                           initial=core_residual(TEAM_STATE_PATH, row_agent),
+                           skip_if_unchanged=True)
         print(f"Updated {field}")
         return
 
@@ -333,7 +345,8 @@ def cmd_clear_in_flight(args):
         sys.exit(f"team-state clear-in-flight: {e}")
 
     locked_modify_yaml(row_path(WORLD_DIR, target_agent), _row_modifier,
-                       initial=core_residual(TEAM_STATE_PATH, target_agent))
+                       initial=core_residual(TEAM_STATE_PATH, target_agent),
+                       skip_if_unchanged=True)
     if status["cleared"]:
         print(f"in_flight cleared for {target_agent}")
     elif status["skipped_goal_id"]:
@@ -438,7 +451,8 @@ def cmd_clear_body_row(args):
                                                  status=status)
     # No core_residual seed — see the daemon twin: in_flight_bodies is a
     # post-sharding field that never lived in the core file.
-    locked_modify_yaml(row_path(WORLD_DIR, args.agent), _row_modifier)
+    locked_modify_yaml(row_path(WORLD_DIR, args.agent), _row_modifier,
+                       skip_if_unchanged=True)
     print(json.dumps({"ok": True, "agent": args.agent, "sid": args.sid,
                       "removed": status["removed"],
                       "nulls_swept": status["nulls_swept"],

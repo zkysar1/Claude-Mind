@@ -852,6 +852,15 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
        rate = effective / total (or 0.0 if total == 0)
      Bash: meta-set.sh reflection-strategy.yaml reflection_effectiveness_by_type '<updated_json>'
      This closes the meta-learning loop: reflection quality → depth allocation → better reflections
+     # ⛔ KNOWN AND OWNED: THE RATE IS STRUCTURALLY 1.0. DO NOT RE-DERIVE IT OR
+     # FILE A GOAL FOR IT. The log's only producer (log_reflection_quality in
+     # utilization-feedback.py) is handed helpful items only, so every row reads
+     # helpful=true. Measured at fire #118 (zeta, cc-02, 2026-09-30): 279 of 279
+     # rows helpful, no `type` field, cap 500. So "the loop" above never closes:
+     # no type can fall below 1.0. Owner: g-115-7398. Run the bookkeeping, and
+     # attach a fresh count there instead of rediscovering this (rb-7613).
+     # There is no type field, so the split is a prefix heuristic: ref-2026-* and
+     # ref-hyp* are hypothesis rows; everything else is execution.
 6. invoke /replay --sharp-wave --selective (if violations detected)
 7. **Tree Health Lint (wiki integrity check)**:
      # Periodically verify the knowledge tree's structural and content health.

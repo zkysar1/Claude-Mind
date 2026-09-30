@@ -24,6 +24,7 @@ daemon thread — those are reimplemented to return HTTP 400.
 """
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ from _fileops import locked_modify_yaml, locked_write_yaml  # noqa: E402
 from _team_state import (  # noqa: E402
     body_row_shard_present,
     core_residual,
+    last_active_write_is_floored,
     make_clear_body_row_modifier,
     make_clear_in_flight_modifier,
     retire_agent as _retire_agent,
@@ -197,6 +199,11 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
         def _row_modifier(row):
             if not isinstance(row, dict):
                 row = {}
+            if last_active_write_is_floored(row, subpath, operation, parsed):
+                # : a heartbeat inside the floor returns the row as
+                # read, so skip_if_unchanged writes no new store version.
+                return row
+            before = copy.deepcopy(row)
             if subpath == "":
                 row = dict(parsed)
             elif operation == "set":
@@ -205,11 +212,16 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
                 _append_nested(row, subpath, parsed)
             elif operation == "remove":
                 _remove_nested(row, subpath, parsed)
+            if row == before:
+                # No field changed: leave the stamp alone so the write is
+                # skipped ( — each rewrite is a store version).
+                return row
             return stamp_row_metadata(row, agent, now)
 
         try:
             locked_modify_yaml(row_path(ctx.paths.world, row_agent), _row_modifier,
-                               initial=core_residual(_ts_path(ctx), row_agent))
+                               initial=core_residual(_ts_path(ctx), row_agent),
+                               skip_if_unchanged=True)
         except (OSError, ValueError) as e:
             return Response.error(500, "write_failed", str(e))
         return Response.json({"ok": True, "field": field, "operation": operation})
@@ -405,7 +417,8 @@ def clear_in_flight(ctx) -> "Response":  # type: ignore[name-defined]
 
     try:
         locked_modify_yaml(row_path(ctx.paths.world, target_agent), _row_modifier,
-                           initial=core_residual(_ts_path(ctx), target_agent))
+                           initial=core_residual(_ts_path(ctx), target_agent),
+                           skip_if_unchanged=True)
     except (OSError, ValueError) as e:
         return Response.error(500, "write_failed", str(e))
 
@@ -470,7 +483,8 @@ def clear_body_row(ctx) -> "Response":  # type: ignore[name-defined]
     # post-sharding field that has never lived in the core file, so seeding from
     # a residual could only ever re-materialize an unrelated legacy in_flight.
     try:
-        locked_modify_yaml(row_path(ctx.paths.world, target_agent), _row_modifier)
+        locked_modify_yaml(row_path(ctx.paths.world, target_agent), _row_modifier,
+                           skip_if_unchanged=True)
     except (OSError, ValueError) as e:
         return Response.error(500, "write_failed", str(e))
 

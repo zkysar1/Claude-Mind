@@ -191,6 +191,28 @@ the demoted runner, bound autonomous, the demotion is recent and no user-stop
 artifact post-dates it, no peer holds the claim) it restores the runner
 triple-write + heartbeat + RUNNING and logs `action: yank_reversed`.
 
+## A parked Body's other turns are held until the park check runs (g-375-104)
+
+The park check lives in worker-loop Phase -0 and in the deadman prompt's parked
+branch, so it runs only on a turn that enters one of them. Any other turn skipped
+it: a background command's exit (both harnesses deliver it as a NEW turn), a plan
+prompt, a hook's words. Measured 2026-09-30 on a worker Body (g-375-98): a
+background-command exit opened a turn the second its park turn ended, and that
+turn continued its plan for 3 h 21 min with no claim while the manifest read
+parked; its park wakeup waited four hours behind it.
+
+`parked-body-gate.py` (PreToolUse on Bash and the three file writers) denies work
+on a parked worker session until the park check has run. `park` stamps
+`last_parked_at` on every park; `park-due` answering DUE stamps
+`repoll_opened_at`; the gate lets work through only while the second is STRICTLY
+later than the first, or after an operator slash command (its UserPromptSubmit
+`stamp` mode). `resume` clears both. The park path always passes (the Phase -0
+and park-sequence commands by marker, and a lone echo), every unreadable state
+fails open, and the deny names Skill(worker-loop), so a held turn is one
+instruction away from the check. It is FIRST in each hook list: a harness that
+runs PreToolUse hooks in order threads each rewrite forward, and the agent-inject
+hook prepends exports that would hide a lone echo.
+
 ## Context pressure is not a close condition — the Phase 1 text, measured
 
 Moved verbatim from worker-loop Phase 1 (the no-goal branch) on 2026-09-23
@@ -245,6 +267,8 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   defined by what resets its stamp
 - rb-9659 — an unattended session at the idle prompt with a complete plan is a
   dead worker Body (the Zak-Code side of the same incident)
+- g-375-98 / g-375-104 — a turn opened by a background-command exit skipped the
+  park check; `core/scripts/parked-body-gate.py` holds work until it runs
 - `core/scripts/body-manifest.py` (`park`, `resume`, `park-expired`,
   `PARK_MAX_HOURS`), `core/scripts/stop-reason-record.py` (`NO_NOTIFY_PATHS`),
   `core/scripts/deadman-directive.sh` (resumable branch),

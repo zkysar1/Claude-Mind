@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Pins for rt_python_launcher (core/scripts/_python_launcher.sh), .
+"""Pins for rt_python_launcher and rt_python_launcher_into
+(core/scripts/_python_launcher.sh), g-115-11431 and g-115-11513.
 
-rt_python_launcher is the single source of truth for "which python do I call":
-`py -3` on a Windows shell that has the py launcher, `python3` everywhere else.
-Since g-115-11431 every core script that runs inline python resolves through it,
-instead of calling a bare `py -3` that dies rc=127 on a Linux box without the
-/usr/local/bin/py shim (WSL, fresh containers), mostly behind `|| true`.
+The launcher selection is the single source of truth for "which python do I
+call": `py -3` on a Windows shell that has the py launcher, `python3` everywhere
+else. Since g-115-11431 every core script that runs inline python resolves
+through it, instead of calling a bare `py -3` that dies rc=127 on a Linux box
+without the /usr/local/bin/py shim (WSL, fresh containers), mostly behind
+`|| true`. rt_python_launcher_into holds the selection and sets a named
+variable. rt_python_launcher prints the same value for `$(...)` callers.
 
 Clauses, each pinned by a test that fails when the clause is removed:
 
@@ -16,9 +19,14 @@ Clauses, each pinned by a test that fails when the clause is removed:
      carry /usr/local/bin/py, and a POSIX box must still get python3
   4. the inline idiom `PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3`
      yields python3 on a Windows shell without py (guard-1098 fallback)
-  5. no fork inside the function: it reads $OSTYPE instead of `uname -s`.
+  5. no fork inside the selection: it reads $OSTYPE instead of `uname -s`.
      The uname form cost ~217 ms per call on Git Bash (measured 2026-09-29),
      and the resolver now runs at the top of ~60 scripts, several on hook paths.
+  6. rt_python_launcher_into sets the variable IN THE CALLER'S SHELL, with the
+     same value and rc as the print form in every case above ("" and rc=1 on a
+     Windows shell without py), whatever name the caller picks. It has no
+     subshell, which the print form's caller always pays: ~26 ms per call on
+     Git Bash (g-115-11513).
 
 $OSTYPE is the platform gate, and bash honours an INHERITED value (set-if-not;
 the positive control below proves it on the box that runs the suite), so every
@@ -82,6 +90,16 @@ class RtPythonLauncherTest(unittest.TestCase):
         out, rc = p.stdout.rsplit("|", 1)
         return out, int(rc)
 
+    def _resolve_into(self, ostype: str, bindir: Path, name: str = "PYLAUNCH"):
+        # The variable starts stale, so a path that leaves it untouched cannot
+        # pass for one that sets it to "".
+        p = self._run(ostype, bindir,
+                      f'{name}=stale; rt_python_launcher_into {name}; rc=$?; '
+                      f'printf "%s|%s" "${name}" "$rc"')
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out, rc = p.stdout.rsplit("|", 1)
+        return out, int(rc)
+
     def test_inherited_ostype_is_honoured(self):
         # Positive control: without it, every platform case below could be
         # silently testing the host platform only.
@@ -112,12 +130,45 @@ class RtPythonLauncherTest(unittest.TestCase):
         self.assertEqual(self._run("linux-gnu", self.with_py, body).stdout, "python3")
 
     def test_function_does_not_fork(self):
-        p = self._run("msys", self.with_py, "declare -f rt_python_launcher")
+        # The selection lives in rt_python_launcher_into; the print form only
+        # delegates. Neither body may fork.
+        p = self._run("msys", self.with_py,
+                      "declare -f rt_python_launcher_into rt_python_launcher")
         self.assertEqual(p.returncode, 0, p.stderr)
         body = p.stdout
         self.assertIn("OSTYPE", body)
+        self.assertIn("printf -v", body)
         self.assertNotIn("uname", body)
         self.assertNotIn("$(", body)
+        self.assertNotIn("`", body)
+
+    def test_into_gives_the_print_forms_value_and_rc_everywhere(self):
+        for ostype in ("msys", "cygwin", "linux-gnu", "darwin23", ""):
+            for bindir in (self.with_py, self.no_py):
+                self.assertEqual(self._resolve_into(ostype, bindir),
+                                 self._resolve(ostype, bindir),
+                                 f"OSTYPE={ostype!r} bindir={bindir.name}")
+
+    def test_into_values(self):
+        # The parity test above would still pass if both forms broke together.
+        self.assertEqual(self._resolve_into("msys", self.with_py), ("py -3", 0))
+        self.assertEqual(self._resolve_into("msys", self.no_py), ("", 1))
+        self.assertEqual(self._resolve_into("linux-gnu", self.with_py), ("python3", 0))
+
+    def test_into_sets_whatever_name_the_caller_picks(self):
+        # A local in rt_python_launcher_into would shadow a caller variable of
+        # the same name, so printf -v would set the local and the caller's
+        # variable would stay stale. The print form's own local name is the
+        # likeliest collision.
+        for name in ("PYLAUNCH", "_rt_python_launcher", "launcher"):
+            self.assertEqual(self._resolve_into("msys", self.with_py, name),
+                             ("py -3", 0), name)
+
+    def test_into_inline_idiom_falls_back_to_python3(self):
+        body = 'rt_python_launcher_into PYLAUNCH || PYLAUNCH=python3; printf "%s" "$PYLAUNCH"'
+        self.assertEqual(self._run("msys", self.no_py, body).stdout, "python3")
+        self.assertEqual(self._run("msys", self.with_py, body).stdout, "py -3")
+        self.assertEqual(self._run("linux-gnu", self.with_py, body).stdout, "python3")
 
 
 if __name__ == "__main__":

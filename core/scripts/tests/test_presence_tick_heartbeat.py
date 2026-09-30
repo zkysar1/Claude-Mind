@@ -17,6 +17,9 @@ WHAT THESE TESTS PIN (through presence-tick main(), spawn captured):
   4. a session with no carrier never ticks.
   5. under pytest WITHOUT the opt-in the spawn is refused (g-115-5310).
   6. a failing tick never costs the presence record.
+  7. a PreToolUse call ticks at the START of any tool, tagged via=pre-tool, and
+     writes no presence record; the same call's end shares that window.
+  8. settings.json runs this hook on PreToolUse '*' as well as PostToolUse '*'.
 """
 
 from __future__ import annotations
@@ -93,6 +96,12 @@ def _capture(monkeypatch) -> list:
 
 def _post_tool(monkeypatch, tool: str, sid: str = WORKER) -> int:
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"tool_name": tool, "session_id": sid})))
+    return pt.main()
+
+
+def _pre_tool(monkeypatch, tool: str, sid: str = WORKER) -> int:
+    payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "session_id": sid}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     return pt.main()
 
 
@@ -175,3 +184,47 @@ def test_a_failing_tick_never_costs_the_presence_record(tmp_path, monkeypatch):
     root = _root(tmp_path, monkeypatch)
     assert _post_tool(monkeypatch, "Edit") == 0
     assert _presence_records(root) == 1
+
+
+def test_a_long_non_bash_call_is_ticked_at_its_start(tmp_path, monkeypatch):
+    """zc-02, 2026-09-30: a 10-minute model call chose deep_think, which ran about
+    28.5 min. The Bash hook ticks before Bash only and this hook ran only after a
+    call, so nothing ticked at deep_think's start and the carrier aged 38.6 min while
+    the Body worked. On PreToolUse the hook ticks and writes no presence record:
+    presence still records each call once, when it ends."""
+    calls = _capture(monkeypatch)
+    root = _root(tmp_path, monkeypatch)
+    assert _pre_tool(monkeypatch, "deep_think") == 0
+    assert len(calls) == 1, f"a call's start must tick once the interval allows, got {calls!r}"
+    assert calls[0][1]["body_only"] is True and calls[0][1]["via"] == "pre-tool"
+    assert _presence_records(root) == 0, "a PreToolUse call must not write a presence record"
+    assert _post_tool(monkeypatch, "deep_think") == 0
+    assert len(calls) == 1, "the call's own end must share the window its start opened"
+    assert _presence_records(root) == 1
+
+
+def test_a_bash_start_is_left_to_the_bash_hook(tmp_path, monkeypatch):
+    """bash-agent-inject ticks before Bash. Two emitters on one event could race
+    through the carrier's shared .tmp on a host that runs hooks in parallel."""
+    calls = _capture(monkeypatch)
+    root = _root(tmp_path, monkeypatch)
+    assert _pre_tool(monkeypatch, "Bash") == 0
+    assert calls == [] and not _stamp(root).exists()
+    assert _pre_tool(monkeypatch, "Read") == 0
+    assert len(calls) == 1 and calls[0][1]["via"] == "pre-tool"
+
+
+def test_settings_run_the_hook_before_and_after_every_tool():
+    """The PreToolUse half is wiring: a lost settings entry would silently undo it."""
+    settings = json.loads(
+        (CORE_SCRIPTS.parents[1] / ".claude" / "settings.json").read_text(encoding="utf-8"))
+
+    def wired(event: str) -> bool:
+        return any(
+            group.get("matcher") == "*"
+            and any("core/scripts/presence-tick.sh" in h.get("command", "")
+                    for h in group.get("hooks", []))
+            for group in settings["hooks"].get(event, []))
+
+    assert wired("PreToolUse"), "presence-tick.sh must run on PreToolUse '*'"
+    assert wired("PostToolUse"), "presence-tick.sh must run on PostToolUse '*'"

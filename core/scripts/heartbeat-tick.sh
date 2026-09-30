@@ -225,10 +225,18 @@ if [ -n "${MIND_SID:-}" ]; then
         # the header) and a python spawn per tick would tax the hot path to
         # recover a value that, when absent, cannot indicate the fault anyway --
         # a cloned .env.local is set BY DEFINITION on every path that loads it.
+        #
+        # Per-process tmp name (). A fixed `<carrier>.tmp` was shared by
+        # every writer, so a second tick's `>` could empty the first tick's pending
+        # tmp and the first mv then published an empty carrier. BASHPID, since a
+        # subshell inherits $$. On failure remove only our own tmp (guard-2474). A
+        # SIGKILL between write and rename can still orphan one (rb-9000): it is
+        # gitignored and never synced, as the manifest glob is body-heartbeat-*.json.
+        _HB_TMP="$_HB_CARRIER.tmp.${BASHPID:-$$}"
         printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s","machine_id":"%s"}\n' \
             "$MIND_SID" "${MIND_AGENT:-}" "$(hostname || echo unknown)" \
-            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" > "$_HB_CARRIER.tmp" \
-            && mv -f "$_HB_CARRIER.tmp" "$_HB_CARRIER" || true
+            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" > "$_HB_TMP" \
+            && mv -f "$_HB_TMP" "$_HB_CARRIER" || { rm -f "$_HB_TMP" || true; }
     else
         # Say so. A silent skip here reads as "the tick ran and wrote nothing",
         # and the caller's next move is to hand-write the carrier (measured
@@ -470,6 +478,9 @@ touch "$AGENT_DIR/session/runner-heartbeat"
 # `exit 2` meant this line never ran on the box it exists to protect. See the
 # block above for the full rationale. Do NOT move it back down.
 
+# The writer floors this field (): a stamp less than 600 s newer
+# than the stored last_active writes nothing, so last_active advances at most
+# once per 600 s while runner-heartbeat above advances every tick.
 bash "$(dirname "$0")/team-state-update.sh" \
     --field "agent_status.$MIND_AGENT.last_active" \
     --value "\"$(date +%Y-%m-%dT%H:%M:%S)\"" || true

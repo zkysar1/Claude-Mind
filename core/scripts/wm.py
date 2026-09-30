@@ -1308,6 +1308,9 @@ def cmd_set(args):
         )
         sys.exit(1)
 
+    # : initialized OUTSIDE the lock so the post-lock push can read it.
+    _carrier_path = None
+
     with wm_lock():
         data = read_wm()
         if not data:
@@ -1370,12 +1373,40 @@ def cmd_set(args):
                     file=sys.stderr,
                 )
 
+        _before = parent.get(key) if isinstance(parent, dict) else None
         parent[key] = value
 
         if not is_top:
             update_modified(data, args.slot)
 
         write_wm(data)
+
+        # : a whole-slot replace of a capture lane mirrors what it
+        # CHANGED into this Body's carrier, as cmd_append does for an append, so
+        # an in-place correction reaches the reducer through the priority lane.
+        # Recorded INSIDE the lock, after the write, like cmd_append. TWIN of
+        # wm_write.py::set_slot — the DAEMON one is the LIVE path (wm-set.sh is
+        # daemon-only); this exists for parity.
+        if args.slot in CAPTURE_SLOTS:
+            try:
+                import body_capture_carrier as _bcc
+                _carrier_path = _bcc.record_slot_replace(
+                    wm_path(), args.slot, _before, value)
+            except Exception:  # noqa: BLE001 — never fail a WM set
+                _carrier_path = None
+
+    # Push OUTSIDE the lock, for the reason cmd_append gives.
+    if _carrier_path is not None:
+        try:
+            import body_capture_carrier as _bcc
+            _carrier_pushed = bool(_bcc.push(_carrier_path))
+        except Exception:  # noqa: BLE001
+            _carrier_pushed = False
+        if not _carrier_pushed:
+            print("[wm] carrier push did not deliver — the corrected load-bearing "
+                  "capture entries are in the local carrier only and will reach "
+                  "the reducer at the close-time full merge, not through the "
+                  "priority lane.", file=sys.stderr)
 
 def cmd_append(args):
     """Append an item to an array slot from stdin (JSON).

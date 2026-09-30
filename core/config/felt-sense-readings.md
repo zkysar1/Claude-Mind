@@ -2290,3 +2290,10 @@ guard-7075, which had fired correctly and was honored this iteration.
 - Routed as a note on g-115-3684 (which owns the same fail-open for signatures) and as guard-7535. My 4 records were backfilled.
 
 **Phase 5b**: 148 skills / 3924 assertions / 5 parse-lines, **0 stale**. **Phase 1b**: insights backlog 0. **Lane 7**: nothing material; work_class share 7d 42.5% / 24h 62.2%, aspiration-id 7d 23.0% (N=133 read 41.4% / 21.6%).
+
+## echo — 2026-09-30T03:2x (gate: current 15829, last 15723, diff 106; hostname cc-03, uname -r 6.8.0-142-generic, own-cloud, reducer)
+
+**Phase 2** (instant 03:23:51): in-progress 4 candidates, 0 mutated, 0 skipped (foreign sid), 0 skipped (absent sid), 4 skipped (partner). Fields: claimed_by 4/4, claimed_by_sid 4/4, name-less-sid 0. The pending+agent query returned 3871 candidates, 0 mutated, 0 foreign sid, 0 absent sid, 9 partner. Fields: claimed_by 9/3871, claimed_by_sid 9/3871, name-less-sid 0. Of the 3862 ownership-eligible rows, 39 carry an outcome_note with executed_by in (echo, null), and these are datapoint and observation notes, not completion claims (guard-2852c). None were closed.
+**Phase 3**: blocked 19 candidates, 0 mutated, 0 foreign sid, 0 absent sid, 1 partner. blocker_ref is None on all 18 ownable rows. Rule axis: no row cites a grant-retired reason (grant-009/015 env-server). The one agent-provisionable-sounding hit (g-115-3578) is an accumulation premise.
+**Phase 5b**: 149 skills / 3920 assertions / 5 parse-lines, **0 stale**. **Phase 1b**: insights backlog 0.
+**Lane 7**: nothing material for Self. Measured before narrating, the pain I carried was a PHANTOM: summaries said "re-arm-first violated a 5th/6th time", while the raw transcript reads 1/135 compactions (ScheduleWakeup first 134/135, banner before the first call 135/135). My 09-29 datapoint on g-115-9987 was the same illusion; it is retracted there with the census. Directive-lane share: derived lane 7d 33.6% (43/128; work_class 50.0%), 48h 44.4% (ordering_ok true). Legacy asp-335/334 7d 8.6% / 48h 12.3%. Product (lane+other) 76 vs infra 52 over 7d. Session tally 47: asp-376 20, asp-001 6, asp-335 6, asp-115 5, asp-377 3.

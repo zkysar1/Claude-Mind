@@ -1,6 +1,6 @@
 ---
 name: start
-description: "Creates or resumes an agent in reader (read-only), assistant (user-directed), or autonomous mode (perpetual loop), initializing new agents (Self, program, paths, aspirations, curriculum) and transitioning existing ones. USER-ONLY: the user types /start {agent-name} [--mode {mode}]; Claude must NEVER invoke it. Enforces the one-autonomous-session-per-agent invariant and supports observer sessions alongside running loops. Auto-recovers zombie sessions (state=RUNNING + stale heartbeat + no pending obligations) inline so /start {name} just works after a crash; --recover is reserved for the --force override path."
+description: "Creates or resumes an agent in reader (read-only), assistant (user-directed), or autonomous mode (perpetual loop), initializing new agents (Self, program, paths, aspirations, curriculum) and transitioning existing ones. USER-ONLY: the user types /start {agent-name} [--mode {mode}]; Claude must NEVER invoke it. Enforces the one-autonomous-session-per-agent invariant and supports observer sessions alongside running loops. Unbound start (g-377-81): before the session binding exists, a perception frame gets no reaction line and no tool call; the start is the unit in hand, decision=ignore implicit until the loop is RUNNING."
 triggers:
   - "/start"
 disable-model-invocation: true

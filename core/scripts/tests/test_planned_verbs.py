@@ -18,6 +18,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import _goal_fields  # noqa: E402
 from planned_verbs import (  # noqa: E402
     MEMBER_PAUSE_DEFER_PREFIX,
     MEMBER_WRITE_OPT_IN_FIELD,
@@ -109,6 +110,27 @@ class TestVerbs:
     def test_comment_is_capped(self):
         plan = plan_verb(_goal(), "comment", "x" * 5000)
         assert len(plan.writes["member_comment"]) == 1000
+
+
+class TestEveryPlannedWriteIsAKnownGoalField:
+    """Every key a verb writes must pass the update-goal allowlist, or the live write is
+    refused. member_comment and member_directive shipped unregistered on 2026-09-04 and
+    every comment, pause and not-this was refused until g-369-150 measured it on
+    2026-09-29. This walks the verb TABLE, so a new verb or a new key fails here first."""
+
+    VALID = {"prioritize": ["HIGH"], "pause": ["on", "off"], "not-this": ["on", "off"],
+             "comment": ["please do this after the demo"]}
+
+    def test_every_verb_has_a_value_here(self):
+        assert set(self.VALID) == set(PLANNED_VERBS), "a verb was added; give it a value"
+
+    @pytest.mark.parametrize("verb", sorted(PLANNED_VERBS))
+    def test_every_write_key_is_registered(self, verb):
+        for value in self.VALID[verb]:
+            plan = plan_verb(_goal(), verb, value)
+            assert plan.ok, (verb, value, plan.refusal)
+            unknown = sorted(k for k in plan.writes if not _goal_fields.is_known(k))
+            assert not unknown, f"{verb}={value!r} writes unregistered goal field(s) {unknown}"
 
 
 class TestProjectionFieldsAreNeverWritten:

@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.90",
+    "previous_version": "2.12.89",
+    "date": "2026-09-30",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Release-train time-push cut (g-115-11727): 79 framework commits past v2.12.89, incl. worker-Body diary carrier (g-306-555), parked worker Body gate (g-375-104), cron sync-tick integrate (g-375-96), bash_cmd backslash-run refusal (g-115-11460), quiesce_ripeness readiness parsing (g-115-11307)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.89",
     "previous_version": "2.12.88",
     "date": "2026-09-29",

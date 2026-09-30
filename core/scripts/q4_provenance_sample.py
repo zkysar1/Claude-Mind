@@ -474,8 +474,32 @@ def expressible_predicate(session_id: Optional[str] = None) -> Optional[Callable
         """
         yield root / tok
         yield root / ("." + tok)
+        # THE SLASH THE TOKENIZER DROPPED. `_NODE_KEY` starts at a \b, so a
+        # citation written as `/opt/<repo>/core/githooks/commit-msg` (absolute
+        # paths are what the Read tool emits) arrives as
+        # `opt/<repo>/core/githooks/commit-msg`. None of the candidates above
+        # exists, so the token fell through to the default-True fail-safe: a
+        # correctly cited, genuinely READ out-of-scope file reported
+        # `decorative-citation` instead of being demoted to
+        # `unadjudicable-citation`, and its repo-relative twin was demoted
+        # correctly — the verdict then depended on the author's path STYLE.
+        # Re-try the path with the leading slash restored; the guard below
+        # admits it only where it starts with THIS repo root (or the world
+        # root), so an arbitrary absolute path still resolves to nothing and
+        # stays adjudicable — the invariant that a citation is demoted only
+        # where it POSITIVELY resolves to a real out-of-scope file is kept.
+        if tok.startswith(str(root).lstrip("/") + "/"):
+            yield Path("/" + tok)
         if world is not None and tok.startswith("world/"):
             yield world / tok[len("world/"):]
+        if world is not None:
+            # The world root is ABSOLUTE (e.g. /opt/<...>/.mind-data/world), so a
+            # world citation written absolute arrives with ITS leading slash
+            # dropped too. Same guard, same reason; without this the world half
+            # of the fix would be dead code on every initialized run.
+            wt = str(world).lstrip("/")
+            if tok.startswith(wt + "/"):
+                yield Path("/" + tok)
         # DELIBERATELY NOT a `world/knowledge/tree/<tok>` candidate for a BARE node
         # key. It would resolve `system/daemon-only-architecture` to a real in-scope
         # file and return True -- the SAME answer the default already gives, so it

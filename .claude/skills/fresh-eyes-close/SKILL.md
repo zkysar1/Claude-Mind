@@ -218,7 +218,12 @@ flag, self-review of an APPROVAL, or `--approve-with-notes` carrying no
 Every written verdict carries `reviewed_at` (naive ISO-8601, UTC wall time).
 Artifacts written before 2026-09-03 do not have it and were deliberately NOT
 backfilled — inventing a timestamp on another reviewer's attestation is worse
-than the gap — so treat it as optional when reading old rows.
+than the gap — so treat it as optional when reading old rows. Since g-375-55 it
+also carries the goal's `completed_by`, `completed_by_role` and
+`completed_by_sid`, copied from the live goal record at write time, so the
+lane's per-role pass rate survives the goal's archival or eviction; with no live
+record they are absent and the producer says so. Older rows have them only where
+g-375-84 backfilled them (marked `closer_backfilled_at`).
 
 **Pick APPROVE_WITH_NOTES over a REJECT when the defects do not block the
 close, and over a plain APPROVE when you have any.** It releases the close
@@ -275,7 +280,11 @@ second review — the case this routing exists to serve.
 If routing fails the verdict still stands (the artifact is already on disk) and
 the failure is printed as `ROUTING FAILED ... NOT annotated`. Do not read past
 that line: an unrouted REJECT is indistinguishable from a goal nobody found
-defects in.
+defects in. The producer has already retried lock contention by then, so re-route
+with `--route-only` (same `--goal`, `--reviewer` and `--route-to-goal`, nothing
+else): it routes your recorded verdict and writes none. Never re-run the verdict
+command for this; it appends a second, identical verdict entry (g-375-85).
+`--route-only` exits `0` routed, `1` nothing of yours to route, `4` still failed.
 
 An APPROVE written for a superseded artifact is stale, not valid — re-run the
 review after any rework rather than reusing the earlier verdict.

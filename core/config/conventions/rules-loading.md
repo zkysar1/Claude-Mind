@@ -206,7 +206,7 @@ Code's loader ignores both (its only rules key is `paths`, verified above):
 | key | who reads it | contract |
 |---|---|---|
 | `description: "<imperative>"` | Zak-Code lean index (and any Cursor-style loader) | ≤ 140 chars, one sentence, the rule's imperative — not its title. Every rule carries one; `core/scripts/tests/test_rules_frontmatter_index.py` pins length and presence. |
-| `alwaysApply: true` | Zak-Code (ADR-0105) | the FULL body rides in the prompt ahead of the index (8 KB per-file cap — the test pins that a pinned body fits) and is folded first under the full render. Budget ≈ 25 KB across pins by the test's formula — a ceiling, not a guarantee that the index fits (see "The always-on core" below). **Pinned now: `perception-reaction`, `return-protocol`, `verify-before-assuming`** — the always-on core decided 2026-09-28 (g-374-171) and applied by g-374-160 the same day. The pins it replaced (2fa1504d78; 971fbcaead): `return-protocol`, `verify-before-assuming`, `read-before-edit`, `no-scratchpad`, `plan-completion-verdict`. |
+| `alwaysApply: true` | Zak-Code (ADR-0105) | the FULL body rides in the prompt ahead of the index (8 KB per-file cap — the test pins that a pinned body fits) and is folded first under the full render. Budget ≈ 25 KB across pins by the test's formula — a ceiling, not a guarantee that the index fits (see "The always-on core" below). **Pinned now: `perception-reaction`, `return-protocol`, `verify-before-assuming`** — the always-on core decided 2026-09-28 (g-374-171) and applied by g-374-160 the same day. The pins it replaced (2fa1504d78; 971fbcaead): `return-protocol`, `verify-before-assuming`, `read-before-edit`, `no-scratchpad`, `plan-completion-verdict`. **A resident also carries one pin from OUTSIDE the framework** (since 2026-09-30): its boot recipe re-plants a companion-safety rule, `alwaysApply: true`, in the Zak-Code USER rules root (`~/.config/zakcode/rules`, which the resident cannot rewrite). It counts against the same budget. |
 
 A rule that had no front matter gained a block; a rule that already had `paths:` gained
 the keys inside its block. The HTML-comment `domain-leak-exempt` marker on rules without
@@ -274,10 +274,23 @@ Staying:
 - `verify-before-assuming`. It carries six distinct signal rules; its index line
   carries one.
 
-Before adding a rule or a pin, re-measure the RENDER, not just the test: the +3,492
-margin is about eleven index lines. Printing workspace-relative paths in the index line
-would free 3,500 more chars (the path share falls from 4,790 to 1,290). That is a
-Zak-Code change and is not decided here.
+Before adding a rule or a pin, re-measure the RENDER, not just the test. The +3,492
+margin above no longer holds for residents. It was measured without the planted findings
+rule and before the planted safety pin. Measured 2026-09-30 with the same `render_index()`
+(Zak-Code 71be630) over the 37 fleet rules, the findings rule, and the safety pin:
+
+| resident workspace path | render | slack | index lines lost |
+|---|---|---|---|
+| 136 chars, without the safety pin | 30,502 | +2,186 | 0 |
+| 136 chars | 32,041 | +647 | 0 |
+| 146 chars (the longest on the shared filesystem: 4 of 138 workspaces; 124 are 99) | 32,391 | +297 | 0 |
+| 155 chars | 32,410 | +278 after the drop | 1 |
+
+At the longest real path the margin is about ONE index line. The next rule added to
+`.claude/rules/` drops an index line (the alphabetical tail) on those residents, unless
+something is unpinned or the paths get shorter. Printing workspace-relative paths in the
+index line would free 3,500 more chars (the path share falls from 4,790 to 1,290). That
+is a Zak-Code change and is not decided here.
 
 ## Cross-references
 

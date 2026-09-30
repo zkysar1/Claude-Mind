@@ -8,10 +8,17 @@ whitespace-free argument carrying quotes or braces is silently altered:
   quotes -> argv TRUNCATION (the argument AND every following one are lost)
   braces -> value MANGLING  ('{a:b}' -> 'a:b'; '{a,b}' expands into two args)
 
+A third class needs whitespace (g-115-11460): inside the quotes list2cmdline
+adds, MSYS collapses each backslash PAIR to one, unless the run ends the value
+or precedes a double quote (list2cmdline doubles exactly those).
+
+  backslash run -> value COLLAPSE ('a\\\\b c' arrives as 'a\\b c')
+
 The CORRUPTING / SAFE tables below are not hand-reasoned: every entry was
 measured on Windows with an argv-echo script (0 false positives, 0 false
-negatives over the 25 shapes). They are kept as data so a future change to the
-predicate is checked against observed behaviour rather than against intuition.
+negatives over the 25 shapes, then over 14 backslash shapes on 2026-09-29).
+They are kept as data so a future change to the predicate is checked against
+observed behaviour rather than against intuition.
 """
 import os
 import sys
@@ -22,12 +29,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from _runtime_bash import bash_cmd, _win_arg_corrupts  # noqa: E402
 
+B = "\\"  # ONE backslash; the backslash shapes below are built from it so each run length is explicit
+
 # Measured to be altered in transit on win32.
 CORRUPTING = [
     '{"title":"probe","priority":"LOW"}',  # the real-world case: JSON flag value
     '{"a":"b"}', 'a="b"', '"quoted"', 'x"y', '"', 'a"',
     "single'quote", "'sq'",
     '{a:b}', 'brace{x}', '{a,b}', 'a{b}c', '{x}',
+    # : a backslash run inside a value that has whitespace
+    "a" + B * 2 + "b c",              # pair + space: arrives as a\b c
+    "a" + B * 2 + "b\tc",             # pair + tab
+    B * 2 + "srv" + B + "my share",   # UNC + space: arrives as \srv\my share
+    "x" + B * 2 + " y",               # pair directly before the space
+    "a" + B * 3 + "b c",              # odd run: loses one
+    "a" + B * 4 + "b c",              # halved
 ]
 
 # Measured to survive unaltered. Whitespace is protective for BOTH classes,
@@ -38,6 +54,13 @@ SAFE = [
     'has space "q"', "has space 'q'", 'has {a} space', 'has {a,b} space',
     'back\\slash', 'tick`cmd`', 'dollar$VAR', 'semi;colon',
     'pipe|x', 'amp&x', 'paren(x)', 'gt>x', 'star*',
+    # : backslash shapes measured intact
+    "a" + B * 2 + "b",                    # pair, no whitespace: never quoted
+    "a" + B + "b c", "a" + B + " b",      # a single backslash survives quoted
+    "C:" + B + "dir name" + B * 2,        # a run that ENDS the value is doubled by list2cmdline
+    "C:" + B + "dir name" + B,
+    "a b" + B * 3,
+    "a" + B * 2 + '"b c',                 # a run before a double quote is doubled too
 ]
 
 
@@ -66,6 +89,12 @@ def test_whitespace_is_protective_for_both_classes():
     assert _win_arg_corrupts('{a,b} x') is False
 
 
+def test_whitespace_is_what_exposes_a_backslash_run():
+    """The mirror image: quoting is what collapses a backslash pair ()."""
+    assert _win_arg_corrupts("a" + B * 2 + "b") is False
+    assert _win_arg_corrupts("a" + B * 2 + "b c") is True
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="guard is win32-only by design")
 def test_refuses_a_corrupting_argument_and_names_the_remedy():
     with pytest.raises(ValueError) as exc:
@@ -89,6 +118,20 @@ def test_failure_modes_are_described_distinctly():
         bash_cmd("x.sh", "{a:b}")
     assert "MANGLE" in str(b.value)
     assert "TRUNCATE" not in str(b.value)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="guard is win32-only by design")
+def test_backslash_run_refusal_names_its_own_class():
+    """A collapse is neither a truncation nor a mangle, and the quote/brace
+    wording would send the reader after the wrong characters (rb-11407)."""
+    with pytest.raises(ValueError) as exc:
+        bash_cmd("x.sh", "--path", B * 2 + "srv" + B + "my share")
+    msg = str(exc.value)
+    assert "COLLAPSE" in msg and "TRUNCATE" not in msg and "MANGLE" not in msg
+    assert "a run of 2+ backslashes, in a value that has whitespace" in msg
+    assert "quote/brace" not in msg
+    assert "argument 2" in msg, "must identify which argument by position"
+    assert "input=payload" in msg and "g-115-11460" in msg
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="guard is win32-only by design")

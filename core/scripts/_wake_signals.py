@@ -20,10 +20,13 @@ Signal contract (must match interruptible-sleep.sh + session.py VALID_SIGNALS):
 
 NOT WRITTEN HERE, and listed precisely so the omission does not read as a gap:
   perception-received    an environment CHANGE envelope reached /observe on a
-                         vessel (g-373-10). Its writer is the vessel runtime
-                         (Zak-Code), not this helper — these three are touched
-                         by MIND-side producers, and that one is produced
-                         outside the Mind entirely. The receiver side is shared:
+                         vessel (g-373-10). Its writer is
+                         observation-received-hook.sh, which the vessel runtime
+                         (Zak-Code) runs as its ObservationReceived hook, through
+                         session-signal-set.sh rather than this helper: the hook
+                         is a shell process on the runtime's schedule, and it
+                         must report a failed write as its exit code where this
+                         helper swallows one. The receiver side is shared:
                          interruptible-sleep.sh polls it like any other, BLOCKER
                          class.
 
