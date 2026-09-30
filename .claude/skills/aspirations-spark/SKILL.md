@@ -980,6 +980,7 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
    pipeline-add accepts a record with NONE of them; the formation-quality validator
    runs only at the move and raises ONE per attempt -- three round-trips otherwise.
    (guard-2784, guard-1395, guard-1984.)
+   If the prediction tests a tree node's own claim, add `tests_node` (pipeline.md § Tested-Node Link).
 2. Add goal to aspiration: `echo '<goal-json>' | bash core/scripts/aspirations-add-goal.sh --source {source} <asp-id>`
    — the canonical GATED single-goal writer. Do NOT use the read-modify-write
    `aspirations-update.sh` whole-aspiration form: it bypasses the origin-signal

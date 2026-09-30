@@ -116,6 +116,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 OP="${1:-}"
 SWEEP_NAME="${2:-}"
@@ -169,11 +172,11 @@ sweep_tier() {
 
 # Read precheck config from aspirations.yaml. Returns "budget_pct iteration_budget_ms zone_drop_rules_json"
 read_config() {
-    # MUST use `py -3` not bare `python3` (rb-370/guard-335 — the Microsoft
+    # MUST use $PYLAUNCH (py -3 on Windows), never bare `python3` (rb-370/guard-335 — the Microsoft
     # Store stub returns non-zero on bare python3, the `|| echo` fallback
     # would mask the failure and silently use hardcoded defaults regardless
     # of aspirations.yaml. Found by bravo fresh-eyes-code review msg-20260510-045254.
-    GID="$AGENT_DIR" PROOT="$PROJECT_ROOT" py -3 - <<'PYEOF' 2>/dev/null || echo "15 60000 {}"
+    GID="$AGENT_DIR" PROOT="$PROJECT_ROOT" $PYLAUNCH - <<'PYEOF' 2>/dev/null || echo "15 60000 {}"
 import os, sys, yaml, json
 from pathlib import Path
 # Resolve PROJECT_ROOT from the _paths.sh-forwarded PROOT (single source of
@@ -214,7 +217,7 @@ read_zone() {
     # Use env-var pattern (not shell substitution) so paths with apostrophes
     # or special chars don't break the python source. Found by bravo fresh-
     # eyes-code review msg-20260510-045339.
-    CB_E="$cb" py -3 - <<'PYEOF' 2>/dev/null || echo "fresh"
+    CB_E="$cb" $PYLAUNCH - <<'PYEOF' 2>/dev/null || echo "fresh"
 import os, json
 try:
     d = json.load(open(os.environ['CB_E']))
@@ -257,7 +260,7 @@ case "$OP" in
         # Was: py -3 -c "...$bp..." (interpolation).  fix.
         START_MS_E="$start_ms" CAP_MS_E="$cap_ms" BP_E="$bp" IB_E="$ib" \
         ZONE_E="$zone" ZD_E="$zd" \
-        py -3 - <<'PYEOF' > "$STATE_FILE" 2>/dev/null || echo '{"disabled":true}' > "$STATE_FILE"
+        $PYLAUNCH - <<'PYEOF' > "$STATE_FILE" 2>/dev/null || echo '{"disabled":true}' > "$STATE_FILE"
 import json, os
 state = {
     'disabled': False,
@@ -278,7 +281,7 @@ PYEOF
         # `meter start`) plus the iteration when a retrospection-class sweep last
         # ran. guard-784: a discrete counter, never wall-clock.
         TRACKER_FILE="$AGENT_DIR/session/precheck-retrospection-tracker.json"
-        TRACKER_E="$TRACKER_FILE" py -3 - <<'PYEOF' 2>/dev/null || true
+        TRACKER_E="$TRACKER_FILE" $PYLAUNCH - <<'PYEOF' 2>/dev/null || true
 import os, json
 tf = os.environ['TRACKER_E']
 try:
@@ -335,7 +338,7 @@ PYEOF
                 echo "[precheck-meter] UNMETERED: no state file at $STATE_FILE — '$SWEEP_NAME' returns run (fail-open) WITHOUT consulting the zone. Nothing is droppable while this persists; the meter's only drop path is inert. Expected only OUTSIDE a start..end window." >&2
                 mkdir -p "$(dirname "$DROP_LOG")" 2>/dev/null || true
                 SWEEP_E="$SWEEP_NAME" STATE_FILE_E="$STATE_FILE" DROP_LOG_E="$DROP_LOG" \
-                py -3 - <<'PYEOF' 2>/dev/null || true
+                $PYLAUNCH - <<'PYEOF' 2>/dev/null || true
 import os, json, time
 try:
     rec = {
@@ -361,7 +364,7 @@ PYEOF
         STATE_FILE_E="$STATE_FILE" DROP_LOG_E="$DROP_LOG" SWEEP_E="$SWEEP_NAME" TIER_E="$tier" CUR_E="$cur_ms" \
         SCRIPT_DIR_E="$SCRIPT_DIR" TRACKER_FILE_E="$AGENT_DIR/session/precheck-retrospection-tracker.json" \
         CB_FILE_E="$AGENT_DIR/session/context-budget.json" \
-        py -3 - <<'PYEOF' 2>/dev/null || echo "run"
+        $PYLAUNCH - <<'PYEOF' 2>/dev/null || echo "run"
 import os, json, sys
 state_file = os.environ['STATE_FILE_E']
 drop_log = os.environ['DROP_LOG_E']
@@ -551,7 +554,7 @@ PYEOF
         fi
         tier=$(sweep_tier "$SWEEP_NAME")
         STATE_FILE_E="$STATE_FILE" SWEEP_E="$SWEEP_NAME" TIER_E="$tier" \
-        py -3 - <<'PYEOF' 2>/dev/null || true
+        $PYLAUNCH - <<'PYEOF' 2>/dev/null || true
 import os, json
 state_file = os.environ['STATE_FILE_E']
 try:
@@ -600,7 +603,7 @@ PYEOF
         cur_ms=$(now_ms)
         STATE_FILE_E="$STATE_FILE" DROP_LOG_E="$DROP_LOG" CUR_E="$cur_ms" \
         KEEP_STATE_E="$KEEP_STATE" \
-        py -3 - <<'PYEOF' 2>/dev/null || true
+        $PYLAUNCH - <<'PYEOF' 2>/dev/null || true
 import os, json
 state_file = os.environ['STATE_FILE_E']
 drop_log = os.environ['DROP_LOG_E']

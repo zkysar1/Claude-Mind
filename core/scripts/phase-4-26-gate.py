@@ -44,7 +44,7 @@ Verdict matrix (utilization_method field on retrieval-session.json):
   utilization_method=infer, helpful>0  → pass (automated positive signal)
   utilization_method=infer, helpful=0  → block (zero positive signal)
   utilization_method=all_noise         → block (legacy backstop fired alone)
-  utilization_method=all_unknown       → block (preferred backstop fired alone —
+  utilization_method=all_unknown       → block (unknown-counting backstop fired alone —
                                             no times_noise poisoning, but still
                                             no positive signal so the LLM should
                                             either run --infer/Phase 4.26 manually

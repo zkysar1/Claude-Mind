@@ -41,6 +41,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/_platform.sh"
 
@@ -57,7 +60,7 @@ if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
   SCRIPT_DIR="$(cygpath -m "$SCRIPT_DIR")"
 fi
 
-py -3 "$SCRIPT_DIR/shipped-claim-store-check.py" "$@"
+$PYLAUNCH "$SCRIPT_DIR/shipped-claim-store-check.py" "$@"
 rc=$?
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
   # Any unexpected rc (missing interpreter, import failure before the

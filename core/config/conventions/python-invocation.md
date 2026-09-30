@@ -117,16 +117,46 @@ bash core/scripts/pipeline-read.sh --stage active | py -3 -c "..."
 resolution entirely. Windows only: on Linux there is no `py` launcher (a bare
 `py -3` dies rc=127 there) and no shim either — use `python3` directly.
 
-### 3. `python3` inline only inside a `.sh` wrapper you author
+### 3. Inside a `.sh` script: `$PYLAUNCH` or `python3`, never a bare `py -3`
 
-If you write a new `.sh` wrapper, source `_paths.sh` at the top — then
-`python3` inside the script body is safe because the shim is on PATH:
+A `.sh` script runs on Windows AND Linux. A bare `py -3` in one dies rc=127 on
+any Linux box without a hand-installed `/usr/local/bin/py` (WSL, a fresh
+container), and because most call sites sit behind `2>/dev/null`, `|| true` or
+`|| echo <default>`, the script carries on with an empty value and says
+nothing. Measured 2026-09-29 on WSL: `iteration-commit.sh` never wrote its
+commit-refusal record (g-115-11431).
 
 ```bash
 #!/usr/bin/env bash
-source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
-python3 "$CORE_ROOT/scripts/my-new-script.py" "$@"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (g-115-11431, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
+
+$PYLAUNCH "$CORE_ROOT/scripts/my-new-script.py" "$@"
 ```
+
+- `rt_python_launcher` is in `core/scripts/_python_launcher.sh`, which has no
+  side effects; read it for the exact contract. In short: `py -3` under Git
+  Bash or Cygwin when `py` is on PATH, `python3` elsewhere, and on Windows
+  without `py` a non-zero exit, so `|| PYLAUNCH=python3` falls back to
+  `python3` (the `_paths.sh` shim where one was generated). It reads
+  `$OSTYPE`, so a call costs one subshell, not a
+  `uname` fork.
+- Leave `$PYLAUNCH` unquoted so `py -3` splits into two words.
+- Plain `python3` is also correct in a script that sources `_paths.sh` first,
+  because the shim covers Windows. `$PYLAUNCH` keeps Windows on the same
+  `py -3` interpreter as before.
+- **A resolver's own probe stays literal.** `if py -3 --version; then echo
+  "py -3"` tests the launcher it reports. Rewritten to `$PYLAUNCH` it tests
+  `python3` on a Windows box without `py`, and the resolver then reports a
+  launcher that does not exist. A script with its own top-of-file resolver
+  (`stop-hook.sh`'s `$PY`) uses that at every site instead of adding a second.
+
+`core/scripts/tests/test_no_bare_py3_in_scripts.py` enforces this rule: a new
+`py -3` in command position in `core/scripts/*.sh` fails the suite unless the
+test's `ALLOWED` table names the file with a reason.
 
 ### 4. NEVER — raw `python3 -c "..."` from a Bash tool call
 
@@ -304,6 +334,9 @@ rule and recovery story.
 - `core/scripts/bash-agent-inject.sh` + `bash-agent-inject.py` — the hook
   defense (fail-open)
 - `core/scripts/.python-shim/python3` + `python` — the wrappers themselves
+- `core/scripts/_python_launcher.sh` — `rt_python_launcher`, the launcher
+  resolver for `.sh` scripts (rule 3)
+- `core/scripts/tests/test_no_bare_py3_in_scripts.py` — the rule 3 lint
 - `world/guardrails.jsonl` → `guard-335` — fires when the error is seen
 - `world/guardrails.jsonl` → `guard-368` — fires when the agent is about
   to emit a multi-line heredoc in a direct Bash tool call

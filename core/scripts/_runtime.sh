@@ -352,29 +352,13 @@ rt_on_disk_sha() {
     esac
 }
 
-# rt_python_launcher — print the right python launcher for the current OS.
-# Single source of truth for Windows-vs-POSIX launcher selection. On Windows
-# Git Bash, `python3` may resolve to the Microsoft Store stub; `py -3` is
-# the reliable entry point when available. Used by rt_spawn and by wrappers
-# that need a short inline python call (e.g. JSON parse on response handling).
-rt_python_launcher() {
-    case "$(uname -s 2>/dev/null || echo unknown)" in
-        MINGW*|MSYS*|CYGWIN*)
-            if command -v py >/dev/null 2>&1; then
-                echo "py -3"
-                return 0
-            fi
-            #  v3: never fall back to bare `python3` on Windows.
-            # Git-bash python3 is frequently POSIX/MSYS-flavored; under it
-            # _path_helpers.absolutize() returns a RELATIVE WORLD_DIR
-            # (Path("C:/...") is a relative PosixPath there) and the daemon
-            # mkdir-mirrors C<U+F03A>/Users/.../<WORLD_DIR> at cwd then
-            # crash-loops. Fail loud — the caller logs + aborts the spawn.
-            return 1
-            ;;
-    esac
-    echo "python3"
-}
+# rt_python_launcher lives in _python_launcher.sh so that scripts which do not
+# source this file can share it (). Located from BASH_SOURCE without
+# a fork: every daemon wrapper sources this file, and dirname costs ~40 ms on
+# Git Bash.
+_rt_pl_dir="${BASH_SOURCE[0]%/*}"; [ "$_rt_pl_dir" = "${BASH_SOURCE[0]}" ] && _rt_pl_dir=.
+source "$_rt_pl_dir/_python_launcher.sh"
+unset _rt_pl_dir
 
 # rt_spawn — start the daemon in the background. Same bash-native pattern on
 # both POSIX and Windows (Git Bash): launch in a subshell with redirects and

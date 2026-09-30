@@ -21,6 +21,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 # ── : chain the reducer-only retrospective lanes onto the merge ──
 # CORRECTED  (2026-08-11, measured): the sentence that stood here —
@@ -90,7 +93,7 @@ _bm_out="$(mktemp)"
 trap 'rm -f "$_bm_out"' EXIT
 
 set +e
-py -3 "$SCRIPT_DIR/body-merge.py" "$@" > "$_bm_out"
+$PYLAUNCH "$SCRIPT_DIR/body-merge.py" "$@" > "$_bm_out"
 _bm_rc=$?
 set -e
 
@@ -109,7 +112,7 @@ cat "$_bm_out"
 if [ "$_bm_rc" -eq 0 ]; then
     case "$(head -c 1 "$_bm_out" 2>/dev/null)" in
         "{")
-            py -3 "$SCRIPT_DIR/worker_retrospective.py" --from-merge-summary "$_bm_out" >&2 \
+            $PYLAUNCH "$SCRIPT_DIR/worker_retrospective.py" --from-merge-summary "$_bm_out" >&2 \
                 || echo "[body-merge] WARN: worker retrospective lanes did not run (rc=$?) — worker narratives stay unencoded until the next merge" >&2
             ;;
         *)

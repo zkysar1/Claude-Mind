@@ -82,7 +82,8 @@ def _setup_repo(tmp: Path, agent="zeta") -> Path:
     # import, so the hermetic repo silently stops exercising the real path.
     for fname in ("pending-deploys-gate.sh", "pending-deploys.py",
                   "deploy-verify.sh", "_paths.sh", "_runtime_bash.py",
-                  "_repo_slug.sh"):   # deploy-verify.sh sources it ()
+                  "_repo_slug.sh",    # deploy-verify.sh sources it ()
+                  "_python_launcher.sh"):   # ...and this ()
         dst = core / fname
         dst.write_bytes((CORE_SCRIPTS / fname).read_bytes())
         dst.chmod(0o755)

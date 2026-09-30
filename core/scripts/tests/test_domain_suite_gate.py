@@ -241,6 +241,32 @@ def test_a_timeout_fails_open_with_a_warning(tmp_path):
     assert not (world / "domain-suite-baseline.json").exists()
 
 
+def test_a_timeout_lets_the_runner_name_the_unit_it_was_on(tmp_path):
+    # : the gate used to SIGKILL a timed-out runner, which no trap can
+    # catch, so the runner's EXIT-trap trailer never reached the log. That line
+    # is the only one naming the unit the run stopped in (0 of 59 retained logs
+    # on one box carried it, per the  census). The runner here sits in
+    # a command substitution, as every real
+    # unit does. Under the old kill this test fails: the trailer is absent.
+    hook = (
+        "#!/usr/bin/env bash\n"
+        "LAST_UNIT='(none started)'\n"
+        "trap 'echo \"  last unit started: $LAST_UNIT\"' EXIT\n"
+        "echo '[1/2] PASS fast_unit.sh'\n"
+        "LAST_UNIT='slow_unit.sh (shell)'\n"
+        "out=$(sleep 5 2>&1)\n"
+        "echo '[2/2] PASS slow_unit.sh'\n"
+    )
+    log_dir = tmp_path / "retained"
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook=hook)
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD, "--timeout", "1", log_dir=log_dir)
+    assert rc == 0 and doc["decision"] == "error" and "exceeded 1s" in doc["reason"]
+    trailer = "last unit started: slow_unit.sh (shell)"
+    assert any(trailer in ln for ln in doc["tail"]), doc["tail"]
+    assert trailer in Path(doc["log"]).read_text(encoding="utf-8")
+    assert not any("[2/2]" in ln for ln in doc["tail"]), "the slow unit must not have finished"
+
+
 def test_failing_ids_reads_both_output_shapes():
     import importlib.util
     spec = importlib.util.spec_from_file_location("domain_suite_gate_t", GATE)

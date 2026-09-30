@@ -108,7 +108,9 @@ def _rec(rid, rule, util=0.0, category="framework-retrieval", **extra):
     ({"rule": "guardrail only"}, False),                          # 1 token
     ({"rule": None, "title": 7}, False),                          # non-str fields
     ({"tags": ["guardrail", "retrieval"]}, True),                 # tags list
-    ({"tags": "guardrail retrieval"}, False),                     # tags not a list
+    # tags stored as a bare string: read since  (supplementary_text_parts
+    # takes any str field) — malformed, but still the record's own vocabulary.
+    ({"tags": "guardrail retrieval"}, True),
     ({"when_to_use": {"conditions": ["guardrail", "utility"]}}, True),
     ({"when_to_use": {"conditions": "guardrail utility"}}, True),  # conditions str
     ({"when_to_use": "guardrail utility"}, True),                 # legacy bare string

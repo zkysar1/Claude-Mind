@@ -33,6 +33,9 @@
 # Output: JSON {status, stale_hours, checked, summary, leaks[], unverified[], chain[]}
 # Exit:   0 = JSON emitted (any verdict)   1 = usage error (no/invalid chain)
 set -uo pipefail
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$(dirname "${BASH_SOURCE[0]}")/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 STALE_HOURS=24
 while [ $# -gt 0 ]; do
@@ -50,7 +53,7 @@ export PROBE_STALE_HOURS="$STALE_HOURS"
 
 # Heredoc-quoted ('PYEOF') so bash performs NO expansion on the Python source
 # (guard-165: values cross the boundary via env, never string interpolation).
-py -3 <<'PYEOF'
+$PYLAUNCH <<'PYEOF'
 import os, sys, json
 
 raw = os.environ.get("PROBE_CHAIN_JSON", "").strip()

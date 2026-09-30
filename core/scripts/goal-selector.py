@@ -7,7 +7,12 @@ The LLM still handles Phase 2.5 (metacognitive assessment) but MUST NOT override
 ranking except via a sanctioned deviation code at claim time (Scorer Sovereignty Layer B;
 see scorer-verdict-gate.py + the system-constraints-loop/scorer-sovereignty tree node).
 
-Scoring criteria (21 deterministic + 1 stochastic weighted factors):
+Scoring criteria (21 deterministic + 1 stochastic weighted factors). The × figures
+are the framework SEED defaults (core/config/meta.yaml initial_state), not live
+values: each deployment's weights live in meta/goal-selection-strategy.yaml
+`weights:` (read by load_weights(), the SSOT) and are tuned there -- an owner
+instruction can raise directive_boost to 3.0, say. Read that file for a live weight,
+never this list (g-115-11317):
   priority × 1.0 + deadline_urgency × 1.0 + agent_executable × 0.8
   + variety_bonus × 0.5 + streak_momentum × 0.5 + novelty_bonus × 0.6
   + recurring_urgency × 0.8 + recurring_saturation × 0.8 + per_goal_saturation × 0.8
@@ -16,7 +21,7 @@ Scoring criteria (21 deterministic + 1 stochastic weighted factors):
   + tail_bonus × 0.8
   + evidence_backing × 0.7 + deferred_readiness × 0.6
   + context_coherence × 1.0 + skill_affinity × 0.4 + directive_boost × 1.5
-  + co_invest_alignment × 0.5
+  + co_invest_alignment × 0.0 (off by default)
   + exploration_noise × (epsilon × noise_scale)  [dynamic weight]
 
   co_invest_alignment: +1.0 raw bonus when this candidate's co_parent_id
@@ -4365,10 +4370,14 @@ def _coord_rows(base=None):
 
 
 # Raw weight applied to a targeted directive that carries no explicit `weight:`
-# tag. Raw, i.e. BEFORE WEIGHTS["directive_boost"] = 1.5, so the default lands at
-# +1.5 final -- deliberately the same magnitude strategic_focus_boost already
-# contributes in-lane, and BELOW what an author gets by stating a weight
-# explicitly. Stating a weight remains the way to ask for stronger influence.
+# tag. Raw, i.e. BEFORE the criterion weight WEIGHTS["directive_boost"] (seed
+# default 1.5; per deployment in meta/goal-selection-strategy.yaml). score_goal
+# sums this with strategic_focus_boost's raw weight (1.0) into ONE raw criterion,
+# so the default lands at deliberately the same magnitude strategic_focus_boost
+# contributes in-lane AT ANY CRITERION WEIGHT: +1.5 final at the seed, +3.0 where
+# an owner raised the weight to 3.0 (measured both equal, 2026-09-29, ).
+# It stays BELOW what an author gets by stating a larger weight explicitly.
+# Stating a weight remains the way to ask for stronger influence.
 DIRECTIVE_DEFAULT_WEIGHT = 1.0
 
 
@@ -4424,7 +4433,8 @@ def parse_directive_admission(msg, now=None):
     #1/#2 every time and the LLM skipped it anyway". Under (a) a directive no
     longer compels selection with zero numeric support, so the banner's
     MUST-SELECT is better justified than before, NOT worse. But the boost is
-    bounded (+1.5 final, a nudge and never a veto -- Scorer Sovereignty
+    bounded (+1.0 raw x the criterion weight -- +1.5 final at the seed default,
+    +3.0 at an owner-raised 3.0 -- a nudge and never a veto -- Scorer Sovereignty
     g-115-2812), so a directive-targeted goal can still rank below a strong
     candidate and still raise the banner. That residual gap is guard-1310's
     to close via the ack / justified-deferral path, exactly as today; this
@@ -4538,17 +4548,21 @@ def _get_directives():
 
 # --- strategic_focus: the standing user directive () --------------
 # world/team-state.yaml `strategic_focus` is set by the USER and acknowledged by
-# every agent. The live one reads: "Product goals outrank routine infra sweeps
-# AT SELECTION TIME until  drains." Until now it was consumed by exactly
-# two readers — boot/SKILL.md and create-aspiration/SKILL.md — and NOT by this
-# file. A directive whose own text names selection time had no path into
-# selection, so five agents acknowledged it and the ranking never changed.
+# every agent. Its text is revised over time, so it is not quoted here: read it
+# live, and take the boosted set from load_strategic_focus(), never from the
+# prose (guard-7207). The directive that motivated this code ranked product
+# goals above routine infra sweeps AT SELECTION TIME. Before this code it was
+# consumed by exactly two readers — boot/SKILL.md and create-aspiration/SKILL.md
+# — and NOT by this file. A directive whose own text names selection time had no
+# path into selection, so five agents acknowledged it and the ranking never
+# changed.
 #
 # It rides the EXISTING directive_boost criterion instead of adding a new one:
 # that term already means "user / cross-agent priority influence", already
-# carries WEIGHTS["directive_boost"] = 1.5, and reusing it adds no breakdown key
-# for downstream consumers to break on. Bounded bias, never a veto — the scorer
-# still owns the ranking (Scorer Sovereignty, ).
+# carries the WEIGHTS["directive_boost"] criterion weight (per deployment), and
+# reusing it adds no breakdown key for downstream consumers to break on. Bounded
+# bias, never a veto — the scorer still owns the ranking (Scorer Sovereignty,
+# ).
 #
 # Only the aspiration ids in the prose are machine-usable; the rest is rationale
 # for humans. Parsing is therefore deliberately narrow (an `asp-NNN` regex), and
@@ -4612,9 +4626,10 @@ def load_strategic_focus():
 def strategic_focus_boost(asp_id, completion_ratio):
     """Bounded boost for goals under an aspiration the user's directive names.
 
-    Self-retiring: the live directive says "until asp-335 drains", so a named
-    aspiration at completion_ratio >= 1.0 stops being boosted without anyone
-    having to edit team-state. Stale prose then costs nothing.
+    Self-retiring: ANY aspiration the directive names stops being boosted once
+    its completion_ratio reaches 1.0, without anyone having to edit team-state,
+    so a drained lane left in the prose costs nothing. A lane that never drains
+    stays boosted for as long as the directive names it.
     """
     if not asp_id:
         return 0.0
@@ -5540,9 +5555,10 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
     # pull-waived 18.18. So the directive half is NOT required at 3.0, and saying
     # otherwise would be a rationale that does not survive its own test.
     #
-    # It IS required at 1.5 -- and 1.5 is the value three separate comments in
-    # THIS FILE state as the weight (the module docstring formula, and the two
-    # notes near directive_boost_score), with aspirations.yaml pointing at
+    # It IS required at 1.5 -- the framework SEED default (core/config/meta.yaml
+    # initial_state), which every new deployment starts at and which this box ran
+    # until its owner raised the weight (mc-946/mc-964, now protected as an
+    # owner_mandated_fields entry), with aspirations.yaml pointing at
     # meta/goal-selection-strategy.yaml as the source. At 1.5 a 3.0 raw directive
     # contributes 4.5, so under saturation it nets 4.5 - 4.0 = +0.5 against a
     # pull-waived +4.0, and a machine-set pull outranks a fresh USER directive --
@@ -6881,7 +6897,11 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     candidates): the deterministic score span is 11.60..5.59 and the deficit
     from the lowest directive-eligible row to the top is 4.41, against an
     exploration_noise width of 1.22 applied to 1327 of 1329 rows. A +1.5 scalar
-    cannot close 4.41. guard-1895 rule (2): an intervention sized below the
+    cannot close 4.41. [Correction 2026-09-29, g-115-11317: the 1.5 above was
+    the seed default copied from a stale comment. This deployment ran the weight
+    at 3.0 from the owner's 2026-08-28 restore on, so the in-lane boost that day was
+    +3.0 final; +3.0 cannot close 4.41 either, and the conclusion stands.]
+    guard-1895 rule (2): an intervention sized below the
     contested band changes almost nothing WHILE LOOKING LIKE A FIX, and its
     corollary names the structurally correct remedy — remove the item from the
     competition rather than try to win the lottery. That is this function. The

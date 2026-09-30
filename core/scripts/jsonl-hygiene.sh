@@ -16,6 +16,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 if [ -f "$PROJECT_ROOT/.env.local" ]; then
   set -a
   # shellcheck source=/dev/null
@@ -31,4 +34,4 @@ fi
 # already-set MIND_* (e.g. from .env.local) wins. .
 export MIND_WORLD="${MIND_WORLD:-$WORLD_DIR}"
 export MIND_META="${MIND_META:-$META_DIR}"
-exec py -3 "$SCRIPT_DIR/jsonl_hygiene.py" "$@"
+exec $PYLAUNCH "$SCRIPT_DIR/jsonl_hygiene.py" "$@"

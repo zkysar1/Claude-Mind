@@ -19,8 +19,26 @@ Behavior (all paths fail-open; this must never delay loop continuation):
      index's model matches tree.yaml `embedding_model_name` → exit 0.
   4. Stale OR model-drifted, debounce clear → record the attempt marker, spawn
      `embedding-index-build.py --update` DETACHED (never waits), print one
-     JSON status line. Debounce: at most one spawn per 6h per box — a
-     persistently-failing update retries next window instead of storming.
+     JSON status line. Debounce is SUCCESS-AWARE (g-115-3684): after an attempt
+     that landed (meta.json rewritten after the marker) the next spawn may come
+     SUCCESS_INTERVAL_SECONDS later; after one that did not (failed, or still
+     running) the window is DEBOUNCE_SECONDS — a persistently-failing update
+     retries next window instead of storming, and a running one is never
+     doubled.
+
+Trigger sites: iteration-close.sh productivity-check, AND the daemon's
+/v1/retrieve endpoint (rate-limited there). Until 2026-09-29 the loop close was
+the only one, under a flat 6h debounce — so a box in assistant mode, or a loop
+between iterations, never refreshed at all, and a busy one refreshed at most
+every 6h. A lesson written at 09:00 was invisible to semantic retrieval until
+the next window; one written on a quiet box stayed invisible indefinitely.
+
+Index dir precedence: EMBED_FRESHNESS_INDEX_DIR (this tick's own test seam) >
+MIND_EMBEDDING_INDEX_DIR (the READER's seam, _embedding_retrieval) > the
+per-box default. Honoring the reader's knob keeps the tick and the reader on
+the SAME index: a process whose reader is redirected (the test suite points it
+at a nonexistent dir) can never refresh the production index from its own
+corpus.
 
 MODEL DRIFT IS A STALENESS CONDITION IN ITS OWN RIGHT (cdb3288607,
 2026-09-03), and the corpus-mtime test cannot see it. An index built on a
@@ -60,7 +78,8 @@ _FRAMEWORK_MD_ROOTS = (
 )
 sys.path.insert(0, str(SCRIPT_DIR))
 
-DEBOUNCE_SECONDS = 6 * 3600  # one spawn attempt per box per 6h window
+DEBOUNCE_SECONDS = 6 * 3600  # after an attempt that did NOT land: one per 6h
+SUCCESS_INTERVAL_SECONDS = 10 * 60  # after one that landed: next may spawn in 10 min
 INDEX_DIR = SCRIPT_DIR.parent.parent / "mind_api" / "state" / "retrieval-embedding-index"
 UPDATE_LOG = SCRIPT_DIR.parent / "logs" / "embedding-index-update.log"
 
@@ -147,7 +166,10 @@ def _source_mtime():
     except Exception:
         return None
     newest = None
-    for name in ("reasoning-bank.jsonl", "guardrails.jsonl"):
+    # pattern-signatures.jsonl joined load_corpus 2026-09-29 (), so it
+    # joins this list in the same change — the  rule.
+    for name in ("reasoning-bank.jsonl", "guardrails.jsonl",
+                 "pattern-signatures.jsonl"):
         p = Path(WORLD_DIR) / name
         try:
             m = p.stat().st_mtime
@@ -197,7 +219,8 @@ def _source_mtime():
 
 def main():
     dry_run = os.environ.get("EMBED_FRESHNESS_DRYRUN") == "1"
-    index_dir = Path(os.environ.get("EMBED_FRESHNESS_INDEX_DIR") or INDEX_DIR)
+    index_dir = Path(os.environ.get("EMBED_FRESHNESS_INDEX_DIR")
+                     or os.environ.get("MIND_EMBEDDING_INDEX_DIR") or INDEX_DIR)
     meta = index_dir / "meta.json"
 
     if not _blend_enabled():
@@ -216,8 +239,15 @@ def main():
     marker = index_dir / ".last-update-attempt"
     now = time.time()
     try:
-        if marker.exists() and now - marker.stat().st_mtime < DEBOUNCE_SECONDS:
-            return 0  # attempted recently — wait out the window
+        if marker.exists():
+            attempted = marker.stat().st_mtime
+            # --update rewrites meta.json on every successful run, so a meta at
+            # least as new as the marker means the last attempt LANDED. Anything
+            # else — it failed, or is still running — keeps the long window.
+            landed = meta.stat().st_mtime >= attempted
+            window = SUCCESS_INTERVAL_SECONDS if landed else DEBOUNCE_SECONDS
+            if now - attempted < window:
+                return 0  # attempted recently — wait out the window
     except OSError:
         pass
 
@@ -246,7 +276,7 @@ def main():
             kwargs["start_new_session"] = True
         args = [sys.executable, str(SCRIPT_DIR / "embedding-index-build.py"),
                 "--update"]
-        if os.environ.get("EMBED_FRESHNESS_INDEX_DIR"):
+        if index_dir != INDEX_DIR:
             args += ["--out", str(index_dir)]
         subprocess.Popen(args, **kwargs)
         print(json.dumps({"op": "freshness-tick", "spawned": True,

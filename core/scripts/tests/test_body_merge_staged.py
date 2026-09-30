@@ -148,6 +148,8 @@ def _repo_skeleton(tmp_path: Path) -> Path:
     dst = tmp_path / "core" / "scripts"
     dst.mkdir(parents=True, exist_ok=True)
     shutil.copy2(CLEANUP_SH, dst / "cleanup-stale-bindings.sh")
+    # cleanup-stale-bindings.sh sources _python_launcher.sh beside itself ().
+    shutil.copy2(CLEANUP_SH.parent / "_python_launcher.sh", dst / "_python_launcher.sh")
     return dst / "cleanup-stale-bindings.sh"
 
 

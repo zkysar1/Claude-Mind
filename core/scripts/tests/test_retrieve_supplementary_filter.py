@@ -117,10 +117,12 @@ def test_entry_matches_category_bidirectional():
 
 
 def test_entry_matches_category_fail_open():
-    """Untagged entry and empty category list both pass through."""
+    """An empty category list passes everything through. An untagged entry does
+    NOT match a non-empty query by category (g-115-3684: it used to ride every
+    page); it is left to the text predicate in _entry_matches."""
     untagged = {"category": ""}
     tagged = {"category": "framework-architecture"}
-    assert _retrieve._entry_matches_category(untagged, ["foo"])  # untagged passes
+    assert not _retrieve._entry_matches_category(untagged, ["foo"])  # no free pass
     assert _retrieve._entry_matches_category(tagged, [])  # empty list passes
     assert _retrieve._entry_matches_category(untagged, [])  # both empty passes
 

@@ -21,6 +21,9 @@
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Paths handed to NATIVE Windows programs (py -3, git -C) use NATIVE_ROOT
@@ -78,7 +81,7 @@ fi
 # EVERY file, exempting the entire tree -- the worst possible direction for this
 # particular failure -- so an unresolvable predicate is a hard error, not a
 # degraded mode (communication-clarity.md rule 5).
-MARKER_RX="$(py -3 "$NATIVE_ROOT/core/scripts/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
+MARKER_RX="$($PYLAUNCH "$NATIVE_ROOT/core/scripts/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
 if [[ -z "$MARKER_RX" ]]; then
   echo "ERROR: cannot resolve the exemption-marker predicate from $SCRIPT_DIR/_domain_leak_marker.py" >&2
   echo "       Refusing to scan: an empty pattern would exempt every file." >&2
@@ -182,7 +185,7 @@ SCOPED=false
 # positive control instead: this gate ships with the seed, so a list that lacks
 # it is not this repo's include-set.
 if [[ -f "$SEED_MANIFEST" ]] \
-   && { py -3 "$NATIVE_ROOT/core/scripts/_seed_engine.py" list-includes --lines \
+   && { $PYLAUNCH "$NATIVE_ROOT/core/scripts/_seed_engine.py" list-includes --lines \
           --manifest "$SEED_MANIFEST" --source "$NATIVE_ROOT" | tr -d '\r' > "$SHIP_FILE"
         [[ "${PIPESTATUS[0]}" -eq 0 && "${PIPESTATUS[1]}" -eq 0 ]]; } \
    && grep -Fxq -- "core/scripts/domain-leak-check.sh" "$SHIP_FILE"; then

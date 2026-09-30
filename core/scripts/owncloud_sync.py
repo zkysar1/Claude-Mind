@@ -3675,9 +3675,11 @@ def main() -> int:
     # silent-failure generator.
     #
     # Measured 2026-08-31 (g-369-80): this exact recipe — printed verbatim by
-    # owncloud-push-on-write.sh's own failure message as the guard-983 manual
-    # recovery — returned rc=0 with ZERO bytes on BOTH stdout and stderr and
-    # pushed nothing, against a file genuinely absent from the store. A silent
+    # owncloud-push-on-write.sh's failure message at the time (citing guard-983,
+    # which never made it into the store, measured 2026-09-17; the hook no
+    # longer prints a bare-CLI recipe as of g-115-9814) — returned rc=0 with
+    # ZERO bytes on BOTH stdout and stderr and pushed nothing, against a file
+    # genuinely absent from the store. A silent
     # command is zero signals, not one (verify-before-assuming rule 4), and the
     # hook's own comment warns that such an unpushed write "WILL be reverted by
     # the next no-baseline reconcile" — so the silence loses data rather than

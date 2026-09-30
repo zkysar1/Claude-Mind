@@ -33,6 +33,9 @@ ADVISORY="${MISS_THRESHOLD_ADVISORY:-5}"
 ALERT="${MISS_THRESHOLD_ALERT:-20}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 # SCRIPT_DIR is core/scripts; PROJECT_ROOT is two levels up.
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # 2026-05-19 (plan v1 step 0.14): miss log relocated from PROJECT_ROOT/
@@ -64,7 +67,7 @@ MISS_LOG_PATH="$LOG_PATH_NATIVE" \
 MISS_WINDOW_HOURS="$WINDOW_HOURS" \
 MISS_THRESHOLD_ADVISORY="$ADVISORY" \
 MISS_THRESHOLD_ALERT="$ALERT" \
-py -3 -c "
+$PYLAUNCH -c "
 import json
 import os
 from datetime import datetime, timedelta

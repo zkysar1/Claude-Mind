@@ -25,6 +25,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || true
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 WINDOW="168h"
 WINDOW_LABEL="7d"
@@ -51,7 +54,7 @@ if [ -d core/config/environments ]; then
             eid=$(grep -m1 '^environment_id:' "$f" 2>/dev/null | sed 's/^environment_id:[[:space:]]*//')
             bk=$(grep -m1 '^backend:' "$f" 2>/dev/null | sed 's/^backend:[[:space:]]*//')
             [ -n "$eid" ] && printf '%s\t%s\n' "$eid" "$bk"
-        done | py -3 -c '
+        done | $PYLAUNCH -c '
 import sys, json
 out = {}
 for line in sys.stdin:
@@ -74,7 +77,7 @@ fi
 # Fail-open to empty: an empty roster never inflates the peer count (attribution
 # requires independent @env-id evidence), it only makes the excluded-author
 # footnote noisier.
-ROSTER=$(bash core/scripts/team-state-read.sh --json 2>/dev/null | py -3 -c '
+ROSTER=$(bash core/scripts/team-state-read.sh --json 2>/dev/null | $PYLAUNCH -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -93,7 +96,7 @@ BOARD=$(
 printf '%s\n' "$BOARD" | \
     PEER_SELF_ENV="$SELF_ENV" PEER_REGISTRY="$REGISTRY" PEER_ROSTER="$ROSTER" \
     PEER_WINDOW="$WINDOW_LABEL" PEER_JSON="$AS_JSON" \
-    py -3 core/scripts/peer_surface.py 2>/dev/null
+    $PYLAUNCH core/scripts/peer_surface.py 2>/dev/null
 
 # Never fail the caller: /prime treats this as observability, not a gate.
 exit 0

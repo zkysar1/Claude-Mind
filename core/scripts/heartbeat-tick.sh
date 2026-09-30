@@ -13,6 +13,9 @@
 # precheck alone outlasted OWNERSHIP_STALE_SECONDS read as a crashed reducer and
 # its worker Body parked (coach, zc-03, 2026-08-28). A non-reducer Body passes
 # `--body-only` (below) so it refreshes its own carrier and nothing agent-wide.
+# Since  the PostToolUse hook presence-tick.py also ticks a non-reducer
+# Body `--body-only` after EVERY tool call, on the same per-SID stamp, so a
+# stretch with no Bash call no longer ages the carrier (never the full tick).
 #
 # Liveness model: pure mtime. heartbeat-stale.sh compares file age against
 # runner_heartbeat.stale_minutes and returns fresh/stale. No writer-identity

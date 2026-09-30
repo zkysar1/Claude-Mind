@@ -19841,6 +19841,14 @@ Signals routed: 2 LOW to WM `strategic_scan_signals` (S4a, S4b). Not routed: S2a
   - **S4.6** (read-only): 0 candidates at --min-failures 2 AND 1 (undecidable), failing_count 0. ceiling_ratio 0.0587 (2268/38624) is a span reading, not coverage (guard-4566). `--apply` was skipped because it is a no-op on 0 candidates.
   - Routed: 2 LOW to WM (S4a, S4b). 0 HIGH. 0 new MEDIUM (S2a and S3 axis2 are standing and owned).
 
+## Strategic scan — bravo, 2026-09-29T04:4x (`hostname` cc-05, `uname -r` 6.8.0-142-generic, own-cloud, world=ayoai-mind; `time_cadence` fired by the precheck cadence battery at Phase 0.5e, meter=run, zone normal post-compaction; stamped via verified-wm-set) — REPRODUCTION for S2a (nothing appended to g-115-5462)
+- S2a: threshold 30d, stale EXPLORE 38 of 62, opened 38/38, **STRUCTURAL: 7** (adoption-strategy-patterns, attention-performance-design, env-agnostic-exploration-primitives, infrastructure-performance, solver-v0-audits, v2-directed-steering-ship-log, v2-directed-steering-wiring). All 7 keys, `STRUCTURAL: 7` and cc-05 already present in g-115-5462's note, so stop condition held. Split 38 raw / 5 re-verify / 33 suspect; content_verified on 0. Histogram {271:1,142:1,132:1,93:1,87:1,80:7,79:9,76:1,74:1,72:1,65:1,61:1,56:3,51:1,48:1,47:1,44:2,40:1,39:1,34:1,33:1}.
+- S2b: 57/62 = 91.9% thin; depth>=2 true 62/62 (inert clause unchanged). Routed nothing (g-115-4840).
+- S3a (FULL compact, goals_omitted absent, 24 active, n=3749, 317 categories): axis1 framework-architecture 24.1% / axis1b framework-* 58.3% (51 labels) / axis2 asp-115 2985 = 79.6% FIRES — standing property, not routed.
+- S1: 113 sensors of 120 recurring; top-10 mine/fleet census 5 DROPPED mine<2 (g-335-1348 0/2, g-326-85 0/113, g-306-284 0/173, g-115-15 0/12, g-326-84 0/8) — g-115-3215 owns it.
+- S4a: 14/76 L2 subtrees >90d, nodes reached 1681/1681. S4b: rb-9824 (infrastructure) 54 retrievals, v2 0.0, 208/590 mature. Both LOW -> WM.
+- S4.5: 0 new, 2 dedup. S4.6: 2 candidates at min 2, 4 at min 1, sole member g-335-816 (completed) = window confound, routed nothing; ceiling_ratio 0.076 with alpha's 2-window 32d span supplying 2158 in-span (guard-4566 span artifact).
+
 ## Strategic scan — foxtrot, 2026-09-29T04:2x (`hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud, world=ayoai-mind; `time_cadence` fired by the precheck cadence battery at Phase 0.5e of it253, meter=run, zone fresh, post-compaction; stamped via verified-wm-set) — REPRODUCTION for S2a (nothing appended to g-115-5462)
   - **S1:** 108 of 115 recurring goals clear `achievedCount >= 2` (full compact, goals_omitted 0). Top-10 mine/fleet census (experience + archive, 7 agent stores):
     - g-326-85 158/158 (mine = fleet; the only trustworthy local trend). Its #238 dev/ppe split is handled in-cycle (prediction (h) + the server-detail counter step, g-374-193), so it is not routed.
@@ -19901,3 +19909,92 @@ Signals routed: 2 LOW to WM `strategic_scan_signals` (S4a, S4b). Not routed: S2a
   - **S4.5** (`--apply`): 0 new, 2 dedup (rt-arr.yaml and rt-nf.yaml, both under g-115-6169), 0 rb-245, filed 0.
   - **S4.6** (read-only): 0 candidates at --min-failures 2 AND 1 (undecidable), failing_count 3. ceiling_ratio 0.1128 (4376/38782) against this box's own 00:4x reading of 0.1134 (4375/38588), with the SAME shape: alpha's 08-01T23:29..09-22T23:10 diary (24 windows) supplies 4216 of the ceiling (96.3%). Every other peer sits on the 08-01/08-02 batched seed (starts within 36 min), and zeta is live 01:07..09:04. So this is a same-box, same-shape pair in which the ratio fell only because invocations grew (+194 against a ceiling of +1): span news, not coverage news (guard-4566). Nothing routed.
   - Routed: 2 LOW to WM (S4a unexplored_territory, S4b rb-279). 0 HIGH. 0 new MEDIUM.
+
+## Strategic scan — echo, 2026-09-29T13:3x (`hostname` cc-03, `uname -r` 6.8.0-142-generic, own-cloud, world=ayoai-mind; `time_cadence` fired by the precheck cadence battery at Phase 0.5e (deferrable tier resumed after compaction), meter=run, zone fresh; stamped 13:38:06 via verified-wm-set; full compact mtime 13:29:04) — REPRODUCTION for S2a (nothing appended to g-115-5462)
+  - **S1:** 108 of 115 recurring goals clear `achievedCount >= 2` (full compact). Top-10 mine/fleet census counts `experience.jsonl` PLUS `experience-archive.jsonl` across every local agent store, so compare only with rows of that method (foxtrot 04:2x): g-326-516 5/13; g-115-105 3/36; g-115-817 38/147; g-375-20 6/28; g-115-7106 3/9; g-115-1538 20/70.
+    - g-001-04 56/163 is AGENT-PRIVATE (the id collides across agents), so that count is conflated.
+    - DROPPED at mine < 2: g-115-8602 0/3; g-326-85 0/158; g-115-15 0/20 (local newest 08-01 against `lastAchievedAt` 09-29T10:48).
+    - Readable trends show no regression, anomaly or stagnation. g-326-85's "prod key halt #23 -> #24" is a condition foxtrot's own cycle notes count, not a new reading. Owner g-115-3215; nothing routed.
+  - **S2a:** 38/62 EXPLORE over 30d. Front matter was opened for ALL 62 EXPLORE nodes (62/62), not just the stale set, and index-vs-file `last_updated` disagreed on 0/62, so this count is of the files, not the index. STRUCTURAL: 7, the same seven members (new=[], gone=[]). g-115-5462's note already carries `STRUCTURAL: 7`, `attention-performance-design` and `cc-03`, so the stop condition is met.
+    - Trigger buckets: knowledge_reconciliation 5, re-verify 5, refresh 5, tree_growth 4, goal_execution 3.
+    - The histogram peaks at 80d (7) and 79d (9), identical to alpha 06:1x and zeta 09:1x on the same calendar day.
+    - **S2b:** 57/62 = 91.9%; depth>=2 is true on 62/62 (inert clause). Not routed (g-115-4840).
+  - **S3** (full compact, `goals_omitted` absent): n=3777, 317 categories, 52 `framework-*` labels.
+    - axis1 framework-architecture 915 = 24.2%; axis1b 2207 = 58.4%; axis2 asp-115 3017 = 79.9% FIRES (standing, not routed).
+    - asp-115 absolute is +30 against my own 06:3x row (2987), a same-box gap of ~7h.
+    - **S3b:** 0 uncovered. **S3c:** 15/23 = 0.652, completed_unarchived 0, so no portfolio signal.
+  - **S4a:** 14/76 = 18.4%; the walk reached 1684/1684.
+  - **S4b:** `--category framework-hygiene`: scanned 494, mature 209, 66 qualify; top rb-10010 (v2 0.0, retrieval 23). That is the same top as alpha 06:1x (mature 207 -> 209, qualify 67 -> 66).
+  - **S4.5** (`--apply`): 0 new, 2 dedup, 0 rb-245, filed 0.
+  - **S4.6** (read-only): 0 candidates at --min-failures 2 AND 1 (undecidable), failing_count 2.
+    - ceiling_ratio 0.0586 (2276/38831) against this box's 06:3x reading of 0.0588 (2278/38726), with the same shape. alpha's 08-20..09-20 diary (27 windows) supplies 2177 of the ceiling (95.7%). bravo and echo are live 8h slices; foxtrot and zeta are still on the 08-07 seed.
+    - This is span news, not coverage news (guard-4566). `--apply` was skipped (a no-op on 0 candidates).
+  - Routed: 2 LOW to WM (S4a unexplored_territory, S4b rb-10010). 0 HIGH. 0 new MEDIUM (S2a and S3 axis2 are standing and owned).
+
+## Strategic scan — foxtrot, 2026-09-29T11:3x (`hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud, world=ayoai-mind; `time_cadence` fired by the precheck cadence battery at Phase 0.5e of it258, with the whole deferrable tier run by hand (zone fresh, post-compaction), meter=run; stamped via verified-wm-set) — REPRODUCTION for S2a (nothing appended to g-115-5462)
+  - **S1:** 108 of 115 recurring goals clear `achievedCount >= 2` (full compact, `goals_omitted` absent on 24/24). Top-10 mine/fleet census (experience + archive + spool, 18 stores including charlie and delta):
+    - g-326-85 159/159 (mine = fleet): #237 fast, #238 dev slower, #239 dev partly back (16.27) plus the new ppe double boot. That anomaly is owned in-cycle (g-326-1075), so it is not routed.
+    - g-115-15 10/20: mine and fleet newest are both 08-01 while the goal last closed 09-29T10:48, so its closes stopped writing experience and no current trend is readable. g-115-105 5/36 (local newest 08-01 vs fleet 08-27); g-115-1538 6/70 (09-10 vs 09-27); g-115-817 11/146 (08-05 vs 09-25).
+    - DROPPED at mine < 2: g-375-20 0/28, g-115-7106 0/9, g-115-9530 0/4, g-306-284 0/185, g-115-6951 0/1. No S1 signal (g-115-3215).
+  - **S2a:** 38/62 EXPLORE over 30d, opened 38/38, STRUCTURAL: 7, the same seven members (new=[], gone=[]). g-115-5462's retained note (18,223 chars) carries `STRUCTURAL: 7` and all seven keys but not `LAPTOP-3IOFCNEO`. Nothing appended: a hostname is not a new member, a moved numerator or a falsified prior. Buckets: knowledge_reconciliation 5, re-verify 5, refresh 5, tree_growth 4, goal_execution 3. Histogram peaks 79d (9) and 80d (7), identical to zeta's 09:1x row (no day boundary crossed).
+    - **S2b:** 57/62 = 91.9%, depth>=2 on 62/62. Not routed (g-115-4840).
+  - **S3** (full compact): n=3763, 317 categories, 51 `framework-*` labels. axis1 framework-architecture 914 = 24.3%; axis1b 2198 = 58.4%; axis2 asp-115 3005 = 79.9% FIRES (standing, not routed). Same box vs 04:2x: asp-115 2981 -> 3005 (+24), n 3734 -> 3763 (+29). **S3b:** 0 uncovered. **S3c:** 16/24 = 0.67, completed_unarchived 0.
+  - **S4a:** 14/76 = 18.4%; the walk reached 1683/1683 from 1 root.
+  - **S4b:** `--category npc-behavior`: scanned 142, mature 96, 57 qualify; top rb-11968 (v2 0.0, retrieval 13). `roblox-integration` re-run for the same-box comparison: 253/169/75, top rb-10024 (v2 0.0, retrieval 22), the same top as 04:2x.
+  - **S4.5** (`--apply`): 0 new, 2 dedup (rt-arr.yaml and rt-nf.yaml, both g-115-6169), 0 rb-245, filed 0.
+  - **S4.6** (read-only): 0 candidates at --min-failures 2 AND 1 (undecidable), failing_count 1. ceiling_ratio 0.0478 (1855/38809) against this box's 04:2x 0.0481 (1861/38659), a span reading (guard-4566): alpha's 08-05..08-26 diary (15 windows) supplies 1696 of the ceiling (91.4%); bravo, echo and zeta sit on the 08-05/08-06 batched seed (starts 17:35-18:16); foxtrot is live 03:19..11:07. Coverage, not skill quality; `--apply` skipped (0 candidates).
+  - Routed: 2 LOW to WM (S4a unexplored_territory, S4b rb-11968). 0 HIGH. 0 new MEDIUM (S2a and S3 axis2 are standing and owned).
+
+## Strategic scan — bravo, 2026-09-29T15:3x (`hostname` cc-05, `uname -r` 6.8.0-142-generic, own-cloud, world=ayoai-mind; `time_cadence` dispatched by the cadence battery's STARVATION override (fired 5x undispatched); PARTIAL pass at zone tight (~50k tokens to compaction): the S1 per-sensor trend reads were skipped, every script-backed phase ran)
+  - **S1:** gate only: 113 of 120 recurring goals clear `achievedCount >= 2` (the zero-guard passes). Trend reads were SKIPPED at zone tight; the cross-agent blindness stays owned by g-115-3215.
+  - **S2a:** 7 of 38 stale EXPLORE nodes at 30d, opened 38/38. Structural: adoption-strategy-patterns, attention-performance-design, env-agnostic-exploration-primitives, infrastructure-performance, solver-v0-audits, v2-directed-steering-ship-log, v2-directed-steering-wiring. This is a REPRODUCTION: g-115-5462's note already carries `STRUCTURAL: 7` and attention-performance-design, so nothing was appended there. Re-verify 5, so 33 suspect. Age histogram: a 16-node cohort at 79-80d (80:7, 79:9); the oldest is 271d.
+  - **S2b:** 57 of 62 EXPLORE leaves are thin (91.9%). The screen does not discriminate, so nothing was routed (g-115-4840).
+  - **S3:** full corpus, n=3806, 320 labels, 24 active aspirations. axis1: framework-architecture 914 = 24.0%. axis1b: framework-* 2218 = 58.3%. axis2: asp-115 3028 = 79.6%, FIRES (standing, not routed). Against the 11:3x row, asp-115 went 3005 -> 3028 (+23). n is per-agent, so only the asp-115 absolute compares across boxes (method rule 1). HIGH share 0.62.
+  - **S4a:** 14/76 = 18.4% of L2 subtrees untouched for 90d+; the walk reached 1684/1684.
+  - **S4b:** `--category framework-hygiene`: scanned 495, mature 210, 66 qualify. Top: rb-10010 (v2 0.0, retrieval 23).
+  - **S4.5** (`--apply`): 0 new, 2 dedup, 0 rb-245, 0 filed.
+  - **S4.6** (read-only): 2 candidates at --min-failures 2 and 4 at --min-failures 1. The member set is {g-335-816} in both: the standing window confound, with zero real failures, so nothing was filed. failing_count 642. ceiling_ratio 0.0751 (2918/38874) is a span reading (guard-4566), not coverage.
+  - Routed: 2 LOW to WM (S4a unexplored_territory, S4b rb-10010). 0 HIGH. 0 new MEDIUM (S2a and S3 axis2 are standing and owned).
+- **2026-09-29T15:36**: alpha (reducer), `hostname` cc-04, `uname -r` 6.8.0-142-generic, own-cloud. Trigger: time_cadence (cadence-battery 0.5e.9).
+  - **S1:** 116 recurring, 109 with achievedCount >= 2. Census of the top 10 by lastAchievedAt, as mine/fleet:
+    - g-115-22 4/72; g-326-516 3/13; g-115-105 13/36; g-115-817 29/147.
+    - g-306-284 187/187. It is alpha-private in practice, and occ253-255 show no regression, anomaly or stagnation.
+    - DROPPED at mine < 2: g-115-4398 0/0, g-370-09 0/3, g-375-20 1/28, g-370-58 1/5, g-115-8602 1/3. g-115-4398 is ach=4 with ZERO records fleet-wide (the g-115-5318 class).
+    - No S1 signal (g-115-3215).
+  - **S2a:** 38/62 EXPLORE over 30d, opened 38/38. STRUCTURAL: 7, the same seven members as the LAPTOP-3IOFCNEO row above.
+    - g-115-5462's note carries `STRUCTURAL: 7`, all seven keys and `cc-04`, so this is a reproduction and nothing was appended. The SKILL.md CURRENT PRIOR paragraph still says numerator 6; the note wins.
+    - Split: raw 38, re-verify 5, suspect 33. content_verified is present on 0. The histogram peaks at 79d (9) and 80d (7), the same as the rows above.
+  - **S2b:** 57/62 = 91.9%. Not routed (g-115-4840).
+  - **S3** (full compact; the goals_omitted key is absent on all 23 aspirations): n=3796, 53 `framework-*` labels.
+    - axis1 framework-architecture 916 = 24.1%; axis1b 2216 = 58.4%; axis2 asp-115 3028 = 79.8% FIRES (standing, not routed).
+    - The asp-115 absolute is world-scoped: 3005 -> 3028 (+23) against the row above. n is per-agent and not comparable across boxes.
+    - **S3b:** 0 uncovered. **S3c:** HIGH share 0.65 (15/23), completed_unarchived 0, so no portfolio_health_signal.
+  - **S4a:** 14/76 = 18.4%; the children walk reached 1684/1684.
+  - **S4b:** `--category infrastructure`: scanned 974, mature 592, 211 qualify. Top: rb-9824 (v2 0.0, retrieval 55).
+  - **S4.5** (`--apply`): 0 new, 2 dedup, 0 rb-245, filed 0.
+  - **S4.6** (read-only): 0 candidates at --min-failures 2 AND 1 (undecidable); failing_count 5.
+    - ceiling_ratio 0.0043 (168/38870) on alpha's own box, against 0.0478 on the LAPTOP row. That gap is box-local span news (guard-4566): there, alpha's old 08-05..08-26 diary supplied the ceiling, and here alpha's diary is the live short span.
+    - This is coverage, not skill quality. `--apply` skipped (0 candidates).
+  - Routed: 2 LOW to WM (S4a unexplored_territory, S4b rb-9824). 0 HIGH. 0 new MEDIUM (S2a and S3 axis2 are standing and owned).
+
+## Strategic scan — zeta, 2026-09-29T13:5x (`hostname` cc-02, `uname -r` 6.8.0-142-generic, own-cloud, world=ayoai-mind; `time_cadence` fired by the precheck cadence battery at Phase 0.5e of iteration 31, meter=run, zone fresh post-compaction; stamped via verified-wm-set) — REPRODUCTION on S2a, nothing appended to g-115-5462
+  - **S1** (full compact: 114 recurring, 107 sensors; top 10 by lastAchievedAt; fleet census via `experience-read.sh --goal` under each MIND_AGENT): mine<2 on 5 of 10 (g-326-516 0/10, g-115-105 0/13, g-115-8602 0/3, g-326-85 0/115, g-115-15 0/13), so a local-only read would drop all five. On g-115-15 and g-115-105 the fleet-newest record trails lastAchievedAt by 2.5 months and 1 month (owned: g-115-3215, g-115-5318). One LOW stagnation: g-326-85's prod leg halted on consecutive cycles (prod key halt #23 -> #24, cycles #237-#238).
+  - **S2a:** 30d screen, stale EXPLORE 38, opened 38/38, STRUCTURAL: 7 — the same seven keys as foxtrot's 11:3x row (attention-performance-design backfill 271d, adoption-strategy-patterns backfill 40d, env-agnostic-exploration-primitives distill 61d, infrastructure-performance decompose 80d, solver-v0-audits distill 93d, v2-directed-steering-ship-log and -wiring node_split 79d). g-115-5462's note carries `STRUCTURAL: 7`, all seven keys and `cc-02`, so this is a reproduction and nothing was appended. Buckets: knowledge_reconciliation 5, re-verify 5, refresh 5, tree_growth 4, goal_execution 3. content_verified is on 0 nodes. Histogram peaks at 79d (9) and 80d (7).
+    - **S2b:** 57/62 = 91.9%, depth>=2 on 62/62. Not routed (g-115-4840).
+  - **S3** (full compact, goals_omitted absent on all 23; the loader's stderr said BOUNDED, 3284 of 3797 omitted from the summary): n=3777, 317 categories, 52 `framework-*` labels. axis1 framework-architecture 913 = 24.2%; axis1b 2207 = 58.4%; axis2 asp-115 3019 = 79.9% FIRES (standing, not routed). Against foxtrot's 11:3x row: asp-115 3005 -> 3019, n 3763 -> 3777 (different boxes, so n is not comparable per method rule 1; the world-aspiration absolute is). **S3b:** 0 uncovered. **S3c:** 15/23 = 0.65, completed_unarchived 0.
+  - **S4a:** 14/76 = 18.4% at 90d; the walk reached 1684/1684.
+  - **S4b:** `--category infrastructure`: scanned 974, mature 592, 213 qualify; top rb-9824 (v2 0.0, retrieval 55).
+  - **S4.5** (`--apply`): 0 new, 2 dedup, 0 rb-245, 0 filed.
+  - **S4.6** (read-only): 0 candidates at --min-failures 2 AND at 1 (undecidable); failing_count 1. ceiling_ratio 0.1126 (4377/38864) is ABOVE the band's recorded 0.104 top, and it is a span reading (guard-4566): alpha's 08-01..09-22 diary (24 windows, 4216 in-span, ~176 per window) supplies 96.3% of the ceiling. bravo, echo and foxtrot sit on the 08-01T23:29..08-02T07:42 batched seed, the same window this box measured on 08-16, so those three peer slices have not been re-pulled to cc-02 in 44 days. zeta is live 05:51..13:53. This measures coverage, not skill quality; `--apply` skipped.
+  - Routed: 3 LOW to WM (S4a unexplored_territory, S4b rb-9824, S1 g-326-85 stagnation). 0 HIGH. 0 new MEDIUM (S2a and S3 axis2 are standing and owned).
+
+## Strategic scan — foxtrot, 2026-09-29T15:5x (`hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, own-cloud, world=ayoai-mind; `time_cadence` fired by the precheck cadence battery, meter=run)
+  - **S1:** full compact, 115 recurring, 108 sensors. Per-sensor trend reads skipped (owned by g-115-3215; context budget). Nothing filed.
+  - **S2a:** 30d screen, stale EXPLORE 38, opened 38/38, STRUCTURAL: 7. The seven keys are identical to zeta's 13:5x row, and g-115-5462's note already carries `attention-performance-design` and the count. So this is a REPRODUCTION, and nothing was appended to the owner. Age histogram top: 271/142/132/93/87, cohorts 80d:7 and 79d:9.
+    - **S2b:** 57/62 = 91.9%. Not routed (g-115-4840).
+  - **S3** (full store, world+agent `--active`): n=3794. axis1 framework-architecture 24.1%, axis1b framework-* 58.4%, axis2 asp-115 3030 = 79.9%. Axis2 FIRES at 0.7; this is a standing property, so it was not routed.
+  - **S4a:** 14/76 L2 subtrees at 90d; the walk reached 1684/1684.
+  - **S4b:** `--category roblox-integration`: scanned 253, mature 169, 74 qualify. Top rb-10024 (retrieval 22, v2 0.0).
+  - **S4.5** (`--apply`): 0 new, 2 dedup, 0 rb-245, 0 filed.
+  - **S4.6** (read-only): 0 candidates at --min-failures 2 AND at 1 (undecidable), failing_count 4. ceiling_ratio 0.0477 (1857/38908) is inside the band, so this is a coverage measurement, not a skill-quality one.
+  - Routed: 2 LOW to WM (S4a unexplored_territory, S4b rb-10024). 0 HIGH. 0 new MEDIUM (S2a and S3 axis2 are standing and owned).

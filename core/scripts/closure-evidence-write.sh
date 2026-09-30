@@ -67,6 +67,9 @@ set -uo pipefail
 # Skinny PROJECT_ROOT resolve, matching the sibling wrappers (no _paths.sh —
 # this runs on the close path of every iteration).
 _SELF="$(cd "$(dirname "$0")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$_SELF/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 PROJECT_ROOT="$(cd "$_SELF/../.." && pwd)"
 SCRIPT_DIR="$PROJECT_ROOT/core/scripts"
 
@@ -244,7 +247,7 @@ if [[ -n "$SUMMARY_FILE" ]]; then
         # tests, where the gate file is absent), and a gate that cannot run
         # must not silently stop every close. Fail OPEN, loudly.
         _sss_rc=0
-        py -3 "$SCRIPT_DIR/stale-summary-source-gate.py" \
+        $PYLAUNCH "$SCRIPT_DIR/stale-summary-source-gate.py" \
             --path "$SUMMARY_FILE" --goal "${GOAL_ID:-}" --source "${SOURCE:-}" \
             --caller "closure-evidence-write.sh:summary-file-read" \
             ${OVERRIDE_STALE_SOURCE:+--override-stale-source "$OVERRIDE_STALE_SOURCE"} \

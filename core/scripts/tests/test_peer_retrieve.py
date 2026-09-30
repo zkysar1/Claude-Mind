@@ -681,6 +681,18 @@ def test_granted_scope_does_not_admit_a_sibling_sharing_a_prefix():
     assert m.filter_by_tier(rows, m.TIER_PUBLIC, scopes=["intelligence/agent"]) == []
 
 
+def test_empty_or_slash_scope_is_the_root_grant_and_admits_every_raw_row():
+    """_grants.ROOT_SCOPE is "/" and normalize_scope("") returns it, so an empty
+    or "/" scope is the designed root grant, not a bypass. Skipping it would
+    narrow a root grantee to public rows."""
+    m = _pr()
+    rows = [{"store": "board/general", "ref": "msg-1"},
+            {"store": "knowledge-tree", "ref": "intelligence/agent/memory"},
+            {"store": "knowledge-tree", "ref": "performance/latency"}]
+    for root in ("", "/"):
+        assert m.filter_by_tier(rows, m.TIER_PUBLIC, scopes=[root]) == rows, repr(root)
+
+
 def test_tier_helpers_did_not_introduce_a_fileops_import():
     """peer_retrieve's core invariant — the guard-955/rb-2983 backend class."""
     m = _pr()

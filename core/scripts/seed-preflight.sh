@@ -31,6 +31,9 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || {
     echo "ERROR: failed to source _paths.sh" >&2
     exit 2
 }
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 JSON_OUTPUT=0
 QUIET=0
@@ -52,7 +55,7 @@ done
 CHECKS=(
     "domain-leak|Domain token blocklist sweep|bash $SCRIPT_DIR/domain-leak-check.sh"
     "skill-frontmatter|SKILL.md front matter parses|bash $SCRIPT_DIR/skill-frontmatter-audit.sh"
-    "pseudocode-scripts|SKILL.md pseudocode-script references exist|py -3 $SCRIPT_DIR/verify-pseudocode-scripts.py --scripts-only"
+    "pseudocode-scripts|SKILL.md pseudocode-script references exist|$PYLAUNCH $SCRIPT_DIR/verify-pseudocode-scripts.py --scripts-only"
     "forged-skill-tagging|Forged-skill registry bidirectional consistency|bash $SCRIPT_DIR/audit-forged-skill-tagging.sh"
     "aspirations-templates|Agent-aspirations starter templates domain-free|bash $SCRIPT_DIR/audit-aspirations-templates-clean.sh"
     "toplevel-allowlist|core/ + .claude/ top-level allowlist|bash $SCRIPT_DIR/audit-toplevel-allowlist.sh"

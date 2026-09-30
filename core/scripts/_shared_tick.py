@@ -12,22 +12,28 @@ re-derive on its own:
   * `spawn_detached()`, the fire-and-forget form a hook may use — a PreToolUse
     hook sits on the critical path of EVERY tool call, and a tick that waits on a
     slow daemon would time the hook out and drop the MIND_AGENT injection for
-    that call (guard-1562 shape: a liveness courtesy must never block work).
+    that call (guard-1562 shape: a liveness courtesy must never block work);
+  * `maybe_tick()`, the per-Body decision both tool-call hooks share, so the
+    two of them tick a Body at most once per interval between them.
 
 Callers — keep this list current, it is the caller inventory (g-115-8200):
   * core/scripts/execution-diary.py `_tick_shared_heartbeat_if_due` — on every
     diary write, synchronous (g-306-233).
   * core/scripts/bash-agent-inject.py `_maybe_tick_heartbeat` — before every
-    Bash tool call, detached. This is what makes a runner's freshness
-    independent of its iteration length: a served 27B whose precheck alone ran
-    past OWNERSHIP_STALE_SECONDS read as a crashed reducer, and its worker Body
-    parked (measured 2026-08-28, coach on zc-03).
+    Bash tool call, detached, via `maybe_tick()`. This is what makes a runner's
+    freshness independent of its iteration length: a served 27B whose precheck
+    alone ran past OWNERSHIP_STALE_SECONDS read as a crashed reducer, and its
+    worker Body parked (measured 2026-08-28, coach on zc-03).
+  * core/scripts/presence-tick.py — after EVERY tool call (PostToolUse '*'),
+    detached, via `maybe_tick(..., full_allowed=False)`: worker Bodies only
+    (g-375-80). Before it, a worker's carrier aged through any stretch without
+    a Bash call, and a slow Body's Read/Edit/Grep stretch lasted hours: the
+    stranded-claim sweep released zc-05's live claim at 04:42 on 2026-09-29.
 """
 
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -82,8 +88,60 @@ def _rotate(log_path: Path) -> None:
         pass
 
 
+def maybe_tick(agent: str, sid: str, state_dir: Path, project_root: Path,
+               script_dir: Path, *, full_allowed: bool = True, via: str = "") -> None:
+    """Tick THIS Body's liveness from a tool-call hook, at most once per interval.
+
+    `state_dir` is the agent's `session/` dir, which holds the carrier.
+    ROLE SPLIT: the tick's own state gate separates a cross-box worker (IDLE by
+    design) from the reducer, but a same-box worker shares agent-state=RUNNING
+    and would renew the reducer's lease with the shared runner-token. So:
+    SID == running-session-id -> the full tick, on the diary path's own
+    `claim-renewal-last` window (one tick per interval across both callers);
+    any other Body -> `--body-only`, which refreshes only its carrier, on a
+    per-SID stamp under core/logs that every tool-call hook shares. A caller
+    passes `full_allowed=False` when its environment is not the one the full
+    tick's agent-wide legs were built for; the reducer then keeps its other
+    cadences. A session with NO carrier is not a Body (an observer, an
+    assistant) and never ticks, and this never creates the carrier: /start
+    and the tick own that. Fail-open on every path.
+    """
+    try:
+        if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
+            return
+        if not (state_dir / f"body-heartbeat-{sid}.json").is_file():
+            return
+        if pytest_suppressed():
+            return
+        running = ""
+        try:
+            running = (state_dir / "running-session-id").read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        if running == sid:
+            if not full_allowed:
+                return
+            body_only = False
+            stamp = state_dir / "claim-renewal-last"
+        else:
+            body_only = True
+            stamp = project_root / "core" / "logs" / "heartbeat-hook" / sid
+        if not due(stamp):
+            return
+        # Stamp BEFORE the spawn so a slow or failing tick cannot re-fire on
+        # every subsequent call (the same order execution-diary.py uses).
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+        spawn_detached(
+            script_dir, agent, sid, body_only=body_only,
+            log_path=project_root / "core" / "logs" / f"heartbeat-hook-{agent}.log",
+            cwd=project_root, via=via)
+    except Exception:
+        pass
+
+
 def spawn_detached(script_dir: Path, agent: str, sid: str, *, body_only: bool,
-                   log_path: Path, cwd: Path) -> None:
+                   log_path: Path, cwd: Path, via: str = "") -> None:
     """Fire heartbeat-tick.sh and return without waiting.
 
     The child runs in its own session (POSIX) / detached process group
@@ -91,10 +149,15 @@ def spawn_detached(script_dir: Path, agent: str, sid: str, *, body_only: bool,
     stderr land in `log_path` — never on the hook's stdout, which is the hook
     JSON channel. `--body-only` refreshes only this SID's per-Body carrier and
     exits before the agent-wide runner signal, which only the reducer may
-    advance. Fail-open on every path: a liveness courtesy must never block the
-    tool call it rides on.
+    advance. `via` names the caller on the log line when it is not the Bash
+    hook, whose lines keep their old shape. Fail-open on every path: a liveness
+    courtesy must never block the tool call it rides on.
     """
     try:
+        # Imported here, not at module top: bash-agent-inject.py imports this
+        # module on every Bash call, and only a due tick needs subprocess.
+        import subprocess
+
         from _runtime_bash import bash_cmd  # guard-580: never a bare "bash" argv[0]
 
         env = dict(os.environ)
@@ -111,7 +174,8 @@ def spawn_detached(script_dir: Path, agent: str, sid: str, *, body_only: bool,
             kwargs["start_new_session"] = True
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} tick sid={sid} "
-                      f"{'body-only' if body_only else 'full'}\n")
+                      f"{'body-only' if body_only else 'full'}"
+                      f"{f' via={via}' if via else ''}\n")
             log.flush()
             subprocess.Popen(
                 bash_cmd(str(Path(script_dir) / "heartbeat-tick.sh"), *args),

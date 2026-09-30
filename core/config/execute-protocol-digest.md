@@ -450,10 +450,11 @@ Bash: utilization-feedback.sh --goal {goal.id} --helpful "node1,node2,rb-001,gua
 # IDs can be tree-node keys, reasoning-bank IDs (rb-NNN), OR guardrail IDs (guard-NNN).
 # --all-helpful: uniform helpful classification.
 # --all-noise: uniform noise classification (LEGACY — poisons times_noise on
-#   unattested-but-relevant nodes; prefer --all-unknown for the backstop case).
-# --all-unknown: no-op on counters; just clears utilization_pending. The
-#   preferred backstop. phase-4-26-gate still blocks goal completion (same as
-#   all_noise) but no times_noise pollution.
+#   unattested-but-relevant nodes).
+# --all-unknown: no-op on counters; clears utilization_pending. LAST RESORT:
+#   phase-4-26-gate BLOCKS goal completion on bare all_unknown (measured
+#   2026-09-29) — credit ids from the CURRENT manifest with --helpful instead
+#   (see guard-7420: a mid-goal retrieve replaces the manifest).
 # Reads retrieval-session.json, increments tree + supplementary counters, clears pending flag.
 
 # BACKSTOP (hot path): iteration-close.sh _repair_utilization_pending runs inside
@@ -462,8 +463,9 @@ Bash: utilization-feedback.sh --goal {goal.id} --helpful "node1,node2,rb-001,gua
 # BACKSTOP (direct-skill path only): the utilization-gate.sh PreToolUse[Skill] hook
 # covers Skill(aspirations-state-update) calls that bypass iteration-close. It does
 # NOT cover the Bash hot path — a PreToolUse[Skill] matcher structurally cannot.
-# The gate still flags backstop-only goals to force the LLM to attest or pass
-# --no-retrieval-applicable (though the gate is itself inert today — g-115-3113).
+# The hook still flags backstop-only goals to force the LLM to attest or pass
+# --no-retrieval-applicable (the hook itself is inert today — g-115-3113 — but
+# phase-4-26-gate ACTIVELY BLOCKS a bare all_unknown close, measured 2026-09-29).
 ```
 
 ## Phase 4.5: Knowledge Reconciliation (IF NOT trivial_mode — no_diff ⇒ nothing to reconcile; escape hatch re-enables on diff)

@@ -36,7 +36,7 @@ set -uo pipefail
 cd "$(dirname "$0")/../../.." 2>/dev/null || cd "$(git rev-parse --show-toplevel)"
 
 HOST="core/scripts/seed-transplant.sh"
-MARKER='ORPHAN_JSON" | py -3 -c'
+MARKER='ORPHAN_JSON" | $PYLAUNCH -c'
 FAILED=0
 note(){ printf '%s\n' "$*"; }
 fail(){ printf 'FAIL: %s\n' "$*"; FAILED=1; }

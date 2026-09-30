@@ -33,6 +33,9 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || exit 0
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || exit 0
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 # MIND_AGENT must be bound. Without it we have no destination log path.
 if [ -z "${MIND_AGENT:-}" ]; then
@@ -139,7 +142,7 @@ fi
 
 # Get mtime as epoch seconds. py -3 because POSIX `date -r` is not portable
 # on Windows Git-Bash and would silently fail.
-mtime=$(FILE_E="$file_path" py -3 - 2>/dev/null <<'PYEOF'
+mtime=$(FILE_E="$file_path" $PYLAUNCH - 2>/dev/null <<'PYEOF'
 import os, sys
 try:
     print(int(os.path.getmtime(os.environ["FILE_E"])))

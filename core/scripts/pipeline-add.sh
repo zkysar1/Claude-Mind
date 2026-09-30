@@ -56,6 +56,21 @@ BODY="$(cat)"
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
+# Confidence-calibration capture () — twin of pipeline-move.sh's, whose
+# comment carries the why. An add at stage=resolved is a resolution event (the
+# daemon stamps and evidence-gates it as one); capture_resolution_response checks
+# the stage on the record the daemon wrote, so any other add records nothing.
+_calibration_capture() {
+    case "$RESPONSE" in *'"tests_node"'*) ;; *) return 0;; esac
+    # shellcheck disable=SC2086
+    printf '%s' "$RESPONSE" | PROJECT_ROOT="$PROJECT_ROOT" $(rt_python_launcher) -c "
+import os, sys
+sys.path.insert(0, os.path.join(os.environ['PROJECT_ROOT'], 'core', 'scripts'))
+from _confidence_ledger import capture_resolution_response
+capture_resolution_response(sys.stdin.read())
+" >&2 || true
+}
+
 rc=0
 RESPONSE="$(rt_call POST /v1/pipeline/add \
     --body-string "$BODY" \
@@ -70,6 +85,7 @@ resp = json.load(sys.stdin)
 rec = resp.get('record') or resp
 print(json.dumps(rec, indent=2, ensure_ascii=False))
 "
+        _calibration_capture
         exit 0;;
     2)
         exit 1;;
@@ -87,6 +103,7 @@ resp = json.load(sys.stdin)
 rec = resp.get('record') or resp
 print(json.dumps(rec, indent=2, ensure_ascii=False))
 "
+                _calibration_capture
                 exit 0
             fi
         fi

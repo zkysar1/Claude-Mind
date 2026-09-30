@@ -97,6 +97,9 @@ def _shim_iteration_commit(tmpdir: Path) -> Path:
     target = shim_dir / "iteration-commit.sh"
     target.write_bytes(ITERATION_COMMIT_SH.read_bytes())
     target.chmod(0o755)
+    # iteration-commit.sh sources _python_launcher.sh beside itself ().
+    launcher = ITERATION_COMMIT_SH.parent / "_python_launcher.sh"
+    (shim_dir / launcher.name).write_bytes(launcher.read_bytes())
     # Mock team-state-read.sh to return null (no in_flight claimed_at) so
     # the cross-agent mtime filter is fail-open. This isolates the
     # stash-overlap filter as the only active filter for these tests.

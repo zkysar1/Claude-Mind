@@ -141,6 +141,7 @@ PIPELINE_KNOWN_FIELDS = frozenset((
     "measurement_pending_set_at",
     "mechanism",
     "mitigations",
+    "node_verdict",  # : resolver's judgement of the tested node (review-hypotheses Step 4.1)
     "note",
     "notes",
     "origin",
@@ -219,6 +220,7 @@ PIPELINE_KNOWN_FIELDS = frozenset((
     "surprise_level",
     "tags",
     "test",
+    "tests_node",  # : tree node whose claim the hypothesis tests (aspirations-spark Step 1)
     "title",
     "type",
     "verification",

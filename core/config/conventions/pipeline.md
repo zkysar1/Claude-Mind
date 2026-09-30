@@ -13,7 +13,7 @@ Defaults: `slug` (from id), `rationale` (""), `outcome` (null), `reflected` (fal
 Optional: `outcome_detail`, `outcome_date`, `reflected_date`, `reflected_by`, `verification`, `resolves_by`,
           `resolves_no_earlier_than`, `strategy`, `depth`, `mechanism`, `context_manifest`,
           `context_quality`, `process_score`, `replay_metadata`, `source_validation`, `experience_ref`,
-          `evidence_for`, `evidence_override`
+          `evidence_for`, `evidence_override`, `tests_node`, `node_verdict` (both: § Tested-Node Link below)
 
 ID format: `YYYY-MM-DD_slug` (regex: `^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$`)
 
@@ -198,3 +198,36 @@ shape passes); the precise compliance rate is tracked separately as
 Escape hatch: set `evidence_override` to a short non-empty reason string in the
 resolve merge JSON (e.g. a math proof where the derivation IS the evidence).
 The reason persists in the record (more auditable than a transient CLI flag).
+
+## Tested-Node Link (`tests_node`) and Its Calibration Row (g-306-553)
+
+`tests_node` links a hypothesis to the knowledge-tree node whose CLAIM it tests.
+Write it at FORMATION, in the `pipeline-add.sh` payload:
+
+```json
+"tests_node": {"key": "<the node's key in _tree.yaml>", "stance": "supports"}
+```
+
+- `key`: the node's index key. Confirm it resolves with `tree-read.sh --node <key>`.
+- `stance`: `supports` when the prediction IS the node's claim, so it comes true
+  only if the claim holds; `challenges` when the prediction is that the claim fails.
+
+Set it only when the prediction tests something the node itself asserts, and link
+one node. A node you merely read belongs in `context_consulted`; linking it scores
+the node on a claim it never made.
+
+At RESOLUTION, add `node_verdict` to the resolve merge JSON: `survived`, `refuted`,
+`revised` or `unknown`. It judges the NODE's claim, not the prediction. Give it on
+every CORRECTED: a bare CORRECTED is never mapped, because a prediction can miss
+its criterion while the node's mechanism held (guard-2728), so without it the row
+is recorded as `unknown`. On CONFIRMED it may be omitted: `supports` maps to
+`survived` and `challenges` to `refuted`, on an exact outcome match (guard-654).
+
+What it produces: once the daemon has written a move INTO `resolved` (or an add at
+stage `resolved`), `pipeline-move.sh` / `pipeline-add.sh` append one row to
+`world/confidence-calibration-ledger.jsonl`. The row carries the node's
+`declared_confidence` read from the `_tree.yaml` INDEX at that moment, `evidence_ref`
+set to the hypothesis id, and `source: hypothesis-resolution`. EXPIRED and
+UNRESOLVABLE outcomes write nothing, and a later verdict correction through
+`pipeline-update-field.sh` writes no new row. Mapping and placement:
+`core/config/conventions/confidence-calibration-ledger.md`.

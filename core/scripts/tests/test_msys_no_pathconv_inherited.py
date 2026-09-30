@@ -56,7 +56,7 @@ def test_domain_leak_staged_scan_runs_with_the_variable_inherited(tmp_path):
     repo = tmp_path / "repo"
     scripts = repo / "core" / "scripts"
     scripts.mkdir(parents=True)
-    for name in ("domain-leak-check.sh", "_domain_leak_marker.py"):
+    for name in ("domain-leak-check.sh", "_domain_leak_marker.py", "_python_launcher.sh"):
         (scripts / name).write_bytes((SCRIPTS / name).read_bytes())
     (repo / "core" / "config").mkdir()
     # Bytes, not write_text: on Windows write_text emits CRLF, and the scanner

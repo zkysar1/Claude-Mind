@@ -279,7 +279,8 @@ core/config/rationale/forge-skill-gates.md.
      `.claude/skills/{new-skill-name}/SKILL.md` and re-run. rc=2 → you passed no
      skill name; a usage error is NOT approval.
      WHY: a registry row over an absent body is a PHANTOM registration (guard-2242, rb-10227);
-     the gate checks DISK PRESENCE at the load path, not catalog listing (guard-2335). Rationale:
+     the gate checks DISK PRESENCE at the load path, not catalog listing, because a script cannot
+     read the model's catalog (guard-7539, which supersedes guard-2335). Rationale:
      core/config/rationale/forge-skill-gates.md.
    - Add entry under `skills:` with `parent`, `type`, `forged_date`, `forged_by: {agent-name}`, `gap_ref`, `triggers`
    - **AMENDING an EXISTING row (adding a trigger, fixing a `companion_scripts`
@@ -551,6 +552,8 @@ bash core/scripts/forged-skill-body-gate.sh --skill {new-skill-name}
 
 rc≠0 → the forge is NOT done. Say so plainly, leave the validation goal open,
 and do not post a "forge-skill,complete" board message. Note what this can and
-cannot prove: it confirms a loadable body, NOT that the skill will trigger — descriptions load
-at STARTUP, so trigger behaviour is only testable in a session started AFTER the forge commit
-(guard-2335). Never revise a description because the new skill did not fire in its own session.
+cannot prove: it confirms a loadable body, NOT that the skill will trigger. On Claude Code
+2.1.283 a skill written mid-session is announced in a "skills available" reminder about 45 s
+later and can fire in its own session (guard-7539, superseding guard-2335). So test triggering
+only after that reminder has listed the skill. Before it, and on a harness that loads skills
+only at startup, never revise a description because the new skill did not fire.

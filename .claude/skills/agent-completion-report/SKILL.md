@@ -260,7 +260,9 @@ All data comes from framework scripts — no direct JSONL reads.
      _load_questions logic the sweep sibling uses, rb-1786). Do NOT hand-roll a
      naive top-level `status == "pending"` scan of the raw YAML — it silently
      SKIPS entries nested inside a `{questions: [...]}` wrapper (g-115-3039).
-   Bash: bash core/scripts/load-aspirations-compact.sh → IF path returned: Read it
+   Bash: bash core/scripts/load-aspirations-compact.sh → its printed path is BOUNDED (drops
+   pending LOW/MEDIUM; the stderr caveat is build-run-only, guard-3698), so filter the FULL
+   corpus agents/<agent>/session/aspirations-compact.json (2026-09-29: 7 bounded vs 15 full).
    (compact data has IDs, titles, statuses, participants — no descriptions/verification)
    Filter goals with participants containing "user"
    # ⚠ AND NO completed_date — ON ANY RECORD, INCLUDING THE COMPLETED ONES. So a
@@ -889,8 +891,8 @@ Note: `agents/<agent>/COMPLETION-REPORT.md` is the single latest-pointer report,
 ## Phase 5: Save Report Timestamp
 
 ```
-1. Write current timestamp to agents/<agent>/session/last-report-timestamp:
-   Bash: echo "$(date +%Y-%m-%dT%H:%M:%S)" > agents/<agent>/session/last-report-timestamp
+1. Write the Phase-2 READ START (carried from context), NOT `date` (guard-7460):
+   Bash: echo "<read-start ISO>" > agents/<agent>/session/last-report-timestamp
 ```
 
 ## Phase 5.5: Notify the User — send the FLEET DIGEST, not the report

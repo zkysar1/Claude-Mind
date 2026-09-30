@@ -1608,7 +1608,8 @@ user_signal_boost:
 # Rides the EXISTING directive_boost criterion (goal-selector.py 13b) rather than
 # adding a knob: board directives and the standing user directive are the same
 # kind of signal ("someone with authority said this matters more") and share the
-# criterion weight (meta/goal-selection-strategy.yaml → directive_boost, 1.5).
+# criterion weight (meta/goal-selection-strategy.yaml → directive_boost; seed
+# default 1.5, tuned per deployment).
 #
 # The natural gate is field presence — no `enabled` flag. Absent strategic_focus,
 # or prose naming no `asp-NNN`, contributes zero. Self-retiring: a named
@@ -1616,7 +1617,8 @@ user_signal_boost:
 # prose costs nothing once the work has drained.
 strategic_focus_boost:
   weight: 1.0                         # raw boost per goal under a named aspiration
-                                      # (x1.5 criterion weight -> +1.5 effective).
+                                      # (x the criterion weight: +1.5 effective at
+                                      # the 1.5 seed default, +3.0 at 3.0).
                                       # Bias, not veto (Scorer Sovereignty, ).
 #
 # DO NOT RAISE THIS TO MAKE PRODUCT WORK WIN (, 2026-07-28).

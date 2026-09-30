@@ -45,6 +45,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 # Convert MSYS /c/... → Windows C:/... for inline `python3 -c "open(r'$path', ...)"`.
 source "$SCRIPT_DIR/_platform.sh"
 # _platform.sh converts REPO_ROOT/PROJECT_ROOT/CORE_ROOT/etc but NOT SCRIPT_DIR,
@@ -305,12 +308,12 @@ OUTCOME="$FINAL_OUTCOME"
 # Fail-open at every step — must never change MAX_RC or block the close.
 write_phase6_sentinel() {
     local _exp _set _payload _existing _other
-    _exp="$(py -3 -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
+    _exp="$($PYLAUNCH -c "from datetime import datetime, timedelta; print((datetime.now() + timedelta(minutes=60)).isoformat(timespec='seconds'))" 2>/dev/null || true)"
     if [[ -z "$_exp" ]]; then
         echo "[recurring-close] WARN: could not compute expires_at for pending_phase_6_spark (non-fatal)" >&2
         return 0
     fi
-    _set="$(py -3 -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
+    _set="$($PYLAUNCH -c "from datetime import datetime; print(datetime.now().isoformat(timespec='seconds'))" 2>/dev/null || true)"
 
     # guard-2104 REFUSE-GUARD. This slot is a payload-carrying SINGLE-SLOT
     # sentinel whose payload is derived from THIS close, so it is LOSS-BEARING:
@@ -322,7 +325,7 @@ write_phase6_sentinel() {
     # _sentinel_registry.py, stale-sentinel-canary.py). An EXPIRED payload is a
     # dead obligation and is overwritten freely.
     _existing="$(bash "$SCRIPT_DIR/wm-read.sh" pending_phase_6_spark --json 2>/dev/null || true)"
-    _other="$(printf '%s' "$_existing" | GID="$GOAL_ID" py -3 -c '
+    _other="$(printf '%s' "$_existing" | GID="$GOAL_ID" $PYLAUNCH -c '
 import json, os, sys
 from datetime import datetime
 raw = sys.stdin.read().strip()
@@ -351,7 +354,7 @@ print(gid)
         return 0
     fi
 
-    _payload="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$_exp" SETAT="$_set" py -3 -c "
+    _payload="$(GID="$GOAL_ID" OUT="$OUTCOME" SRC="$SOURCE" SUM="$SUMMARY" EXP="$_exp" SETAT="$_set" $PYLAUNCH -c "
 import json, os
 print(json.dumps({
     'goal_id':    os.environ['GID'],

@@ -138,6 +138,9 @@ def _shim_iteration_commit(tmp: Path) -> Path:
     target = shim_dir / "iteration-commit.sh"
     target.write_bytes(ITERATION_COMMIT_SH.read_bytes())
     target.chmod(0o755)
+    # iteration-commit.sh sources _python_launcher.sh beside itself ().
+    launcher = ITERATION_COMMIT_SH.parent / "_python_launcher.sh"
+    (shim_dir / launcher.name).write_bytes(launcher.read_bytes())
     # No in_flight row anywhere: the assistant-mode Final.5 condition.
     ts = shim_dir / "team-state-read.sh"
     ts.write_text("#!/usr/bin/env bash\n# null shim\necho null\nexit 0\n")
@@ -415,7 +418,8 @@ def _setup_recorder_repo(tmp: Path) -> Path:
     core_scripts = repo / "core" / "scripts"
     core_scripts.mkdir(parents=True)
     (repo / ".claude").mkdir()
-    for fname in ("uncommitted-edits-record.sh", "bash-edit-record.sh", "_paths.sh"):
+    for fname in ("uncommitted-edits-record.sh", "bash-edit-record.sh", "_paths.sh",
+                  "_python_launcher.sh"):
         dst = core_scripts / fname
         dst.write_bytes((CORE_SCRIPTS / fname).read_bytes())
         dst.chmod(0o755)

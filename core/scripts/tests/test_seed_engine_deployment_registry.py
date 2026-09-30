@@ -197,7 +197,8 @@ def test_plan_lists_no_dest_entry_as_an_orphan(tmp_path):
 # (c) GATE SCOPE — end to end, through the real script
 # ─────────────────────────────────────────────────────────────────────────────
 GATE_FILES = ("domain-leak-check.sh", "_domain_leak_marker.py", "_seed_engine.py",
-              "_seed_transforms.py", "_exec_bits.py", "_peer_registry.py")
+              "_seed_transforms.py", "_exec_bits.py", "_peer_registry.py",
+              "_python_launcher.sh")
 TERM = "Widgetron"
 CLEAN = "CLEAN: No domain terms found in framework files."
 

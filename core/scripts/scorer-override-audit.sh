@@ -19,6 +19,9 @@
 # every existing caller and hand-run keeps working unchanged.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 DERIVE_FROM=""
 POSITIONAL=""
@@ -36,7 +39,7 @@ if [ -n "$DERIVE_FROM" ]; then
     # or break it. stderr is deliberately NOT discarded — it carries the
     # one-line reason for the chosen window, and a window nobody can explain
     # is the condition this flag exists to end (guard-1675).
-    derived="$(py -3 "$SCRIPT_DIR/derive-lookback.py" \
+    derived="$($PYLAUNCH "$SCRIPT_DIR/derive-lookback.py" \
                    --goal-id "$DERIVE_FROM" --default "$SINCE" || true)"
     if printf '%s' "$derived" | grep -Eq '^[0-9]+$' && [ "$derived" -ge "$SINCE" ]; then
         SINCE="$derived"
@@ -50,7 +53,7 @@ fi
 
 # The engine builds the Investigate-goal JSON itself (testable, no fragile bash
 # JSON) and prints it ONLY on hits; clean windows print nothing.
-goal_json="$(py -3 "$SCRIPT_DIR/scorer-override-audit.py" --since-hours "$SINCE" --emit-investigate-goal || true)"
+goal_json="$($PYLAUNCH "$SCRIPT_DIR/scorer-override-audit.py" --since-hours "$SINCE" --emit-investigate-goal || true)"
 
 if [ -n "$goal_json" ]; then
     # : resolve the escalation aspiration per deployment. A literal
@@ -86,6 +89,6 @@ if [ -n "$goal_json" ]; then
     fi
 else
     # Also print the human report for the log/operator when clean.
-    py -3 "$SCRIPT_DIR/scorer-override-audit.py" --since-hours "$SINCE"
+    $PYLAUNCH "$SCRIPT_DIR/scorer-override-audit.py" --since-hours "$SINCE"
     echo "[scorer-override-audit] clean (no hits in ${SINCE}h) — no goal filed"
 fi

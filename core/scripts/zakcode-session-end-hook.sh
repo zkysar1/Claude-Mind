@@ -56,6 +56,9 @@
 # Exit codes: 0 = wrote summary, 2 = skipped (no session_id or agent undetectable)
 #
 set -euo pipefail
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$(dirname "${BASH_SOURCE[0]}")/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 PAYLOAD=$(cat)
 if [ -z "$PAYLOAD" ]; then
@@ -64,9 +67,9 @@ if [ -z "$PAYLOAD" ]; then
 fi
 
 # Parse payload fields
-PARSED=$(py -3 -c "
+PARSED=$(printf '%s' "$PAYLOAD" | $PYLAUNCH -c "
 import json, sys
-payload = json.loads(sys.argv[1])
+payload = json.load(sys.stdin)
 s = payload.get('data', {}).get('session_summary', {})
 usage = s.get('total_usage', {})
 print(payload.get('session_id', ''))
@@ -75,7 +78,7 @@ print(s.get('created_at', ''))
 print(usage.get('input_tokens', 0))
 print(usage.get('output_tokens', 0))
 print(payload.get('cwd', ''))
-" "$PAYLOAD" 2>/dev/null) || {
+" 2>/dev/null) || {
     echo "[zakcode-session-end-hook] ERROR: could not parse JSON payload" >&2
     exit 2
 }
@@ -154,7 +157,7 @@ _write_experience_record() {
     local NOW_TS
     NOW_TS="$(date +%Y-%m-%dT%H:%M:%S)"
     local EXP_ID="exp-zak-${TODAY}-${SESSION_ID:0:8}"
-    py -3 - "$EXP_ID" "$TODAY" "$SESSION_ID" "$CREATED_AT" "$NOW_TS" \
+    $PYLAUNCH - "$EXP_ID" "$TODAY" "$SESSION_ID" "$CREATED_AT" "$NOW_TS" \
              "$MSG_COUNT" "$IN_TOK" "$OUT_TOK" "$CWD" "$AGENT" <<'PYEOF'
 import json, sys
 a = sys.argv
@@ -181,7 +184,7 @@ PYEOF
     if [ -n "$EXP_RECORD" ]; then
         EXP_FILE="$PROJECT_ROOT/agents/$AGENT/experience.jsonl"
         printf '%s\n' "$EXP_RECORD" >> "$EXP_FILE"
-        EXP_ID=$(py -3 -c "import json,sys; print(json.loads(sys.argv[1]).get('id','?'))" "$EXP_RECORD" 2>/dev/null || echo "?")
+        EXP_ID=$(printf '%s' "$EXP_RECORD" | $PYLAUNCH -c "import json,sys; print(json.load(sys.stdin).get('id','?'))" 2>/dev/null || echo "?")
         echo "[zakcode-session-end-hook] appended experience record $EXP_ID"
     fi
 } 2>/dev/null || true

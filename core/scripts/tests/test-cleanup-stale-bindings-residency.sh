@@ -21,7 +21,8 @@ SANDBOX="$(mktemp -d)"
 trap "rm -rf '$SANDBOX'" EXIT
 
 mkdir -p "$SANDBOX/core/scripts" "$SANDBOX/core/config"
-for f in cleanup-stale-bindings.sh heartbeat-stale.sh _paths.sh _paths.py _platform.sh; do
+for f in cleanup-stale-bindings.sh heartbeat-stale.sh _paths.sh _paths.py _platform.sh \
+         _python_launcher.sh; do
     cp "$PROJECT_ROOT_REAL/core/scripts/$f" "$SANDBOX/core/scripts/"
 done
 # heartbeat-stale.sh reads runner_heartbeat.stale_minutes from this file and

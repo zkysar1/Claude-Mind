@@ -5552,6 +5552,19 @@ def _reconcile_front_matter(ours_text: str, theirs_text: str):
     content-derived side and the equal-date tiebreak is identical on every box
     (commutativity is this handler's load-bearing property).
     """
+    # : RETIRED keys (_tree_fm_retired.RETIRED_FM_KEYS: `parent:`)
+    # come off BOTH sides before anything is compared. Without this, a node the
+    # store migration stripped and a stale mirror copy that still carries the
+    # key differ outside the provenance keys, so the loop below refuses and the
+    # node freezes on a key no reader uses. Stripping each side independently
+    # keeps the merge commutative. A side whose strip cannot be verified is left
+    # as it was, which reproduces the refusal below exactly.
+    try:
+        from _tree_fm_retired import strip_retired_fm_keys
+        ours_text = strip_retired_fm_keys(ours_text)[0]
+        theirs_text = strip_retired_fm_keys(theirs_text)[0]
+    except Exception:  # noqa: BLE001 -- unverifiable strip -> pre-existing path
+        pass
     o_fm, o_rest = _split_front_matter(ours_text)
     t_fm, t_rest = _split_front_matter(theirs_text)
     if o_fm is None or t_fm is None:

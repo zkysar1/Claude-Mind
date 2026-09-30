@@ -15,6 +15,9 @@
 #   2 — script error
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (g-115-11431, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 DEST="${1:-}"
 if [ -z "$DEST" ] || [ ! -d "$DEST" ]; then
@@ -28,7 +31,7 @@ DEST="$(cd "$DEST" && pwd)"
 # interpreter spawn per candidate file. Fail loud rather than fall back: an
 # empty pattern would make `grep -qE ""` match every file and drop the entire
 # candidate set, reporting a clean seed over an unscanned tree.
-MARKER_RX="$(py -3 "$SCRIPT_DIR/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
+MARKER_RX="$($PYLAUNCH "$SCRIPT_DIR/_domain_leak_marker.py" --print-ere 2>/dev/null || true)"
 if [ -z "$MARKER_RX" ]; then
     echo "ERROR: cannot resolve the exemption-marker predicate from $SCRIPT_DIR/_domain_leak_marker.py" >&2
     echo "       Refusing to scan: an empty pattern would drop every candidate." >&2

@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.89",
+    "previous_version": "2.12.88",
+    "date": "2026-09-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Owner-requested merge-identity carve-out in retrieve-before-deciding (g-115-11549, f59ec38bf3; via omni-600): a literal edit inside a store record's merge-identity field is never mechanical. Also carries the blind-refusing daemon orphan sweep (g-115-11484, 84df8d45e0) and the retired 4.26 --all-unknown backstop prescription (a0029ec34a, f69c0d5a14). Cut by g-115-11549",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.88",
+    "previous_version": "2.12.87",
+    "date": "2026-09-29",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Retire tree-node front-matter parent: (T21 strip, merge tolerance, census + clock-neutral migration CLI) - g-115-11490, cut by g-115-11535",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.87",
     "previous_version": "2.12.86",
     "date": "2026-09-29",

@@ -3,6 +3,9 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 DEST=""
 MANIFEST="$CONFIG_DIR/seed-manifest.yaml"
@@ -22,4 +25,4 @@ if [ -z "$DEST" ] || [ ! -d "$DEST" ]; then
 fi
 DEST="$(cd "$DEST" && pwd)"
 
-py -3 "$SCRIPT_DIR/_seed_engine.py" diff --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST"
+$PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" diff --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST"

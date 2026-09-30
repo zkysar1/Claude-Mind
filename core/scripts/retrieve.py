@@ -1075,12 +1075,19 @@ def _entry_matches_category(entry, categories):
     intersects any requested category. Bidirectional substring match — e.g.
     "npc-intelligence-evaluation" matches a "npc-intelligence" query.
 
-    Untagged entries and empty category lists match by default (fail-open):
-    this is a counter-bump signal, not a safety gate.
+    An empty category list matches by default (fail-open: no query, no filter).
+    An UNTAGGED entry does NOT match by category — it falls through to the
+    text predicate in `_entry_matches`, like any other entry. It used to match
+    every query, so the 7 of 102 active pattern signatures that carry no
+    category rode EVERY signature page regardless of topic (g-115-3684,
+    measured 2026-09-29 on a frozen snapshot; guardrails and reasoning-bank
+    entries all carry a category, so only signatures were affected).
     """
     entry_cat = (entry.get("category") or "").lower()
-    if not categories or not entry_cat:
+    if not categories:
         return True
+    if not entry_cat:
+        return False
     for c in categories:
         cl = (c or "").lower()
         if cl and (cl in entry_cat or entry_cat in cl):
@@ -1168,36 +1175,54 @@ def _entry_token_corpus(entry):
     return tokens
 
 
-def _entry_token_corpus_uncached(entry):
+# The ONE searchable text surface of a guardrail / reasoning-bank / pattern-
+# signature record: the token matcher below tokenizes it and
+# embedding-index-build.py's match_text embeds it, so what a query can match
+# lexically and what it can match semantically never drift apart again
+# (). SITUATION fields come first — the fields that say WHEN the
+# record applies — then the body. Order matters only for the embedding: the
+# encoder truncates at ~126 word-pieces, and a long reasoning-bank `content`
+# that came first pushed `when_to_use` past the cut.
+#
+# Before 2026-09-29 the surface was title/content/rule/summary/tags/when_to_use
+# only. A guardrail's `trigger_condition` — the field written for the very
+# purpose of being found — was in neither the token corpus nor the embedding,
+# and signatures' name/description/retrieval_cues/indicators were in neither.
+# Measured on a frozen snapshot: a query made of trigger-only words reached its
+# guardrail 3.3% of the time before, 92.7% after; a signature queried by its
+# own name was returned 30.4% of the time before, 100% after (with the
+# signature embedding blend in load_pattern_signatures).
+SUPPLEMENTARY_TEXT_FIELDS = (
+    "title", "name", "trigger_condition", "when_to_use", "conditions",
+    "retrieval_cues", "tags", "summary", "description", "rule", "content",
+    "expected_outcome", "indicators", "action_hint", "failure_lesson",
+)
+
+
+def supplementary_text_parts(entry):
+    """Non-empty strings of SUPPLEMENTARY_TEXT_FIELDS, in order. A str field
+    contributes itself, a list field its str items. `when_to_use` is read in
+    both shapes: the canonical {"conditions": [...]} and the legacy bare string
+    that 4,901 of 11,056 active reasoning-bank entries and 135 of 6,900
+    guardrails still carried at g-115-10666."""
     parts = []
-    for field in ("title", "content", "rule", "summary"):
+    for field in SUPPLEMENTARY_TEXT_FIELDS:
         v = entry.get(field)
+        if field == "when_to_use" and isinstance(v, dict):
+            v = v.get("conditions")
         if isinstance(v, str):
-            parts.append(v)
-    tags = entry.get("tags")
-    if isinstance(tags, list):
-        parts.extend(t for t in tags if isinstance(t, str))
-    when = entry.get("when_to_use")
-    if isinstance(when, dict):
-        cond = when.get("conditions")
-        if isinstance(cond, list):
-            parts.extend(s for s in cond if isinstance(s, str))
-        elif isinstance(cond, str):
-            parts.append(cond)
-    elif isinstance(when, str):
-        # The canonical shape is {"conditions": [...]}, the store default; a bare string is
-        # the legacy one, and 4,901 of 11,056 active reasoning-bank entries and 135 of 6,900
-        # guardrails still carry it (). Skipping it hid each of those entries from
-        # the situation its when_to_use names: queried by its own when_to_use, a string-shaped
-        # guardrail reached the top 20 for 40 of 135 before this branch and 134 after.
-        # embedding-index-build.py's match_text, which embeds this same surface, reads it too.
-        parts.append(when)
+            if v.strip():
+                parts.append(v)
+        elif isinstance(v, list):
+            parts.extend(x for x in v if isinstance(x, str) and x.strip())
+    return parts
+
+
+def _entry_token_corpus_uncached(entry):
+    parts = supplementary_text_parts(entry)
     if not parts:
         return set()
-    corpus = " ".join(parts).lower()
-    if not corpus:
-        return set()
-    return {sys.intern(t) for t in _TEXT_FALLBACK_TOKEN_RE.findall(corpus)}
+    return {sys.intern(t) for t in _TEXT_FALLBACK_TOKEN_RE.findall(" ".join(parts).lower())}
 
 
 def _query_overlap(entry, categories, corpus_tokens=None):
@@ -1243,10 +1268,10 @@ def _entry_matches(entry, categories):
         return True
     return _entry_matches_text(entry, categories)
 
-def _embedding_blend(matched, active, categories, exclude=None):
+def _embedding_blend(matched, active, categories):
     """ part b2 — flag-gated embedding-cosine hybrid for the
-    supplementary stores (reasoning bank + guardrails; the two corpora
-    embedding-index-build.py persists).
+    supplementary stores (reasoning bank, guardrails and, since 2026-09-29,
+    pattern signatures — the corpora embedding-index-build.py persists).
 
     Fixes the two weaknesses the g-306-77 A/B exposed (delta msg-2771,
     hit@3 67% vs 13%, MRR .512 vs .129): the token predicate is BINARY
@@ -1276,10 +1301,6 @@ def _embedding_blend(matched, active, categories, exclude=None):
     returned unchanged. cosine_scores() itself never raises
     (_embedding_retrieval.py contract); the try/except here additionally
     covers the import on a box without numpy.
-
-    `exclude` filters the widen pass (load_reasoning_bank passes
-    is_universal_rb — the universal partition has its own cap and must not
-    be double-returned via the domain list).
     """
     cfg = _load_retrieval_config()
     if not cfg.get("embedding_blend_enabled", False):
@@ -1329,8 +1350,6 @@ def _embedding_blend(matched, active, categories, exclude=None):
     for r in active:
         rid = r.get("id")
         if not rid or rid in matched_ids:
-            continue
-        if exclude is not None and exclude(r):
             continue
         if scores.get(rid, 0.0) >= min_cos:
             widened.append(r)
@@ -1900,11 +1919,12 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     = exact pre-g-306-36 current-version behavior.
 
     Universal entries (framework-* category OR applies_to in {any, framework})
-    are always surfaced as meta_lessons, capped at UNIVERSAL_RB_CAP, ordered by
-    utilization_score desc then recency. Domain entries are filtered by
-    `_entry_matches` (strict category, then token-overlap fallback), sorted by
-    `utilization.utilization_score` desc then `created` desc, and capped at
-    SUPPLEMENTARY_CAPS[depth].
+    are always surfaced as meta_lessons, capped at UNIVERSAL_RB_CAP (see
+    _universal_relevance_split). The returned `domain` list is every entry —
+    universal or not — that `_entry_matches` admits (strict category, then
+    token-overlap fallback), sorted by `utilization.utilization_score` desc then
+    `created` desc, blended, minus the ids already in meta_lessons, and capped at
+    SUPPLEMENTARY_CAPS[depth]. The name `domain` is historical.
 
     INVARIANT (utility_ratio alignment, 2026-05-09 fresh-eyes-fix): the bump
     set MUST equal the return set. retrieval_count is bumped ONLY on the
@@ -1942,8 +1962,17 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     if entry_type is not None:
         active = [r for r in active if r.get("entry_type") == entry_type]
     universal = [r for r in active if is_universal_rb(r)]
-    domain = [r for r in active if not is_universal_rb(r)
-              and _entry_matches(r, categories)]
+    # The domain lane admits UNIVERSAL entries that MATCH the query too
+    # ( / ). It used to exclude them, leaving universal
+    # lessons — 84% of the bank (9,905 of 11,771 active, 2026-09-29) — only the
+    # 5-slot meta_lessons lane, where 3 slots go to the most-used entries
+    # regardless of the query. Measured on a frozen snapshot: a universal
+    # lesson queried by its own when_to_use came back 38% of the time before,
+    # 100% after; one added since the last index build, 0% before, 100% after.
+    # A blind rating of 40 real queries' changed entries favoured the new page
+    # 37-1. An entry the universal split then picks for meta_lessons is removed
+    # from this lane below, so no id appears in both.
+    domain = [r for r in active if _entry_matches(r, categories)]
     # Sidecar counters loaded ONCE and shared by BOTH sorts below ():
     # this lane ranks twice — domain here, universal at sort_universal_rbs —
     # and they are the same store, so a second read would be pure waste.
@@ -1956,15 +1985,7 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
     # as_of reads — blending a historical view against the current-corpus
     # index would rank yesterday's records by today's semantics.
     if as_of_dt is None:
-        domain = _embedding_blend(domain, active, categories,
-                                  exclude=is_universal_rb)
-    # : reserve a bounded number of cap slots for the strongest
-    # token-overlap matches. OUTSIDE the as_of guard above on purpose — it reads
-    # only the query and the entry's own text, so it is valid at any T (see
-    # _relevance_floor). AFTER the blend so the blend's re-rank cannot undo it,
-    # BEFORE the cap so the bump-set == return-set invariant below still holds.
-    domain = _relevance_floor(domain, categories, cap)
-    domain = domain[:cap]
+        domain = _embedding_blend(domain, active, categories)
     sort_universal_rbs(universal, _rb_counters)
     # : flag-gated relevance split of the universal cap. as_of reads
     # keep the pure utilization slice — same historical-view reasoning as the
@@ -1998,6 +2019,18 @@ def load_reasoning_bank(categories, depth="medium", read_only=False, entry_type=
             universal, categories, stats=_UNIVERSAL_SPLIT_STATS)
     else:
         universal = universal[:UNIVERSAL_RB_CAP]
+    # Dedupe AFTER the universal split has chosen meta_lessons and BEFORE the
+    # floor and cap, so a lesson already served there does not also spend a
+    # domain slot — the slot goes to the next entry instead.
+    _ml_ids = {r.get("id") for r in universal}
+    domain = [r for r in domain if r.get("id") not in _ml_ids]
+    # : reserve a bounded number of cap slots for the strongest
+    # token-overlap matches. OUTSIDE the as_of guard above on purpose — it reads
+    # only the query and the entry's own text, so it is valid at any T (see
+    # _relevance_floor). AFTER the blend so the blend's re-rank cannot undo it,
+    # BEFORE the cap so the bump-set == return-set invariant below still holds.
+    domain = _relevance_floor(domain, categories, cap)
+    domain = domain[:cap]
 
     # : never bump on a point-in-time (as_of) read — it is observational
     # history, not current usage, and would inflate the counters that rank
@@ -2065,9 +2098,9 @@ def load_guardrails(categories, depth="medium", read_only=False, as_of=None):
 def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=None):
     """Load active pattern signatures matching the requested categories.
 
-    Filtered by `_entry_matches` (strict category, then token-overlap fallback), sorted by utilization, capped at
-    SUPPLEMENTARY_CAPS[depth]. Pattern signatures are tiny (~5 active today)
-    so the cap rarely binds — the filter is what matters when the corpus grows.
+    Filtered by `_entry_matches` (strict category, then token-overlap fallback),
+    sorted by utilization, embedding-blended like the two sibling lanes, capped
+    at SUPPLEMENTARY_CAPS[depth]. 102 active on 2026-09-29, so the cap binds.
 
     as_of (g-306-36): point-in-time validity filter — see load_reasoning_bank.
     Pattern signatures carry no explicit valid_from/valid_to yet (out of the
@@ -2093,9 +2126,18 @@ def load_pattern_signatures(categories, depth="medium", read_only=False, as_of=N
     # _check_kind would raise. This lane keeps reading the embedded field, which
     # is correct rather than a gap: nothing splits these counters out.
     _sort_by_utility(filtered)
-    #  — same floor as the two sibling lanes. A strict no-op here
-    # today: this corpus is far below the cap, and the floor returns unchanged
-    # whenever nothing is being cut.
+    # Same embedding blend as the two sibling lanes (). Without it
+    # the final order was utility, not relevance: a signature the query named
+    # sat at rank 16 behind higher-utility off-topic ones (sig-14, sig-38 on
+    # 2026-09-29), and a query sharing <2 long tokens never reached it at all.
+    # Needs `signature` rows in the index (embedding-index-build.py writes them
+    # since the same change); until the index is rebuilt every signature is
+    # unindexed, sorts AT the threshold, and the order is unchanged — measured
+    # identical on the old index. The status it writes to _BLEND_STATS is the
+    # value the guardrail call already wrote: flag, index and query are shared.
+    if as_of_dt is None:
+        filtered = _embedding_blend(filtered, active, categories)
+    #  — same floor as the two sibling lanes.
     filtered = _relevance_floor(filtered, categories, cap)
     filtered = filtered[:cap]
 
@@ -3124,8 +3166,8 @@ def _score_weight_limit(matched, channels, limit,
     _tree_embedding_scores) is non-empty, it REPLACES the TF-IDF bonus —
     same COSINE_BONUS_WEIGHT, real semantic cosine instead of token IDF,
     and the tree_idf index build is skipped entirely. Nodes absent from
-    the embedding index contribute 0 bonus (their channel/depth/confidence
-    signals still rank them). Empty/None emb_scores → the TF-IDF path,
+    the embedding index are scored AT the tree cosine floor (see the
+    imputation note below). Empty/None emb_scores → the TF-IDF path,
     byte-identical to pre-g-306-83.
     """
     cfg = _load_retrieval_config()
@@ -3169,12 +3211,33 @@ def _score_weight_limit(matched, channels, limit,
                                COSINE_BONUS_WEIGHT))
     except (TypeError, ValueError):
         _emb_w = COSINE_BONUS_WEIGHT
+    # UNINDEXED-NODE IMPUTATION (, 2026-09-29). emb_scores holds a real
+    # cosine for EVERY indexed node (see _tree_embedding_scores), so a missing
+    # key means only one thing: the node was written after the last index
+    # build. Scoring it 0 put it structurally below every indexed rival — at
+    # W=12 an indexed node at the 0.32 floor already carries +3.8 — so a fresh
+    # node could not surface even by its own exact key until the next rebuild
+    # (guard-7002). It is scored AT the floor instead: "barely relevant", the
+    # neutral value for an unknown cosine — above indexed nodes the query does
+    # not reach, below every real semantic hit. It does NOT make the node
+    # eligible for the cosine slot reservation below, which still reads real
+    # scores only. Measured on a frozen snapshot: nodes the index had not seen
+    # reached the page by their own key 3/7 (top 5: 0/7) before, 6/7 (6/7)
+    # after; with every target node masked from the index, by-key reach went
+    # 12.5% -> 65.5%, and no indexed node's by-key or by-summary query lost.
+    _unindexed_cos = 0.0
+    if use_emb:
+        try:
+            _unindexed_cos = float(cfg.get("embedding_tree_min_cosine",
+                                           cfg.get("embedding_min_cosine", 0.35)))
+        except (TypeError, ValueError):
+            _unindexed_cos = 0.0
     scored = []
     for key, node in matched:
         channel = channels.get(key, "parent")
         base = _compute_match_score(key, node, channel)
         if use_emb:
-            base += _emb_w * float(emb_scores.get(key, 0.0))
+            base += _emb_w * float(emb_scores.get(key, _unindexed_cos))
         elif idf_index is not None:
             d_vm = idf_index["vectors"].get(key, ({}, 0.0))
             base += COSINE_BONUS_WEIGHT * cosine(q_vm, d_vm)

@@ -125,6 +125,9 @@ def _shim_iteration_commit(tmpdir: Path, inflight_goal: str | None,
     target = shim_dir / "iteration-commit.sh"
     target.write_bytes(ITERATION_COMMIT_SH.read_bytes())
     target.chmod(0o755)
+    # iteration-commit.sh sources _python_launcher.sh beside itself ().
+    launcher = ITERATION_COMMIT_SH.parent / "_python_launcher.sh"
+    (shim_dir / launcher.name).write_bytes(launcher.read_bytes())
     _field_aware_shim(shim_dir, inflight_goal, claimed_at_iso)
     return target
 

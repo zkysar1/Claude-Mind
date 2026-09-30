@@ -21,6 +21,9 @@
 # Knowledge tree: world/knowledge/tree/system/system-constraints-loop/skill-telemetry-signal-master-plan.md
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 DAYS="${STALENESS_DAYS:-7}"
 MODE="check"
@@ -144,7 +147,7 @@ if [ "$MODE" = "file-goal" ] && [ "$rc" = "2" ]; then
         # it was written; found by the  sweep, never masked by a
         # successful filing (zero goals carry this title, any status).
         # Values reach python via ENV, single-quoted source (guard-165).
-        _sq_payload="$(SQ_TITLE="$title" SQ_DESC="$desc" py -3 -c '
+        _sq_payload="$(SQ_TITLE="$title" SQ_DESC="$desc" $PYLAUNCH -c '
 import json, os
 print(json.dumps({
     "title": os.environ["SQ_TITLE"],

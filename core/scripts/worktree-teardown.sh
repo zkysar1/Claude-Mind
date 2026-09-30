@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # worktree-teardown.sh — Safely tear down a git worktree by FIRST reaping the
 # worktree's OWN mind_api daemon (by its published PIDs, zero cross-repo risk),
-# waiting for Windows async handle release, then removing the worktree, and
-# finishing with one cross-repo-safe orphan sweep pass.
+# waiting for Windows async handle release, then removing the worktree. No
+# box-wide orphan sweep, deliberately: see step 5 below ().
 #
 # Usage:
 #   bash core/scripts/worktree-teardown.sh <worktree-path> [--force] [--quiet]
@@ -144,11 +144,14 @@ fi
 #    leaves the worktree registry clean even if removal needed --force).
 git -C "$OWNER" worktree prune >/dev/null 2>&1 || true
 
-# 5. One cross-repo-safe sweep pass to clean any residual orphan whose pid file
-#    has now vanished with the worktree. daemon-orphan-sweep.sh is cross-repo
-#    safe by construction (): it protects every live sibling deployment.
-_say "[worktree-teardown] cross-repo-safe orphan sweep..."
-bash "$SCRIPT_DIR/daemon-orphan-sweep.sh" --clean --quiet || true
+# 5. NO box-wide orphan sweep here (). This step used to run
+#    `daemon-orphan-sweep.sh --clean`, whose keep-set comes from pidfiles near
+#    PROJECT_ROOT while its process scan covers the whole box. Run from a clone,
+#    a worktree-at-tag or a scratch dir, that neighbourhood held no live
+#    deployment, so every mind_api daemon on the box read ORPH and was killed
+#    (two deployments' live daemons, one of them production, 2026-09-29). Step 1
+#    is the precise reap; a residual orphan is a job for a deliberate sweep run
+#    from a deployment root.
 
 if [ "$rm_ok" = "1" ]; then
     _say "[worktree-teardown] done."

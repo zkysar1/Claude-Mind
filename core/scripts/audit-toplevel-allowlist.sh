@@ -26,9 +26,12 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || {
     echo "ERROR: failed to source _paths.sh" >&2
     exit 2
 }
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 SCRIPT_DIR_NATIVE="$(cygpath -w "$SCRIPT_DIR" 2>/dev/null || echo "$SCRIPT_DIR")"
 
-SCRIPT_DIR_NATIVE="$SCRIPT_DIR_NATIVE" py -3 -c "
+SCRIPT_DIR_NATIVE="$SCRIPT_DIR_NATIVE" $PYLAUNCH -c "
 import os, sys, subprocess, pathlib
 sys.path.insert(0, os.environ['SCRIPT_DIR_NATIVE'])
 from _paths import PROJECT_ROOT

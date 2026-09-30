@@ -304,6 +304,17 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
 1.5. invoke /reflect-on-outcome Mode: Execution for goals completed this session with notable outcomes
      (only if not already reflected via --on-hypothesis pathway — check goal IDs)
 1.75. invoke /reflect-maintain Mode: Curate Aspirations (groom stuck goals before reflecting on hypotheses)
+   # A PEER'S RECENT PASS IS NOT A REASON TO SKIP THIS STEP. The 1a sweep takes
+   # the OLDEST stale goals, and each KEEP writes a progress_note datapoint, which
+   # refreshes `last_modified`. So the next pass evaluates a DISJOINT trio; it does
+   # not repeat the last one.
+   # Measured 2026-09-29, zeta, cc-02 (fire #117):
+   #   - Echo's 09:0x trio (g-115-3369 / 4278 / 4693) had already left the stale set.
+   #   - A pass 5h later evaluated g-115-3496 / 7120 / 5320, and found g-115-5320's
+   #     damaged set narrowed from 4 to 2.
+   #   - The append set g-115-3496 last_modified to 14:17:53.
+   # Fire #116 skipped this step "(echo ran it 23:16)" on the opposite premise.
+   # Skipping forfeits a trio; it saves no duplication.
 2. Bash: pipeline-read.sh --unreflected → get unreflected resolved hypotheses
    # ⛔ EXPECT ZERO REFLECTABLE, AND DO NOT RE-DERIVE WHY — the zero is CORRECT.
    # Recorded as a bare count for five consecutive fires of g-001-01 (#100-#104,
@@ -882,7 +893,10 @@ Run all reflection modes in sequence. This is the comprehensive learning pass.
      stale = [(k, n) for k, n in nodes.items() if n.retrieval_count > 10 and days_since(n.last_updated) > 14]
      Log: "▸ Tree lint: {len(stale)} stale high-retrieval nodes (of {len(hi)} with rc>10) — flagging top 5"
      # CHECK THE CAP FIRST (echo, cc-03, 2026-09-23, g-001-01 i520). knowledge_debt is
-     # capped at core/config/memory-pipeline.yaml array_limits.knowledge_debt, and a
+     # capped at core/config/memory-pipeline.yaml working_memory_pruning.array_limits.knowledge_debt
+     # (NESTED, like config.K_max below: there is no top-level array_limits, so a top-level
+     # lookup returns None -- this line said array_limits.knowledge_debt until 2026-09-29,
+     # when echo/cc-03 followed it literally in g-001-01), and a
      # wm-append into a FULL slot silently evicts the oldest unflagged entry, whatever
      # its priority. Measured: 5 appends into a 15/15 slot evicted a HIGH debt and a
      # hand-written framework contradiction, to make room for 5 lint flags that this

@@ -21,6 +21,9 @@
 set -uo pipefail
 
 _SELF="$(cd "$(dirname "$0")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$_SELF/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$_SELF/../.." && pwd)}"
 cd "$PROJECT_ROOT" || exit 2
 
@@ -44,4 +47,4 @@ fi
 # have reported a confident all-clear over nothing. Do not remove either half.
 export AGENT_WRITE_PATH
 
-exec py -3 "$PROJECT_ROOT/core/scripts/generated-content-commit-audit.py" "$@"
+exec $PYLAUNCH "$PROJECT_ROOT/core/scripts/generated-content-commit-audit.py" "$@"

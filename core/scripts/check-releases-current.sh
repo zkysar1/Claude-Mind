@@ -15,6 +15,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo "ERROR: failed to source _paths.sh" >&2; exit 2; }
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 INIT_PY="$PROJECT_ROOT/mind_api/src/__init__.py"
 RELEASES_JSON="$PROJECT_ROOT/RELEASES.json"
 
@@ -50,7 +53,7 @@ fi
 
 # Parse-or-fail (M1): a malformed RELEASES.json is a hard FAIL, not a silent pass.
 set +e
-NEWEST="$(py -3 "$SCRIPT_DIR/_release_lib.py" seed-latest "$RELEASES_JSON" 2>&1)"
+NEWEST="$($PYLAUNCH "$SCRIPT_DIR/_release_lib.py" seed-latest "$RELEASES_JSON" 2>&1)"
 RC=$?
 set -e
 if [[ $RC -ne 0 ]]; then

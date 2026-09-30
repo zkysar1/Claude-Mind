@@ -1250,3 +1250,108 @@ def test_utilization_declares_the_seven_measured_reader_symbols():
     # This store is UNSCOPED — every spec applies to every consumer. Scoping
     # () is opt-in per SPEC, and nothing here opted in.
     assert all(s is None for _, _, s in specs)
+
+
+# ---------------------------------------------------------------- 
+# The DOWNSTREAM fall-through. This world's seam shas never exist in a
+# downstream repository (measured on ZDS-Mind: git rc=128), so both lanes used
+# to refuse `seam_object_absent` BEFORE any routing read, and SAFE was
+# unreachable on every downstream deployment. A store that declares
+# seam_symbols now proves on routing alone, over EVERY consumer (identity to
+# that repository's origin/main proves nothing without ancestry), under its own
+# reason. Refusals keep `seam_object_absent`, which is why the  pins
+# above hold unchanged.
+
+DOWN = "seam_routed_without_seam_object"
+
+
+def test_downstream_absent_seam_with_symbols_yields_a_routing_verdict(monkeypatch):
+    """THE OUTCOME-3 PIN: seam object absent plus seam_symbols declared yields a
+    routing verdict, under a reason distinct from both tiers."""
+    r = _prove(monkeypatch, [], {"core/scripts/a.py": "load_counters(x)\n",
+                                 "core/scripts/b.py": "utilization_of(r)\n"},
+               ["load_counters", "utilization_of"], ancestor_rc=128)
+    assert r["proven"] is True
+    assert r["reason"] == DOWN
+    assert r["routed"] == [
+        {"consumer": "core/scripts/a.py", "symbol": "load_counters"},
+        {"consumer": "core/scripts/b.py", "symbol": "utilization_of"}]
+
+
+def test_downstream_routing_reads_EVERY_consumer_not_only_the_diverging(monkeypatch):
+    """Mirror of test_tier2_is_scoped_to_the_DIVERGING_files_only. Nothing
+    diverges from this repository's origin/main (changed == []), yet b.py does
+    not route and must refuse: identity to a main with no ancestry link to the
+    seam proves nothing, so the downstream read may not stop at divergence."""
+    r = _prove(monkeypatch, [], {"core/scripts/a.py": "load_counters(x)\n",
+                                 "core/scripts/b.py": "rows = read(LEGACY)\n"},
+               ["load_counters"], ancestor_rc=128)
+    assert r["proven"] is False
+    assert r["reason"] == "seam_object_absent"
+    assert r["missing"] == ["core/scripts/b.py"]
+    assert r["git_rc"] == 128
+
+
+def test_downstream_routing_fails_closed_on_an_unreadable_consumer(monkeypatch):
+    """guard-487 (outcome 2). A consumer unreadable at the box's commit is
+    indistinguishable from the pre-seam state, so it REFUSES: one readable,
+    routing consumer must not carry the verdict."""
+    r = _prove(monkeypatch, [], {"core/scripts/a.py": "load_counters(x)\n"},
+               ["load_counters"], ancestor_rc=128)
+    assert r["proven"] is False
+    assert r["reason"] == "seam_object_absent"
+    assert [u["consumer"] for u in r["unreadable"]] == ["core/scripts/b.py"]
+
+
+def test_downstream_fall_through_is_opt_in_per_store(monkeypatch):
+    """Decision part 4 still holds: a store declaring no seam_symbols keeps the
+    refusal and never reads a consumer, even when every one would route."""
+    r = _prove(monkeypatch, [], {"core/scripts/a.py": "load_counters(x)\n",
+                                 "core/scripts/b.py": "load_counters(y)\n"},
+               None, ancestor_rc=128)
+    assert r["proven"] is False
+    assert r["reason"] == "seam_object_absent"
+    assert "missing" not in r and "routed" not in r
+
+
+def test_rc1_is_never_rescued_by_the_downstream_fall_through(monkeypatch):
+    """The fall-through fires on an ABSENT seam only. rc=1 means the seam
+    exists and this commit lacks it (the pull-first state), and every consumer
+    routing does not change that."""
+    r = _prove(monkeypatch, [], {"core/scripts/a.py": "load_counters(x)\n",
+                                 "core/scripts/b.py": "load_counters(y)\n"},
+               ["load_counters"], ancestor_rc=1)
+    assert r["proven"] is False
+    assert r["reason"] == "seam_not_ancestor"
+
+
+def test_local_lane_downstream_proves_when_every_consumer_routes(tmp_path, monkeypatch):
+    """The local half. evaluate_roster gives the box running the check a veto,
+    so the remote lane alone could never read SAFE on a downstream box."""
+    cfg = _tmp_consumers(tmp_path, monkeypatch,
+                         lambda rel: f"rows = {SYM}(META)\n")
+    monkeypatch.setattr(scc, "_git", _local_ancestry_git(128))
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
+    assert r == {"seam_present": True, "reason": DOWN}
+
+
+def test_local_lane_downstream_still_refuses_local_drift(tmp_path, monkeypatch):
+    """Decision part 2 holds downstream too: this lane has no divergence tier,
+    so uncommitted drift refuses even when every consumer routes. The refusal
+    keeps the root reason and nests the tree report that decided it."""
+    cfg = _tmp_consumers(tmp_path, monkeypatch,
+                         lambda rel: f"rows = {SYM}(META)\n")
+    drifted = cfg["consumers"][0]
+
+    def fake(*args, **kw):
+        if args[0] == "merge-base":
+            return _Proc(128, "", f"fatal: Not a valid commit name {args[2]}")
+        if args[0] == "diff":
+            return _Proc(0, drifted + "\n")
+        return _Proc(0, "")
+    monkeypatch.setattr(scc, "_git", fake)
+    r = scc._local_report(cfg["seam_commit"], cfg["consumers"], SYMS)
+    assert r["seam_present"] is False
+    assert r["reason"] == "seam_object_absent"
+    assert r["downstream"]["reason"] == "consumers_differ_from_origin_main"
+    assert r["downstream"]["diff_files"] == [drifted]

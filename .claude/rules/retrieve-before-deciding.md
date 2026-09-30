@@ -1,5 +1,5 @@
 ---
-description: "Before a consequential decision (goal pick, verify, hypothesis, blocker, aspiration, framework fix, negation, census) run retrieve.sh first."
+description: "Retrieve before consequential decisions: goal pick, verify, hypothesis, blocker, aspiration, framework fix, negation, census, identity edit."
 ---
 
 # Retrieve Before Deciding
@@ -13,11 +13,8 @@ the decisions it could inform. The default for every consequential
 decision is to retrieve first, decide second.
 
 This rule names the decision points where retrieval should fire. The
-canonical catalog of retrieval triggers (active and missing), plus the
-measured evidence behind the least-obvious points below, lives in
-`core/config/conventions/retrieval-triggers.md` (`load-conventions.sh
-retrieval-triggers`) — refer to it for the authoritative status of any
-specific trigger.
+canonical trigger catalog, with the measured evidence behind the
+least-obvious points, is `core/config/conventions/retrieval-triggers.md`.
 
 ## What counts as a "consequential decision"
 
@@ -56,6 +53,11 @@ or has to be undone. In particular:
 13. **Computing a census or aggregate over a store** — retrieve on the
    MECHANISM, not only the subject (count-hazard guardrails are indexed on
    the operation). Detail: `retrieval-triggers.md` § "Why TWO queries".
+14. **Editing a store record's merge-identity field** (what the
+   `_*_identity` functions in `coordination_merge.py` key on), including
+   repointing an id after a merge renumbered it: the edit forks the record at
+   the next cross-box merge. Retrieve on the MECHANISM; correct a
+   non-identity field or write a new record instead (g-115-11549).
 
 If you find yourself making one of these decisions without having
 retrieved in the same turn, STOP and retrieve first.
@@ -77,7 +79,8 @@ notification, or answering the user beyond echoing a fresh read.
 ## When retrieval is NOT required
 
 - Pure mechanical operations: file renames, formatting fixes, removing
-  trailing whitespace, replacing a known-literal-value
+  trailing whitespace, replacing a known-literal-value — EXCEPT inside a
+  store record's merge-identity field, which is never mechanical (point 14)
 - Routine recurring goals whose verification is a simple presence check
   (`outcome_class: routine`; retrieval can be similarly light)
 - Reading a file the user just pointed at (the file IS the source of truth)
@@ -116,7 +119,3 @@ notification, or answering the user beyond echoing a fresh read.
 - `core/config/conventions/retrieval-triggers.md` — canonical trigger catalog + moved evidence for points 11–13
 - `core/config/conventions/retrieval-escalation.md` — three-tier escalation
 - `core/config/conventions/tree-retrieval.md` — engine details
-- `core/config/conventions/exhaustive-search-before-negation.md` — negation protocol
-- `.claude/rules/verify-before-assuming.md` — multi-signal rule
-- `.claude/rules/code-review-protocol.md` — pre-apply consultation step
-- `.claude/rules/encode-stable-facts.md` — retrieve-before-discovery

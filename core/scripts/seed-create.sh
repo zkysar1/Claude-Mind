@@ -10,6 +10,9 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 MANIFEST="$CONFIG_DIR/seed-manifest.yaml"
 DRY_RUN=1
@@ -36,7 +39,7 @@ echo "[seed-create] Scanning for new files since manifest 'updated' date..."
 export PROJECT_ROOT
 export MANIFEST
 
-py -3 "$SCRIPT_DIR/_seed_create_scan.py"
+$PYLAUNCH "$SCRIPT_DIR/_seed_create_scan.py"
 
 if [ $DRY_RUN -eq 1 ]; then
     echo "[seed-create] Dry run (default). Re-run with --write when auto-update is implemented."

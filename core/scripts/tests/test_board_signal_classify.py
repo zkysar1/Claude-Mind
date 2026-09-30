@@ -209,3 +209,56 @@ def test_body_is_read_from_the_text_key():
     row = {"id": "k1", "author": "alpha", "tags": ["self_evolution", "alpha"],
            "content": "Fresh-eyes N=1 — wrong key", "text": "Fresh-eyes N=1"}
     assert _c([row], "alpha")["receipts_dropped"] == ["k1"]
+
+
+# --- the roster is the fleet's, not the box's (guard-6527/6572/6595) -------
+
+FOXTROT_3401 = {  # live record: foxtrot answers bravo's belief -> 0 for echo
+    "id": "msg-20260929-073311-foxtrot-3401", "author": "foxtrot",
+    "tags": ["bravo", "self_evolution", "answered", "closing-protocol",
+             "asp-326"],
+    "text": "@bravo: ANSWERING the NOT VERIFIED clause of your belief about "
+            "foxtrot, by measurement.",
+}
+
+
+class _Done:
+    def __init__(self, returncode, stdout):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, ""
+
+
+def _one_resident_box(monkeypatch, run):
+    import _paths
+    monkeypatch.setattr(_paths, "enumerate_agent_confs",
+                        lambda: [Path("/box/agents/echo/local-paths.conf")])
+    monkeypatch.setattr(bsc.subprocess, "run", run)
+
+
+def test_a_one_resident_box_roster_cannot_exclude_a_partner_signal():
+    """The defect, pinned: with only the local agent in the roster, a post
+    tagged with a partner's name is not recognised as naming an agent at all.
+    Measured on cc-03 at fresh-eyes N=178: 8 of 8 `untagged` rows carried a
+    partner tag, and `excluded_other_agents_signal` was 0.
+    """
+    assert _c([FOXTROT_3401], "echo", roster=["echo"])["untagged"] == [
+        FOXTROT_3401["id"]]
+    assert _c([FOXTROT_3401], "echo")["excluded_other_agents_signal"] == [
+        FOXTROT_3401["id"]]
+
+
+def test_roster_unions_team_state_with_local_confs(monkeypatch):
+    status = {"alpha": {}, "bravo": {}, "charlie": {"retired_at": "x"},
+              "echo": {}}
+    _one_resident_box(monkeypatch,
+                      lambda *a, **k: _Done(0, __import__("json").dumps(status)))
+    roster, source = bsc._roster()
+    # Retired rows stay: a roster name only routes a post to EXCLUDE.
+    assert roster == ["alpha", "bravo", "charlie", "echo"]
+    assert source == "team-state+local"
+
+
+def test_a_failed_team_state_read_falls_back_visibly(monkeypatch):
+    _one_resident_box(monkeypatch, lambda *a, **k: _Done(1, ""))
+    roster, source = bsc._roster()
+    assert roster == ["echo"]
+    assert source.startswith("local-conf-only")

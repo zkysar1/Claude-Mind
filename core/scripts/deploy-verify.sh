@@ -29,6 +29,9 @@
 #           SHA within grace, or API error) — verify manually before claiming
 #       3 = usage error
 set -uo pipefail
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$(dirname "${BASH_SOURCE[0]}")/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 DIR="."
 REPO=""
@@ -193,7 +196,7 @@ probe_platform() {
     # One py call returns "state<TAB>detail"; guard-165 — the value goes
     # through the environment and the source is single-quoted, never
     # interpolated.
-    parsed=$(RAW="$raw" py -3 -c '
+    parsed=$(RAW="$raw" $PYLAUNCH -c '
 import json, os, sys
 raw = os.environ.get("RAW", "")
 line = ""
@@ -250,7 +253,7 @@ emit_with_platform() {
             # hardcoded: this emitter is wired to the no_ci paths too, where
             # asserting "CI passed" would be false. A verdict that misstates
             # its own evidence is the defect class this seam exists to remove.
-            CI_JSON="$ci_json" PDETAIL="$platform_detail" py -3 -c '
+            CI_JSON="$ci_json" PDETAIL="$platform_detail" $PYLAUNCH -c '
 import json, os
 d = json.loads(os.environ["CI_JSON"])
 ci = "CI passed" if d.get("status") == "ok" else "this repo has no push CI"
@@ -262,7 +265,7 @@ d["detail"] = ("platform build FAILED for this sha (" + ci + "): "
 print(json.dumps(d))'
             exit 1 ;;
         *)
-            CI_JSON="$ci_json" PSTATE="$platform_state" PDETAIL="$platform_detail" py -3 -c '
+            CI_JSON="$ci_json" PSTATE="$platform_state" PDETAIL="$platform_detail" $PYLAUNCH -c '
 import json, os
 d = json.loads(os.environ["CI_JSON"])
 st = os.environ.get("PSTATE", "unknown")
@@ -414,7 +417,7 @@ fi
 # signal (non-404 fetch error, unparseable body, unexpected shape) is treated as
 # push-capable → fall through to the poll → unverified, NEVER collapsed to no_ci.
 push_capable=$("$GH" api "repos/$REPO/actions/workflows?per_page=100" \
-    -q '.workflows[] | select(.state=="active") | .path' 2>/dev/null | REPO="$REPO" GH_BIN="$GH" BASH_BIN="${BASH_BIN:-$BASH}" py -3 -c "
+    -q '.workflows[] | select(.state=="active") | .path' 2>/dev/null | REPO="$REPO" GH_BIN="$GH" BASH_BIN="${BASH_BIN:-$BASH}" $PYLAUNCH -c "
 import os, sys, json, base64, subprocess, yaml
 repo = os.environ['REPO']
 paths = [p.strip() for p in sys.stdin if p.strip()]
@@ -480,7 +483,7 @@ while :; do
         sleep "$POLL_SECS"; continue
     fi
 
-    verdict=$(printf '%s' "$runs_json" | py -3 -c "
+    verdict=$(printf '%s' "$runs_json" | $PYLAUNCH -c "
 import json, sys
 data = json.load(sys.stdin)
 runs = data.get('workflow_runs', [])
@@ -506,7 +509,7 @@ bad = [r for r in deploy_out if r.get('conclusion') not in ('success', 'skipped'
 print(json.dumps({'state': 'failed' if bad else 'ok', 'runs': out, 'bad': bad}))
 " 2>/dev/null) || verdict='{"state":"error"}'
 
-    state=$(printf '%s' "$verdict" | py -3 -c "import json,sys; print(json.load(sys.stdin).get('state','error'))" 2>/dev/null || echo error)
+    state=$(printf '%s' "$verdict" | $PYLAUNCH -c "import json,sys; print(json.load(sys.stdin).get('state','error'))" 2>/dev/null || echo error)
     now=$(date +%s)
 
     case "$state" in
@@ -516,7 +519,7 @@ print(json.dumps({'state': 'failed' if bad else 'ok', 'runs': out, 'bad': bad}))
             # the environment (guard-165) — the previous form interpolated
             # $REPO/$SHA into the source text, and this site had to be rewritten
             # to route through the emitter regardless.
-            ci_ok_json=$(printf '%s' "$verdict" | REPO="$REPO" SHA="$SHA" py -3 -c '
+            ci_ok_json=$(printf '%s' "$verdict" | REPO="$REPO" SHA="$SHA" $PYLAUNCH -c '
 import json, os, sys
 v = json.load(sys.stdin)
 print(json.dumps({"status": "ok", "repo": os.environ["REPO"],
@@ -524,7 +527,7 @@ print(json.dumps({"status": "ok", "repo": os.environ["REPO"],
             emit_with_platform "$ci_ok_json"
             ;;
         failed)
-            printf '%s' "$verdict" | py -3 -c "
+            printf '%s' "$verdict" | $PYLAUNCH -c "
 import json, sys
 v = json.load(sys.stdin)
 print(json.dumps({'status': 'failed', 'repo': '$REPO', 'sha': '$SHA', 'runs': v['runs'],

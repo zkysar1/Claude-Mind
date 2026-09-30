@@ -30,6 +30,9 @@ set -uo pipefail  # intentionally no -e: we fail-open on any sub-failure
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 . "$SCRIPT_DIR/_platform.sh"
 
 OUTCOME_CLASS="${1:-}"
@@ -364,14 +367,14 @@ ATTRIB_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_cross_agent_attrib
 if [ "$COMMIT_SHA_VALID" != "yes" ] && [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB_HELPER" ]; then
   if [ -n "$CORE_FILES" ]; then
     ATTRIB_TMP=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/xagent-core-$$.txt")
-    if printf '%s\n' "$CORE_FILES" | py -3 "$ATTRIB_HELPER" > "$ATTRIB_TMP" 2>/dev/null; then
+    if printf '%s\n' "$CORE_FILES" | $PYLAUNCH "$ATTRIB_HELPER" > "$ATTRIB_TMP" 2>/dev/null; then
       CORE_FILES=$(sed '/^$/d' "$ATTRIB_TMP" || true)
     fi
     rm -f "$ATTRIB_TMP"
   fi
   if [ -n "$UNTRACKED" ]; then
     ATTRIB_TMP2=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/xagent-untracked-$$.txt")
-    if printf '%s\n' "$UNTRACKED" | py -3 "$ATTRIB_HELPER" > "$ATTRIB_TMP2" 2>/dev/null; then
+    if printf '%s\n' "$UNTRACKED" | $PYLAUNCH "$ATTRIB_HELPER" > "$ATTRIB_TMP2" 2>/dev/null; then
       UNTRACKED=$(sed '/^$/d' "$ATTRIB_TMP2" || true)
     fi
     rm -f "$ATTRIB_TMP2"
@@ -383,7 +386,7 @@ if [ "$COMMIT_SHA_VALID" != "yes" ] && [ -n "${MIND_AGENT:-}" ] && [ -f "$ATTRIB
   # filter exists to prevent (bravo session 69, 4 zeta files).
   if [ -n "$REVIEW_EXTRA_FILES" ]; then
     ATTRIB_TMP3=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/xagent-extra-$$.txt")
-    if printf '%s\n' "$REVIEW_EXTRA_FILES" | py -3 "$ATTRIB_HELPER" > "$ATTRIB_TMP3" 2>/dev/null; then
+    if printf '%s\n' "$REVIEW_EXTRA_FILES" | $PYLAUNCH "$ATTRIB_HELPER" > "$ATTRIB_TMP3" 2>/dev/null; then
       REVIEW_EXTRA_FILES=$(sed '/^$/d' "$ATTRIB_TMP3" || true)
     fi
     rm -f "$ATTRIB_TMP3"
