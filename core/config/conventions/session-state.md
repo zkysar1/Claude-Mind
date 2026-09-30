@@ -734,6 +734,9 @@ invariants.
     runner fresh whose ITERATIONS outlast the threshold (served small models).
     A non-reducer Body gets `heartbeat-tick.sh --body-only`, which refreshes
     only its `body-heartbeat-<SID>.json` carrier and exits before this file.
+    `core/scripts/presence-tick.py` (PostToolUse, every tool) ticks a
+    non-reducer Body the same way on the same per-SID stamp (g-375-80), so it
+    is not a writer of this file.
 - **Content**: irrelevant (the probe reads mtime only).
 - **mtime**: seconds-granularity liveness timestamp.
 - **Recovery action**: `clear` — `/start --recover` and `recovery-gate.sh`

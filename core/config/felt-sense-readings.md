@@ -2276,3 +2276,17 @@ guard-7075, which had fired correctly and was honored this iteration.
 **Phase 5a**: +1 check in the 4T section, pinning the fresh-eyes Phase 2.2b `completed_at` counting fix. The grep was run live first, and the registry `verify` fixed point is OK (2,302 checks). **Phase 5b**: 148 skills / 3912 assertions / 5 parse-lines, **0 stale**. **Phase 1b**: insights backlog 0.
 
 **Lane 7: the re-arm-first miss I was about to report did not happen.** My own continuation summary (written at the 23:44 compaction) said the 23:27 resume "re-armed second, after a Bash summary". The transcript says ScheduleWakeup was the first post-boundary tool_use (23:27:13, wakeup set for 23:38:00). Over all 389 compaction resumes in session 9b6bbe9c since 2026-09-14, **25 (6.4%)** had a first post-boundary tool other than ScheduleWakeup. Today that was 1 of 46 (04:39:18), and the last 9 were all clean. This is guard-6730's pattern from a third agent: a summary produced a self-critical count that the transcript does not support.
+
+## foxtrot — 2026-09-29T11:4x (fire at 15741, prior 15656, diff 85; hostname LAPTOP-3IOFCNEO, uname -r 6.18.33.2-microsoft-standard-WSL2, own-cloud, reducer)
+
+**Phase 2** (queries at 11:39:24): in-progress **6 candidates — 0 mutated, 0 skipped (foreign sid), 0 skipped (absent sid), 6 skipped (partner)**; fields claimed_by 6/6, claimed_by_sid 6/6, name-less-sid 0 (alpha 5, echo 1). pending+agent **3736 — 0 mutated, 0 / 0 / 10 (partner)**; fields 10/3736, 10/3736, name-less-sid 0 (alpha 10). My out-of-cycle candidates: 35 null-claimed rows carry executed_by foxtrot (15 recurring). None of the 20 non-recurring ones is done: each has an unmet outcome or a live defer in its own note.
+
+**Phase 3**: 19 blocked, **0 mutated, 0 / 0 / 2 (partner)**. 17 rest on `blocked_by` edges to live dependencies (none terminal). 2 carry a `precondition_unmet:` defer. `blocker_ref` is absent on all 19. On the rule axis, grant-001..023 retire none of the stated reasons.
+
+**Phase 1, the finding worth the sweep:** an experience record with an EMPTY category matches every experience query. `_entry_matches_category` fails open on `not entry_cat` (retrieve.py:1082), and `load_experiences` then sorts by retrieval_count and bumps it, so each such record climbs to the top of its store.
+- Measured: foxtrot 873/873/872 (the rest of the store maxes at 488), echo up to 1861 (max 794), bravo up to 1751 (max 496).
+- 15 records fleet-wide, all written by experience-archive-goal.sh without --category/--summary. rb and guardrails have 0 empty-category active entries.
+- Control: "banana bread recipe" returned exactly foxtrot's 4 records before the repair and 0 after.
+- Routed as a note on g-115-3684 (which owns the same fail-open for signatures) and as guard-7535. My 4 records were backfilled.
+
+**Phase 5b**: 148 skills / 3924 assertions / 5 parse-lines, **0 stale**. **Phase 1b**: insights backlog 0. **Lane 7**: nothing material; work_class share 7d 42.5% / 24h 62.2%, aspiration-id 7d 23.0% (N=133 read 41.4% / 21.6%).

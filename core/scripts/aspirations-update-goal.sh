@@ -470,11 +470,25 @@ declare -a HEADER_ARGS=()
 [ -n "$CROSS_LANE" ] && HEADER_ARGS+=(--header "X-Mind-Cross-Lane: $CROSS_LANE")
 [ -n "$EXPECT_SHA256" ] && HEADER_ARGS+=(--header "X-Mind-Expect-Field-Sha256: $EXPECT_SHA256")
 
+# : rt_call buffers the reply and prints it LAST (since ce44c5c2e5,
+# 2026-07-18;  kept the order), so the `[runtime]` lines it prints for a
+# stale daemon reach this 2>&1 capture BEFORE the body. raw_decode
+# below tolerates only TRAILING residue (), so a write that LANDED exited
+# 1 with a traceback. Pass everything ahead of the first line opening with `{`
+# through to stderr unchanged, and keep the body.
+_split_leading_diag() {
+    if [ "${COMBINED:0:1}" != "{" ] && [[ "$COMBINED" == *$'\n{'* ]]; then
+        printf '%s\n' "${COMBINED%%$'\n{'*}" >&2
+        COMBINED="{${COMBINED#*$'\n{'}"
+    fi
+}
+
 rc=0
 COMBINED="$(rt_call POST /v1/aspirations/update-goal \
     --query "$QUERY" \
     --body-string "$ENCODED_VALUE" \
     "${HEADER_ARGS[@]+"${HEADER_ARGS[@]}"}" 2>&1)" || rc=$?
+_split_leading_diag
 
 case $rc in
     0)
@@ -541,6 +555,7 @@ else:
                 --query "$QUERY" \
                 --body-string "$ENCODED_VALUE" \
                 "${HEADER_ARGS[@]+"${HEADER_ARGS[@]}"}" 2>&1)" || rc=$?
+            _split_leading_diag
             if [ "$rc" = "0" ]; then
                 # shellcheck disable=SC2086
                 printf '%s' "$COMBINED" | $(rt_python_launcher) -c "

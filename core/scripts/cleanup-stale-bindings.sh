@@ -40,6 +40,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # Phase 2.5.C: sync with _paths.sh AGENTS_PARENT_DIR
 _APD="agents"
@@ -195,7 +198,7 @@ _preserve_unmerged_body_wm() {
         # already consolidated -> no double-merge: the WM is NOT re-staged. Only a
         # staged archive still has to leave this box (push-staged relocates it).
         if [ -n "$_ARCH_STAGED" ]; then
-            py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" push-staged \
+            $PYLAUNCH "$PROJECT_ROOT/core/scripts/body-manifest.py" push-staged \
                 --sid "$_SID" --agent "$_BA" >/dev/null || \
                 echo "[cleanup-stale-bindings] WARN: staged capture-eviction archive for ${_SID} was NOT pushed; it is on local disk only" >&2
         fi
@@ -244,7 +247,7 @@ _preserve_unmerged_body_wm() {
     # that never forked a WM, so the common sweep is unaffected. stderr is
     # deliberately NOT silenced -- its diagnostic is the only signal that a Body's
     # WM failed to reach the reducer.
-    py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" push-staged \
+    $PYLAUNCH "$PROJECT_ROOT/core/scripts/body-manifest.py" push-staged \
         --sid "$_SID" --agent "$_BA" >/dev/null || \
         echo "[cleanup-stale-bindings] WARN: staged Body WM set for ${_SID} (WM, sidecars, eviction archive) was NOT fully pushed; it is on local disk only" >&2
 }
@@ -401,7 +404,7 @@ for _ASR in "$(_agents_root)"/*; do
                 # hold this agent's runner claim — which used to be reported as
                 # success. Substring test, never equality: the suffix rides on
                 # whichever base verdict the manifest state produced.
-                _CBL_OUT="$(py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" close-body-late \
+                _CBL_OUT="$($PYLAUNCH "$PROJECT_ROOT/core/scripts/body-manifest.py" close-body-late \
                     --sid "$_BIND_SID" --agent "$_BA" 2>/dev/null)" || \
                     echo "[cleanup-stale-bindings] WARN: late close failed for ${_BIND_SID}; its carrier may still read active" >&2
                 # `marked-push-failed` matches too, and SHOULD: its own docstring
@@ -471,7 +474,7 @@ for _ASR in "$(_agents_root)"/*; do
         # silence is what this reads. Warning here does not repair it — only a
         # claim-holding box can (units 12/22) — but it makes the gap reportable
         # instead of invisible, which is the whole of this unit's scope.
-        _CBL_OUT="$(py -3 "$PROJECT_ROOT/core/scripts/body-manifest.py" close-body-late \
+        _CBL_OUT="$($PYLAUNCH "$PROJECT_ROOT/core/scripts/body-manifest.py" close-body-late \
             --sid "$_HB_SID" --agent "$_CA" 2>/dev/null)" || \
             echo "[cleanup-stale-bindings] WARN: orphan-carrier reconcile failed for ${_HB_SID} (${_CA}); it may still read active" >&2
         case "$_CBL_OUT" in

@@ -45,10 +45,12 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from _runtime_bash import bash_cmd  # noqa: E402  (guard-580)
 from _stdio import reconfigure_stdio  # noqa: E402
 import peer_surface as ps  # noqa: E402
 
@@ -69,13 +71,37 @@ SIGNAL_TAGS = ("self_evolution", "self-drift")
 
 
 def _roster():
-    """Local agent names, via the agent-dir helper (never a hardcoded join)."""
+    """(names, source): the FLEET roster, not this box's.
+
+    Local-conf discovery answers which agents are configured ON THIS BOX, which
+    on a single-resident box is one name, so (a0) recognised no partner tag and
+    every partner-tagged signal fell through to `untagged` (guard-6527,
+    guard-6572, guard-6595). The fleet roster is team-state `agent_status`
+    (guard-1699), unioned with the local confs. Retired and phantom rows are
+    KEPT: a roster name only routes a post to the EXCLUDE branch, so a wider
+    roster errs toward a smaller count, the opposite sign of the defect this
+    replaces. A failed read falls back to the local confs and says so in
+    `source`, so a short roster is never silent.
+    """
+    local = set()
     try:
         from _paths import enumerate_agent_confs
+        local = {os.path.basename(os.path.dirname(str(c)))
+                 for c in enumerate_agent_confs()}
     except ImportError:
-        return []
-    return sorted({os.path.basename(os.path.dirname(str(c)))
-                   for c in enumerate_agent_confs()})
+        pass
+    reader = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "team-state-read.sh")
+    try:
+        p = subprocess.run(bash_cmd(reader, "--field", "agent_status", "--json"),
+                           capture_output=True, text=True, timeout=60)
+        status = json.loads(p.stdout) if p.returncode == 0 and p.stdout.strip() else None
+        if isinstance(status, dict) and status:
+            return sorted(local | set(status)), "team-state+local"
+        why = "team-state-read rc=%d, no agent_status map" % p.returncode
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        why = "team-state-read failed: %s" % type(exc).__name__
+    return sorted(local), "local-conf-only (%s)" % why
 
 
 def classify(rows, agent, self_env, roster):
@@ -170,7 +196,9 @@ def main():
         except Exception:
             self_env = None
 
-    result = classify(ps.parse_jsonl(sys.stdin), args.agent, self_env, _roster())
+    roster, roster_source = _roster()
+    result = classify(ps.parse_jsonl(sys.stdin), args.agent, self_env, roster)
+    result["roster_source"] = roster_source
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

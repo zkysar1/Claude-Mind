@@ -19,6 +19,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 # Six hooks instrumented by . Order matches investigate-2.1.139 risk
 # severity (HIGH first).  / zeta allowlist audit S1: this is a DELIBERATE
@@ -57,7 +60,7 @@ if [[ "$PLAIN" -eq 1 ]]; then
             mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
             now=$(date +%s)
             age=$(( now - mtime ))
-            ts=$(HF_MTIME="$mtime" py -3 -c "import os,time; print(time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(int(os.environ['HF_MTIME']))))" 2>/dev/null || echo "?")
+            ts=$(HF_MTIME="$mtime" $PYLAUNCH -c "import os,time; print(time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(int(os.environ['HF_MTIME']))))" 2>/dev/null || echo "?")
             if [[ "$STALE_MIN" -gt 0 ]] && [[ "$age" -gt $((STALE_MIN * 60)) ]]; then
                 printf "%-40s %-21s %ds ago STALE\n" "$hook" "$ts" "$age"
             else
@@ -74,7 +77,7 @@ fi
 HOOKS_LIST="$(printf '%s\n' "${HOOKS[@]}")"
 HOOKDIR="$HOOKDIR" HOOKS_LIST="$HOOKS_LIST" STALE_MIN="$STALE_MIN" \
     AGENT_NAME="${MIND_AGENT:-}" \
-    py -3 - <<'PYEOF'
+    $PYLAUNCH - <<'PYEOF'
 import json
 import os
 import time

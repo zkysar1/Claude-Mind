@@ -17,6 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # needs GATE_D_CORPUS_PATH, which is set in the environment by .claude/settings.json.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || true
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (g-115-11431, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 GOAL_ID=""; GOAL_TEXT=""; CATEGORY=""
 while [[ $# -gt 0 ]]; do
@@ -31,7 +34,7 @@ done
 # Pass every value as argv (NOT interpolated into Python source) — guard-165.
 # py -3 launches the file directly (guard-368: no heredoc; guard-581: pass the
 # .py path explicitly). On Windows the bash-agent-inject hook supplies PATH.
-OUT="$(py -3 "$SCRIPT_DIR/_gate_d.py" --goal-id "$GOAL_ID" --goal-text "$GOAL_TEXT" --category "$CATEGORY" 2>/dev/null)"
+OUT="$($PYLAUNCH "$SCRIPT_DIR/_gate_d.py" --goal-id "$GOAL_ID" --goal-text "$GOAL_TEXT" --category "$CATEGORY" 2>/dev/null)"
 if [[ -z "$OUT" ]]; then
   echo '{"arm":"A","status":"error","patterns":[]}'
 else

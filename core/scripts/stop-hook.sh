@@ -969,7 +969,7 @@ _T_AFTER_TTD=$(date +%s%3N)
 # any driver error, fall through to the default payload so a runner is never stranded.
 if [[ -f "$HOOK_AGENT_DIR/session/driver-mode" ]]; then
     if HOOK_AGENT_DIR="$HOOK_AGENT_DIR" HOOK_AGENT="$HOOK_AGENT" HOOK_SID="$HOOK_SID" \
-        py -3 "$(cd "$(dirname "$0")" && pwd)/aspirations-driver.py"; then
+        $PY "$(cd "$(dirname "$0")" && pwd)/aspirations-driver.py"; then
         exit 0
     fi
 fi

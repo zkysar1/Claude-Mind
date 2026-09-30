@@ -41,6 +41,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/_platform.sh"
 
@@ -77,7 +80,7 @@ emit_json() {
   CANDIDATE_NODE_KEY="${CANDIDATE_NODE_KEY:-}" \
   CANDIDATE_NODE_FILE="${CANDIDATE_NODE_FILE:-}" \
   TREE_PROBE="${TREE_PROBE:-}" \
-  py -3 - <<'PYEOF'
+  $PYLAUNCH - <<'PYEOF'
 import json, os
 fired = os.environ.get("FIRED") == "true"
 dc = int(os.environ.get("DISTINCT_COUNT", "0") or "0")
@@ -138,7 +141,7 @@ fi
 # `<<PYEOF` redirects stdin to the heredoc content, so a pipe in would be
 # silently swallowed. Env vars are the only safe channel for multi-line
 # bash-to-Python-heredoc data.
-EXTRACT_JSON=$(OUTCOME_NOTE="$OUTCOME_NOTE" py -3 - <<'PYEOF' 2>/dev/null
+EXTRACT_JSON=$(OUTCOME_NOTE="$OUTCOME_NOTE" $PYLAUNCH - <<'PYEOF' 2>/dev/null
 import json, os, re
 text = os.environ.get("OUTCOME_NOTE", "").encode("utf-8", errors="replace").decode("utf-8")
 
@@ -248,8 +251,8 @@ if [ -z "${EXTRACT_JSON:-}" ]; then
   EXTRACT_JSON='{"count":0,"candidates_sep":""}'
 fi
 
-DISTINCT_COUNT=$(echo "$EXTRACT_JSON" | py -3 -c "import json,sys; print(json.load(sys.stdin).get('count', 0))" 2>/dev/null || echo 0)
-CANDIDATES=$(echo "$EXTRACT_JSON" | py -3 -c "import json,sys; print(json.load(sys.stdin).get('candidates_sep', ''))" 2>/dev/null || echo "")
+DISTINCT_COUNT=$(echo "$EXTRACT_JSON" | $PYLAUNCH -c "import json,sys; print(json.load(sys.stdin).get('count', 0))" 2>/dev/null || echo 0)
+CANDIDATES=$(echo "$EXTRACT_JSON" | $PYLAUNCH -c "import json,sys; print(json.load(sys.stdin).get('candidates_sep', ''))" 2>/dev/null || echo "")
 
 # Test case 3 (full): below threshold -> no-op
 if [ "$DISTINCT_COUNT" -lt "$DISTINCT_COUNT_THRESHOLD" ]; then
@@ -269,9 +272,9 @@ fi
 TREE_PROBE="ran_no_edit"
 CHECKPOINT_FILE="$AGENT_DIR/session/iteration-checkpoint.json"
 if [ -f "$CHECKPOINT_FILE" ]; then
-  SELECTED_AT=$(py -3 -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(d.get('selected_at',''))" "$CHECKPOINT_FILE" 2>/dev/null || true)
+  SELECTED_AT=$($PYLAUNCH -c "import json,sys; d=json.load(open(sys.argv[1],encoding='utf-8')); print(d.get('selected_at',''))" "$CHECKPOINT_FILE" 2>/dev/null || true)
   if [ -n "$SELECTED_AT" ]; then
-    if py -3 "$SCRIPT_DIR/tree-edit-since.py" "$SELECTED_AT" >/dev/null 2>&1; then
+    if $PYLAUNCH "$SCRIPT_DIR/tree-edit-since.py" "$SELECTED_AT" >/dev/null 2>&1; then
       TREE_PROBE="ran_found_edit"
       FIRED=false DISTINCT_COUNT="$DISTINCT_COUNT" REASON="tree already edited since selected_at=$SELECTED_AT (LLM already encoded; no encoding-drift to signal)" emit_json
     fi
@@ -302,7 +305,7 @@ esac
 # unrelated whitespace drift in the prose doesn't fool the dedup.
 PREVIOUS_SIGNAL=$(bash "$SCRIPT_DIR/wm-read.sh" force_metric_encoding_pending --json 2>/dev/null || echo "null")
 if [ "$PREVIOUS_SIGNAL" != "null" ] && [ -n "$PREVIOUS_SIGNAL" ]; then
-  DEDUP_CHECK=$(CANDIDATES_RAW="$CANDIDATES" PREVIOUS_SIGNAL="$PREVIOUS_SIGNAL" py -3 - <<'PYEOF' 2>/dev/null
+  DEDUP_CHECK=$(CANDIDATES_RAW="$CANDIDATES" PREVIOUS_SIGNAL="$PREVIOUS_SIGNAL" $PYLAUNCH - <<'PYEOF' 2>/dev/null
 import json, os, hashlib
 cands_raw = os.environ.get("CANDIDATES_RAW", "")
 cur_vals = [c.split(" :: ", 1)[0].strip() for c in cands_raw.split("\x1f") if c.strip()]

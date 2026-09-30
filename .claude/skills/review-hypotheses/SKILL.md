@@ -540,24 +540,10 @@ IF surprise >= 7:
                                    pattern_signatures: [], tree_nodes: [] }
       (still record the empty manifest — proof retrieval was attempted)
 
-    # E10: Cross-reference confidence recalibration on high-surprise CORRECTED
-    # outcomes. Phase 8 will encode the ONE node it picks; this loop touches
-    # ALL cited nodes that didn't make it into the encoding bundle but were
-    # implicitly endorsing the falsified prediction. Without this, the cited
-    # nodes retain their pre-correction confidence and look authoritative on
-    # the next retrieve.
-    IF outcome == "CORRECTED" AND context_consulted.tree_nodes_read is non-empty:
-        For each node_key in context_consulted.tree_nodes_read:
-            Bash: bash core/scripts/tree-read.sh --node <node_key>
-            IF read failed (node missing or error): SKIP this node
-            Parse result JSON → old_confidence = result.confidence (default 0.0)
-            new_confidence = max(0.0, round(old_confidence - 0.05, 2))
-            IF new_confidence == old_confidence: SKIP (already at floor)
-            Bash: echo '{"operations": [{"op": "set", "key": "<node_key>", "field": "confidence", "value": <new_confidence>}, {"op": "set", "key": "<node_key>", "field": "last_update_trigger", "value": "surprise-recalibration"}]}' | bash core/scripts/tree-update.sh --batch
-            Log: "RECALIBRATED {node_key}: confidence {old_confidence} → {new_confidence} (hypothesis {hypothesis.id} surprise={surprise})"
-
-        # Fail-open: if a tree-update call errors, log and continue. Do NOT
-        # block the atomic resolve in Step 4 on a recalibration failure.
+    # E10 (confidence recalibration of the consulted tree nodes) runs in Step
+    # 4.3, AFTER the atomic move: Step 4.2's wrapper records the tested node's
+    # confidence for the calibration ledger, so recalibrating here would record
+    # a value this verdict had already lowered (g-306-553).
 
 ELIF surprise >= 5:
     # Medium-surprise — re-use Step 1.5 cached batch retrieval, no new probe
@@ -595,6 +581,12 @@ For each resolved hypothesis, execute this checklist IN ORDER.
        # re-invoke the helper: a second call is a second implementation in
        # everything but name (g-115-3594).
        - outcome_detail: resolution summary text
+       - node_verdict (ONLY when the record carries tests_node): survived |
+         refuted | revised | unknown, judging the linked tree node's CLAIM, not
+         the prediction. Give it on every CORRECTED: a bare CORRECTED is never
+         mapped (guard-2728), so omitting it records the node as unknown. On
+         CONFIRMED it may be omitted (derived from tests_node.stance). The row
+         it feeds: pipeline.md § Tested-Node Link.
        - horizon: (preserve from original — defaults to "short" if missing)
 
        # Horizon-dependent metadata:
@@ -652,7 +644,8 @@ For each resolved hypothesis, execute this checklist IN ORDER.
 □ 4.2  ATOMIC MOVE+UPDATE (single script call):
        # The merge JSON MUST include ALL fields from Step 4.1 above.
        # For short/long horizon, this means: outcome, outcome_detail, outcome_date,
-       # surprise, replay_metadata, context_quality, process_score, reflected: false.
+       # surprise, replay_metadata, context_quality, process_score, reflected: false,
+       # plus node_verdict when the record carries tests_node.
        # DO NOT skip fields — pipeline-move.sh merges them atomically.
        # Missing fields here = missing fields forever (reflect can't backfill structure).
        # RESOLUTION-EVIDENCE GATE (g-303-27): a CONFIRMED/CORRECTED move to
@@ -670,6 +663,31 @@ For each resolved hypothesis, execute this checklist IN ORDER.
 
 GATE: Do NOT proceed to the next hypothesis until the move completes successfully.
 If the script exits non-zero, STOP and report the error — do not partially resolve.
+
+□ 4.3  E10 RECALIBRATION — only after 4.2 succeeded (moved from Step 3.5, g-306-553):
+       # Cross-reference confidence recalibration on high-surprise CORRECTED
+       # outcomes. Phase 8 will encode the ONE node it picks; this loop touches
+       # ALL cited nodes that didn't make it into the encoding bundle but were
+       # implicitly endorsing the falsified prediction. Without this, the cited
+       # nodes retain their pre-correction confidence and look authoritative on
+       # the next retrieve.
+       # WHY AFTER THE MOVE: 4.2's wrapper records the tested node's confidence
+       # (tests_node) in the calibration ledger as it stood when judged, and the
+       # tested node is usually among the nodes read. Lowering it first recorded
+       # the value this verdict had already moved. It also recalibrated for
+       # resolutions whose move then failed.
+       IF surprise >= 7 AND outcome == "CORRECTED" AND context_consulted.tree_nodes_read is non-empty:
+           For each node_key in context_consulted.tree_nodes_read:
+               Bash: bash core/scripts/tree-read.sh --node <node_key>
+               IF read failed (node missing or error): SKIP this node
+               Parse result JSON → old_confidence = result.confidence (default 0.0)
+               new_confidence = max(0.0, round(old_confidence - 0.05, 2))
+               IF new_confidence == old_confidence: SKIP (already at floor)
+               Bash: echo '{"operations": [{"op": "set", "key": "<node_key>", "field": "confidence", "value": <new_confidence>}, {"op": "set", "key": "<node_key>", "field": "last_update_trigger", "value": "surprise-recalibration"}]}' | bash core/scripts/tree-update.sh --batch
+               Log: "RECALIBRATED {node_key}: confidence {old_confidence} → {new_confidence} (hypothesis {hypothesis.id} surprise={surprise})"
+
+           # Fail-open: if a tree-update call errors, log and continue. The
+           # resolution is already recorded; a recalibration failure never undoes it.
 ```
 
 ### Step 4.5: Rate Context Quality (Retrieval Protocol Phase 5)

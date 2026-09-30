@@ -121,6 +121,11 @@ def _stage(tmp_path, drop_gid_guard=False):
     (core / "_goal-arg-normalize.sh").write_text(
         (SCRIPTS / "_goal-arg-normalize.sh").read_text(encoding="utf-8"),
         encoding="utf-8")
+    # Real bytes, same reason: iteration-close.sh sources _python_launcher.sh
+    # beside itself (), and the launcher is self-contained too.
+    (core / "_python_launcher.sh").write_text(
+        (SCRIPTS / "_python_launcher.sh").read_text(encoding="utf-8"),
+        encoding="utf-8")
     (core / "team-state-clear-in-flight.sh").write_text(STUB_CLEAR, encoding="utf-8")
     (core / "loop-state-save.sh").write_text(STUB_LOOP_SAVE, encoding="utf-8")
 

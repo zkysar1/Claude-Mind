@@ -26,6 +26,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo "ERROR: failed to source _paths.sh" >&2; exit 2; }
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 LIB="$SCRIPT_DIR/_release_lib.py"
 INIT_PY="$PROJECT_ROOT/mind_api/src/__init__.py"
 RELEASES_JSON="$PROJECT_ROOT/RELEASES.json"
@@ -130,7 +133,7 @@ CURRENT="$(grep -E '^__version__' "$INIT_PY" | sed -E 's/.*"([^"]+)".*/\1/' || t
 say "current version (from disk): $CURRENT"
 
 # --- Step 3: compute new version ------------------------------------------
-NEW="$(py -3 "$LIB" bump "$CURRENT" "$KIND")" || fail "version bump failed"
+NEW="$($PYLAUNCH "$LIB" bump "$CURRENT" "$KIND")" || fail "version bump failed"
 say "new version: $NEW ($KIND bump)"
 
 # Refuse if the target tag already exists (e.g. a prior interrupted run). M2 tags
@@ -146,7 +149,7 @@ set +e
 VALID_OUT="$(PROJECT_ROOT="$PROJECT_ROOT" RELEASES_PATH="$RELEASES_JSON" \
   CURRENT_VERSION="$CURRENT" NEW_VERSION="$NEW" BUMP_KIND="$KIND" \
   CROSS_WORLD="$CROSS_WORLD" ALLOW_NB_CW="$ALLOW_NB_CW" RECIPE_PATH="$RECIPE" \
-  py -3 "$LIB" validate)"
+  $PYLAUNCH "$LIB" validate)"
 VALID_RC=$?
 set -e
 if [[ $VALID_RC -ne 0 ]]; then
@@ -174,7 +177,7 @@ SEED_LATEST_FOR_LEDGER=""
 # (point it at an instant-fail URL instead of waiting on a 30s network fetch).
 SEED_URL="${RELEASE_SEED_URL:-}"
 if [[ -z "$SEED_URL" && -f "$OVERLAY" ]]; then
-  SEED_URL="$(SEED_OVERLAY="$OVERLAY" py -3 -c 'import os,sys
+  SEED_URL="$(SEED_OVERLAY="$OVERLAY" $PYLAUNCH -c 'import os,sys
 try:
     import yaml
     d=yaml.safe_load(open(os.environ["SEED_OVERLAY"],encoding="utf-8")) or {}
@@ -186,7 +189,7 @@ if [[ -n "$SEED_URL" ]]; then
   SEED_TMP="$(mktemp 2>/dev/null || echo "$PROJECT_ROOT/.seed-releases.tmp")"
   if curl --fail --silent --show-error --max-time 30 "$SEED_URL" -o "$SEED_TMP" 2>/dev/null; then
     set +e
-    SEED_LATEST="$(py -3 "$LIB" seed-latest "$SEED_TMP" 2>/dev/null)"
+    SEED_LATEST="$($PYLAUNCH "$LIB" seed-latest "$SEED_TMP" 2>/dev/null)"
     SEED_RC=$?
     set -e
     rm -f "$SEED_TMP"
@@ -197,7 +200,7 @@ if [[ -n "$SEED_URL" ]]; then
       # compare can raise on a non-semver seed version — wrap so a parse failure
       # routes through fail-closed instead of killing the script. (review: MED)
       set +e
-      CMP="$(py -3 "$LIB" compare "$NEW" "$SEED_LATEST")"
+      CMP="$($PYLAUNCH "$LIB" compare "$NEW" "$SEED_LATEST")"
       CMP_RC=$?
       set -e
       if [[ $CMP_RC -ne 0 ]]; then
@@ -291,8 +294,8 @@ TMP_REL="$RELEASES_JSON.tmp.$$"
 PROJECT_ROOT="$PROJECT_ROOT" RELEASES_PATH="$RELEASES_JSON" NEW_VERSION="$NEW" \
   CURRENT_VERSION="$CURRENT" DATE="$DATE" BREAKING="$BREAKING" CROSS_WORLD="$CW_FINAL" \
   SUMMARY="$SUMMARY" UPGRADE_RECIPE="$UPGRADE_RECIPE" ROLLBACK_RECIPE="$ROLLBACK_RECIPE" \
-  MIN_SOURCE="$MIN_SOURCE" py -3 "$LIB" build-prepended > "$TMP_REL" || { rm -f "$TMP_REL"; fail "failed to build new RELEASES.json"; }
-py -3 -c 'import json,sys; json.load(open(sys.argv[1],encoding="utf-8"))' "$TMP_REL" || { rm -f "$TMP_REL"; fail "new RELEASES.json does not parse"; }
+  MIN_SOURCE="$MIN_SOURCE" $PYLAUNCH "$LIB" build-prepended > "$TMP_REL" || { rm -f "$TMP_REL"; fail "failed to build new RELEASES.json"; }
+$PYLAUNCH -c 'import json,sys; json.load(open(sys.argv[1],encoding="utf-8"))' "$TMP_REL" || { rm -f "$TMP_REL"; fail "new RELEASES.json does not parse"; }
 mv -f "$TMP_REL" "$RELEASES_JSON"
 say "prepended RELEASES.json entry for $NEW"
 
@@ -336,7 +339,7 @@ if [[ $FORCE_RELEASE -eq 1 && -n "$META" ]]; then
   FR_DETAIL="${INVARIANT_FAIL_REASON:-}" FR_SEED="$SEED_LATEST_FOR_LEDGER" \
   FR_BREAKING="$BREAKING" FR_CW="$CW_FINAL" FR_SUMMARY="$SUMMARY" \
   FR_AGENT="${MIND_AGENT:-}" FR_SID="${MIND_SID:-}" FR_LEDGER="$FORCE_RELEASE_LEDGER" \
-  py -3 -c 'import os, json, pathlib
+  $PYLAUNCH -c 'import os, json, pathlib
 p = pathlib.Path(os.environ["FR_LEDGER"])
 p.parent.mkdir(parents=True, exist_ok=True)
 rec = {

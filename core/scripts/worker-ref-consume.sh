@@ -70,6 +70,9 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 . "$SCRIPT_DIR/_paths.sh" 2>/dev/null || true
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 REPO="${ITERATION_PUSH_REPO:-${PROJECT_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}}"
 
 DO_FETCH=1
@@ -197,10 +200,10 @@ if [ -n "$RETIRE_REF" ]; then
     fi
     body_row_state="UNREADABLE-OVERRIDDEN rc=$reader_rc"
   elif [ "$row_json" != "null" ]; then
-    row_goal="$(ROW_JSON="$row_json" py -3 -c 'import json,os
+    row_goal="$(ROW_JSON="$row_json" $PYLAUNCH -c 'import json,os
 try: r=json.loads(os.environ["ROW_JSON"]); print(r.get("goal_id") or "unknown")
 except Exception: print("unparseable")' 2>/dev/null || echo unknown)"
-    row_claimed="$(ROW_JSON="$row_json" py -3 -c 'import json,os
+    row_claimed="$(ROW_JSON="$row_json" $PYLAUNCH -c 'import json,os
 try: r=json.loads(os.environ["ROW_JSON"]); print(r.get("claimed_at") or "unknown")
 except Exception: print("unparseable")' 2>/dev/null || echo unknown)"
     row_age_h="?"
@@ -237,7 +240,7 @@ except Exception: print("unparseable")' 2>/dev/null || echo unknown)"
     # normal case only teaches operators to pass --force-retire-live.
     status_json="$(bash "$TEAM_STATE_READER" --field agent_status --json 2>/dev/null)"
     status_rc=$?
-    drift="$(REF_AGENT="$ref_agent" STATUS_JSON="$status_json" STATUS_RC="$status_rc" py -3 -c '
+    drift="$(REF_AGENT="$ref_agent" STATUS_JSON="$status_json" STATUS_RC="$status_rc" $PYLAUNCH -c '
 import json, os, sys
 rc  = os.environ.get("STATUS_RC", "1")
 raw = os.environ.get("STATUS_JSON", "")

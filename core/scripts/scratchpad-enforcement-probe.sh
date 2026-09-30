@@ -23,6 +23,9 @@
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 1
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "core/scripts/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 fails=0
 pass() { printf '  PASS  %s\n' "$1"; }
@@ -34,7 +37,7 @@ echo "scratchpad-enforcement-probe (g-115-8761)"
 # Tested against REAL path shapes, including the numeric suffix the harness
 # actually appends. A probe against the unsuffixed form passes vacuously and
 # is exactly the mistake being guarded against.
-settings_out=$(py -3 -c '
+settings_out=$($PYLAUNCH -c '
 import json, fnmatch, re, sys, pathlib
 p = pathlib.Path(".claude/settings.json")
 if not p.exists():
@@ -82,7 +85,7 @@ fi
 # would break the harness rather than the anti-pattern.
 probe_hook() {
     printf '%s' "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"$1\"}}" \
-        | py -3 core/scripts/bash-path-resolution-hook.py 2>&1
+        | $PYLAUNCH core/scripts/bash-path-resolution-hook.py 2>&1
 }
 
 deny_out=$(probe_hook 'echo x > /tmp/claude-0/-proj/sid/scratchpad/probe.txt')

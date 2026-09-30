@@ -8,7 +8,7 @@ Usage:
     utilization-feedback.sh --goal <goal-id> --helpful "node1,node2,rb-001"
     utilization-feedback.sh --goal <goal-id> --all-helpful
     utilization-feedback.sh --goal <goal-id> --all-noise     # legacy (poisons times_noise)
-    utilization-feedback.sh --goal <goal-id> --all-unknown   # preferred backstop
+    utilization-feedback.sh --goal <goal-id> --all-unknown   # LAST RESORT — phase-4-26-gate blocks it alone
 
 The --helpful flag marks named items as helpful and everything else as noise.
 The --all-helpful and --all-noise flags apply uniformly. The hook fallback
@@ -854,14 +854,16 @@ def main():
     group.add_argument("--all-helpful", action="store_true",
                        help="Mark all items as helpful")
     group.add_argument("--all-noise", action="store_true",
-                       help="Mark all items as noise (LEGACY; poisons times_noise — "
-                            "use --all-unknown for the backstop case)")
+                       help="Mark all items as noise (LEGACY; poisons times_noise and "
+                            "phase-4-26-gate blocks a bare all_noise close — attest the "
+                            "ids actually used with --helpful instead)")
     group.add_argument("--all-unknown", action="store_true",
                        help="Mark every retrieved item as unclassified — no counter "
                             "changes, just records utilization_method=all_unknown so "
-                            "the retrieval-session is no longer pending. The preferred "
-                            "backstop: phase-4-26-gate still blocks goal completion "
-                            "(same as --all-noise) but no times_noise pollution.")
+                            "the retrieval-session is no longer pending. LAST RESORT: "
+                            "phase-4-26-gate still blocks a bare all_unknown close, so "
+                            "attest ids used with --helpful, or pass "
+                            "--no-retrieval-applicable at state-update.")
     group.add_argument("--infer", action="store_true",
                        help="Heuristic inference: match distinctive_tokens against "
                             "execution diary + guardrail triggers to classify each item "
@@ -1025,8 +1027,7 @@ def main():
             }
             if matched_count == 0:
                 # ZERO of the named ids are in the manifest. That is the
-                # signature of an untracked-retrieval caller, for whom
-                # --all-unknown is the documented correct posture. Applying the
+                # signature of an untracked-retrieval caller. Applying the
                 # noise default here would mark every manifest item noise on the
                 # strength of a verdict about entries this session never
                 # retrieved. Refuse instead of silently succeeding.
@@ -1045,8 +1046,11 @@ def main():
                     ),
                     "remedy": (
                         "if the retrieval that informed you was untracked, re-run "
-                        "it with --goal, or record this session with "
-                        "--all-unknown (a no-op on counters) instead"
+                        "it with --goal (tied) and attest with --helpful; if "
+                        "retrieval genuinely did not inform this goal, pass "
+                        "--no-retrieval-applicable at state-update. Do NOT fall "
+                        "back to --all-unknown: phase-4-26-gate blocks a bare "
+                        "all_unknown close (guard-4365 / guard-7420)."
                     ),
                 })
                 print(json.dumps(detail, indent=2))

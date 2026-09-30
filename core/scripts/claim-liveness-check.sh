@@ -21,6 +21,9 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 GOAL_ID="${1:-}"
 if [ -z "$GOAL_ID" ]; then
@@ -38,7 +41,7 @@ fi
 # Goal-id reaches python via env (guard-165: never interpolate bash vars
 # into python source text).
 meta=$(bash "$SCRIPT_DIR/aspirations-query.sh" --goal-field id "$GOAL_ID" 2>/dev/null) || meta=""
-loc=$(printf '%s' "$meta" | CLC_GOAL_ID="$GOAL_ID" py -3 -c '
+loc=$(printf '%s' "$meta" | CLC_GOAL_ID="$GOAL_ID" $PYLAUNCH -c '
 import json, os, sys
 gid = os.environ["CLC_GOAL_ID"]
 try:
@@ -61,7 +64,7 @@ read -r ASP_ID SRC <<<"$loc"
 
 # Step 2: full record (claimed_by lives here) -> pure verdict helper.
 verdict=$(bash "$SCRIPT_DIR/aspirations-read.sh" --source "${SRC:-world}" --id "$ASP_ID" 2>/dev/null \
-    | py -3 "$SCRIPT_DIR/_claim_liveness.py" --agent "$AGENT" --goal-id "$GOAL_ID" 2>/dev/null) \
+    | $PYLAUNCH "$SCRIPT_DIR/_claim_liveness.py" --agent "$AGENT" --goal-id "$GOAL_ID" 2>/dev/null) \
     || verdict="INDETERMINATE: helper error (fail-open)"
 
 echo "[claim-liveness] $GOAL_ID ($AGENT): $verdict"

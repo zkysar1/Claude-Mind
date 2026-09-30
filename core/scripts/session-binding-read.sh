@@ -15,6 +15,9 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 if [ "$#" -lt 1 ]; then
     echo "usage: session-binding-read.sh <SID> [--field <field>] [--json]" >&2
@@ -43,7 +46,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-OUT=$(py -3 "$SCRIPT_DIR/_session_binding.py" "$SID" 2>/dev/null || true)
+OUT=$($PYLAUNCH "$SCRIPT_DIR/_session_binding.py" "$SID" 2>/dev/null || true)
 if [ -z "$OUT" ]; then
     exit 1
 fi
@@ -55,7 +58,7 @@ fi
 
 # Field selector. Use py -3 to extract from the JSON line for robustness.
 if [ -n "$FIELD" ]; then
-    py -3 -c "
+    $PYLAUNCH -c "
 import json, sys
 data = json.loads('''$OUT''')
 v = data.get('$FIELD')
@@ -67,7 +70,7 @@ print(v)
 fi
 
 # Default: print agent name (legacy-compatible).
-py -3 -c "
+$PYLAUNCH -c "
 import json, sys
 data = json.loads('''$OUT''')
 if data.get('resolved') is False:

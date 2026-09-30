@@ -97,6 +97,29 @@ QUERY="id=$(rt_url_encode "$REC_ID")&stage=$(rt_url_encode "$STAGE")"
 
 if [ -z "$BODY" ]; then BODY='{}'; fi
 
+# Confidence-calibration capture (). After the daemon answers 200 to a
+# move INTO resolved, a record whose tests_node links a knowledge-tree node gets
+# one calibration-ledger row: the node's confidence from the tree index at this
+# moment, and the verdict the resolution implies for the node's claim. Mapping
+# and row: _confidence_ledger.capture_resolution_response; spec:
+# core/config/conventions/confidence-calibration-ledger.md.
+# CALLER-SIDE ON PURPOSE, not in the daemon (guard-742 weighed): judge_model and
+# harness must describe the resolver, and the daemon process cannot know them.
+# It reads only the record the daemon wrote and second-guesses nothing
+# (guard-582). Its stdout goes to stderr and every failure is swallowed, so it
+# can never change the record this wrapper prints or its exit code.
+_calibration_capture() {
+    [ "$STAGE" = "resolved" ] || return 0
+    case "$RESPONSE" in *'"tests_node"'*) ;; *) return 0;; esac
+    # shellcheck disable=SC2086
+    printf '%s' "$RESPONSE" | PROJECT_ROOT="$PROJECT_ROOT" $(rt_python_launcher) -c "
+import os, sys
+sys.path.insert(0, os.path.join(os.environ['PROJECT_ROOT'], 'core', 'scripts'))
+from _confidence_ledger import capture_resolution_response
+capture_resolution_response(sys.stdin.read())
+" >&2 || true
+}
+
 rc=0
 RESPONSE="$(rt_call POST /v1/pipeline/move \
     --query "$QUERY" \
@@ -112,6 +135,7 @@ resp = json.load(sys.stdin)
 rec = resp.get('record') or resp
 print(json.dumps(rec, indent=2, ensure_ascii=False))
 "
+        _calibration_capture
         exit 0;;
     2)
         exit 1;;
@@ -130,6 +154,7 @@ resp = json.load(sys.stdin)
 rec = resp.get('record') or resp
 print(json.dumps(rec, indent=2, ensure_ascii=False))
 "
+                _calibration_capture
                 exit 0
             fi
         fi

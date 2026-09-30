@@ -184,6 +184,9 @@ def _shim_iteration_commit(tmpdir: Path, claimed_at_iso: str | None) -> Path:
     src_content = ITERATION_COMMIT_SH.read_bytes()
     target.write_bytes(src_content)
     target.chmod(0o755)
+    # iteration-commit.sh sources _python_launcher.sh beside itself ().
+    launcher = ITERATION_COMMIT_SH.parent / "_python_launcher.sh"
+    (shim_dir / launcher.name).write_bytes(launcher.read_bytes())
     # Create mock team-state-read.sh
     _mock_team_state_read(shim_dir, claimed_at_iso)
     return target

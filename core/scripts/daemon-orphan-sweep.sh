@@ -10,20 +10,32 @@
 #   bash core/scripts/daemon-orphan-sweep.sh --clean     # report + kill orphans
 #   bash core/scripts/daemon-orphan-sweep.sh --strict    # exit 1 if orphans exist
 #   bash core/scripts/daemon-orphan-sweep.sh --clean --strict
+#   bash core/scripts/daemon-orphan-sweep.sh --clean --allow-blind  # reap even with no live deployment in view
 #   bash core/scripts/daemon-orphan-sweep.sh --keep-repo <path>   # extra repo to protect
 #   bash core/scripts/daemon-orphan-sweep.sh --print-keepset      # show protected PIDs, no scan/kill
 #
-# CROSS-REPO SAFE (): --clean only reaps mind_api.src processes that are
-# NOT in ANY live deployment's published daemon pair. The keep-set is auto-built
-# from this repo PLUS every sibling deployment found under the deployments' parent
-# dir (default: dirname PROJECT_ROOT; override via ORPHAN_SWEEP_DEPLOY_PARENT) PLUS
-# any --keep-repo paths. So --clean run from one Mind repo never kills a sibling
-# repo's live daemon — it is no longer a multi-deployment footgun.
+# CROSS-REPO (): --clean only reaps mind_api.src processes that are NOT
+# in any published daemon pair it can FIND. The keep-set is built from this repo
+# PLUS every sibling deployment found under the deployments' parent dir (default:
+# dirname PROJECT_ROOT; override via ORPHAN_SWEEP_DEPLOY_PARENT) and its parent,
+# PLUS any --keep-repo paths. A deployment outside those roots is invisible, and
+# nothing in the process table says which repo a daemon belongs to.
+#
+# BLIND VANTAGE (): so when no process the sweep would KEEP is alive,
+# it sees no live deployment at all and cannot tell another deployment's daemon
+# from an orphan. --clean then REFUSES (exit 3) and kills nothing. Measured
+# 2026-09-29: run from a scratch clone whose neighbourhood held no pidfile,
+# --clean killed two deployments' live daemons, one of them production.
+# --allow-blind overrides, for an operator who has checked every ORPH line.
+#
+# ORPHAN_SWEEP_SCOPE_TOKEN (test seam): when set, only processes whose command
+# line also contains this word are candidates. It can only NARROW the scan.
 #
 # Exit codes:
 #   0 — healthy (exactly 1 daemon pair, no orphans) OR --clean swept successfully
 #   1 — orphans found AND --strict (without --clean) OR --clean failed
 #   2 — usage error
+#   3 — --clean refused: blind vantage (see above); nothing was killed
 #
 # Why this exists:  v3 added bulletproof in-flight prevention via
 # _force_kill_tree + _sweep_orphan_daemons in mind-api-start.sh and
@@ -53,6 +65,7 @@ CLEAN=0
 STRICT=0
 QUIET=0
 PRINT_KEEPSET=0
+ALLOW_BLIND=0
 KEEP_REPOS=()
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -60,6 +73,7 @@ while [ $# -gt 0 ]; do
         --strict) STRICT=1 ;;
         --quiet) QUIET=1 ;;
         --print-keepset) PRINT_KEEPSET=1 ;;
+        --allow-blind) ALLOW_BLIND=1 ;;
         --keep-repo)
             shift
             [ $# -gt 0 ] || { echo "[orphan-sweep] ERROR: --keep-repo needs a path" >&2; exit 2; }
@@ -67,7 +81,7 @@ while [ $# -gt 0 ]; do
             ;;
         --keep-repo=*) KEEP_REPOS+=("${1#--keep-repo=}") ;;
         -h|--help)
-            sed -n '2,30p' "$0"
+            sed -n '2,38p' "$0"
             exit 0
             ;;
         *)
@@ -77,6 +91,14 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
+
+# A plain word stays literal in both pgrep's regex and PowerShell's .Contains(),
+# so the token can only narrow the scan, never widen or break it.
+SCOPE_TOKEN="${ORPHAN_SWEEP_SCOPE_TOKEN:-}"
+if [ -n "$SCOPE_TOKEN" ] && ! [[ "$SCOPE_TOKEN" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "[orphan-sweep] ERROR: ORPHAN_SWEEP_SCOPE_TOKEN must be letters, digits, '_' or '-': $SCOPE_TOKEN" >&2
+    exit 2
+fi
 
 _say() {
     [ "$QUIET" = "1" ] && return 0
@@ -130,8 +152,8 @@ _collect_pair "$RT_DIR"
 #    stale pidfile can spare a process but never condemn one.
 #    The GRANDPARENT is searched the same way, so the view is the same whichever
 #    repo runs the sweep: run from the nested repo, the parent alone missed a
-#    shallower sibling's live daemon (; worktree-teardown.sh runs
-#    --clean automatically). Setting ORPHAN_SWEEP_DEPLOY_PARENT without
+#    shallower sibling's live daemon (; worktree-teardown.sh ran
+#    --clean automatically until ). Setting ORPHAN_SWEEP_DEPLOY_PARENT without
 #    ORPHAN_SWEEP_DEPLOY_GRANDPARENT turns the grandparent OFF, so a tmp_path
 #    override never reaches pytest's shared basetemp and other tests' pidfiles.
 DEPLOY_PARENT="${ORPHAN_SWEEP_DEPLOY_PARENT:-$(dirname "$PROJECT_ROOT")}"
@@ -168,6 +190,24 @@ KEEP_PIDS=($(_dedup "${KEEP_PIDS[@]:-}"))
 # shellcheck disable=SC2207
 KEEP_CHILDREN=($(_dedup "${KEEP_CHILDREN[@]:-}"))
 
+# BLIND VANTAGE (, see header): called only when --clean would kill
+# and no process the sweep would keep is alive. Keys on a LIVE keep member, not
+# on an empty keep-set, because scratch areas collect stale pidfiles. Prints to
+# stderr even under --quiet: a refusal is not chatter.
+_refuse_blind() {
+    local searched="$RT_DIR, $DEPLOY_PARENT" r
+    [ -n "$DEPLOY_GRANDPARENT" ] && searched="$searched, $DEPLOY_GRANDPARENT"
+    for r in "${KEEP_REPOS[@]:-}"; do [ -n "$r" ] && searched="$searched, $r"; done
+    {
+        echo "[orphan-sweep] REFUSED --clean (exit 3, g-115-11484): no process this sweep would keep is alive,"
+        echo "  so it sees no live deployment from here and cannot tell another deployment's daemon"
+        echo "  from an orphan. Nothing was killed. Searched: $searched"
+        echo "  Run it from the deployment that owns these daemons, add --keep-repo <path> for each"
+        echo "  live deployment, or pass --allow-blind once you have checked every ORPH line."
+    } >&2
+    exit 3
+}
+
 if [ "$PRINT_KEEPSET" = "1" ]; then
     # Debug/inspection + hermetic test seam: print the protected set and exit
     # WITHOUT scanning processes or killing anything.
@@ -192,13 +232,15 @@ esac
 
 if [ "$PLATFORM" = "posix" ]; then
     # POSIX: pgrep python processes running mind_api.src.
-    mapfile -t pids < <(pgrep -f 'python.* -m mind_api\.src' 2>/dev/null)
+    mapfile -t pids < <(pgrep -f "python.* -m mind_api\.src${SCOPE_TOKEN:+.*$SCOPE_TOKEN}" 2>/dev/null)
     _say "  Alive mind_api.src processes (POSIX): ${#pids[@]}"
     _in_keepset() { local x="$1" k; for k in "${KEEP_PIDS[@]:-}"; do [ "$x" = "$k" ] && return 0; done; return 1; }
     orphans=()
+    live_keep=0
     for p in "${pids[@]}"; do
         if _in_keepset "$p"; then
             _say "    KEEP  PID=$p (live deployment pair)"
+            live_keep=$((live_keep + 1))
         else
             _say "    ORPH  PID=$p (orphan)"
             orphans+=("$p")
@@ -206,6 +248,9 @@ if [ "$PLATFORM" = "posix" ]; then
     done
     orphan_count=${#orphans[@]}
     _say "  Orphans found: $orphan_count"
+    if [ "$orphan_count" -gt 0 ] && [ "$CLEAN" = "1" ] && [ "$live_keep" -eq 0 ] && [ "$ALLOW_BLIND" = "0" ]; then
+        _refuse_blind
+    fi
     if [ "$orphan_count" -gt 0 ] && [ "$CLEAN" = "1" ]; then
         _say "  Killing orphans..."
         killed=0; failed=0
@@ -227,7 +272,8 @@ fi
 
 # Windows: PowerShell + WMI.
 # Serialize the cross-repo keep-set into PowerShell array literals.
-# Empty -> @() (no protected pair found; every mind_api.src proc is an orphan).
+# Empty -> @(): nothing is protected, every mind_api.src proc reads ORPH, and
+# --clean refuses as blind ().
 keep_pids_ps="$(IFS=,; echo "${KEEP_PIDS[*]:-}")"
 keep_children_ps="$(IFS=,; echo "${KEEP_CHILDREN[*]:-}")"
 
@@ -235,7 +281,9 @@ ps_script="
     \$keep_pids = @($keep_pids_ps)
     \$keep_children = @($keep_children_ps)
     \$do_clean = \$$([ "$CLEAN" = "1" ] && echo "true" || echo "false")
-    \$procs = Get-CimInstance Win32_Process -Filter \"Name='py.exe' OR Name='python.exe'\" -ErrorAction SilentlyContinue | Where-Object { \$_.CommandLine -match 'mind_api\\.src' }
+    \$allow_blind = \$$([ "$ALLOW_BLIND" = "1" ] && echo "true" || echo "false")
+    \$scope_token = '$SCOPE_TOKEN'
+    \$procs = Get-CimInstance Win32_Process -Filter \"Name='py.exe' OR Name='python.exe'\" -ErrorAction SilentlyContinue | Where-Object { \$_.CommandLine -match 'mind_api\\.src' -and (-not \$scope_token -or \$_.CommandLine.Contains(\$scope_token)) }
     \$total = (\$procs | Measure-Object).Count
 
     # Derive the live parent for every protected child whose parent PID is not
@@ -272,6 +320,12 @@ ps_script="
         if (\$keep_pids -notcontains \$p.ProcessId) {
             \$orphans += \$entry
         }
+    }
+    # Blind vantage (): nothing this sweep would keep is alive.
+    \$live_keep = @(\$alive | Where-Object { \$keep_pids -contains \$_.PID }).Count
+    if (\$do_clean -and \$orphans.Count -gt 0 -and \$live_keep -eq 0 -and -not \$allow_blind) {
+        Write-Output \"REFUSED_BLIND=1\"
+        \$do_clean = \$false
     }
     Write-Output \"ALIVE_COUNT=\$total\"
     Write-Output \"ORPHAN_COUNT=\$(\$orphans.Count)\"
@@ -319,6 +373,7 @@ killed_count=0
 cascade_count=0
 failed_count=0
 derived_parent=""
+refused_blind=0
 while IFS= read -r line; do
     # PowerShell on Windows emits CRLF; strip trailing \r so integer
     # comparisons like `[ "$orphan_count" -gt 0 ]` don't blow up with
@@ -330,6 +385,7 @@ while IFS= read -r line; do
         KILLED_COUNT=*)  killed_count="${line#KILLED_COUNT=}" ;;
         CASCADE_COUNT=*) cascade_count="${line#CASCADE_COUNT=}" ;;
         FAILED_COUNT=*)  failed_count="${line#FAILED_COUNT=}" ;;
+        REFUSED_BLIND=*) refused_blind=1 ;;
         DERIVED_PARENT=*)
             derived_parent="${line#DERIVED_PARENT=}"
             _say "  NOTE: daemon.parent.pid missing; derived legit parent dynamically: PID=$derived_parent"
@@ -358,6 +414,8 @@ if [ "$CLEAN" = "1" ]; then
     _say "  Killed: $killed_count   Cascade-killed: $cascade_count   Failed: $failed_count"
 fi
 _say "═════════════════════════════════════════════════════════"
+
+[ "$refused_blind" = "1" ] && _refuse_blind
 
 # Exit code logic
 if [ "$CLEAN" = "1" ]; then

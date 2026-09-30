@@ -89,6 +89,50 @@ from ..jsonl_cache import cache as _jsonl_cache
 _swap_lock = threading.Lock()
 
 
+# --- Embedding-index freshness trigger (, 2026-09-29) --------------
+# The per-box index was refreshed ONLY from iteration-close.sh, under a flat 6h
+# debounce, so a box in assistant mode never refreshed and a busy one refreshed
+# at most every 6h: every lesson, guardrail and node written in between was
+# invisible to the semantic lanes. Retrieval is where staleness costs, so it is
+# also where the check runs. Rate-limited per daemon process; the tick itself
+# holds the success-aware debounce, so this only decides how often to ASK.
+# Spawned detached with the REQUESTER's world — the index is built from the
+# world whose retrieval it serves — and never waited on.
+_FRESHNESS_MIN_INTERVAL = 300.0
+_freshness_last = [0.0]
+_freshness_lock = threading.Lock()
+
+
+def _maybe_freshness_tick(world, agent):
+    # A test process must never refresh a real index from its tmp world; the
+    # tick also honors MIND_EMBEDDING_INDEX_DIR, this is the belt to that brace.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return
+    import time
+    now = time.time()
+    with _freshness_lock:
+        if now - _freshness_last[0] < _FRESHNESS_MIN_INTERVAL:
+            return
+        _freshness_last[0] = now
+    try:
+        import subprocess
+        env = dict(os.environ)
+        env["MIND_WORLD"] = str(world)
+        env["MIND_AGENT"] = agent
+        kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                  "stdin": subprocess.DEVNULL, "env": env,
+                  "cwd": str(_SCRIPTS_DIR.parent.parent)}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000008 | 0x00000200
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen([sys.executable,
+                          str(_SCRIPTS_DIR / "embedding-index-freshness.py")],
+                         **kwargs)
+    except Exception:
+        pass  # fail-open: freshness must never cost a retrieval
+
+
 # --- Hot-path caches (installed once at module load) -----------------------
 # Without these, retrieve takes ~7-10s per call on OneDrive worlds because:
 #   1. read_yaml() reparses _tree.yaml (~270KB, 50-100ms) on every call.
@@ -514,10 +558,12 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                 # return set") and warns off exactly the
                 # `is_universal_rb or _entry_matches_category` test that stood
                 # here: that decides ELIGIBILITY, and the cap decides RETURN.
-                # Note the `is_universal_rb` disjunct was also INERT — the domain
-                # list is built with `not is_universal_rb(r)`, so it could never
-                # fire, which is why the measured free-text case dropped 100% of
-                # reasoning_bank and not merely the non-universal part.
+                # Note the `is_universal_rb` disjunct was also INERT at the time —
+                # the domain list was built with `not is_universal_rb(r)`, so it
+                # could never fire, which is why the measured free-text case
+                # dropped 100% of reasoning_bank and not merely the non-universal
+                # part. (Since  the list admits matching universal
+                # entries too; the point stands — membership is the loader's.)
                 for item in reasoning_bank:
                     iid = item.get("id", "")
                     if not iid:
@@ -729,6 +775,7 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
     # ensure_ascii=True + indent=2 mirrors retrieve.py (rb-597 hardening).
     # Output equivalence with the pre-cutover CLI is the acceptance test;
     # do not silently switch to ensure_ascii=False here.
+    _maybe_freshness_tick(world, explicit_agent)
     return Response.text(
         json.dumps(result, ensure_ascii=True, indent=2),
         content_type="application/json",

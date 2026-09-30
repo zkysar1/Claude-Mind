@@ -688,6 +688,17 @@ fi
 
 rc=0
 RESPONSE="$(rt_call POST /v1/aspirations/claim --query "$QUERY" 2>&1)" || rc=$?
+# : rt_call buffers the reply and prints it LAST (since ce44c5c2e5,
+# 2026-07-18;  kept the order), so the `[runtime]` lines it prints for a
+# stale daemon reach this 2>&1 capture BEFORE the body. Every parser
+# of RESPONSE below, _post_claim_effects included, tolerates only TRAILING residue
+# (), so a claim that LANDED exited 1 before its post-claim effects ran.
+# Pass everything ahead of the first line opening with `{` through to stderr
+# unchanged, and keep the body.
+if [ "${RESPONSE:0:1}" != "{" ] && [[ "$RESPONSE" == *$'\n{'* ]]; then
+    printf '%s\n' "${RESPONSE%%$'\n{'*}" >&2
+    RESPONSE="{${RESPONSE#*$'\n{'}"
+fi
 
 case $rc in
     0)

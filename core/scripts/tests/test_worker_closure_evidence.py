@@ -121,6 +121,10 @@ def _stage(tmp_path, query_stub=None):
     core.mkdir(parents=True)
     (core / "closure-evidence-write.sh").write_text(
         HELPER.read_text(encoding="utf-8"), encoding="utf-8")
+    # closure-evidence-write.sh sources _python_launcher.sh beside itself ().
+    (core / "_python_launcher.sh").write_text(
+        (SCRIPTS / "_python_launcher.sh").read_text(encoding="utf-8"),
+        encoding="utf-8")
     (core / "aspirations-update-goal.sh").write_text(STUB_UPDATE, encoding="utf-8")
     (core / "aspirations-query.sh").write_text(
         query_stub or STUB_QUERY, encoding="utf-8")
@@ -767,6 +771,10 @@ def _stage_shrink(tmp_path):
     core.mkdir(parents=True)
     (core / "closure-evidence-write.sh").write_text(
         HELPER.read_text(encoding="utf-8"), encoding="utf-8")
+    # closure-evidence-write.sh sources _python_launcher.sh beside itself ().
+    (core / "_python_launcher.sh").write_text(
+        (SCRIPTS / "_python_launcher.sh").read_text(encoding="utf-8"),
+        encoding="utf-8")
     (core / "aspirations-update-goal.sh").write_text(STUB_UPDATE_SHRINK, encoding="utf-8")
     (core / "aspirations-query.sh").write_text(STUB_QUERY, encoding="utf-8")
     for f in core.iterdir():
@@ -959,6 +967,10 @@ class TestFieldShrinkRefusalMessage:
         core.mkdir(parents=True)
         (core / "closure-evidence-write.sh").write_text(
             HELPER.read_text(encoding="utf-8"), encoding="utf-8")
+        # closure-evidence-write.sh sources _python_launcher.sh beside itself ().
+        (core / "_python_launcher.sh").write_text(
+            (SCRIPTS / "_python_launcher.sh").read_text(encoding="utf-8"),
+            encoding="utf-8")
         (core / "aspirations-update-goal.sh").write_text(
             '#!/usr/bin/env bash\n'
             '{ for a in "$@"; do printf \'%s\\n\' "---ARG---"; printf \'%s\\n\' "$a"; done; } >> "$UPDATE_SINK"\n'

@@ -249,6 +249,43 @@ item 3, observed doing exactly what it was designed to do.
 **Re-measure before quoting any of this.** The 2.9 consumer-commits/day figure
 and the fleet's byte-alignment are both DATED observations of a moving repo.
 
+## Downstream fall-through (g-358-226, 2026-09-29, alpha, cc-09)
+
+**The defect.** Every `STORES` entry pins a 40-char seam sha from THIS world's
+history, and a downstream repository fed by the promotion train can never
+contain that object: `merge-base --is-ancestor` returns rc=128 there (measured
+on a downstream deployment 2026-09-21, msg-20260921-093025-omni-5659).
+g-358-190 made the REASON honest (`seam_object_absent`, not
+`seam_not_ancestor`), but both lanes still returned BEFORE any routing read, so
+SAFE was permanently unreachable downstream. The local lane matters as much as
+the remote one: `evaluate_roster` gives the box running the check a veto.
+
+**The decision.** When the seam OBJECT is absent (rc other than 0 or 1) and the
+store declares `seam_symbols`, both lanes fall through to symbol routing over
+EVERY consumer, never only the files that diverge from that repository's
+`origin/main`. Tier 1's byte-identity is evidence only because ancestry anchors
+`origin/main` to the seam, and downstream nothing does. The remote lane reads
+each consumer at the box's own proof commit (the same `git show` read as tier
+2, shared through `_route_at_commit`). The local lane runs its existing tree
+checks (`_local_tree_report`), so uncommitted local drift still refuses and
+decision part 2 holds. A proof reports its own reason,
+`seam_routed_without_seam_object`; a refusal keeps `seam_object_absent` and
+carries what the routing read found.
+
+**What this gives up (guard-4315 inventory).** § "What the narrowing GIVES UP"
+bounded risks (1) and (2) partly by the ancestry check running first.
+Downstream that bound is gone, and both risks now apply to every consumer
+rather than only the diverging ones. What still bounds them: the fall-through
+fires only on an absent seam object, never on rc=1, so a genuine non-ancestor
+is never rescued by routing; it is opt-in per store; it reports its own
+reason; the fleet-level `_symbol_report` veto against `origin/main` is
+untouched; and a consumer unreadable at the box's commit still refuses
+(guard-487).
+
+**What a downstream deployment still needs.** The gzip `seam_symbols`
+(193004e357, g-358-95) and this change both reach it only through the
+promotion train. Until they land there, its gate reads what it read before.
+
 ## Cross-references
 
 - `g-358-23` — this decision; `g-358-05` unit 14 — the same finding scoped to

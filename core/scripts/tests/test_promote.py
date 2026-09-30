@@ -290,7 +290,7 @@ def _setup_promote_source(tmp_path: Path, version: str = "1.0.0", frontier: bool
     # and its weights-contract check self-skips: no goal-selector.py in the copy).
     for name in ("promote-to-upstream.sh", "_paths.sh", "_release_lib.py",
                  "check-releases-current.sh", "promotion-preflight.sh",
-                 "promotion-preflight.py"):
+                 "promotion-preflight.py", "_python_launcher.sh"):
         shutil.copy(CORE_SCRIPTS / name, src / "core" / "scripts" / name)
     (src / "core" / "scripts" / "seed-preflight.sh").write_text(_STUB_OK, encoding="utf-8")
     (src / "core" / "scripts" / "seed-verify.sh").write_text(_STUB_OK, encoding="utf-8")

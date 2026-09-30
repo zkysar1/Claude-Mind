@@ -150,8 +150,8 @@ utilization data on the loop path is false — g-115-3123.**
 SESSION_FILE="agents/<agent>/session/retrieval-session.json"
 IF session file exists:
     IF utilization_pending == true:
-        # Hook should have caught this — run feedback as safety net
-        Bash: utilization-feedback.sh --goal {goal.id} --all-unknown
+        # 4.26 gate blocks bare --all-unknown; attest ids used
+        Bash: utilization-feedback.sh --goal {goal.id} --helpful <ids used>
         Output: "▸ RETRIEVAL GATE: forced utilization feedback for {goal.id}"
     # else: already processed by Phase 4.26 or hook — pass
 

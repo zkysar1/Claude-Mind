@@ -14,4 +14,7 @@
 #   - User: manual override (rare)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec py -3 "$SCRIPT_DIR/evolution-complete.py" "$@"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
+exec $PYLAUNCH "$SCRIPT_DIR/evolution-complete.py" "$@"

@@ -164,6 +164,9 @@ def _shim_iteration_commit(tmpdir: Path) -> Path:
     target = shim_dir / "iteration-commit.sh"
     target.write_bytes(ITERATION_COMMIT_SH.read_bytes())
     target.chmod(0o755)
+    # iteration-commit.sh sources _python_launcher.sh beside itself ().
+    launcher = ITERATION_COMMIT_SH.parent / "_python_launcher.sh"
+    (shim_dir / launcher.name).write_bytes(launcher.read_bytes())
     _mock_team_state_read_null(shim_dir)
     return target
 
@@ -428,7 +431,7 @@ def _setup_full_record_env(tmp: Path) -> Path:
     core_scripts = repo / "core" / "scripts"
     # Copy the real scripts + helpers. _paths.sh anchors via BASH_SOURCE so
     # placing it in repo/core/scripts/ makes PROJECT_ROOT resolve to `repo`.
-    for fname in ("uncommitted-edits-record.sh", "_paths.sh"):
+    for fname in ("uncommitted-edits-record.sh", "_paths.sh", "_python_launcher.sh"):
         src = CORE_SCRIPTS / fname
         dst = core_scripts / fname
         dst.write_bytes(src.read_bytes())

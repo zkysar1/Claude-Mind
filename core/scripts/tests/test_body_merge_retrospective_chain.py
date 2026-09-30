@@ -81,6 +81,8 @@ def _stage(tmp_path, *, merge_rc=0, retro_rc=0, ids=None):
     d = tmp_path / "scripts"
     d.mkdir()
     shutil.copy(WRAPPER, d / "body-merge.sh")
+    # body-merge.sh sources _python_launcher.sh beside itself ().
+    shutil.copy(WRAPPER.parent / "_python_launcher.sh", d / "_python_launcher.sh")
     argv_log = tmp_path / "argv.json"
     seen_log = tmp_path / "seen.json"
     (d / "body-merge.py").write_text(

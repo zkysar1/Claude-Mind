@@ -218,6 +218,10 @@ def test_missing_from_index_sorts_at_threshold_keeping_utility_order(monkeypatch
 # ── 5. Partition, cap, bump invariants ───────────────────────────────────────
 
 def test_universal_rb_never_widened_into_domain(monkeypatch, stores):
+    # Since  the widen pass MAY admit a universal entry into the
+    # domain candidates; what this pins is that an entry meta_lessons already
+    # serves is removed from the domain list, so it is returned exactly once.
+    # (test_retrieve_reach.py covers a universal entry meta_lessons did NOT pick.)
     rb_p, _ = stores
     _retrieve._RETRIEVAL_CFG_CACHE = _cfg(True)
     scores = {"rb-uni": 0.99, "rb-sem": 0.90}

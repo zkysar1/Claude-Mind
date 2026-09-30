@@ -52,6 +52,7 @@ _TREE_FILES = (
     "_platform.sh",
     "_session_binding.py",
     "session-binding-read.sh",
+    "_python_launcher.sh",  # session-binding-read.sh sources it ()
     "context-reads.py",
     GATE_HOOK,
     RECORD_HOOK,

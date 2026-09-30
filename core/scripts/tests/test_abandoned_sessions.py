@@ -852,6 +852,6 @@ def test_the_call_site_reads_the_verdict_and_not_only_the_rc():
     """
     src = (Path(__file__).resolve().parents[1] / "cleanup-stale-bindings.sh"
            ).read_text(encoding="utf-8")
-    assert src.count("_CBL_OUT=\"$(py -3") == 2, "both call sites must capture stdout"
+    assert src.count("_CBL_OUT=\"$($PYLAUNCH") == 2, "both call sites must capture stdout"
     assert src.count("*-push-failed)") == 2, "both call sites must branch on it"
     assert "close-body-late \\\n                    --sid \"$_BIND_SID\" --agent \"$_BA\" >/dev/null" not in src

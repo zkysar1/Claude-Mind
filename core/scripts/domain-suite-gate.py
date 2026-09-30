@@ -103,6 +103,9 @@ FALLBACK_WINDOW = timedelta(hours=6)
 # minute it claims must not slip under the window on clock granularity.
 SLACK_SECONDS = 60
 DEFAULT_TIMEOUT = 900
+# How long a timed-out runner gets between SIGTERM and SIGKILL ().
+# Enough for its EXIT trap to name the unit it was on; see run_suite.
+TERM_GRACE_SECONDS = 5
 TAIL_LINES = 25
 # Where a NON-CLEAN run's full output is preserved (). Gitignored,
 # and already the home of this gate's own stderr, so a reader chasing a refusal
@@ -457,13 +460,30 @@ def run_suite(scripts_dir: Path, timeout: int,
     retained: str | None = None
     try:
         with open(log_path, "w", encoding="utf-8", errors="replace") as fh:
-            try:
-                proc = subprocess.run(cmd, cwd=str(scripts_dir), env=env,
-                                      stdout=fh, stderr=subprocess.STDOUT,
-                                      timeout=timeout, check=False)
-                rc = proc.returncode
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            with subprocess.Popen(cmd, cwd=str(scripts_dir), env=env,
+                                  stdout=fh, stderr=subprocess.STDOUT) as proc:
+                try:
+                    rc = proc.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    # SIGTERM FIRST, SIGKILL only after a grace ().
+                    # subprocess.run's timeout path SIGKILLs the runner, and
+                    # SIGKILL cannot be trapped, so the runner's EXIT trap never
+                    # ran here. That trap writes the ONLY line that names the unit
+                    # the run was on ("last unit started: ..."), and 0 of 59
+                    # retained logs on one box carried it. Measured on a bash
+                    # runner blocked in a command substitution: it exits 1ms after
+                    # SIGTERM with the line written. On Windows terminate() is
+                    # kill(), so nothing changes there. This reaps the runner only;
+                    # its descendants are orphaned exactly as before ().
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=TERM_GRACE_SECONDS)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                except BaseException:
+                    proc.kill()  # what subprocess.run does on an interrupt
+                    raise
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     finally:
         # PRESERVE BEFORE DELETING, and only when the run was not clean

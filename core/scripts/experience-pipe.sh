@@ -6,13 +6,17 @@
 # When both conditions hold, launches the Lodestar pipe in the background.
 # Always exits 0 — never blocks a Write or Edit.
 
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$(dirname "${BASH_SOURCE[0]}")/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
+
 # Read the PostToolUse hook event from stdin.
 HOOK_JSON=$(cat)
 
 # Extract tool_input.file_path from the event JSON.
 FILE_PATH=""
 FILE_PATH=$(printf '%s' "$HOOK_JSON" \
-  | py -3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tool_input",{}).get("file_path",""))' \
+  | $PYLAUNCH -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tool_input",{}).get("file_path",""))' \
   2>/dev/null) || true
 
 # Fast-exit: only fire on experience archive entries.

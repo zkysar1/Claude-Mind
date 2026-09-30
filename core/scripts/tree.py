@@ -1954,6 +1954,25 @@ def validate_tree(tree):
             warnings.append(
                 "Node '{}' body references tree node '{}' which does not exist on disk".format(_key, _ref))
 
+    # --- Retired front-matter key census () ---
+    # T21 removes retired keys (`parent:`) on every Edit/Write, but a Bash or
+    # script write bypasses T21 (guard-1162), so a carrier that slipped past it
+    # surfaces here. Remove with core/scripts/tree-retired-fm-keys.py --apply.
+    from _tree_fm_retired import find_retired_fm_keys
+    for key, node in nodes.items():
+        file_path = node.get("file")
+        if not file_path:
+            continue
+        try:
+            with open(resolve_file_path(file_path), "r", encoding="utf-8",
+                      errors="replace") as fh:
+                retired = find_retired_fm_keys(fh.read())
+        except OSError:
+            continue  # a missing body is already reported by the existence check
+        if retired:
+            warnings.append("Node '{}' front matter carries retired key(s) {} "
+                            "(g-115-11490)".format(key, ", ".join(retired)))
+
     # Check for orphan .md files (exist on disk but have no _tree.yaml entry)
     tree_dir = str(WORLD_DIR / "knowledge" / "tree")
     if os.path.isdir(tree_dir):

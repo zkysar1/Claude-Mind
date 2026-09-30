@@ -9,6 +9,7 @@ fields where today's date or current SID is the unambiguous right answer:
   - last_update_trigger.session → current MIND_SID (always ensure)
   - last_update_trigger.source → in-flight goal_id from team-state
                                  (fill only if missing)
+  - RETIRED keys (`parent:`)   → removed (g-115-11490; _tree_fm_retired.py)
 
 Layer A NEVER touches semantic fields — those need LLM judgment and belong
 to Layer B (/tree edit Step 4):
@@ -45,6 +46,15 @@ try:
 except Exception as e:
     print(f"tree-front-matter-sync: setup error: {e}", file=sys.stderr)
     sys.exit(0)
+
+# Separate from the setup imports above: a deployment missing the helper loses
+# only the retired-key strip, never the last_updated sync that is this hook's
+# primary job.
+try:
+    from _tree_fm_retired import RetiredKeyStripError, strip_retired_fm_keys  # type: ignore
+except Exception as e:
+    strip_retired_fm_keys = None
+    print(f"tree-front-matter-sync: retired-key strip unavailable: {e}", file=sys.stderr)
 
 
 # Match the front-matter block but DO NOT consume any trailing newline after
@@ -310,6 +320,26 @@ def main():
         )
         sys.exit(0)
 
+    # : remove RETIRED front-matter keys (`parent:`) on every node
+    # write. Nothing reads them (the parent lives in the _tree.yaml index), so a
+    # kept copy only goes stale on the next node move. The helper is shared with
+    # the store migration, the merge handler and tree validate, so all four agree
+    # on what is retired. An unverifiable strip leaves the file as it was.
+    retired_removed = []
+    if fm_text is not None and strip_retired_fm_keys is not None:
+        try:
+            stripped_text, retired_removed = strip_retired_fm_keys(text)
+        except RetiredKeyStripError as e:
+            print(f"FRONT-MATTER-SYNC: {args.virtual_path} — retired front-matter "
+                  f"key left in place: {e}", file=sys.stderr)
+        else:
+            if retired_removed:
+                s_fm, s_body = _split_front_matter(stripped_text)
+                if s_fm is None:
+                    retired_removed = []
+                else:
+                    fm_text, body = s_fm, s_body
+
     # All checks passed — perform surgical mutations on the FM text.
     # We use the parsed dict ONLY for read decisions (refusal checks above,
     # and the source-already-set check below). All writes are surgical so
@@ -385,6 +415,8 @@ def main():
         parts.append(f"source→{inflight_goal}")
     if inline_trigger_seen:
         parts.append("trigger inline — session/source not auto-filled (run /tree edit to fill, Layer B)")
+    if retired_removed:
+        parts.append(f"retired key removed: {', '.join(retired_removed)}")
     if key and bumped_yaml:
         parts.append(f"_tree.yaml[{key}]✓")
     summary = ", ".join(parts)

@@ -28,6 +28,9 @@ set -u
 set -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 if ! source "$SCRIPT_DIR/_paths.sh" 2>/dev/null; then
     echo "[output-style-gate] WARN: _paths.sh not sourceable; layer-B disabled (fail-open)" >&2
@@ -42,7 +45,7 @@ fi
 
 # Single source of truth: .claude/settings.local.json. If the file or the
 # outputStyle key is absent, STYLE is empty → "unknown" → gate exits 0.
-STYLE=$(py -3 -c "
+STYLE=$($PYLAUNCH -c "
 import json, pathlib
 p = pathlib.Path('.claude/settings.local.json')
 if p.exists():

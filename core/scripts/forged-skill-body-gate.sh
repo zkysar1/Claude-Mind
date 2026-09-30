@@ -18,15 +18,15 @@
 # invoked from forge-skill Step 4 (before the registry write) AND from its
 # Return Protocol (before the forge may report done).
 #
-# WHAT IT DELIBERATELY DOES *NOT* CHECK, and why (guard-2335): whether the
-# runtime's CATALOG lists the skill. 's description asks the Return
-# Protocol to "verify the body loads (catalog lists it)", and on Claude Code
-# that is STRUCTURALLY UNSATISFIABLE in the forging session — skill
-# descriptions are loaded at STARTUP, so a skill forged mid-session cannot
-# appear in its own session's catalog no matter how correct the body is. A gate
-# asserting catalog presence would therefore refuse every correct forge on
-# Claude Code. Disk presence at the load path is the checkable half, and it is
-# the half the coach incident actually violated.
+# WHAT IT DELIBERATELY DOES *NOT* CHECK, and why: whether the runtime's CATALOG
+# lists the skill. 's description asks the Return Protocol to "verify
+# the body loads (catalog lists it)". A script cannot satisfy that: the catalog
+# lives in the model's context, not on disk. guard-2335 added that a skill
+# forged mid-session could not appear in its own session's catalog at all;
+# guard-7539 (2026-09-29) superseded it, because Claude Code 2.1.283 announces
+# such a skill about 45 s after the write. That announcement still reaches only
+# the model, never a shell. Disk presence at the load path is the checkable
+# half, and it is the half the coach incident actually violated.
 #
 # EXIT CONTRACT (a CALLABLE gate, not a PreToolUse hook — it must be able to
 # refuse, so it does NOT fail open):

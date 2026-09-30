@@ -21,8 +21,23 @@
 #
 # CRITICAL — DO NOT add `set -e` or `set -o pipefail`. Per guard-141, Claude
 # Code hooks MUST fail open on every error path: a push failure must never
-# block the user's edit. Failures print a stderr pointer to the guard-983
-# manual push recipe instead.
+# block the user's edit. Failures print the self-contained manual push recipe
+# inline below (the printed lines must never cite a guardrail that does not
+# exist — guard-983 never made it into the store, measured 2026-09-17).
+#
+# AUTH DECISION (, 2026-09-29): the daemon's admin routes gate on
+# MIND_API_TOKEN CONDITIONALLY (mind_api/src/server.py: _api_token = os.environ
+# .get("MIND_API_TOKEN","").strip(); if _api_token: ...) — a token-SET daemon
+# 401s every header-less call, a token-UNSET daemon accepts them. The hook's
+# own daemon POST below therefore authenticates WHEN a token resolves (env
+# first, then .env.local — the _rt.py chain the daemon's launcher uses), and
+# stays header-less when none resolves (measured: that is exactly the
+# token-unset regime, where the gate is skipped). Decision: the daemon-first
+# path is the intended primary — it carries the registry-derived STORAGE_* +
+# MIND_AWS_* context the CLI fallback must reconstruct — so it is RESTORED on
+# token-set boxes instead of letting them silently fall through to the CLI.
+# The token never reaches this script's stdout/stderr: it lives in a variable
+# used by -H only, and the printed recipe re-resolves it at run time.
 #
 # ORDERING NOTE: hook commands for the same matcher may run concurrently, so
 # tree-front-matter-sync (inside tree-sync-check.sh) can mutate a tree-node .md
@@ -155,8 +170,23 @@ PORT_FILE="${OWNCLOUD_PUSH_HOOK_PORT_FILE:-$PROJECT_ROOT/mind_api/state/daemon.p
 port=""
 [ -f "$PORT_FILE" ] && port=$(tr -d '[:space:]' < "$PORT_FILE")
 if [ -n "$port" ]; then
-    out=$(curl -s -X POST --max-time 8 -w '\n%{http_code}' \
-        "http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=${enc}" 2>/dev/null)
+    # : authenticate when a token resolves (env first, then the
+    # .env.local the daemon's launcher sources — the _rt.py chain; 
+    # is why the .env.local half exists). A token-unset daemon skips its
+    # auth gate entirely, so no resolved token stays header-less — an
+    # empty-Bearer header would 401 on a token-set daemon for nothing.
+    tok="${MIND_API_TOKEN:-}"
+    if [ -z "$tok" ]; then
+        tok=$(grep -E '^[[:space:]]*MIND_API_TOKEN=' "$ENV_LOCAL" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')
+    fi
+    if [ -n "$tok" ]; then
+        out=$(curl -s -X POST --max-time 8 -w '\n%{http_code}' \
+            -H "Authorization: Bearer $tok" \
+            "http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=${enc}" 2>/dev/null)
+    else
+        out=$(curl -s -X POST --max-time 8 -w '\n%{http_code}' \
+            "http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=${enc}" 2>/dev/null)
+    fi
     code=${out##*$'\n'}
     resp=${out%$'\n'*}
     if [ -n "$code" ] && [ "$code" != 000 ] && [ "$code" != 404 ]; then
@@ -214,13 +244,24 @@ else:
             invisible)
                 _tell_model "[owncloud-push-on-write] NOT pushed: the daemon cannot see $target (missing_or_dir) — $resp. The edit is local-only. Most likely it landed somewhere unintended, such as a literal PROJECT_ROOT/world or /meta path instead of the configured external root. Check: bash core/scripts/backend-cat.sh head <path> --exit-on-drift" ;;
             wrong-daemon)
-                _tell_model "[owncloud-push-on-write] NOT pushed: the process on port $port answered as a non-own-cloud backend, but this box's config selects own-cloud, so it is not this box's daemon (a test daemon can hold the port). $target is local-only until the real daemon answers: check mind_api/state/daemon.port, then re-push per guard-983." ;;
+                _tell_model "[owncloud-push-on-write] NOT pushed: the process on port $port answered as a non-own-cloud backend, but this box's config selects own-cloud, so it is not this box's daemon (a test daemon can hold the port). $target is local-only until the real daemon answers: check mind_api/state/daemon.port, then re-push once it answers." ;;
             skipped)
                 _tell_model "[owncloud-push-on-write] NOT pushed: the daemon skipped $target for a reason this hook does not know — $resp. Treat the edit as not in the store until checked: bash core/scripts/backend-cat.sh head <path> --exit-on-drift" ;;
             not-landed)
                 _tell_model "[owncloud-push-on-write] NOT pushed: the daemon answered ok but did not land $target in the store — $resp. ok means no error, not pushed (guard-5663). diverged_skipped: local and store both changed since the baseline, so every sweep skips the file until it is reconciled (/reconcile-owncloud-conflicts). stale_pulled or nobaseline_reconciled: the store copy replaced this edit locally. Check before the next write to this file: bash core/scripts/backend-cat.sh head <path> --exit-on-drift" ;;
             *)
-                _tell_model "[owncloud-push-on-write] push FAILED or unreadable for $target (HTTP $code) — $resp. Treat the edit as not in the store until checked: bash core/scripts/backend-cat.sh head <path> --exit-on-drift. A transient error clears on a re-push or the next sweep; a refused merge (both sides changed since the baseline) does not, and the file stays frozen until reconciled (/reconcile-owncloud-conflicts). Re-push per guard-983: curl -X POST 'http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=<urlencoded-path>'" ;;
+                # : the re-push recipe is assembled in two variables, not
+                # inlined in the message argument: _py holds the token-resolver
+                # (single-quoted at the operator's shell; the python program
+                # contains NO single quotes, so nothing inside can close it), and
+                # _recipe backslashes $( and $TOK so they survive this script's
+                # double-quoted string and run in the OPERATOR's shell, not here.
+                # A one-liner embedded directly in a giant double-quoted argument
+                # cannot be escaped to survive both parses (three measured
+                # failures 2026-09-29); the split makes both parses trivial.
+                _py='import os;f="'"$ENV_LOCAL"'";t=os.environ.get("MIND_API_TOKEN","").strip();v=t if t else (next((l.partition("=")[2].strip().strip(chr(34)).strip(chr(39)) for l in open(f,encoding="utf-8",errors="replace") if l.partition("=")[0].strip()=="MIND_API_TOKEN"),"") if os.path.isfile(f) else "");print(v,end="")'
+                _recipe="TOK=\"\$(python3 -c '$_py')\" && curl -s -X POST \"http://127.0.0.1:${port}/v1/admin/owncloud-sync-file?path=${enc}\" -H \"Authorization: Bearer \$TOK\" -w \"\\nHTTP %{http_code}\\n\""
+                _tell_model "[owncloud-push-on-write] push FAILED or unreadable for $target (HTTP $code) — $resp. Treat the edit as not in the store until checked: bash core/scripts/backend-cat.sh head <path> --exit-on-drift. A transient error clears on a re-push or the next sweep; a refused merge (both sides changed since the baseline) does not, and the file stays frozen until reconciled (/reconcile-owncloud-conflicts). Re-push (read the body's pushed/in_sync/reason fields for the verdict, never just ok — guard-5663, guard-5478): ${_recipe}" ;;
         esac
         exit 0
     fi
@@ -262,7 +303,12 @@ fi
 
 if ! python3 "$SCRIPT_DIR/owncloud_sync.py" --file "$target"; then
     # The bare-CLI recipe this line used to offer silently no-ops from a shell
-    # (guard-5663), so it is not handed to the model.
-    _tell_model "[owncloud-push-on-write] NOT pushed: no daemon answered (or it predates the push route), and the CLI fallback failed for $target. Check the store (bash core/scripts/backend-cat.sh head <path> --exit-on-drift), then re-push through the daemon once it is up, per guard-983: curl -X POST 'http://127.0.0.1:<daemon-port>/v1/admin/owncloud-sync-file?path=<urlencoded-path>' (port: mind_api/state/daemon.port)"
+    # (guard-5663), so it is not handed to the model. Same fragment assembly as
+    # the daemon arm above, but the daemon may be DOWN here, so the recipe
+    # re-reads the port from the port file at run time ($P) instead of baking
+    # this shell's $port (which may be stale or empty).
+    _py='import os;f="'"$ENV_LOCAL"'";t=os.environ.get("MIND_API_TOKEN","").strip();v=t if t else (next((l.partition("=")[2].strip().strip(chr(34)).strip(chr(39)) for l in open(f,encoding="utf-8",errors="replace") if l.partition("=")[0].strip()=="MIND_API_TOKEN"),"") if os.path.isfile(f) else "");print(v,end="")'
+    _recipe="P=\"\$(tr -d '[:space:]' < \"${PORT_FILE}\")\"; TOK=\"\$(python3 -c '$_py')\" && curl -s -X POST \"http://127.0.0.1:\$P/v1/admin/owncloud-sync-file?path=${enc}\" -H \"Authorization: Bearer \$TOK\" -w \"\\nHTTP %{http_code}\\n\""
+    _tell_model "[owncloud-push-on-write] NOT pushed: no daemon answered (or it predates the push route), and the CLI fallback failed for $target. Check the store (bash core/scripts/backend-cat.sh head <path> --exit-on-drift), then re-push through the daemon once it is up (the recipe below re-reads the port from ${PORT_FILE}, so it also works before the daemon answers; read the body's pushed/in_sync/reason fields for the verdict, never just ok — guard-5663, guard-5478): ${_recipe}"
 fi
 exit 0

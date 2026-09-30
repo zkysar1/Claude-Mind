@@ -31,6 +31,9 @@
 
 set -uo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (g-115-11431, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 # ─── Args ────────────────────────────────────────────────────────────────
 # --auto-clean: when Mode D findings are present AND daemon /v1/admin/health
@@ -197,7 +200,7 @@ if [ -d "$PROJECT_ROOT" ]; then
     #
     # Form matches guard-165: env-var values + single-quoted python
     # source — no shell interpolation into source text.
-    cruft_stream="$(SCRIPT_DIR="$SCRIPT_DIR" PROJECT_ROOT="$PROJECT_ROOT" py -3 -c '
+    cruft_stream="$(SCRIPT_DIR="$SCRIPT_DIR" PROJECT_ROOT="$PROJECT_ROOT" $PYLAUNCH -c '
 import os, sys
 sys.path.insert(0, os.environ["SCRIPT_DIR"])
 from _orphan_root_helpers import is_mode_d_cruft
@@ -297,7 +300,7 @@ if [ "$AUTO_CLEAN" = "true" ] && [ "${#mode_d_paths[@]}" -gt 0 ]; then
         # Quiet curl; if reachable, extract git_head_sha via py -3 (jq absent on Windows git-bash).
         daemon_response="$(curl -sf --max-time 3 "$daemon_url" 2>/dev/null || echo "")"
         if [ -n "$daemon_response" ]; then
-            daemon_sha="$(printf '%s' "$daemon_response" | py -3 -c 'import json,sys
+            daemon_sha="$(printf '%s' "$daemon_response" | $PYLAUNCH -c 'import json,sys
 try:
     d = json.load(sys.stdin)
     print(d.get("git_head_sha") or "")

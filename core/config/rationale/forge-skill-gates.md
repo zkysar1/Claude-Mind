@@ -153,7 +153,7 @@ verdict per entry. (guard-1220, rb-4004, rb-4124.)
 
 ## Step 4 registration — why the gates
 
-**Phantom registration (rb-10227, guard-2242, guard-2335).** Measured on a
+**Phantom registration (rb-10227, guard-2242, guard-7539).** Measured on a
 downstream clone 2026-09-05 11:55Z: `mkdir -p` succeeded, the `Write` of SKILL.md
 was refused by the L1 hook, and registration proceeded anyway — registry row
 written, skill dir EMPTY, a test goal filed to exercise a skill with no body, two
@@ -161,9 +161,11 @@ written, skill dir EMPTY, a test goal filed to exercise a skill with no body, tw
 pointing at an absent body is a PHANTOM registration: it advertises a trigger
 fleet-wide that dispatches to nothing (guard-2242: a pointer field is not evidence
 until its referent is confirmed to exist). The body gate checks DISK PRESENCE at
-the load path, deliberately not catalog listing — a skill forged mid-session
-cannot appear in its own session's catalog on Claude Code (guard-2335), so a
-catalog assertion would refuse every correct forge.
+the load path, deliberately not catalog listing: a script cannot read the model's
+catalog. guard-2335 held that a skill forged mid-session could not appear in its
+own session's catalog at all. guard-7539 (2026-09-29) superseded it, because Claude
+Code 2.1.283 announces such a skill about 45 s after the write. That announcement
+reaches only the model, so a catalog assertion is still ungateable.
 
 **`amended_at` is LWW tier 0 (guard-1153).** `merge_forged_skills` resolves a
 same-name conflict WHOLE-RECORD, and an amendment bumps no `forged_date` and adds
@@ -226,7 +228,7 @@ relation instead of forging a new one.
 - rb-10227 — phantom-registration incident (downstream clone, 2026-09-05)
 - guard-1153 — `amended_at` LWW; guard-1195 — capability_level/confidence coupling
 - guard-1220, guard-1462, guard-1793, guard-920, guard-2329 — dogfood vacuity/seam guards
-- guard-2242, guard-2335 — pointer-not-evidence, mid-session catalog absence
+- guard-2242, guard-7539 (supersedes guard-2335) — pointer-not-evidence, mid-session catalog listing
 - guard-4841, guard-2119 — overlap-check by-hand
 - g-115-3131, g-250-269 — typeless default + confidence-gloss correction
 - g-115-2373 — forged-body git-distribution

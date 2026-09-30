@@ -12,4 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/_paths.sh"
-exec py -3 "$SCRIPT_DIR/goal-citation-audit.py" "$@"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
+exec $PYLAUNCH "$SCRIPT_DIR/goal-citation-audit.py" "$@"

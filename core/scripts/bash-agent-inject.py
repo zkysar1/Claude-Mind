@@ -418,17 +418,13 @@ def _maybe_tick_heartbeat(agent: str, sid: str, project_root: Path) -> None:
     stale-break its lease. Measured 2026-08-28 (coach on zc-03, a served 27B):
     precheck alone ran 1h53m, the claim heartbeat aged to 6544s, the worker
     parked on "Reducer STALE". This hook fires before EVERY Bash call, so a
-    tick from here is the one cadence that tracks the model's actual pace.
+    tick from here tracks the model's pace. It does not cover a stretch with
+    no Bash call, which is why presence-tick.py ticks worker Bodies after
+    every tool call too (g-375-80).
 
-    ROLE SPLIT is the caller's job. The tick's own state gate separates a
-    cross-box worker (IDLE by design) from the reducer, but a same-box worker
-    shares agent-state=RUNNING and would renew the reducer's lease with the
-    shared runner-token. So: SID == running-session-id -> the full tick, on the
-    diary path's own `claim-renewal-last` window (one tick per interval across
-    both callers); any other Body -> `--body-only`, which refreshes only its
-    carrier, on a per-SID stamp under core/logs. A session with NO carrier is
-    not a Body (an observer, an assistant) and never ticks — and this function
-    never creates the carrier; /start and the tick own that.
+    The decision (carrier check, role split, stamps, rate limit) lives in
+    _shared_tick.maybe_tick, shared with presence-tick.py so the two hooks
+    tick a Body at most once per interval between them.
 
     DETACHED (see _shared_tick.spawn_detached): this hook is on the critical
     path of every tool call, and a tick blocked on a slow daemon would time the
@@ -436,36 +432,9 @@ def _maybe_tick_heartbeat(agent: str, sid: str, project_root: Path) -> None:
     every path, like every other clause in this hook.
     """
     try:
-        if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
-            return
-        state_dir = _agent_dir(project_root, agent) / "session"
-        carrier = state_dir / f"body-heartbeat-{sid}.json"
-        if not carrier.is_file():
-            return
         import _shared_tick
-        if _shared_tick.pytest_suppressed():
-            return
-        running = ""
-        try:
-            running = (state_dir / "running-session-id").read_text(encoding="utf-8").strip()
-        except OSError:
-            pass
-        if running == sid:
-            body_only = False
-            stamp = state_dir / "claim-renewal-last"
-        else:
-            body_only = True
-            stamp = project_root / "core" / "logs" / "heartbeat-hook" / sid
-        if not _shared_tick.due(stamp):
-            return
-        # Stamp BEFORE the spawn so a slow or failing tick cannot re-fire on
-        # every subsequent call (the same order execution-diary.py uses).
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.touch()
-        _shared_tick.spawn_detached(
-            SCRIPT_DIR, agent, sid, body_only=body_only,
-            log_path=project_root / "core" / "logs" / f"heartbeat-hook-{agent}.log",
-            cwd=project_root)
+        _shared_tick.maybe_tick(agent, sid, _agent_dir(project_root, agent) / "session",
+                                project_root, SCRIPT_DIR)
     except Exception:
         pass
 

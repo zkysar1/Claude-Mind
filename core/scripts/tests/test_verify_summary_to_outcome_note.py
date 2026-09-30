@@ -150,6 +150,11 @@ def _stage(tmp_path):
     (core / "closure-evidence-write.sh").write_text(
         (SCRIPTS / "closure-evidence-write.sh").read_text(encoding="utf-8"),
         encoding="utf-8")
+    # Real bytes: iteration-close.sh and closure-evidence-write.sh both source
+    # _python_launcher.sh beside themselves ().
+    (core / "_python_launcher.sh").write_text(
+        (SCRIPTS / "_python_launcher.sh").read_text(encoding="utf-8"),
+        encoding="utf-8")
     (core / "aspirations-update-goal.sh").write_text(STUB_UPDATE, encoding="utf-8")
     (core / "aspirations-query.sh").write_text(STUB_QUERY, encoding="utf-8")
     for name in PASSTHROUGH_STUBS:

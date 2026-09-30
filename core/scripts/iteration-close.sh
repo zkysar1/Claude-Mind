@@ -105,6 +105,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (g-115-11431, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 # _platform.sh converts MSYS /c/... paths to Windows C:/... paths on Git Bash
 # so every inline `python3 -c "open(r'$path', ...)"` block resolves correctly. Without
 # this, Python treats /c/ZakNoCloud/... as relative-to-drive-root and the open
@@ -900,7 +903,7 @@ if [[ -n "$SUMMARY_FILE" ]]; then
     # LOUDLY (guard-2298: a malfunction that renders as a clean result is worse
     # than the fault). `|| true` keeps `set -e` out of the decision.
     _sss_rc=0
-    py -3 "$(_winpath "$SCRIPT_DIR/stale-summary-source-gate.py")" \
+    $PYLAUNCH "$(_winpath "$SCRIPT_DIR/stale-summary-source-gate.py")" \
         --path "$SUMMARY_FILE" --goal "${GOAL_ID:-}" --source "${SOURCE:-}" \
         --caller "iteration-close.sh:summary-file-resolve" \
         ${OVERRIDE_STALE_SOURCE:+--override-stale-source "$OVERRIDE_STALE_SOURCE"} \
@@ -4563,7 +4566,9 @@ do_productivity_check() {
     # and a corpus source is newer than the index — rb, guardrails, OR the
     # knowledge tree (_tree.yaml + node .md bodies, added g-115-3763) — spawns
     # `embedding-index-build.py --update` DETACHED (incremental — re-embeds
-    # changed docs only), debounced to one attempt per 6h. Same LOCAL-tick
+    # changed docs only). The debounce is success-aware: 10 min after an update
+    # that landed, 6h after one that did not. The daemon's /v1/retrieve runs
+    # the same tick (g-115-3684). Same LOCAL-tick
     # rationale as agent-watchdog above: the index is per-box daemon cache,
     # so a world-scoped recurring goal (runs on ONE box per firing) cannot
     # keep every box fresh. Fail-open: never delays loop continuation.

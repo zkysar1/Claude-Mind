@@ -21,6 +21,11 @@ hand-run chore on every box:
             the files that DIVERGE — still route to a declared seam symbol when
             read at X's own proof commit.
 
+A DOWNSTREAM repository never contains the seam commit (the sha is this
+world's), so there ancestry is unanswerable rather than failed: a store that
+declares `seam_symbols` then proves on routing alone, over EVERY consumer at
+X's own commit (g-358-226, reason `seam_routed_without_seam_object`).
+
 Tier 2 exists because byte-identity is a TRANSPORT for a narrower property:
 every unrelated edit to any consumer breaks the proof without touching whether
 the consumer routes to the seam. On a dev tier moving at ~2.9 consumer
@@ -295,6 +300,33 @@ def _live_body_sids(bodies: dict | None, now: datetime) -> list[str]:
     return live
 
 
+def _route_at_commit(commit: str, paths: list[str],
+                     specs) -> tuple[list, list, list]:
+    """Read each path AT `commit`; return (routed, missing, unreadable).
+
+    Read at the box's own proof commit — NOT at origin/main, which would prove
+    nothing about this box, and NOT from the working tree, which is a
+    different box's. Shared by tier 2 (the diverging files) and the downstream
+    fall-through (every consumer) so the two cannot disagree about "routes".
+    """
+    routed, missing, unreadable = [], [], []
+    for path in paths:
+        out = _git("show", f"{commit}:{path}")
+        if out.returncode != 0:
+            # guard-487: unreadable input REFUSES. A consumer missing at the
+            # box's commit is exactly the pre-seam state this gate exists to
+            # catch, and `git show` failing is indistinguishable from it.
+            unreadable.append({"consumer": path,
+                               "error": out.stderr.strip()[:160]})
+            continue
+        matched = _calls_any_symbol(out.stdout, specs, path)
+        if matched:
+            routed.append({"consumer": path, "symbol": matched})
+        else:
+            missing.append(path)
+    return routed, missing, unreadable
+
+
 def _prove_commit(commit: str, ciso: str, seam_commit: str,
                   consumers: list[str], now: datetime,
                   seam_symbols=None) -> dict:
@@ -320,6 +352,11 @@ def _prove_commit(commit: str, ciso: str, seam_commit: str,
     `reason="seam_routed_despite_divergence"` where tier 1 carries no reason at
     all, so a reader can always tell which predicate carried a verdict. Never
     make them equal.
+
+    DOWNSTREAM (g-358-226): when the seam OBJECT is absent from this repository
+    (merge-base rc other than 0 or 1), a store that declares `seam_symbols`
+    runs the same routing read over EVERY consumer and proves under a third
+    reason, `seam_routed_without_seam_object`.
     """
     # ciso is git's %cI, which always carries an offset. Hand-splitting it off
     # kept the wall-clock reading (12:00+02:00 -> 12:00); _parse_ts CONVERTS to
@@ -346,10 +383,27 @@ def _prove_commit(commit: str, ciso: str, seam_commit: str,
         return {"proven": False, "reason": "seam_not_ancestor",
                 "commit": commit[:9]}
     if anc.returncode != 0:
-        return {"proven": False, "reason": "seam_object_absent",
-                "commit": commit[:9], "seam": seam_commit[:9],
-                "git_rc": anc.returncode,
-                "git_error": anc.stderr.strip()[:160]}
+        absent = {"proven": False, "reason": "seam_object_absent",
+                  "commit": commit[:9], "seam": seam_commit[:9],
+                  "git_rc": anc.returncode,
+                  "git_error": anc.stderr.strip()[:160]}
+        # DOWNSTREAM FALL-THROUGH (). The seam sha is this world's
+        # commit, so a downstream repository can never contain it: tier 1 is
+        # unanswerable there, not failed. A store that declares seam_symbols
+        # falls through to symbol routing over EVERY consumer at this box's own
+        # commit, not only the files that diverge from this repository's
+        # origin/main, because byte-identity proves nothing without ancestry to
+        # anchor it. rc==1 returned above, so a genuine non-ancestor is still
+        # never rescued by routing evidence. A refusal keeps the root reason.
+        specs = _symbol_specs(seam_symbols)
+        if not specs:
+            return absent
+        routed, missing, unreadable = _route_at_commit(commit, consumers, specs)
+        if missing or unreadable:
+            return {**absent, "missing": missing, "unreadable": unreadable}
+        return {"proven": True, "reason": "seam_routed_without_seam_object",
+                "commit": commit[:9], "committed_at": ciso,
+                "age_days": round(age_days, 1), "routed": routed}
     # Rationale (WHY two tiers, and what tier 2 gives up):
     # core/config/rationale/store-cutover-attestation-predicate.md
     # Byte-identity is a TRANSPORT for a narrower property ("the consumers route
@@ -369,24 +423,8 @@ def _prove_commit(commit: str, ciso: str, seam_commit: str,
             # cannot reach the narrower tier — opt-in per store, by design.
             return {"proven": False, "reason": "consumers_diverge_from_main",
                     "commit": commit[:9], "diff_files": changed[:10]}
-        # TIER 2, scoped to the DIVERGING files only. Read each at the box's own
-        # proof commit — NOT at origin/main, which would prove nothing about
-        # this box, and NOT from the working tree, which is a different box's.
-        missing, unreadable, routed = [], [], []
-        for path in changed:
-            out = _git("show", f"{commit}:{path}")
-            if out.returncode != 0:
-                # guard-487: unreadable input REFUSES. A consumer missing at the
-                # box's commit is exactly the pre-seam state this gate exists to
-                # catch, and `git show` failing is indistinguishable from it.
-                unreadable.append({"consumer": path,
-                                   "error": out.stderr.strip()[:160]})
-                continue
-            matched = _calls_any_symbol(out.stdout, specs, path)
-            if matched:
-                routed.append({"consumer": path, "symbol": matched})
-            else:
-                missing.append(path)
+        # TIER 2, scoped to the DIVERGING files only.
+        routed, missing, unreadable = _route_at_commit(commit, changed, specs)
         if missing or unreadable:
             return {"proven": False,
                     "reason": "diverging_consumers_do_not_route_to_seam",
@@ -892,37 +930,56 @@ def _local_report(seam_commit: str, consumers: list[str],
         if anc.returncode == 1:
             return {"seam_present": False, "reason": "seam_not_ancestor_of_HEAD"}
         if anc.returncode != 0:
-            return {"seam_present": False, "reason": "seam_object_absent",
-                    "seam": seam_commit[:9], "git_rc": anc.returncode,
-                    "git_error": anc.stderr.strip()[:160]}
-        diff = _git("diff", "--name-only", "origin/main", "--", *consumers)
-        if diff.returncode != 0:
-            return {"seam_present": False, "reason": "diff_failed"}
-        changed = [l for l in diff.stdout.splitlines() if l.strip()]
-        if changed:
-            return {"seam_present": False,
-                    "reason": "consumers_differ_from_origin_main",
-                    "diff_files": changed[:10]}
-        specs = _symbol_specs(seam_symbols)
-        if specs:
-            missing, unreadable = [], []
-            for path in consumers:
-                try:
-                    text = (PROJECT_ROOT / path).read_text(
-                        encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    unreadable.append({"consumer": path, "error": str(exc)})
-                    continue
-                if not _calls_any_symbol(text, specs, path):
-                    missing.append(path)
-            if missing or unreadable:
-                return {"seam_present": False,
-                        "reason": "consumers_do_not_route_to_any_seam_symbol",
-                        "symbols": [n for n, _, _ in specs],
-                        "missing": missing, "unreadable": unreadable}
-        return {"seam_present": True}
+            absent = {"seam_present": False, "reason": "seam_object_absent",
+                      "seam": seam_commit[:9], "git_rc": anc.returncode,
+                      "git_error": anc.stderr.strip()[:160]}
+            # DOWNSTREAM FALL-THROUGH (), the local half of
+            # _prove_commit's: with ancestry unanswerable, the tree checks (no
+            # drift from this repository's origin/main, then EVERY consumer
+            # routing to a declared seam symbol) are the whole proof. Local
+            # drift still refuses, so this lane still has no divergence tier.
+            if not _symbol_specs(seam_symbols):
+                return absent
+            tree = _local_tree_report(consumers, seam_symbols)
+            if not tree["seam_present"]:
+                return {**absent, "downstream": tree}
+            return {"seam_present": True,
+                    "reason": "seam_routed_without_seam_object"}
+        return _local_tree_report(consumers, seam_symbols)
     except Exception as exc:
         return {"seam_present": False, "reason": f"git_error: {exc}"}
+
+
+def _local_tree_report(consumers: list[str], seam_symbols=None) -> dict:
+    """_local_report's working-tree half: identity to origin/main, then (when
+    the store declares `seam_symbols`) every consumer's deployed bytes route to
+    one of them. A git error raises; _local_report catches it."""
+    diff = _git("diff", "--name-only", "origin/main", "--", *consumers)
+    if diff.returncode != 0:
+        return {"seam_present": False, "reason": "diff_failed"}
+    changed = [l for l in diff.stdout.splitlines() if l.strip()]
+    if changed:
+        return {"seam_present": False,
+                "reason": "consumers_differ_from_origin_main",
+                "diff_files": changed[:10]}
+    specs = _symbol_specs(seam_symbols)
+    if specs:
+        missing, unreadable = [], []
+        for path in consumers:
+            try:
+                text = (PROJECT_ROOT / path).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError as exc:
+                unreadable.append({"consumer": path, "error": str(exc)})
+                continue
+            if not _calls_any_symbol(text, specs, path):
+                missing.append(path)
+        if missing or unreadable:
+            return {"seam_present": False,
+                    "reason": "consumers_do_not_route_to_any_seam_symbol",
+                    "symbols": [n for n, _, _ in specs],
+                    "missing": missing, "unreadable": unreadable}
+    return {"seam_present": True}
 
 
 def _head_commit() -> str:

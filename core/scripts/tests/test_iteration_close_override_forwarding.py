@@ -243,8 +243,12 @@ def test_residual_override_reaches_the_status_call_not_a_later_one():
     """
     src = _close_sh()
     idx_build = src.find("update_cmd=(")
-    idx_exec = src.find('"${update_cmd[@]}"')
+    # Anchor the exec search to the build site. The FIRST "${update_cmd[@]}" in the
+    # file sits inside a comment (the header paragraph quotes the call), so an
+    # unanchored find measures that comment, not the executable status-write call --
+    # which fails a correct script on a stale-looking offset. ()
     idx_append = src.find('update_cmd+=(--override-residual')
+    idx_exec = src.find('"${update_cmd[@]}"', idx_build)
     assert idx_build != -1 and idx_exec != -1, "update_cmd build/exec sites not found"
     assert idx_append != -1, "--override-residual is never appended to update_cmd"
     assert idx_build < idx_append < idx_exec, (

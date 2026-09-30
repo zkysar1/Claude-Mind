@@ -17,6 +17,9 @@
 set -euo pipefail
 
 SCRIPT_NAME="iteration-commit.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$(dirname "${BASH_SOURCE[0]}")/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 usage() {
   cat <<'EOF'
@@ -310,7 +313,7 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" ]]; then
       committer_claimed_at_iso="${raw_claimed_at//\"/}"  # strip surrounding quotes
       if [[ -n "$committer_claimed_at_iso" && "$committer_claimed_at_iso" != "null" ]]; then
         # Convert ISO timestamp to epoch via py -3 (POSIX date doesn't parse ISO portably on Windows).
-        committer_claimed_at_epoch=$(CLAIMED_AT_E="$committer_claimed_at_iso" py -3 - 2>/dev/null <<'PYEOF' || echo 0
+        committer_claimed_at_epoch=$(CLAIMED_AT_E="$committer_claimed_at_iso" $PYLAUNCH - 2>/dev/null <<'PYEOF' || echo 0
 import os, sys, datetime
 try:
     t = os.environ.get("CLAIMED_AT_E", "")
@@ -348,7 +351,7 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -g
       raw_p=$("$paths_sh_partner" --field "agent_status.${partner}.in_flight.claimed_at" --json 2>/dev/null || echo '""')
       iso_p="${raw_p//\"/}"
       if [[ -n "$iso_p" && "$iso_p" != "null" ]]; then
-        ep_p=$(CLAIMED_AT_E="$iso_p" py -3 - 2>/dev/null <<'PYEOF' || echo 0
+        ep_p=$(CLAIMED_AT_E="$iso_p" $PYLAUNCH - 2>/dev/null <<'PYEOF' || echo 0
 import os, sys, datetime
 try:
     t = os.environ.get("CLAIMED_AT_E", "")
@@ -404,7 +407,7 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -g
         if [[ -z "${partner_uncommitted_owner[$recorded_path]:-}" ]]; then
           partner_uncommitted_owner["$recorded_path"]="$partner"
         fi
-      done < <(LOG_PATH="$partner_log" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
+      done < <(LOG_PATH="$partner_log" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" $PYLAUNCH - 2>/dev/null <<'PYEOF' || true
 import json, os, sys, time
 # Normalize recorded paths to PROJECT_ROOT-relative POSIX form so legacy
 # absolute uncommitted-edits.jsonl entries (C:/...) match the relative
@@ -476,7 +479,7 @@ if [[ $INCLUDE_UNTRACKED -eq 0 && -n "${MIND_AGENT:-}" && ${#known_agents[@]} -g
       recorded_path="${recorded_path%$'\r'}"
       [[ -z "$recorded_path" ]] && continue
       committer_authored_paths["$recorded_path"]=1
-    done < <(LOG_PATH="$own_log_snap" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
+    done < <(LOG_PATH="$own_log_snap" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" $PYLAUNCH - 2>/dev/null <<'PYEOF' || true
 import json, os, sys
 # Normalize own-log paths to PROJECT_ROOT-relative POSIX form so the
 # committer_authored_paths membership check below (keyed on git-status
@@ -550,7 +553,7 @@ if [[ $SESSION_SCOPE -eq 1 ]]; then
       recorded_path="${recorded_path%$'\r'}"
       [[ -z "$recorded_path" ]] && continue
       session_authored_paths["$recorded_path"]=1
-    done < <(LOG_PATH="$session_log" SESSION_SID_E="$SESSION_SID" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - <<'PYEOF' || true
+    done < <(LOG_PATH="$session_log" SESSION_SID_E="$SESSION_SID" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" $PYLAUNCH - <<'PYEOF' || true
 import json, os, sys
 # Same path normalizer as the two log consumers above (rb-1405 SSOT).
 sys.path.insert(0, os.environ.get("XAGENT_SCRIPTS", ""))
@@ -969,7 +972,7 @@ while IFS= read -r line; do
     if [[ $pc_is_agent_dir -eq 0 ]]; then
       file_full="$REPO/$path"
       if [[ -f "$file_full" || -d "$file_full" ]]; then
-        file_mtime=$(FILE_E="$file_full" py -3 - 2>/dev/null <<'PYEOF' || echo 0
+        file_mtime=$(FILE_E="$file_full" $PYLAUNCH - 2>/dev/null <<'PYEOF' || echo 0
 import os, sys
 try:
     print(int(os.path.getmtime(os.environ["FILE_E"])))
@@ -1018,7 +1021,7 @@ PYEOF
     if [[ $pc_is_agent_dir_p -eq 0 ]]; then
       file_full_p="$REPO/$path"
       if [[ -f "$file_full_p" || -d "$file_full_p" ]]; then
-        file_mtime_p=$(FILE_E="$file_full_p" py -3 - 2>/dev/null <<'PYEOF' || echo 0
+        file_mtime_p=$(FILE_E="$file_full_p" $PYLAUNCH - 2>/dev/null <<'PYEOF' || echo 0
 import os, sys
 try:
     print(int(os.path.getmtime(os.environ["FILE_E"])))
@@ -1462,7 +1465,7 @@ _record_commit_refusal() {
   CR_RC="${1:-}" CR_OUT="${2:-}" CR_REPO="$REPO" CR_SIG="$sig" CR_AGENT="${MIND_AGENT:-}" \
   CR_STAGED="$(git -C "$REPO" diff --cached --name-only 2>/dev/null | head -40 | tr '\n' '\f' || true)" \
   CR_TS="$(date +%Y-%m-%dT%H:%M:%S)" \
-  py -3 - <<'CRPYEOF' || true
+  $PYLAUNCH - <<'CRPYEOF' || true
 import json, os
 staged = [s for s in os.environ.get("CR_STAGED", "").split("\f") if s]
 rec = {
@@ -1764,7 +1767,7 @@ if [[ -n "${MIND_AGENT:-}" && ${#staged_files[@]} -gt 0 ]]; then
   if [[ -f "$own_log" ]]; then
     # Build newline-delimited set of committed rel paths.
     committed_set=$(printf '%s\n' "${staged_files[@]}")
-    OWN_LOG="$own_log" COMMITTED="$committed_set" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" py -3 - 2>/dev/null <<'PYEOF' || true
+    OWN_LOG="$own_log" COMMITTED="$committed_set" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" $PYLAUNCH - 2>/dev/null <<'PYEOF' || true
 import json, os, tempfile, sys
 # : normalize the own-log `file` to PROJECT_ROOT-relative POSIX before
 # the committed-set membership test — the SAME _normalize_rel_path the two

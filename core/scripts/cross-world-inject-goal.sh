@@ -45,6 +45,9 @@
 #
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (g-115-11431, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 # ── Target-world resolution (PER-MACHINE — never a hardcoded literal) ────────
 # A sibling world's directory is a filesystem path that exists on SOME machines
@@ -260,7 +263,7 @@ check_rate_limit() {
     [ -f "$asp_file" ] || return 0   # file doesn't exist yet — no prior injections
 
     local count
-    count=$(py -3 -c "
+    count=$($PYLAUNCH -c "
 import json, sys
 from datetime import datetime, timedelta
 
@@ -369,7 +372,7 @@ GOAL_ID="g-xw-${ID_SLUG}-01"
 # G2: sandbox:true + injected_by on both aspiration and goal
 # G3: participants:[agent,user] on the goal — human must approve before goal executes
 # G5: cross_world_origin, cross_world_reason, cross_world_timestamp on aspiration
-RECORD=$(py -3 -c "
+RECORD=$($PYLAUNCH -c "
 import json, sys
 
 asp_id       = sys.argv[1]
@@ -442,7 +445,7 @@ if [ "$DRY_RUN" = "true" ]; then
     echo "DRY-RUN: Would append TWO records to $ASP_FILE:"
     echo ""
     echo "[1] Audit record (asp-xw-* -- provenance trail; goals[] IS selector-visible; progress cache now populated, g-115-1641):"
-    echo "$RECORD" | py -3 -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()),indent=2))"
+    echo "$RECORD" | $PYLAUNCH -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()),indent=2))"
     echo ""
     echo "[2] Selector-visible goal (Layer 1): g-${TARGET_ASPIRATION#asp-}-<next_seq> in $TARGET_ASPIRATION"
     echo "    origin_signal: user_directive | participants: [agent,user] | sandbox: true"
@@ -486,7 +489,7 @@ echo "$RECORD" >> "$ASP_FILE"
 
 # Layer 1: find next goal sequence number -- scans embedded goals in TARGET_ASPIRATION
 # (g-115-1 fix: previously scanned only top-level record IDs, missing all embedded goals)
-SECONDARY_GOAL_ID=$(py -3 -c "
+SECONDARY_GOAL_ID=$($PYLAUNCH -c "
 import json, sys, re
 asp_num  = sys.argv[1]
 asp_id   = sys.argv[2]
@@ -524,7 +527,7 @@ print(f'g-{asp_num}-{max_seq + 1}')
 # Write [2]: inject goal into TARGET_ASPIRATION's goals[] array (in-place rewrite)
 # (g-115-1 fix: previously appended standalone records invisible to collect_candidates())
 set +e   # see the WRITE2 rc handling below -- do NOT let set -e swallow this
-WRITE2_RC=$(py -3 -c "
+WRITE2_RC=$($PYLAUNCH -c "
 import json, os, stat, sys, tempfile
 goal_id=sys.argv[1]; title=sys.argv[2]; description=sys.argv[3]
 priority=sys.argv[4]; category=sys.argv[5]; origin=sys.argv[6]
@@ -652,7 +655,7 @@ if [ "$WRITE2_EXIT" -ne 0 ] || [ "$WRITE2_RC" != "ok" ]; then
 fi
 
 # Layer 2: post-injection verification -- check goal embedded in TARGET_ASPIRATION's goals[]
-VERIFY=$(py -3 -c "
+VERIFY=$($PYLAUNCH -c "
 import json, sys
 goal_id=sys.argv[1]; target_asp=sys.argv[2]; asp_file=sys.argv[3]
 with open(asp_file, 'r', encoding='utf-8') as fh:

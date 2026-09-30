@@ -162,6 +162,28 @@ def main() -> int:
     if not agent:
         return 0
 
+    # Step 3b: tick a worker Body's liveness carrier at EVERY tool call
+    # (). bash-agent-inject.py ticks it only before Bash calls, so a
+    # Body in a long Read/Edit/Grep stretch read as dead: at 3-8 min per model
+    # call such a stretch lasts hours, and the stranded-claim sweep released
+    # zc-05's live claim mid-work (2026-09-29 04:42). Same decision, stamp and
+    # interval as the Bash hook (_shared_tick.maybe_tick), so the two hooks
+    # tick a Body at most once per interval between them. full_allowed=False:
+    # this process runs with STORAGE_BACKEND=local (presence-tick.sh). The
+    # --body-only tick tolerates that, since it writes the carrier as a plain
+    # file and the daemon publishes it with the daemon's own backend. The
+    # reducer's full tick was not built for it, so the reducer keeps its
+    # diary-write and Bash-call cadences. Fail-open: a tick must never delay
+    # or break the presence record below.
+    try:
+        import _shared_tick
+        from _paths import agent_dir
+        _shared_tick.maybe_tick(agent, session_id, agent_dir(agent) / "session",
+                                Path(PROJECT_ROOT), SCRIPT_DIR,
+                                full_allowed=False, via="post-tool")
+    except Exception:
+        pass
+
     # Step 4: Optional goal_id from the agent's team-state row (
     # sharding: row file first, core-file residual fallback).
     goal_id = ""

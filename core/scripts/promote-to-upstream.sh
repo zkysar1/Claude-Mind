@@ -37,6 +37,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo "ERROR: failed to source _paths.sh" >&2; exit 2; }
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 LIB="$SCRIPT_DIR/_release_lib.py"
 INIT_PY="$PROJECT_ROOT/mind_api/src/__init__.py"
 # RELEASES.json check delegated to check-releases-current.sh (role-aware, );
@@ -82,7 +85,7 @@ fail() { echo "[promote] ERROR: $*" >&2; exit 1; }
 # this source) from a silent set -e death into an actionable diagnostic — the
 # same silent-exit-1 class that the ','.join bug originally produced. (review F5)
 set +e
-ROLES="$(OVERLAY="$OVERLAY" FW="$FW_COMPAT" py -3 -c '
+ROLES="$(OVERLAY="$OVERLAY" FW="$FW_COMPAT" $PYLAUNCH -c '
 import os
 try:
     import yaml
@@ -108,7 +111,7 @@ IFS='|' read -r SELF_ROLE TARGET_ROLE CHAIN <<< "$ROLES"
 if [[ "$SELF_ROLE" == "NOTARGET" ]]; then fail "role '$TARGET_ROLE' is the end of the chain — nothing downstream to promote to (CW4)"; fi
 if [[ "$SELF_ROLE" == "ERR" || -z "$SELF_ROLE" ]]; then fail "cannot resolve promotion roles: ${TARGET_ROLE:-unknown}"; fi
 # CW4: hard chain-order check via the lib.
-if ! py -3 "$LIB" check-promotion-order "$CHAIN" "$SELF_ROLE" "$TARGET_ROLE" >/dev/null; then
+if ! $PYLAUNCH "$LIB" check-promotion-order "$CHAIN" "$SELF_ROLE" "$TARGET_ROLE" >/dev/null; then
   fail "promotion $SELF_ROLE -> $TARGET_ROLE is not a single downstream step (CW4)"
 fi
 say "promoting $SELF_ROLE -> $TARGET_ROLE  (target clone: $TARGET)"
@@ -235,7 +238,7 @@ TARGET_INIT="$TARGET/mind_api/src/__init__.py"
 if [[ -f "$TARGET_INIT" ]]; then
   TGT_VER="$(grep -E '^__version__' "$TARGET_INIT" | sed -E 's/.*"([^"]+)".*/\1/' || true)"
   if [[ -n "$TGT_VER" ]]; then
-    set +e; CMP="$(py -3 "$LIB" compare "$LOCAL" "$TGT_VER")"; CRC=$?; set -e
+    set +e; CMP="$($PYLAUNCH "$LIB" compare "$LOCAL" "$TGT_VER")"; CRC=$?; set -e
     if [[ $CRC -ne 0 ]]; then fail "target version '$TGT_VER' is not valid semver"; fi
     if [[ "$CMP" == "-1" ]]; then fail "INVARIANT VIOLATION (CW2): local $LOCAL < target $TARGET_ROLE $TGT_VER — cannot promote backwards"; fi
     say "frontier-invariant OK: local $LOCAL >= target $TGT_VER"

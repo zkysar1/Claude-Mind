@@ -27,6 +27,9 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 DEST=""
 DRY_RUN=0
@@ -115,7 +118,7 @@ if [ $PLAN -eq 1 ]; then
     # a non-zero rc from the engine would otherwise kill the script here with no
     # diagnostic, turning a legible refusal into an opaque death.
     set +e
-    py -3 "$SCRIPT_DIR/_seed_engine.py" plan \
+    $PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" plan \
         --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST" $PLAN_FLAGS
     PLAN_RC=$?
     set -e
@@ -248,7 +251,7 @@ fi
 echo "[seed-transplant] Building copy plan..."
 ERR_LOG="$(mktemp 2>/dev/null || echo "/tmp/seed-transplant-err.$$")"
 set +e
-PLAN="$(py -3 "$SCRIPT_DIR/_seed_engine.py" build-plan --manifest "$MANIFEST" --source "$PROJECT_ROOT" 2>"$ERR_LOG")"
+PLAN="$($PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" build-plan --manifest "$MANIFEST" --source "$PROJECT_ROOT" 2>"$ERR_LOG")"
 RC=$?
 set -e
 if [ $RC -ne 0 ]; then
@@ -258,9 +261,9 @@ if [ $RC -ne 0 ]; then
     exit 5
 fi
 rm -f "$ERR_LOG"
-N_FILES="$(echo "$PLAN" | py -3 -c "import sys,json; d=json.load(sys.stdin); print(len(d['files']))")"
-N_TRANSFORMED="$(echo "$PLAN" | py -3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for f in d['files'] if f['transformations']))")"
-N_PENDING="$(echo "$PLAN" | py -3 -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for f in d['files'] if f['pending_template_skip']))")"
+N_FILES="$(echo "$PLAN" | $PYLAUNCH -c "import sys,json; d=json.load(sys.stdin); print(len(d['files']))")"
+N_TRANSFORMED="$(echo "$PLAN" | $PYLAUNCH -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for f in d['files'] if f['transformations']))")"
+N_PENDING="$(echo "$PLAN" | $PYLAUNCH -c "import sys,json; d=json.load(sys.stdin); print(sum(1 for f in d['files'] if f['pending_template_skip']))")"
 
 echo "  $N_FILES files to copy"
 echo "  $N_TRANSFORMED files with transformations"
@@ -270,7 +273,7 @@ if [ "$N_PENDING" -gt 0 ]; then
     # which is the opposite of what pending_template does: the file_replace is
     # dropped and the file falls through to the chain. Naming the files lets a
     # reader check the residual instead of inferring a freeze that never happened.
-    echo "$PLAN" | py -3 -c "
+    echo "$PLAN" | $PYLAUNCH -c "
 import sys, json
 d = json.load(sys.stdin)
 pend = [f['rel_path'] for f in d['files'] if f['pending_template_skip']]
@@ -284,7 +287,7 @@ fi
 if [ $DRY_RUN -eq 1 ]; then
     echo "[seed-transplant] Dry run complete. Re-run without --dry-run to apply."
     if [ $DO_DIFF -eq 1 ] && [ -e "$DEST/.git" -o -d "$DEST/CLAUDE.md" -o -d "$DEST/core" ]; then
-        py -3 "$SCRIPT_DIR/_seed_engine.py" diff --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST"
+        $PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" diff --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST"
     fi
     exit 0
 fi
@@ -307,8 +310,8 @@ fi
 # Step 7: Backup
 if [ $NO_BACKUP -eq 0 ]; then
     echo "[seed-transplant] Backing up destination framework files..."
-    BACKUP_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" backup --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST")"
-    BACKUP_DIR="$(echo "$BACKUP_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin)['backup_dir'])")"
+    BACKUP_JSON="$($PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" backup --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST")"
+    BACKUP_DIR="$(echo "$BACKUP_JSON" | $PYLAUNCH -c "import sys,json; print(json.load(sys.stdin)['backup_dir'])")"
     echo "  Backup: $BACKUP_DIR"
 fi
 
@@ -321,8 +324,8 @@ COPY_EXTRA_FLAGS=""
 if [ $LIVING_PROD -eq 1 ]; then
     COPY_EXTRA_FLAGS="--preserve-deployment-local"
 fi
-COPY_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" copy-staged --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST" $COPY_EXTRA_FLAGS)"
-echo "$COPY_JSON" | py -3 -c "
+COPY_JSON="$($PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" copy-staged --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST" $COPY_EXTRA_FLAGS)"
+echo "$COPY_JSON" | $PYLAUNCH -c "
 import sys, json
 d = json.load(sys.stdin)
 print(f\"  staged: {d['staged']}, transformed: {d['transformed']}, binary: {d['binary']}\")
@@ -351,7 +354,7 @@ echo "[seed-transplant] Swapping staged files into place..."
 # (: the exit-6 path was previously unreachable dead code).
 SWAP_ERR="$(mktemp 2>/dev/null || echo "/tmp/seed-transplant-swaperr.$$")"
 set +e
-SWAP_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" swap --dest "$DEST" 2>"$SWAP_ERR")"
+SWAP_JSON="$($PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" swap --dest "$DEST" 2>"$SWAP_ERR")"
 SWAP_RC=$?
 set -e
 if [ $SWAP_RC -ne 0 ]; then
@@ -364,7 +367,7 @@ if [ $SWAP_RC -ne 0 ]; then
     # per-file-failure exit-6 branch (formerly below) was unreachable and a
     # genuine partial swap printed the misleading "moves may have FULLY
     # COMPLETED" diagnostic. -1 = no parseable structured result.
-    SWAP_NFAIL="$(echo "$SWAP_JSON" | py -3 -c "
+    SWAP_NFAIL="$(echo "$SWAP_JSON" | $PYLAUNCH -c "
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -377,7 +380,7 @@ except Exception:
         # did NOT all complete; the failing files are listed. This is the
         # (previously unreachable) exit-6 path, now correctly reached + labeled.
         echo "[seed-transplant] swap reported $SWAP_NFAIL per-file FAILURE(s) (rc=$SWAP_RC): a PARTIAL swap, NOT an engine crash — the moves did NOT all complete:" >&2
-        echo "$SWAP_JSON" | py -3 -c "import sys,json; [print('   ', f['rel_path'], ':', f['error']) for f in json.load(sys.stdin)['failures']]" >&2
+        echo "$SWAP_JSON" | $PYLAUNCH -c "import sys,json; [print('   ', f['rel_path'], ':', f['error']) for f in json.load(sys.stdin)['failures']]" >&2
         echo "[seed-transplant] Resolve the file locks/permissions above and re-run; verify state with:" >&2
         echo "                  bash \"$SCRIPT_DIR/seed-verify.sh\" \"$DEST\"" >&2
         rm -f "$SWAP_ERR"
@@ -396,7 +399,7 @@ except Exception:
     exit 8
 fi
 rm -f "$SWAP_ERR"
-MOVED="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin)['moved'])")"
+MOVED="$(echo "$SWAP_JSON" | $PYLAUNCH -c "import sys,json; print(json.load(sys.stdin)['moved'])")"
 echo "  moved: $MOVED"
 # rc==0 guarantees failures==0 (the engine exits non-zero on ANY per-file
 # failure — swap dispatch above), so the former `if N_FAIL>0 -> exit 6` block
@@ -404,7 +407,7 @@ echo "  moved: $MOVED"
 # Non-fatal post-move staging-cleanup error (moves already succeeded; only the
 # staging-dir removal hiccupped). Surfaced by the engine as a NAMED field rather
 # than silently swallowed ( fail-loud). Warn; do not fail the swap.
-STAGING_ERR="$(echo "$SWAP_JSON" | py -3 -c "import sys,json; print(json.load(sys.stdin).get('staging_cleanup_error') or '')" 2>/dev/null)"
+STAGING_ERR="$(echo "$SWAP_JSON" | $PYLAUNCH -c "import sys,json; print(json.load(sys.stdin).get('staging_cleanup_error') or '')" 2>/dev/null)"
 if [ -n "$STAGING_ERR" ]; then
     echo "  WARN: post-move staging cleanup reported: $STAGING_ERR" >&2
     echo "        (moves succeeded; the .seed-staging dir may need manual removal)" >&2
@@ -417,8 +420,8 @@ if [ $NO_CLEAN_CRUFT -eq 0 ]; then
     if [ $LIVING_PROD -eq 1 ]; then
         CRUFT_EXTRA_FLAGS="--preserve-deployment-local"
     fi
-    CRUFT_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" clean-cruft --manifest "$MANIFEST" --dest "$DEST" $CRUFT_EXTRA_FLAGS)"
-    echo "$CRUFT_JSON" | py -3 -c "
+    CRUFT_JSON="$($PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" clean-cruft --manifest "$MANIFEST" --dest "$DEST" $CRUFT_EXTRA_FLAGS)"
+    echo "$CRUFT_JSON" | $PYLAUNCH -c "
 import sys, json
 d = json.load(sys.stdin)
 if d['removed']:
@@ -442,8 +445,8 @@ fi
 # manifest-resolved include set (i.e. removed from source since last plant).
 # This gives the destination true mirror semantics: source = dev, destination = prod.
 echo "[seed-transplant] Removing orphans at destination..."
-ORPHAN_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" remove-orphans --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST")"
-echo "$ORPHAN_JSON" | py -3 -c "
+ORPHAN_JSON="$($PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" remove-orphans --manifest "$MANIFEST" --source "$PROJECT_ROOT" --dest "$DEST")"
+echo "$ORPHAN_JSON" | $PYLAUNCH -c "
 import sys, json
 d = json.load(sys.stdin)
 a = d.get('archive') or {}
@@ -485,7 +488,7 @@ fi
 # an uncommitted change after the commit had already fired. rb-1109-derived
 # fix 2026-05-20.)
 echo "[seed-transplant] Running post-copy actions..."
-py -3 "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" --source "$PROJECT_ROOT" || true
+$PYLAUNCH "$SCRIPT_DIR/_seed_postactions.py" --manifest "$MANIFEST" --dest "$DEST" --source "$PROJECT_ROOT" || true
 
 # Step 12.5: Auto-commit (runs AFTER post-actions so regenerated files are
 # captured in the commit)
@@ -511,7 +514,7 @@ if [ $DO_COMMIT -eq 1 ] && [ -e "$DEST/.git" ]; then
     # (guard-659 shape).
     CARRY_ERR="$(mktemp)"
     set +e
-    CARRY_JSON="$(py -3 "$SCRIPT_DIR/_seed_engine.py" carry-exec-bits --source "$PROJECT_ROOT" --dest "$DEST" 2>"$CARRY_ERR")"
+    CARRY_JSON="$($PYLAUNCH "$SCRIPT_DIR/_seed_engine.py" carry-exec-bits --source "$PROJECT_ROOT" --dest "$DEST" 2>"$CARRY_ERR")"
     CARRY_RC=$?
     set -e
     if [ $CARRY_RC -ne 0 ]; then
@@ -522,7 +525,7 @@ if [ $DO_COMMIT -eq 1 ] && [ -e "$DEST/.git" ]; then
         exit 11
     fi
     rm -f "$CARRY_ERR"
-    echo "$CARRY_JSON" | py -3 -c 'import sys, json; d = json.load(sys.stdin); print("[seed-transplant] exec bits in destination index: %s set to 100755, %s already executable, %s source-executable path(s) not planted" % (d.get("updated", 0), d.get("already_executable", 0), d.get("not_in_dest", 0)))'
+    echo "$CARRY_JSON" | $PYLAUNCH -c 'import sys, json; d = json.load(sys.stdin); print("[seed-transplant] exec bits in destination index: %s set to 100755, %s already executable, %s source-executable path(s) not planted" % (d.get("updated", 0), d.get("already_executable", 0), d.get("not_in_dest", 0)))'
     TS="$(date +%Y-%m-%d)"
     # Generic, public-safe commit message — source path / repo name MUST NOT
     # appear here. The destination is a publication target; commits show on

@@ -83,6 +83,9 @@
 # is framework-authored, not user input.
 
 set -uo pipefail
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$(dirname "${BASH_SOURCE[0]}")/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 SLOT=""
 VERIFY=""
@@ -190,7 +193,7 @@ fi
 # returns) rather than fail open. That is the right way round — the file is a
 # committed framework file whose absence is a far larger problem, whereas voiding
 # typo protection is silent and is what the founding incident actually cost.
-_VALID="$(REG_DIR="$(dirname "${BASH_SOURCE[0]}")" SLOT_TO_CHECK="$SLOT" py -3 -c '
+_VALID="$(REG_DIR="$(dirname "${BASH_SOURCE[0]}")" SLOT_TO_CHECK="$SLOT" $PYLAUNCH -c '
 import os, sys, importlib.util
 reg_dir = os.environ["REG_DIR"]
 sys.path.insert(0, reg_dir)

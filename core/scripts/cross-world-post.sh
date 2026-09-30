@@ -43,6 +43,9 @@
 #
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (g-115-11431, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 # ── Target-world resolution (PER-MACHINE — never a hardcoded literal) ──
 # A sibling world's directory exists on SOME machines and not others, so a
@@ -242,7 +245,7 @@ check_rate_limit() {
     # quote-free); it is now derived from MIND_AGENT + ENVIRONMENT_ID, i.e. from
     # environment input. No injection path is known — both inputs are controlled
     # — so this is latent-correctness, not a live break.
-    count=$(CWP_ORIGIN="$ORIGIN" py -3 -c "
+    count=$(CWP_ORIGIN="$ORIGIN" $PYLAUNCH -c "
 import json, sys, os, glob
 from datetime import datetime, timedelta
 
@@ -358,13 +361,13 @@ if [ -n "$CHANNEL" ]; then
     # Build tags array
     TAGS_JSON="[]"
     if [ -n "$TAGS" ]; then
-        TAGS_JSON=$(py -3 -c "import json; print(json.dumps([t.strip() for t in '$TAGS'.split(',')]))")
+        TAGS_JSON=$($PYLAUNCH -c "import json; print(json.dumps([t.strip() for t in '$TAGS'.split(',')]))")
     fi
 
     # Build the record matching the sibling world's board schema:
     # {id, author, session_id, timestamp, channel, type, text, reply_to, tags}
     # G5: provenance fields embedded in the record
-    RECORD=$(py -3 -c "
+    RECORD=$($PYLAUNCH -c "
 import json, sys
 rec = {
     'id': sys.argv[1],
@@ -418,7 +421,7 @@ if [ -n "$INJECT_GOAL" ]; then
     fi
 
     # Validate the provided JSON and stamp provenance
-    STAMPED=$(py -3 -c "
+    STAMPED=$($PYLAUNCH -c "
 import json, sys
 
 raw = sys.argv[1]
@@ -445,7 +448,7 @@ print(json.dumps(goal, ensure_ascii=True))
 
     if [ "$DRY_RUN" = "true" ]; then
         echo "DRY-RUN: Would append to $ASP_FILE:"
-        echo "$STAMPED" | py -3 -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()),indent=2))"
+        echo "$STAMPED" | $PYLAUNCH -c "import json,sys; print(json.dumps(json.loads(sys.stdin.read()),indent=2))"
         exit 0
     fi
 

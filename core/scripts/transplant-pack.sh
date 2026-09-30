@@ -20,6 +20,9 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_paths.sh"
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 set -euo pipefail
 
 SUB="${1:-}"
@@ -40,7 +43,7 @@ BACKEND="${BACKEND:-local}"
 # Sync ownership is derived from live DDB runner claims (there is no
 # MACHINE_OWNED_AGENTS env list). To pack a specific subset, pass --agents
 # explicitly; it flows through "$@" to _transplant_pack.py.
-exec py -3 "$SCRIPT_DIR/_transplant_pack.py" "$SUB" \
+exec $PYLAUNCH "$SCRIPT_DIR/_transplant_pack.py" "$SUB" \
     --project-root "$PROJECT_ROOT" \
     --world "${WORLD_PATH:-}" \
     --meta "${META_PATH:-}" \

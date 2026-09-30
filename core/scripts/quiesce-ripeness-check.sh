@@ -24,6 +24,9 @@ cd .. 2>/dev/null || true
 REPO="$(pwd)"
 # shellcheck disable=SC1091
 source "$REPO/core/scripts/_paths.sh" || { echo "quiesce-ripeness: cannot source _paths.sh" >&2; exit 2; }
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 
 MODE="human"
 UPDATE="0"
@@ -66,7 +69,7 @@ mkdir -p "$TMP" || { echo "quiesce-ripeness: cannot create $TMP" >&2; exit 2; }
 # value INSIDE Python looks clean, because the CR is added by the stdout
 # translation and is not carried in the string. Linux Bodies are unaffected,
 # which is why no other box ever surfaced it.
-IDS="$(PYTHONPATH="$REPO/core/scripts" py -3 -c "
+IDS="$(PYTHONPATH="$REPO/core/scripts" $PYLAUNCH -c "
 import sys
 from quiesce_ripeness import parse_rows
 md = open(sys.argv[1], encoding='utf-8').read()
@@ -81,7 +84,7 @@ print('\n'.join(sorted({r['goal_id'] for r in parse_rows(md) if r['goal_id']})))
 : > "$TMP/statuses.jsonl"
 for gid in $IDS; do
   bash "$REPO/core/scripts/aspirations-query.sh" --goal-field id "$gid" --full 2>/dev/null \
-    | PYTHONPATH="$REPO/core/scripts" py -3 -c "
+    | PYTHONPATH="$REPO/core/scripts" $PYLAUNCH -c "
 import json,sys
 try: arr = json.load(sys.stdin)
 except Exception: arr = []
@@ -116,7 +119,7 @@ for s in pending blocked in-progress; do
 done
 
 # ---- 4. score -------------------------------------------------------------
-PYTHONPATH="$REPO/core/scripts" py -3 -c "
+PYTHONPATH="$REPO/core/scripts" $PYLAUNCH -c "
 import json, sys
 from quiesce_ripeness import evaluate, is_quiesce_frozen_defer
 

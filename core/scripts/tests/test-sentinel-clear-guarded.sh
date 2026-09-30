@@ -39,6 +39,8 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 cp "$SRC" "$TMP/sentinel-clear-guarded.sh"
+# ...and the python launcher resolver it sources beside itself ().
+cp "$SCRIPTS_DIR/_python_launcher.sh" "$TMP/_python_launcher.sh"
 
 # Copy the registry SSOT beside the script. LOAD-BEARING, not convenience: the
 # script resolves _sentinel_registry.py via `dirname "${BASH_SOURCE[0]}"`, so
@@ -208,7 +210,7 @@ fi
 # from a dir with no registry beside the script — which is exactly the shape this
 # whole suite silently had before the registry copy above was added.
 NOREG="$(mktemp -d)"
-cp "$TMP/sentinel-clear-guarded.sh" "$TMP/verified-wm-set.sh" "$NOREG/"
+cp "$TMP/sentinel-clear-guarded.sh" "$TMP/verified-wm-set.sh" "$TMP/_python_launcher.sh" "$NOREG/"
 : > "$CLEAR_LOG"
 noreg_out="$(bash "$NOREG/sentinel-clear-guarded.sh" --slot force_experience_archival \
               --verify 'echo x' -- true 2>&1)"

@@ -717,7 +717,7 @@ def _setup_release_repo(tmp_path, version="0.2.0"):
     repo = tmp_path / "repo"
     (repo / "core" / "scripts").mkdir(parents=True)
     (repo / "mind_api" / "src").mkdir(parents=True)
-    for name in ("release.sh", "_paths.sh", "_release_lib.py"):
+    for name in ("release.sh", "_paths.sh", "_release_lib.py", "_python_launcher.sh"):
         shutil.copy(CORE_SCRIPTS / name, repo / "core" / "scripts" / name)
     (repo / "mind_api" / "src" / "__init__.py").write_text(
         f'__version__ = "{version}"\n', encoding="utf-8")

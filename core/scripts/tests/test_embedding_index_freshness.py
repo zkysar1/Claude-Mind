@@ -251,3 +251,103 @@ def test_framework_doc_newer_than_index_fires_the_tick(
     rc, out = run()
     assert rc == 0
     assert out and out[0]["would_spawn"] is True
+
+
+# ── : success-aware debounce, reader-dir precedence, signatures ────
+
+def _marker(idx, age_seconds):
+    m = idx / ".last-update-attempt"
+    m.write_text("t", encoding="utf-8")
+    _age(m, age_seconds)
+    return m
+
+
+def test_landed_attempt_allows_refire_after_short_interval(tick_env, monkeypatch):
+    """The last update LANDED (meta rewritten after the marker): new writes
+    since then must be indexed in minutes, not after a 6h window."""
+    idx, run = tick_env
+    _marker(idx, fresh.SUCCESS_INTERVAL_SECONDS + 60)
+    _make_index(idx, age_seconds=fresh.SUCCESS_INTERVAL_SECONDS)  # newer than marker
+    monkeypatch.setattr(fresh, "_blend_enabled", lambda: True)
+    monkeypatch.setattr(fresh, "_source_mtime", lambda: time.time())
+    rc, out = run()
+    assert out and out[0]["would_spawn"] is True
+
+
+def test_landed_attempt_still_rate_limited_inside_short_interval(tick_env, monkeypatch):
+    idx, run = tick_env
+    _marker(idx, 120)
+    _make_index(idx, age_seconds=60)
+    monkeypatch.setattr(fresh, "_blend_enabled", lambda: True)
+    monkeypatch.setattr(fresh, "_source_mtime", lambda: time.time())
+    rc, out = run()
+    assert rc == 0 and out == []
+
+
+def test_attempt_that_did_not_land_keeps_the_long_window(tick_env, monkeypatch):
+    """Failed or still running: meta older than the marker. Never double an
+    in-flight update, never storm a failing one."""
+    idx, run = tick_env
+    _make_index(idx, age_seconds=7200)
+    _marker(idx, 3600)  # newer than meta, 1h old: inside the 6h window
+    monkeypatch.setattr(fresh, "_blend_enabled", lambda: True)
+    monkeypatch.setattr(fresh, "_source_mtime", lambda: time.time())
+    rc, out = run()
+    assert rc == 0 and out == []
+
+
+def test_reader_index_dir_is_honored(tmp_path, monkeypatch, capsys):
+    """A process whose READER is redirected (MIND_EMBEDDING_INDEX_DIR — the
+    test suite's hermeticity seam) must not tick the production index."""
+    idx = tmp_path / "reader-index"
+    idx.mkdir()
+    _make_index(idx, age_seconds=7200)
+    monkeypatch.delenv("EMBED_FRESHNESS_INDEX_DIR", raising=False)
+    monkeypatch.setenv("MIND_EMBEDDING_INDEX_DIR", str(idx))
+    monkeypatch.setenv("EMBED_FRESHNESS_DRYRUN", "1")
+    monkeypatch.setattr(fresh, "_blend_enabled", lambda: True)
+    monkeypatch.setattr(fresh, "_source_mtime", lambda: time.time())
+    fresh.main()
+    out = [json.loads(l) for l in capsys.readouterr().out.strip().splitlines()]
+    assert out and Path(out[0]["index_dir"]) == idx
+
+
+def test_tick_seam_outranks_reader_seam(tmp_path, monkeypatch, capsys):
+    a, b = tmp_path / "tick", tmp_path / "reader"
+    for d in (a, b):
+        d.mkdir()
+        _make_index(d, age_seconds=7200)
+    monkeypatch.setenv("EMBED_FRESHNESS_INDEX_DIR", str(a))
+    monkeypatch.setenv("MIND_EMBEDDING_INDEX_DIR", str(b))
+    monkeypatch.setenv("EMBED_FRESHNESS_DRYRUN", "1")
+    monkeypatch.setattr(fresh, "_blend_enabled", lambda: True)
+    monkeypatch.setattr(fresh, "_source_mtime", lambda: time.time())
+    fresh.main()
+    out = [json.loads(l) for l in capsys.readouterr().out.strip().splitlines()]
+    assert Path(out[0]["index_dir"]) == a
+
+
+def test_non_default_dir_is_passed_to_the_updater(tmp_path, monkeypatch):
+    """Whichever seam redirected the dir, the spawned --update must write THERE."""
+    idx = tmp_path / "reader-index"
+    idx.mkdir()
+    _make_index(idx, age_seconds=7200)
+    monkeypatch.delenv("EMBED_FRESHNESS_INDEX_DIR", raising=False)
+    monkeypatch.delenv("EMBED_FRESHNESS_DRYRUN", raising=False)
+    monkeypatch.setenv("MIND_EMBEDDING_INDEX_DIR", str(idx))
+    monkeypatch.setattr(fresh, "_blend_enabled", lambda: True)
+    monkeypatch.setattr(fresh, "_source_mtime", lambda: time.time())
+    monkeypatch.setattr(fresh, "UPDATE_LOG", tmp_path / "update.log")
+    calls = []
+    monkeypatch.setattr(fresh.subprocess, "Popen", lambda args, **k: calls.append(args))
+    fresh.main()
+    assert calls and calls[0][-2:] == ["--out", str(idx)]
+
+
+def test_source_mtime_tracks_pattern_signatures(world):
+    """Signatures joined the embedded corpus; the watch-set follows ( rule)."""
+    for p in _sources(world):
+        _age(p, 3600)
+    sigs = world / "pattern-signatures.jsonl"
+    sigs.write_text("x\n", encoding="utf-8")
+    assert fresh._source_mtime() == sigs.stat().st_mtime

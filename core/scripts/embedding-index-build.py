@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """embedding-index-build.py — build/update a persisted embedding index for the
-Mind framework's supplementary-store retrieval corpus (guardrails + reasoning-bank).
+Mind framework's retrieval corpus (guardrails, reasoning-bank, pattern signatures,
+tree nodes, framework docs).
 
 Part (a) of g-306-81 (integration), unlocked by the g-306-77 A/B: offline
 all-MiniLM-L6-v2 embedding-cosine beat retrieve.py's token-overlap text-fallback
@@ -70,29 +71,15 @@ def resolve_model_name(cli_override=None):
 
 
 def match_text(e):
-    """The doc text surface embedded — exactly the fields retrieve.py's
-    supplementary matcher (_entry_matches_text) tokenizes: title/content/rule/
-    summary + tags + when_to_use.conditions. Keeping this identical to the matched
-    surface is what made the A/B a clean controlled comparison; the persisted index
-    must embed the SAME surface so part-(b) query-time cosine ranks over it fairly."""
-    parts = []
-    for f in ("title", "content", "rule", "summary"):
-        v = e.get(f)
-        if isinstance(v, str) and v:
-            parts.append(v)
-    tags = e.get("tags")
-    if isinstance(tags, list):
-        parts.extend(t for t in tags if isinstance(t, str))
-    wtu = e.get("when_to_use")
-    if isinstance(wtu, dict):
-        c = wtu.get("conditions")
-        if isinstance(c, list):
-            parts.extend(s for s in c if isinstance(s, str))
-        elif isinstance(c, str):
-            parts.append(c)
-    elif isinstance(wtu, str):
-        parts.append(wtu)
-    return " ".join(parts).strip()
+    """The doc text surface embedded for a guardrail / reasoning-bank / pattern-
+    signature record: retrieve.supplementary_text_parts, the SAME surface the
+    token matcher tokenizes, so the index and the lexical predicate can never
+    disagree about what a record says. This function used to keep its own copy
+    of the field list; the two copies both omitted a guardrail's
+    trigger_condition and every signature field (g-115-3684). The shared list
+    puts situation fields (trigger_condition, when_to_use, ...) BEFORE the body,
+    because the encoder truncates at ~126 word-pieces."""
+    return " ".join(R.supplementary_text_parts(e)).strip()
 
 
 def content_hash(text):
@@ -180,9 +167,9 @@ def tree_doc_text(key, node):
 
 
 def load_corpus(limit=None):
-    """Active guardrails + reasoning-bank + tree nodes as [{id, type, text,
-    hash}], skipping empty-text records. Deterministic order (guardrails,
-    rb, then tree in _tree.yaml order).
+    """Active guardrails + reasoning-bank + pattern signatures + tree nodes as
+    [{id, type, text, hash}], skipping empty-text records. Deterministic order
+    (guardrails, rb, signatures, then tree in _tree.yaml order).
 
     Tree docs (g-306-83) use 'tree:<relpath>' ids — namespace-disjoint from
     rb-*/guard-* so the supplementary consumers' id joins ignore them and
@@ -208,6 +195,15 @@ def load_corpus(limit=None):
         t = match_text(e)
         if t and e.get("id"):
             docs.append({"id": e["id"], "type": "rb", "text": t, "hash": content_hash(t)})
+    # Pattern signatures (): the third supplementary store, blended by
+    # retrieve.load_pattern_signatures. 'sig-*' ids are namespace-disjoint from
+    # rb-*/guard-*/tree:/framework:.
+    for e in R.read_jsonl(R.SIGS_PATH):
+        if (e.get("status") or "active") != "active":
+            continue
+        t = match_text(e)
+        if t and e.get("id"):
+            docs.append({"id": e["id"], "type": "signature", "text": t, "hash": content_hash(t)})
     try:
         tree = R.read_yaml(R.TREE_PATH) if R.TREE_PATH else {}
     except Exception:

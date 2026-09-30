@@ -24,6 +24,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || { echo "ERROR: failed to source _paths.sh" >&2; exit 1; }
+# py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+source "$SCRIPT_DIR/_python_launcher.sh"
+PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 LIB="$SCRIPT_DIR/_release_lib.py"
 INIT_PY="$PROJECT_ROOT/mind_api/src/__init__.py"
 WORLD="${WORLD_DIR:-${WORLD_PATH:-}}"
@@ -51,7 +54,7 @@ fail() { echo "[check-upstream] ERROR: $*" >&2; exit 1; }
 # not found, or a future SyntaxError in this source) from a silent set -e death
 # into an actionable diagnostic. (review F5)
 set +e
-ID="$(OVERLAY="$OVERLAY" FW="$FW_COMPAT" py -3 -c '
+ID="$(OVERLAY="$OVERLAY" FW="$FW_COMPAT" $PYLAUNCH -c '
 import os
 try:
     import yaml
@@ -103,7 +106,7 @@ fi
 
 # --- Step 4+5: classify (parse-or-fail M1 + chain-walk) -------------------
 set +e
-CLS="$(UPSTREAM_RELEASES_PATH="$TMP" LOCAL_VERSION="$LOCAL" py -3 "$LIB" classify-chain)"
+CLS="$(UPSTREAM_RELEASES_PATH="$TMP" LOCAL_VERSION="$LOCAL" $PYLAUNCH "$LIB" classify-chain)"
 CLS_RC=$?
 set -e
 rm -f "$TMP"
@@ -124,7 +127,7 @@ RECIPES="$(echo "$CLS"     | sed -n 's/^UPGRADE_RECIPES=//p')"
 
 # --- Step 8: frontier-invariant (CW2) — local must not exceed upstream -----
 if [[ -n "$UPSTREAM_NEWEST" ]]; then
-  set +e; CMP_UP="$(py -3 "$LIB" compare "$LOCAL" "$UPSTREAM_NEWEST")"; CMP_RC=$?; set -e
+  set +e; CMP_UP="$($PYLAUNCH "$LIB" compare "$LOCAL" "$UPSTREAM_NEWEST")"; CMP_RC=$?; set -e
   if [[ $CMP_RC -eq 0 && "$CMP_UP" == "1" ]]; then
     echo "[check-upstream] INVARIANT VIOLATION (CW2): local $LOCAL exceeds upstream $UPSTREAM_ROLE latest $UPSTREAM_NEWEST" >&2
     exit 5
