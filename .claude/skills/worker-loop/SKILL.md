@@ -216,8 +216,8 @@ Bash: bash core/scripts/heartbeat-tick.sh
 # during a worker's life ever reached it.
 # Rationale (WHY, measured): core/config/rationale/worker-cycle-preamble.md
 #
-# Placed at the TOP of the cycle, between units and before any claim, so a merge
-# can never land under a goal that is mid-execution.
+# TOP of the cycle, before any claim. Merges still land mid-unit (carrier
+# push, cron tick): measured low-harm, accepted (g-375-94).
 #
 # --no-push is deliberate and is the whole difference from the reducer's call:
 # "fetch + integrate, then STOP before the push decision". A worker pulls so it

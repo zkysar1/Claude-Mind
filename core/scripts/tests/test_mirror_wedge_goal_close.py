@@ -234,7 +234,7 @@ def _healthy_probe(wd, tmp_path, monkeypatch, closed_result):
     monkeypatch.setitem(sys.modules, "mirror_health",
                         types.SimpleNamespace(probe=lambda: {"verdict": "healthy"}))
     p = wd.MirrorWedgeProbe(_Ctx(tmp_path))
-    monkeypatch.setattr(p, "_close_wedge_goal", lambda: closed_result)
+    monkeypatch.setattr(p, "_close_wedge_goal", lambda verdict: closed_result)
     return p
 
 
@@ -248,12 +248,14 @@ def test_healthy_tick_attempts_close_even_when_not_fired(wd, tmp_path, monkeypat
                                                    "closed": ["g-1"],
                                                    "held": [], "detail": "closed g-1"})
     monkeypatch.setattr(p, "_close_wedge_goal",
-                        lambda: (seen.append(1), {"attempted": True,
-                                                  "closed": ["g-1"], "held": [],
-                                                  "detail": "closed g-1"})[1])
+                        lambda verdict: (seen.append(verdict),
+                                         {"attempted": True,
+                                          "closed": ["g-1"], "held": [],
+                                          "detail": "closed g-1"})[1])
     p.fired = False
     events = p.check()
-    assert seen == [1], "close must be attempted with fired=False"
+    assert seen == ["healthy"], \
+        "close must be attempted with fired=False, and told the verdict it closes on"
     assert [e.event for e in events] == ["mirror_wedge_cleared"], \
         "a close that actually happened is worth an event even without fired"
 
@@ -285,7 +287,7 @@ def test_unknown_verdict_never_closes(wd, tmp_path, monkeypatch):
                         types.SimpleNamespace(probe=lambda: {"verdict": "unknown"}))
     p = wd.MirrorWedgeProbe(_Ctx(tmp_path))
     monkeypatch.setattr(p, "_close_wedge_goal",
-                        lambda: (seen.append(1), {"attempted": False})[1])
+                        lambda verdict: (seen.append(verdict), {"attempted": False})[1])
     p.fired = True
     p.consecutive_wedged = 3
     assert p.check() == []
@@ -350,3 +352,25 @@ def test_outcome_note_does_not_assert_a_close_that_may_not_land(wd, tmp_path, mo
         "the note must not assert a close that has not been written yet"
     assert "if the status still reads open" in note, \
         "a reader finding this note on an OPEN goal needs to know the write failed"
+
+
+def test_close_note_names_the_verdict_check_observed(wd, tmp_path, monkeypatch):
+    """Fresh-eyes finding (). check() closes on `pull-failing` as well
+    as `healthy`, but the note said "observed mirror-health healthy" either way:
+    a false observation on every pull-failing close. Driven through check(), so
+    it pins the wiring (check passes the verdict it read), not only the note's
+    wording; the healthy arm is the control that shows the two notes differ."""
+    notes = {}
+    for verdict in ("healthy", "pull-failing"):
+        calls = []
+        p = _probe(wd, tmp_path, monkeypatch, [{"id": "g-x", "status": "pending"}],
+                   lambda argv, **k: (calls.append(argv), _ok())[1])
+        monkeypatch.setitem(sys.modules, "mirror_health", types.SimpleNamespace(
+            probe=lambda v=verdict: {"verdict": v}))
+        events = p.check()
+        assert [e.event for e in events] == ["mirror_wedge_cleared"]
+        assert events[0].payload["closed"]["closed"] == ["g-x"]
+        notes[verdict] = calls[0][4]
+    assert "observed mirror-health healthy on echo's box" in notes["healthy"]
+    assert "observed mirror-health pull-failing on echo's box" in notes["pull-failing"]
+    assert "healthy" not in notes["pull-failing"], notes["pull-failing"]

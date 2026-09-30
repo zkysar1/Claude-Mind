@@ -9,7 +9,10 @@ so no local reading could have shown it.
 
 WHAT THESE PIN.
   - Presence is judged on the STORE copy, by the consumer's own identity
-    (`body-merge._content_hash`, keyed per slot). Not by mtime, and not by bytes.
+    (`body-merge._content_hash`, keyed per slot) minus the volatile `_item_ts`
+    stamp (`capture_identity`, g-306-554). Not by mtime, and not by bytes.
+  - A wm-set correction of a capture slot reaches the carrier, and only what
+    it changed does (g-306-554), through the daemon (the LIVE path) and the CLI.
   - Only captures THIS Body flagged since its fork are expected. The Body WM
     starts as a copy of the agent-wide WM, and measured on cc-09, 1,245 of one
     Body's 1,395 flagged entries were inherited. A check without the baseline
@@ -24,11 +27,15 @@ producer writes (guard-3221).
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -270,6 +277,129 @@ def test_the_real_local_backend_reads_the_store_as_the_file(tmp_path):
     b.append("spark_capture", _spark(1, load_bearing=True))
     verdict, detail = b.verify(storage_backend.LocalBackend())
     assert verdict == "delivered", detail
+
+
+# --------------------------------------------------------------------------
+# in-place correction ()
+# --------------------------------------------------------------------------
+
+def _correct(b: Body, slot: str, i: int, **changes) -> tuple:
+    """What a wm-set correction does to the WM: read the slot, fix entry `i` IN
+    PLACE (its `_item_ts` untouched), write the whole slot back. No carrier line
+    is written here; returns (before, after) for the carrier hook."""
+    before = list(b.slots[slot])
+    after = list(before)
+    after[i] = {**before[i], **changes}
+    b.slots[slot] = after
+    _dump(b.wm, {"slots": b.slots})
+    return before, after
+
+
+def _rows(carrier: Path) -> list:
+    return [json.loads(line)["entry"]
+            for line in carrier.read_text(encoding="utf-8").splitlines()]
+
+
+def test_an_in_place_correction_clears_once_its_content_is_redelivered(tmp_path):
+    """The measured case (Body e494793d, cc-10, 2026-09-28): the corrected entry
+    keeps its original `_item_ts`, and the re-append that re-delivers its text
+    gets a fresh one. Hashed whole, the two never match, so the check read
+    "undelivered" on every later unit of that Body."""
+    b = Body(tmp_path)
+    b.append("spark_capture", _spark(1, load_bearing=True, _item_ts="2026-09-28T06:50:00"))
+    _correct(b, "spark_capture", 0, observation="the corrected observation")
+    verdict, detail = b.verify(b.local_store())
+    assert verdict == "undelivered", detail  # the carrier holds the superseded text only
+
+    b.append("spark_capture", {**b.slots["spark_capture"][0],
+                               "_item_ts": "2026-09-28T07:08:00"})
+    verdict, detail = b.verify(b.local_store())
+    assert verdict == "delivered", detail
+
+
+def test_a_whole_slot_replace_carries_exactly_what_it_changed(tmp_path):
+    """The corrected entry is written VERBATIM, original stamp included, so the
+    close-time merge dedups it. The inherited flagged entry and the untouched
+    one are not re-offered. The Body reads delivered with no re-append."""
+    inherited = _spark(0, load_bearing=True, _item_ts="2026-09-27T12:00:00")
+    b = Body(tmp_path, inherited={"spark_capture": [inherited]})
+    b.append("spark_capture", _spark(1, load_bearing=True, _item_ts="2026-09-28T06:50:00"))
+    b.append("spark_capture", _spark(2, load_bearing=True, _item_ts="2026-09-28T06:51:00"))
+    before, after = _correct(b, "spark_capture", 1, observation="the corrected observation")
+
+    path = bcc.record_slot_replace(b.wm, "spark_capture", before, after, world_dir=b.world)
+
+    assert path == b.carrier
+    assert _rows(b.carrier) == [before[1], before[2], after[1]]
+    assert after[1]["_item_ts"] == "2026-09-28T06:50:00"
+    verdict, detail = b.verify(b.local_store())
+    assert verdict == "delivered", detail
+    assert bcc.record_slot_replace(b.wm, "spark_capture", after, after,
+                                   world_dir=b.world) is None
+    assert len(_rows(b.carrier)) == 3
+
+
+def test_a_replace_carries_nothing_that_is_not_this_bodys_flagged_change(tmp_path):
+    b = Body(tmp_path)
+    b.append("spark_capture", _spark(1))  # unflagged: never carried
+    before, after = _correct(b, "spark_capture", 0, observation="fixed")
+    assert bcc.record_slot_replace(b.wm, "spark_capture", before, after,
+                                   world_dir=b.world) is None
+    reducer_wm = tmp_path / "agents" / "alpha" / "session" / "working-memory.yaml"
+    assert bcc.record_slot_replace(reducer_wm, "spark_capture", [],
+                                   [_spark(2, load_bearing=True)],
+                                   world_dir=b.world) is None
+    assert bcc.record_slot_replace(b.wm, "spark_capture", [], None,
+                                   world_dir=b.world) is None
+    assert not b.carrier.exists()
+
+
+def test_the_daemon_set_carries_the_correction_it_wrote(tmp_path):
+    """wm-set.sh is daemon-only, so /v1/wm/set is the LIVE path (guard-742)."""
+    tests_dir = str(Path(__file__).resolve().parent)
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from _daemon_fixture import DaemonFixture
+
+    world = tmp_path / "world"
+    world.mkdir()
+    original = _spark(1, load_bearing=True, _item_ts="2026-09-28T06:50:00")
+    corrected = {**original, "observation": "the corrected observation"}
+    with DaemonFixture(world, agent="alpha") as df:
+        wm_file = (df.project_root / "agents" / "alpha" / "sessions" / SID
+                   / "working-memory.yaml")
+        _dump(wm_file, {"slots": {"spark_capture": [original]}})
+        url = (f"http://127.0.0.1:{df.port}/v1/wm/set?"
+               + urllib.parse.urlencode({"slot": "spark_capture"}))
+        req = urllib.request.Request(url, data=json.dumps([corrected]).encode("utf-8"),
+                                     method="POST")
+        req.add_header("X-Mind-Agent", "alpha")
+        req.add_header("X-Mind-Sid", SID)
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            out = json.loads(resp.read().decode("utf-8"))
+        rows = _rows(bcc.carrier_path(wm_file.parent.parent.parent, SID, world))
+    assert out["ok"] is True and out["carrier_pushed"] is not None, out
+    assert rows == [corrected]
+
+
+def test_the_cli_set_twin_carries_the_correction_too(tmp_path, monkeypatch):
+    import _paths
+    import wm
+
+    monkeypatch.setattr(_paths, "WORLD_DIR", tmp_path / "world", raising=False)
+    pushed = []
+    monkeypatch.setattr(bcc, "push", lambda p: pushed.append(Path(p)) or True)
+    b = Body(tmp_path)
+    original = _spark(1, load_bearing=True, _item_ts="2026-09-28T06:50:00")
+    b.append("spark_capture", original)
+    corrected = {**original, "observation": "the corrected observation"}
+    monkeypatch.setenv("BODY_WM_PATH", str(b.wm))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps([corrected])))
+
+    wm.cmd_set(SimpleNamespace(slot="spark_capture"))
+
+    assert _rows(b.carrier) == [original, corrected]
+    assert pushed == [b.carrier]
 
 
 # --------------------------------------------------------------------------

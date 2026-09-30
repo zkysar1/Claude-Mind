@@ -89,6 +89,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/parked-body-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/bash-agent-inject.sh",
             "timeout": 30
           },
@@ -169,6 +174,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/parked-body-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/path-resolution-hook.sh",
             "timeout": 30
           },
@@ -227,6 +237,11 @@
       {
         "matcher": "Edit",
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/parked-body-gate.sh",
+            "timeout": 15
+          },
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/path-resolution-hook.sh",
@@ -294,6 +309,11 @@
         "hooks": [
           {
             "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/parked-body-gate.sh",
+            "timeout": 15
+          },
+          {
+            "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/path-resolution-hook.sh",
             "timeout": 30
           },
@@ -351,6 +371,16 @@
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/ground-truth-citation-gate.sh",
             "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/presence-tick.sh",
+            "timeout": 5
           }
         ]
       }
@@ -597,6 +627,11 @@
     "UserPromptSubmit": [
       {
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/parked-body-gate.sh stamp",
+            "timeout": 10
+          },
           {
             "type": "command",
             "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/user-prompt-retrieval-inject.sh",

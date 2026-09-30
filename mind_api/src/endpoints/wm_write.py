@@ -993,6 +993,8 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
     else:
         expected_uc = None
 
+    # : initialized OUTSIDE the lock so the post-lock push can read it.
+    _carrier_path = None
     try:
         with _wm_lock(ctx):
             if slot == "loop_state":
@@ -1080,14 +1082,38 @@ def set_slot(ctx) -> "Response":  # type: ignore[name-defined]
                 if parent is None:
                     return Response.error(400, "unresolvable_slot",
                                           f"cannot resolve path '{slot}'")
+                _before = parent.get(key) if isinstance(parent, dict) else None
                 parent[key] = value
                 if not is_top:
                     _update_modified(data, slot)
                 _write_wm(_wm_path(ctx), data)
+                # : a whole-slot replace of a capture lane mirrors what
+                # it CHANGED into this Body's carrier, as append_slot does for an
+                # append, so an in-place correction reaches the reducer through
+                # the priority lane instead of only at the close-time merge.
+                # TWIN of core/scripts/wm.py cmd_set; this daemon copy is the
+                # LIVE path (wm-set.sh is daemon-routed). getattr, because a
+                # daemon that loaded the carrier before this helper existed keeps
+                # that copy in sys.modules until it restarts.
+                if slot in CAPTURE_SLOTS:
+                    _record = getattr(_carrier_mod(ctx), "record_slot_replace",
+                                      None)
+                    if _record is not None:
+                        _carrier_path = _record(_wm_path(ctx), slot, _before,
+                                                value, world_dir=ctx.paths.world)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 
-    return Response.json({"ok": True, "slot": slot})
+    # Push OUTSIDE the lock, for the reason append_slot gives. Same three-valued
+    # `carrier_pushed` as append_slot: true = the store write returned without
+    # raising (an attempt, not a verified delivery), false = it failed, null =
+    # this set wrote no carrier line.
+    _carrier_pushed = None
+    if _carrier_path is not None:
+        _cm = _carrier_mod(ctx)
+        _carrier_pushed = bool(_cm.push(_carrier_path)) if _cm is not None else False
+    return Response.json({"ok": True, "slot": slot,
+                          "carrier_pushed": _carrier_pushed})
 
 
 # ---------------------------------------------------------------------------

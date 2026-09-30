@@ -439,6 +439,27 @@ def _maybe_tick_heartbeat(agent: str, sid: str, project_root: Path) -> None:
         pass
 
 
+def _open_bash_window(agent: str, sid: str, project_root: Path, command: str,
+                      tool_input: dict) -> None:
+    """Open this command's in-flight window ().
+
+    bash-edit-record.sh credits a file change to the one session whose Bash
+    command was running when the file changed, so it needs each command's start.
+    `command` must be the text that will RUN (the rewritten one when this hook
+    rewrites it): PostToolUse receives that text and closes the window by its
+    hash. Fail-open, like every other clause in this hook.
+    """
+    try:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", sid):
+            return
+        import _bash_inflight
+        _bash_inflight.open_window(
+            _agent_dir(project_root, agent) / _SESSIONS_DIRNAME / sid,
+            _bash_inflight.command_key(command), tool_input.get("timeout"))
+    except Exception:
+        pass
+
+
 def _maybe_surface_stop(agent: str, sid: str, project_root: Path, *,
                         worker_body: bool = False,
                         binding_mode: "str | None" = None) -> str:
@@ -835,6 +856,8 @@ def main():
     expected_prefix = (f'export PATH="{shim_path}:$PATH"; '
                        f'{agent_clause}{body_clause}{goal_clause}export MIND_SID={sid};')
     if command.startswith(expected_prefix):
+        if _agent_m:
+            _open_bash_window(_agent_m.group(1), sid, project_root, command, tool_input)
         approve_no_mutation()
 
     new_command = f"{expected_prefix} {command}"
@@ -846,6 +869,10 @@ def main():
     _argv_reason = _argv_gate_reason(new_command, len(expected_prefix) + 1)
     if _argv_reason:
         emit_deny(_argv_reason)
+
+    # After the last deny in this hook, so a command refused HERE opens no window.
+    if _agent_m:
+        _open_bash_window(_agent_m.group(1), sid, project_root, new_command, tool_input)
 
     # updatedInput replaces the whole tool_input per Claude Code's hook
     # contract, so preserve any other fields the LLM set.

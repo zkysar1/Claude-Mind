@@ -253,3 +253,36 @@ def test_cross_box_shard_without_in_flight_allows():
             assert code == 200, (
                 "guard-997: in_flight ABSENCE is the unreliable direction and "
                 f"must never ground a refusal; got {code}: {body}")
+
+
+# --- 7. : the last_active write floor is allowed for -------------
+# The writer drops a last_active set less than LAST_ACTIVE_WRITE_FLOOR_S (600 s)
+# newer than the stored stamp, so a live holder's stamp can trail its latest
+# heartbeat by up to 10 minutes. A stamp 65 minutes old is therefore still
+# inside the holder's 60-minute window; 75 minutes is not.
+def test_cross_box_holder_inside_the_floor_allowance_is_refused():
+    os.environ["STORAGE_BACKEND"] = "local"
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        _seed_shard(world, "alpha", last_active=_ago(STALE_MINUTES + 5),
+                    in_flight_goal=GOAL_ID)
+        with DaemonFixture(world, agent="alpha") as df:
+            _seed_local_session(df.project_root, "alpha", running_sid=None)
+            code, body = _claim(df.port, "alpha", CLAIMER_SID)
+            assert code == 409, (
+                "a stamp within stale_minutes plus the write floor may belong "
+                f"to a live holder whose later heartbeats were floored; got {code}: {body}")
+
+
+def test_cross_box_holder_beyond_the_floor_allowance_is_taken_over():
+    os.environ["STORAGE_BACKEND"] = "local"
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd))
+        _seed_shard(world, "alpha", last_active=_ago(STALE_MINUTES + 15),
+                    in_flight_goal=GOAL_ID)
+        with DaemonFixture(world, agent="alpha") as df:
+            _seed_local_session(df.project_root, "alpha", running_sid=None)
+            code, body = _claim(df.port, "alpha", CLAIMER_SID)
+            assert code == 200, (
+                "past stale_minutes plus the write floor the stamp is stale and "
+                f"must fail open; got {code}: {body}")

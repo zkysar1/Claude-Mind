@@ -87,7 +87,14 @@ fi
 #   8 = ran fine, genuinely ZERO candidates  <- the reading 7 must never be given
 #   9 = the requested field is absent from the payload
 if [ -n "$FIELD" ]; then
-  python3 - "$OUT_TMP" "$FIELD" <<'PYEXTRACT'
+  # _platform.sh exports MSYS_NO_PATHCONV=1, so on Git Bash the MSYS mktemp path
+  # (/tmp/...) reaches NATIVE python3 unconverted and open() below raises
+  # FileNotFoundError, which its except reports as "not JSON" ().
+  # Convert as _platform.sh does for WORLD_DIR: cygpath -m, never -w (guard-581).
+  # OUT_TMP stays MSYS-form for bash's own rm/cat; a no-op where cygpath is absent.
+  OUT_PY="$OUT_TMP"
+  if command -v cygpath >/dev/null 2>&1; then OUT_PY="$(cygpath -m "$OUT_TMP")"; fi
+  python3 - "$OUT_PY" "$FIELD" <<'PYEXTRACT'
 import json, sys
 path, field = sys.argv[1], sys.argv[2]
 try:

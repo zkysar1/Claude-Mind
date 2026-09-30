@@ -63,6 +63,15 @@ if [[ -z "$MANIFEST" ]]; then
     fi
 fi
 
+# Hand python a native path (). pre-commit runs this gate with
+# MSYS_NO_PATHCONV=1 inherited from iteration-close.sh (_platform.sh), so MSYS
+# no longer rewrites the /c/... form in the MANIFEST env var, Windows python
+# answered "manifest not found", and pre-commit refused every loop commit that
+# staged the manifest. No cygpath off Windows: the path passes through unchanged.
+if command -v cygpath >/dev/null 2>&1; then
+    MANIFEST="$(cygpath -m "$MANIFEST")"
+fi
+
 PY="${PY_CMD:-python3}"
 
 MANIFEST="$MANIFEST" QUIET="$QUIET" "$PY" - <<'PYEOF'

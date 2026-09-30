@@ -22,6 +22,13 @@ Fix under test:
   - Final.5 passes `--session-sid "$MIND_SID"` and no longer claims the
     script filters same-agent partner WIP.
 
+g-115-11374 (the stamp was the wrong session's): the Bash recorder now credits
+a change to the one session whose command was running when it happened
+(_bash_inflight.py windows), and --session-sid leaves out a path this session
+changed when another writer also changed it after its last commit. The
+end-to-end test at the bottom runs the real recorder into the real commit in
+the measured incident's shape.
+
 Outcomes 1 and 2 run the Final.5 invocation READ OUT OF THE LIVE SKILL.md, not
 a hand-copied argv (guard-920: replicate the production call shape). So the
 test goes red if the skill ever drops the scope, and it is red against
@@ -43,6 +50,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import pytest
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
@@ -52,7 +61,9 @@ SKILL_MD = REPO_ROOT / ".claude" / "skills" / "encode-session" / "SKILL.md"
 PROJECT_TMP = SCRIPT_DIR / "_tmp_iteration_commit_session_scope_test"
 
 sys.path.insert(0, str(SCRIPT_DIR))
+sys.path.insert(0, str(CORE_SCRIPTS))
 from _bash_helpers import BASH as GIT_BASH  # noqa: E402
+import _bash_inflight  # noqa: E402
 
 # Strip the framework env namespace so a leaked MIND_SID / MIND_AGENT /
 # STORAGE_BACKEND from the running session cannot steer the script under test
@@ -154,12 +165,15 @@ def _write(repo: Path, rel: str, body: str) -> None:
     p.write_text(body)
 
 
-def _record(repo: Path, rel: str, sid: str | None) -> None:
+def _record(repo: Path, rel: str, sid: str | None, mtime: int | None = None,
+            candidates: list | None = None) -> None:
     """Append one edit record, shaped as the recorders write it."""
-    rec = {"file": rel, "mtime": int(time.time()),
+    rec = {"file": rel, "mtime": int(time.time()) if mtime is None else mtime,
            "edit_ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "goal_id": ""}
     if sid is not None:
         rec["sid"] = sid
+    if candidates:
+        rec["candidates"] = candidates
     log = repo / "agents" / "alpha" / "session" / "uncommitted-edits.jsonl"
     with log.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
@@ -328,6 +342,138 @@ def test_a_record_without_a_session_id_is_not_this_sessions():
         assert "not-this-session): core/scripts/legacy.py" in r.stderr, r.stderr
 
 
+# --------------------------------------------------------------------------- #
+#  — a file another writer also changed is not this session's alone
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("other_sid, candidates, label", [
+    (SID_B, None, SID_B[:8]),
+    ("", [SID_A, SID_B], "ambiguous"),
+    (None, None, "unattributed"),
+])
+def test_a_file_another_writer_also_changed_is_left_out_and_named(other_sid, candidates, label):
+    """git stages whole files: committing arch.md for A would ship the other
+    writer's change too, so the scope leaves it out and says who else wrote it."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit(tmp)
+        _write(repo, ".claude/rules/mine.md", "# base\nmine\n")
+        _record(repo, ".claude/rules/mine.md", SID_A)
+        _write(repo, "core/config/arch.md", "# base\nmine\ntheirs\n")
+        _record(repo, "core/config/arch.md", other_sid, candidates=candidates)
+        _record(repo, "core/config/arch.md", SID_A)
+
+        r = _run_commit(shim, _bind(_final5_args(), repo, SID_A))
+
+        assert r.returncode == 0, r.stderr
+        assert _committed(repo) == {".claude/rules/mine.md"}, r.stderr
+        assert "core/config/arch.md" in _dirty(repo)
+        assert f"also-changed-by-another): core/config/arch.md (other: {label})" in r.stderr, r.stderr
+
+
+def test_a_row_older_than_the_files_last_commit_does_not_contest():
+    """The other writer's change is already in HEAD, so it does not block this
+    session's later change: a ledger keeps rows for files committed by pathspec."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit(tmp)
+        committed_at = int(_git(repo, "log", "-1", "--format=%ct").strip())
+        _record(repo, "core/config/arch.md", SID_B, mtime=committed_at - 100)
+        _write(repo, "core/config/arch.md", "# base\nmine\n")
+        _record(repo, "core/config/arch.md", SID_A)
+
+        r = _run_commit(shim, _bind(_final5_args(), repo, SID_A))
+
+        assert r.returncode == 0, r.stderr
+        assert _committed(repo) == {"core/config/arch.md"}, r.stderr
+
+
+def _open_window(repo: Path, sid: str, command: str, start: float) -> None:
+    """The window bash-agent-inject opens before a command, with a chosen start."""
+    d = repo / "agents" / "alpha" / "sessions" / sid / _bash_inflight.DIRNAME
+    d.mkdir(parents=True, exist_ok=True)
+    (d / _bash_inflight.command_key(command)).write_text(
+        json.dumps({"start": start, "expires": time.time() + 600}))
+
+
+def _command_returns(repo: Path, sid: str, command: str) -> None:
+    """The recorder as the PostToolUse of `command` in session `sid`."""
+    r = subprocess.run(
+        [GIT_BASH, _to_bash_path(repo / "core" / "scripts" / "bash-edit-record.sh")],
+        input=json.dumps({"session_id": sid, "tool_input": {"command": command}}),
+        capture_output=True, text=True, timeout=30, env=_hermetic_env(MIND_AGENT="alpha"))
+    assert r.returncode == 0, r.stderr
+
+
+def _write_at(repo: Path, rel: str, body: str, mtime: int) -> None:
+    _write(repo, rel, body)
+    os.utime(repo / rel, (mtime, mtime))
+
+
+def test_end_to_end_recorder_then_commit_in_the_incident_shape():
+    """Both directions of , through the real recorder and the real
+    commit, with the Final.5 argv read from the skill.
+
+    1. Session B's long command writes core/scripts/theirs.py; session A's
+       command starts after that write and ends first, so A's recorder records
+       it (the 2026-09-28 e7311258 shape). It must be credited to B.
+    2. A's next command edits core/scripts/mine.py, whose only earlier row is a
+       stale August row with no sid (the 2026-09-29 06a996f3 shape). Dedup on the
+       file alone dropped the new change; it must be recorded as A's.
+    So A's commit holds mine.py and not theirs.py, and B's commit holds
+    theirs.py."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        tmp = Path(td)
+        repo = _setup_repo(tmp)
+        shim = _shim_iteration_commit(tmp)
+        core_scripts = repo / "core" / "scripts"
+        for fname in ("bash-edit-record.sh", "_paths.sh", "_bash_inflight.py"):
+            (core_scripts / fname).write_bytes((CORE_SCRIPTS / fname).read_bytes())
+            (core_scripts / fname).chmod(0o755)
+        shim_dir = core_scripts / ".python-shim"
+        shim_dir.mkdir()
+        for name in ("python3", "python"):  # sys.executable, never `py -3` ()
+            (shim_dir / name).write_text(f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n')
+            (shim_dir / name).chmod(0o755)
+        (repo / "agents" / "alpha" / "local-paths.conf").write_text("WORLD_PATH=\nMETA_PATH=\n")
+        with (repo / ".gitignore").open("a") as fh:
+            fh.write("**/sessions/\n.python-shim/\ncore/.pycache/\n")
+        _write_at(repo, "core/scripts/mine.py", "print(0)\n", int(time.time()) - 1000)
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "recorders")
+        base = int(time.time())
+        session = repo / "agents" / "alpha" / "session"
+        (session / "uncommitted-edits.jsonl").write_text(json.dumps(
+            {"file": "core/scripts/mine.py", "mtime": base - 5_000_000,
+             "edit_ts": "2026-08-01T00:00:00", "goal_id": ""}) + "\n")
+        cmd_a1, cmd_a2, cmd_b = "python3 retrieve-loop.py", "sed -i s/0/1/ core/scripts/mine.py", "python3 write-tests.py"
+
+        _open_window(repo, SID_B, cmd_b, base - 50)
+        _write_at(repo, "core/scripts/theirs.py", "print('theirs')\n", base - 40)
+        (session / ".bash-edit-cursor").write_text(f"{base - 60}\n")
+        _open_window(repo, SID_A, cmd_a1, base - 35)
+        _command_returns(repo, SID_A, cmd_a1)
+        _command_returns(repo, SID_B, cmd_b)
+        (session / ".bash-edit-cursor").write_text(f"{base - 15}\n")
+        _open_window(repo, SID_A, cmd_a2, base - 12)
+        _write_at(repo, "core/scripts/mine.py", "print('mine')\n", base - 10)
+        _command_returns(repo, SID_A, cmd_a2)
+
+        r = _run_commit(shim, _bind(_final5_args(), repo, SID_A))
+        assert r.returncode == 0, r.stderr
+        assert _committed(repo) == {"core/scripts/mine.py"}, r.stderr
+        assert "not-this-session): core/scripts/theirs.py" in r.stderr, r.stderr
+
+        r = _run_commit(shim, _bind(_final5_args(), repo, SID_B))
+        assert r.returncode == 0, r.stderr
+        assert _committed(repo) == {"core/scripts/theirs.py"}, r.stderr
+
+
 def test_empty_session_id_fails_loud_instead_of_sweeping():
     PROJECT_TMP.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
@@ -419,7 +565,7 @@ def _setup_recorder_repo(tmp: Path) -> Path:
     core_scripts.mkdir(parents=True)
     (repo / ".claude").mkdir()
     for fname in ("uncommitted-edits-record.sh", "bash-edit-record.sh", "_paths.sh",
-                  "_python_launcher.sh"):
+                  "_python_launcher.sh", "_bash_inflight.py"):
         dst = core_scripts / fname
         dst.write_bytes((CORE_SCRIPTS / fname).read_bytes())
         dst.chmod(0o755)
@@ -463,20 +609,21 @@ def test_edit_recorder_stamps_the_payload_session_id():
         assert recs[-1].get("sid") == SID_A, recs
 
 
-def test_bash_recorder_stamps_the_observing_session_id():
+def test_bash_recorder_stamps_the_session_whose_command_was_running():
     PROJECT_TMP.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
         repo = _setup_recorder_repo(Path(td))
         base = int(time.time())
         (repo / "agents" / "alpha" / "session" / ".bash-edit-cursor").write_text(f"{base - 60}\n")
+        _open_window(repo, SID_A, "python3 make.py", base - 20)
         made = repo / "core" / "scripts" / "made-by-command.py"
         made.write_text("# x\n")
         os.utime(made, (base - 5, base - 5))
 
         r = subprocess.run(
             [GIT_BASH, _to_bash_path(repo / "core" / "scripts" / "bash-edit-record.sh")],
-            input=json.dumps({"session_id": SID_A}), capture_output=True, text=True,
-            timeout=30, env=_hermetic_env(MIND_AGENT="alpha"))
+            input=json.dumps({"session_id": SID_A, "tool_input": {"command": "python3 make.py"}}),
+            capture_output=True, text=True, timeout=30, env=_hermetic_env(MIND_AGENT="alpha"))
 
         assert r.returncode == 0, r.stderr
         recs = [x for x in _log_records(repo) if x.get("file") == "core/scripts/made-by-command.py"]

@@ -9,7 +9,8 @@ Files unreadable at hash time are silently omitted from the output dict.
 The reader treats missing entries as "no signature available for this path"
 and falls back to path-only coverage (backward-compat with pre-573 records).
 
-Path resolution: PROJECT_ROOT env var, fallback to CWD.
+Path resolution: a world/ or meta/ path resolves through _paths to the
+configured external directory; any other path joins PROJECT_ROOT (fallback CWD).
 
 file_sig is the ONE signature algorithm. Both writers (this CLI and the
 post-state-update-gate.sh fresh_eyes_last_fire writer) and the reader
@@ -39,12 +40,20 @@ def file_sig(rel_path, root):
     git checks one commit out with CRLF line endings on a Windows box
     (core.autocrlf) and with LF elsewhere. Over raw bytes, a record written on
     one box never matched a reading on the other, so every cross-platform
-    record read as an amend."""
-    full = os.path.join(root, rel_path) if root else rel_path
+    record read as an amend.
+
+    world/ and meta/ are virtual prefixes for external directories, so they
+    resolve through _paths (guard-132). Joined onto root they named a file that
+    does not exist, and no world or meta file was ever signed (g-115-11454)."""
     try:
+        if rel_path.startswith(("world/", "meta/")):
+            import _paths  # only these prefixes need the configured external dirs
+            full = _paths.resolve_file_path(rel_path)
+        else:
+            full = os.path.join(root, rel_path) if root else rel_path
         with open(full, "rb") as f:
             return hashlib.sha1(f.read().replace(b"\r\n", b"\n")).hexdigest()[:12]
-    except (OSError, IOError):
+    except (OSError, IOError, RuntimeError):  # RuntimeError: that dir is not configured
         return None
 
 

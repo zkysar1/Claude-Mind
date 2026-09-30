@@ -539,3 +539,113 @@ def test_body_only_tick_without_a_bound_session_publishes_nothing():
         assert r.returncode == 0, f"rc={r.returncode} stderr={r.stderr[-400:]}"
         assert not _carrier(adir).exists()
         assert _calls(record) == []
+
+
+# --- 9. one tmp per writer () ---------------------------------------
+#
+# The carrier was written through ONE fixed `<carrier>.tmp` shared by every
+# writer, so a second tick's `>` could empty the first tick's pending tmp and the
+# first rename then published an empty carrier. The write happens inside the
+# script, so the interleave is forced at the one external command on that path:
+# a PATH `mv` stub that holds each rename until the test releases it. Each held
+# rename is told apart by the body_state its own tmp carries.
+
+def _stub_mv(bindir: Path, gate: Path, *, fail: bool = False) -> None:
+    """A PATH `mv` that marks `at-mv-<body_state of its source>`, then either
+    waits for `release-<same>` and renames with the real mv, or fails without
+    renaming. The wait is bounded, so a test that never releases cannot hang."""
+    real = shutil.which("mv")
+    assert real, "no real mv on PATH to delegate to"
+    body = ('src="${@: -2:1}"\n'
+            "tag=$(sed -n 's/.*\"body_state\":\"\\([^\"]*\\)\".*/\\1/p' \"$src\" | head -1)\n"
+            ': > "GATE/at-mv-${tag:-none}"\n')
+    if fail:
+        body += "exit 1"
+    else:
+        body += ('i=0\n'
+                 'while [ ! -e "GATE/release-${tag:-none}" ] && [ "$i" -lt 200 ]; do '
+                 'sleep 0.05; i=$((i + 1)); done\n'
+                 'exec "REAL" "$@"')
+    bindir.mkdir(parents=True, exist_ok=True)
+    _stub(bindir / "mv", body.replace("GATE", gate.as_posix()).replace("REAL", real))
+
+
+def _tmps(agent_dir: Path) -> list[str]:
+    return sorted(p.name for p in (agent_dir / "session").glob("body-heartbeat-*.json.tmp*"))
+
+
+def test_two_concurrent_writers_each_keep_their_own_tmp(monkeypatch):
+    """Writer A is held at its rename, then writer B writes. With the shared
+    name, B's write replaced A's pending content: one tmp, holding B's state.
+    With a per-process name both tmps survive intact, and after both renames the
+    carrier parses and no tmp is left behind."""
+    import json
+    import threading
+    with tempfile.TemporaryDirectory() as tmpd:
+        tmp = Path(tmpd)
+        root, adir = _stage_root(tmp, with_session_dir=True, state="IDLE")
+        _stub_runtime(root, tmp / "rt-calls.txt")
+        gate = tmp / "gate"
+        gate.mkdir()
+        _stub_mv(tmp / "bin", gate)
+        monkeypatch.setenv("PATH", f"{tmp / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+        results: dict = {}
+
+        def run(tag: str) -> None:
+            results[tag] = _tick(root, adir, sid=SID, args=("--body-only",))
+
+        def wait_for(marker: str) -> None:
+            deadline = time.time() + 60
+            while not (gate / marker).exists():
+                assert time.time() < deadline, f"no writer reached the rename ({marker}); {results}"
+                time.sleep(0.05)
+
+        a = threading.Thread(target=run, args=("a",))
+        b = threading.Thread(target=run, args=("b",))
+        try:
+            _write_manifest(adir, "writer-a")
+            a.start()
+            wait_for("at-mv-writer-a")
+            _write_manifest(adir, "writer-b")
+            b.start()
+            wait_for("at-mv-writer-b")
+            held = {n: json.loads((adir / "session" / n).read_text(encoding="utf-8"))["body_state"]
+                    for n in _tmps(adir)}
+            assert sorted(held.values()) == ["writer-a", "writer-b"], (
+                "two writers held at their renames must each still own a complete "
+                f"tmp; with a shared name the second write replaces the first. tmps={held}")
+        finally:
+            (gate / "release-writer-a").touch()
+            if a.ident is not None:
+                a.join(timeout=60)
+            for tag in ("writer-b", "none"):
+                (gate / f"release-{tag}").touch()
+            if b.ident is not None:
+                b.join(timeout=60)
+        for tag, r in sorted(results.items()):
+            assert r.returncode == 0, f"writer {tag}: rc={r.returncode} stderr={r.stderr[-400:]}"
+        doc = json.loads(_carrier(adir).read_text(encoding="utf-8"))
+        assert (doc["sid"], doc["body_state"]) == (SID, "writer-b"), doc
+        assert _tmps(adir) == [], f"a completed write left its tmp behind: {_tmps(adir)}"
+
+
+def test_a_failed_rename_removes_its_own_tmp(monkeypatch):
+    """A failed rename must not leave the writer's tmp behind: with one tmp name
+    per process, every failed tick would otherwise add a file. The `at-mv`
+    marker is the positive control that a tmp was really written before the
+    rename failed."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        tmp = Path(tmpd)
+        root, adir = _stage_root(tmp, with_session_dir=True, state="IDLE")
+        _stub_runtime(root, tmp / "rt-calls.txt")
+        gate = tmp / "gate"
+        gate.mkdir()
+        _stub_mv(tmp / "bin", gate, fail=True)
+        monkeypatch.setenv("PATH", f"{tmp / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+        _write_manifest(adir, "writer-a")
+        r = _tick(root, adir, sid=SID, args=("--body-only",))
+        assert r.returncode == 0, f"a failed rename must stay fail-open. stderr={r.stderr[-400:]}"
+        assert (gate / "at-mv-writer-a").exists(), (
+            f"positive control: the write never reached its rename. stderr={r.stderr[-400:]}")
+        assert not _carrier(adir).exists(), "the rename failed, so no carrier may exist"
+        assert _tmps(adir) == [], f"a failed rename left its tmp behind: {_tmps(adir)}"

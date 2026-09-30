@@ -67,12 +67,27 @@ def test_bash_actually_refuses_the_crlf_fixture(tmp_path):
     `set -euo pipefail\\r` and dies with `set: pipefail: invalid option name`,
     rc=2 -- the failure that killed the fleet's outbound email transport
     silently, because callers that swallow stderr see only a non-zero rc.
+
+    PLATFORM-SCOPED (g-115-8624): Git Bash on Windows runs this CRLF fixture
+    CLEAN (rc=0, "ok"; DESKTOP-O91DLK2 2026-09-02), so there the ground truth is
+    false and the test SKIPS -- population zero, not a green (rb-8039). This is
+    not rb-6758's conditional-fix trap: the pin measures the local interpreter,
+    not the repo (rb-10131); the Linux boxes where world/scripts actually break
+    on CRLF still run every assertion; and the unconditional form would delete
+    the only proof bash rejects these bytes. The detector stays pinned on every
+    platform by the RED-arm tests below. The skip fires only on the positively
+    identified tolerance signature (rc=0 AND "ok"), so any other rc=0 still fails.
     """
     d = _fixture_dir(tmp_path, clean=CLEAN, crlf=WHOLE_CRLF)
     ok = subprocess.run([BASH, (d / "clean").as_posix()], capture_output=True, text=True)
     assert ok.returncode == 0 and ok.stdout.strip() == "ok"
 
     bad = subprocess.run([BASH, (d / "crlf").as_posix()], capture_output=True, text=True)
+    if bad.returncode == 0 and bad.stdout.strip() == "ok":
+        pytest.skip(
+            "this bash runs a CRLF script clean (Git Bash / MSYS strips \\r); the "
+            "bash-refuses-CRLF ground truth does not hold here. The CR-presence "
+            "detector is still pinned by the RED-arm tests (g-115-8624)")
     assert bad.returncode != 0, "a CRLF script must not run clean -- fixture is wrong"
     assert "pipefail" in bad.stderr
 

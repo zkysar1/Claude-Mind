@@ -21,6 +21,14 @@ _SELF="$(cd "$(dirname "$0")" && pwd)"
 source "$_SELF/_python_launcher.sh"
 PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$_SELF/../.." && pwd)}"
+# Hand python a native path (). The domain suite runs its units with
+# MSYS_NO_PATHCONV=1 inherited from iteration-close.sh (_platform.sh), so MSYS no
+# longer rewrites the /c/... form and Windows python could not open the .py.
+# Only this wrapper's own path is converted here: path ARGUMENTS in "$@" reach
+# python as the caller gave them (rb-12388). No cygpath off Windows.
+if command -v cygpath >/dev/null 2>&1; then
+    PROJECT_ROOT="$(cygpath -m "$PROJECT_ROOT")"
+fi
 cd "$PROJECT_ROOT" || exit 2
 
 # Exit code is the extractor's verdict (0 PASS / 1 FAIL / 2 ERROR /

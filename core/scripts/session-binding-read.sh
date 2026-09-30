@@ -16,8 +16,9 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # py -3 on Windows, python3 elsewhere: never a bare `py -3` (, guard-1098).
+# The _into form: hooks call this on every tool call, so skip the subshell ().
 source "$SCRIPT_DIR/_python_launcher.sh"
-PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
+rt_python_launcher_into PYLAUNCH || PYLAUNCH=python3
 
 if [ "$#" -lt 1 ]; then
     echo "usage: session-binding-read.sh <SID> [--field <field>] [--json]" >&2

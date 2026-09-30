@@ -353,6 +353,11 @@ def main():
     path = args.file or (DEFAULT_CHECK_FILE if args.grammar == "check" else None)
     if not path:
         die("--file is required for the shell grammar")
+    # A caller running with MSYS_NO_PATHCONV=1 hands a /c/... --file through
+    # untranslated, and Windows python reads it as C:\c\... . Normalize it here,
+    # in the callee: env conversion cannot reach an argv path (rb-12388).
+    from _path_helpers import normalize_msys_path
+    path = normalize_msys_path(path)
     text = read_host(path, args.source)
 
     if args.list:

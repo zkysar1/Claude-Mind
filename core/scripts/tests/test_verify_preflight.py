@@ -186,6 +186,19 @@ def test_a_q4_refusal_refuses_and_its_pass_does_not(tmp_path, monkeypatch):
     assert (r["results"]["q4"]["state"], r["rc"]) == ("PASS", 0)
 
 
+def test_a_q4_refusal_gives_each_finding_kind_its_own_remedy(tmp_path):
+    """. One shared remedy line came before repeat Q4 FAILs: 3 of the 6
+    reruns beyond the skill's single rerun, over 28 worker closes. The two
+    citation kinds are fixed in opposite ways (guard-6180), only a whole-file
+    Read clears a decorative one, and a curl fetch is recorded since
+    g-115-9263, so the old "cat or curl is invisible" was half false."""
+    r = run(Harness(tmp_path), [art(tmp_path, "uncited.md", UNCITED)])
+    remedy = r["results"]["q4"]["remedy"]
+    assert "missing-citation:" in remedy and "decorative-citation:" in remedy, remedy
+    assert "with no offset or limit" in remedy, remedy
+    assert "cat or curl is invisible" not in remedy, remedy
+
+
 # ─── not-applied and could-not-run are never a pass ─────────────────────────
 
 def test_a_skipped_q4_is_not_a_pass_and_is_recorded_as_skipped(tmp_path):

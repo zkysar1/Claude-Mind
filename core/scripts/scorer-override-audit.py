@@ -37,7 +37,10 @@ SIGNAL (the deviation enum is missing a legitimate code), not noise — hence
 force-override is a hit at count 1.
 
 Run modes:
-  --since-hours <N>   # only count events from the last N hours (default 24)
+  --since-hours <N>   # only count events from the last N hours (default 36, =
+                      #   the 24h counting window + 12h delivery-lag headroom,
+                      #   : a Body's rows ride the carrier, and a
+                      #   window with no headroom reads 'clean' over the lag)
   --json              # machine-readable JSON report
   --agents-root <p>   # override the agents root (TEST hermeticity only)
   --exit-on-hits      # exit 1 if any hits in window (cron regression shape)
@@ -93,6 +96,17 @@ STUCK_TOP_THRESHOLD = 3  # STRICTLY MORE THAN this many deviations over ONE scor
 # same stuck top hours later (the  13x shape), which must NOT collapse.
 RETRY_COLLAPSE_WINDOW_S = 300
 
+# : the audit's DEFAULT window must cover the DELIVERY LAG, not just
+# its counting window. A worker Body's rows reach the store via the
+# world/body-diaries carrier (pushed per append; self-healing, but a Body that
+# goes quiet after a failed push waits for the daemon's world/ sweep or the
+# next append). A counting window with no lag headroom undercounts by
+# construction on a lagging box, and the undercount reads as 'clean' — the
+# exact false-clean this goal exists to end. 36h = the counting default plus
+# 12h headroom. An explicit --since-hours (or wrapper positional) gets exactly
+# that window and sizes its own headroom.
+DEFAULT_SINCE_HOURS = 36
+
 
 def _classify(code: str) -> str:
     if code in WEIGHT_SIGNAL_CODES:
@@ -122,7 +136,7 @@ def _parse_ts(s):
     return dt
 
 
-def audit(since_hours: int = 24, root: Path | None = None) -> dict:
+def audit(since_hours: int = DEFAULT_SINCE_HOURS, root: Path | None = None) -> dict:
     """Scan all agents' diaries and return the report dict. Pure read — no
     goal filing, no writes."""
     cutoff = datetime.now() - timedelta(hours=since_hours)  # naive UTC
@@ -435,7 +449,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="Scorer-override detective audit (Scorer Sovereignty Layer C, g-115-2813)"
     )
-    ap.add_argument("--since-hours", type=int, default=24)
+    ap.add_argument("--since-hours", type=int, default=DEFAULT_SINCE_HOURS)
     ap.add_argument("--json", action="store_true")
     ap.add_argument(
         "--agents-root",

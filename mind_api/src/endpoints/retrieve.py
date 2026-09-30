@@ -49,6 +49,7 @@ Path-swap pattern (Decision #25, extended by #58):
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import sys
@@ -71,6 +72,9 @@ import retrieve as _r  # noqa: E402
 # index as the "real" function (which would create infinite recursion on the
 # first cache miss). tree_match.build_concept_index is never patched.
 from tree_match import build_concept_index as _real_build_concept_index  # noqa: E402
+# The same resolver build_concept_index reads node bodies through, so the
+# fingerprint stats exactly the file the index would read ().
+from tree_match import _node_path as _tree_node_path  # noqa: E402
 #  reader seam. Imported from core/scripts directly — there is no daemon
 # twin by construction, so this side cannot drift from the CLI side.
 from _utilization_store import (  # noqa: E402
@@ -151,8 +155,19 @@ def _maybe_freshness_tick(world, agent):
 # Keyed on a CONTENT fingerprint of `nodes` (2026-09-03), not id(nodes). The
 # concept index is a pure function of each node's `file` and that file's
 # front matter, and every hook-mediated front-matter edit bumps the node's
-# `last_updated` in _tree.yaml (T21) — so (key, file, last_updated) over all
-# nodes changes exactly when the index can. The old id(nodes) key missed on
+# `last_updated` in _tree.yaml (T21). But T21 stamps a DATE, so a second edit
+# on the same day does not move it: (key, file, last_updated) alone served an
+# entity edit to a node already dated today stale, until some other node's
+# date moved or the daemon restarted (measured 2026-09-29, ). So the
+# key also carries the file mtime of every node dated within one day of the
+# tree's newest date, the only nodes a same-day edit can leave undated. The
+# cutoff reads the tree's own dates, capped at this process's today, so a
+# timezone skew between the daemon and T21 cannot shrink it and one
+# future-dated typo cannot move it off every real node. Cost on DESKTOP-O91DLK2
+# over 1,686 nodes (113 in the window), two runs: 1.9-3.1 ms -> 28.7-30.9 ms
+# per request, under 0.6% of the 5.6-15.4 s retrieve round trip measured
+# there the same hour. Stat-ing every node would cost 261 ms; that is why the
+# stat is scoped. The old id(nodes) key missed on
 # every yaml_cache reload, and _tree.yaml reloads on every box each time ANY
 # agent's counting retrieval writes a retrieval_count into it: on a busy fleet
 # essentially every request paid the full 1,569-file front-matter walk
@@ -160,24 +175,47 @@ def _maybe_freshness_tick(world, agent):
 # The anchor the id-keyed entry carried (a strong ref to the nodes dict, to
 # defeat CPython address reuse) is unnecessary under a content key and is
 # gone, so a retained index no longer pins a 1.7 MB dict per slot. Known
-# staleness: a hand edit to a node's entities that bypasses the hook is
-# invisible here until that node's last_updated next moves — the same class
-# as yaml_cache's own mtime keying.
+# staleness: a hand edit that bypasses the hook, to a node dated more than a
+# day before the tree's newest date, stays invisible until that node's
+# last_updated next moves. Known over-invalidation (the safe direction): any
+# rewrite of a recently dated node's file, a sync pull included, re-stamps its
+# mtime and costs one rebuild even when its entities did not change.
 _concept_cache: dict = {}
 _concept_cache_lock = threading.Lock()
 _CONCEPT_CACHE_MAX = 8  # bounded; ~1 entry per agent
 
 
-def _concept_fingerprint(nodes):
-    """Content key for the concept index — see the block above. ~2 ms over
-    1,569 nodes. Falls back to id(nodes) (the pre-2026-09-03 key) when the
-    dict is not the shape expected, so a malformed index degrades to the old
-    behaviour rather than to a stale hit."""
+def _concept_fingerprint(nodes, world_root=None):
+    """Content key for the concept index — see the block above. Falls back to
+    id(nodes) (the pre-2026-09-03 key) when the dict is not the shape
+    expected, so a malformed index degrades to the old behaviour rather than
+    to a stale hit. ``world_root`` resolves the node files whose mtime joins
+    the key. A last_updated that is not an ISO date is left out of the newest
+    date, so one malformed stamp cannot switch the mtime window off."""
     try:
-        return hash(tuple(sorted(
-            (str(k), str((n or {}).get("file", "")),
-             str((n or {}).get("last_updated", "")))
-            for k, n in nodes.items())))
+        rows = [(str(k), str((n or {}).get("file", "")),
+                 str((n or {}).get("last_updated", "")))
+                for k, n in nodes.items()]
+        dates = []
+        for _, _, lu in rows:
+            try:
+                dates.append(_dt.date.fromisoformat(lu[:10]))
+            except ValueError:
+                pass
+        # Capped at today: one future-dated typo must not become the anchor
+        # and move the window off every real node.
+        cutoff = ((min(max(dates), _dt.date.today())
+                   - _dt.timedelta(days=1)).isoformat() if dates else None)
+        keyed = []
+        for k, f, lu in rows:
+            mtime = 0
+            if cutoff and f and lu[:10] >= cutoff:
+                try:
+                    mtime = os.stat(_tree_node_path(f, world_root)).st_mtime_ns
+                except (OSError, TypeError, ValueError):
+                    mtime = -1
+            keyed.append((k, f, lu, mtime))
+        return hash(tuple(sorted(keyed)))
     except Exception:
         return id(nodes)
 
@@ -185,10 +223,10 @@ def _concept_fingerprint(nodes):
 def _cached_build_concept_index(nodes, world_root=None):
     """(fingerprint(nodes), world_root)-keyed wrapper. HITS across yaml_cache
     reloads whose only change is retrieval counters; misses when any node's
-    key, file or last_updated moves. ``world_root`` arrives as the swapped-in
-    ``retrieve.WORLD_DIR`` of the request being served (g-367-08) and is part
-    of the key."""
-    cache_key = (_concept_fingerprint(nodes), str(world_root))
+    key, file or last_updated moves, or a recently dated node's file is
+    rewritten. ``world_root`` arrives as the swapped-in ``retrieve.WORLD_DIR``
+    of the request being served (g-367-08) and is part of the key."""
+    cache_key = (_concept_fingerprint(nodes, world_root), str(world_root))
     with _concept_cache_lock:
         entry = _concept_cache.get(cache_key)
     if entry is not None:

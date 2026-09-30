@@ -32,6 +32,7 @@ downstream half for Python-native subprocess callsites that bypass _paths.sh.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -105,13 +106,23 @@ BASH = resolve_bash()
 # checked first. Backslash, backtick, $VAR, ; | & ( ) > and a non-matching *
 # all survive unquoted and are deliberately NOT flagged -- flagging them would
 # be the over-broad predicate guard-2860 warns against.
+#
+# A THIRD class lives on the quoted side (, measured 2026-09-29 over
+# 14 shapes, 0 false positives, 0 false negatives): inside the quotes that
+# list2cmdline adds, MSYS collapses each backslash PAIR to one, silently, rc=0
+# ('a\\b c' arrives as 'a\b c', '\\srv\my share' as '\srv\my share').
+# list2cmdline doubles only a run that ends the value or precedes a double
+# quote, and those arrive intact, so only a run of two or more followed by some
+# other character is flagged. A single backslash survives quoted as well.
 _WIN_ARG_UNSAFE = "\"'{}"
+_WIN_QUOTED_BACKSLASH_RUN = re.compile(r'\\{2,}(?=[^"\\])')
 
 
 def _win_arg_corrupts(value: str) -> bool:
     """True when Windows will silently alter this argument in transit."""
     if any(ch.isspace() for ch in value):
-        return False  # list2cmdline quotes it; measured safe for both classes
+        # list2cmdline quotes it: measured safe for quotes and braces, not for a backslash run
+        return bool(_WIN_QUOTED_BACKSLASH_RUN.search(value))
     return any(ch in value for ch in _WIN_ARG_UNSAFE)
 
 
@@ -137,16 +148,22 @@ def bash_cmd(script, *args) -> "list[str]":
         for i, value in enumerate(argv):
             if not _win_arg_corrupts(value):
                 continue
-            bad = "".join(sorted({c for c in value if c in _WIN_ARG_UNSAFE}))
             shown = value if len(value) <= 120 else value[:117] + "..."
-            mode = ("TRUNCATE argv — this and EVERY FOLLOWING argument are lost"
-                    if ('"' in value or "'" in value)
-                    else "MANGLE this value (braces are stripped; {a,b} expands into extra args)")
+            if any(ch.isspace() for ch in value):
+                bad = "\\\\"
+                where = "a run of 2+ backslashes, in a value that has whitespace"
+                mode = "COLLAPSE each backslash pair in that run to one"
+            else:
+                bad = "".join(sorted({c for c in value if c in _WIN_ARG_UNSAFE}))
+                where = "quote/brace characters, with no whitespace in the value"
+                mode = ("TRUNCATE argv — this and EVERY FOLLOWING argument are lost"
+                        if ('"' in value or "'" in value)
+                        else "MANGLE this value (braces are stripped; {a,b} expands into extra args)")
             raise ValueError(
                 "bash_cmd: argument %d would be silently corrupted by Windows and "
                 "was REFUSED rather than passed.\n"
                 "  argument : %r\n"
-                "  offending: %s   (quote/brace characters, with no whitespace in the value)\n"
+                "  offending: %s   (%s)\n"
                 "  effect   : Windows would %s\n"
                 "\n"
                 "  WHY YOU ARE SEEING THIS RATHER THAN A CONFUSING ERROR LATER:\n"
@@ -163,7 +180,7 @@ def bash_cmd(script, *args) -> "list[str]":
                 "       MIND_BASH_ALLOW_UNSAFE_ARGS=1 to accept the corruption knowingly.\n"
                 "\n"
                 "  Do NOT 'fix' this by adding a space to the value — that changes the data.\n"
-                "  Detail: guard-5633, g-115-8409."
-                % (i + 1, shown, bad, mode)
+                "  Detail: guard-5633, g-115-8409, g-115-11460."
+                % (i + 1, shown, bad, where, mode)
             )
     return [BASH, Path(script).as_posix(), *argv]

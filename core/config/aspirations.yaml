@@ -492,11 +492,16 @@ close_review_gate:
   # uncommitted-work gate), and a refusal it cannot override stalls it on a branch the
   # worker loop does not have — reviewing after keeps the Body untouched and still puts a
   # stronger reader on every closure; a REJECT files a Fix goal (fix-forward).
-  # RELAX RULE (drop a role from this list, or flip it to the blocking gate) only on
-  # evidence from `close-review-queue.py stats`: >= 10 reviewed closures for the role,
-  # approve rate >= 0.8 (APPROVE + APPROVE_WITH_NOTES), and no REJECT among the last 5.
-  # When relaxing, enumerate what depended on the reviews first (guard-3699).
+  # RELAX RULE (move a role from this list to review_sampled_roles, or flip it to the
+  # blocking gate) only on evidence from `close-review-queue.py stats`: >= 10 reviewed
+  # closures for the role, approve rate >= 0.8 (APPROVE + APPROVE_WITH_NOTES), and no
+  # REJECT among the last 5. When relaxing, enumerate what depended on the reviews first
+  # (guard-3699). Relaxing never drops a role to zero coverage (): a sampled role
+  # keeps a deterministic review_sample_rate share of its closures in the queue, so its
+  # pass rate stays measured after relaxing. A rate outside (0, 1] reads as 0.2, loudly.
   review_closer_roles: [worker]
+  review_sampled_roles: []
+  review_sample_rate: 0.2
 
 planning:
   check_interval_goals: 3       # run alignment check every N completed goals

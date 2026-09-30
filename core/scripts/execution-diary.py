@@ -330,6 +330,30 @@ def read_entries():
     return entries
 
 
+def _carry_worker_diary_line(line: str) -> None:
+    """Best-effort delivery of one worker-Body diary line to the store of record.
+
+    A worker Body's local diary write never reaches the agent-wide diary in the
+    store (the agent-tree claim fence refuses a non-claim box's push — g-306-555),
+    so this mirrors the line to the Body-owned carrier
+    `world/body-diaries/<agent>/<sid>.jsonl`, which `_fleet_diary.read_fleet_diaries`
+    unions back into the agent's stream for every consumer. FAIL-OPEN BY
+    CONTRACT: a carrier problem must never fail the diary write that produced the
+    line — the local diary is the durable record, the carrier is a delivery
+    accelerator in front of it.
+    """
+    if not _is_worker_body():
+        return
+    try:
+        import body_diary_carrier as _bdc
+        _sid = os.environ.get("MIND_SID", "").strip()
+        if not _sid:
+            return
+        _bdc.append_row(AGENT_DIR.name, _sid, line)
+    except Exception:  # noqa: BLE001 — delivery must never fail a diary append
+        pass
+
+
 def cmd_append(args):
     """Add a diary entry from stdin JSON."""
     if _is_observer_session():
@@ -380,9 +404,12 @@ def cmd_append(args):
 
     # Append atomically
     DIARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _line = json.dumps(entry, ensure_ascii=False, default=str)
     with open(DIARY_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        f.write(_line + "\n")
 
+    # A worker Body's row would otherwise strand box-local ().
+    _carry_worker_diary_line(_line)
     _advance_heartbeat()
     print(f"ok: {entry.get('entry_type', '?')} @ {entry['timestamp']}")
 
@@ -571,8 +598,11 @@ def _emit_phase_marker(kind, phase, iteration, goal_id, note):
     if _is_worker_body():
         entry["body_sid"] = os.environ.get("MIND_SID", "").strip()
     DIARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _line = json.dumps(entry, ensure_ascii=False, default=str)
     with open(DIARY_PATH, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        f.write(_line + "\n")
+    # A worker Body's row would otherwise strand box-local ().
+    _carry_worker_diary_line(_line)
     _advance_heartbeat()
     _maintain_execute_in_flight(kind, phase)
     print(f"ok: {kind} {phase} @ {entry['timestamp']}")

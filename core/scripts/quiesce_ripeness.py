@@ -18,7 +18,9 @@ showed all five executed in the 2026-08-10 window. Summing the YES cells counts
 finished work and manufactures ripeness -- the exact failure that would spend a
 window (five terminals on five boxes) on an empty batch. So every row carrying a
 goal id is cross-checked against that goal's LIVE status, and a row whose goal is
-terminal is reported as `stale_row` rather than counted.
+terminal is reported as `stale_row` rather than counted. A ready row that names
+no goal, or a goal that resolves to nothing, cannot be cross-checked at all, so
+it is reported as `unverifiable` rather than counted (g-115-7268).
 
 WHY THE CROSS-CHECK IS A REPORT AND NOT A SILENT FILTER. The convention's own
 rb-5301 lesson says goal status LAGS live state and every row must be re-probed
@@ -109,6 +111,17 @@ _ROW_RE = re.compile(r"^\|\s*(Q\d+)\s*\|(.*)$")
 # itself. Both separators are accepted so the low-end rule is deliberate.
 _MINUTES_RE = re.compile(r"(\d+)\s*(?:[-–—]\s*(\d+)\s*)?m", re.IGNORECASE)
 
+# Readiness words match as WHOLE words (). As substrings, 'fresh-eyes'
+# and 'NO (eyes on it)' read as YES, and 'UNDONE' read as DONE. The boundary is an
+# explicit non-alphanumeric class, not \b, so '_' separates a word too
+# (guard-1679). TOMBSTONE keeps its plural and past forms, which the substring
+# match accepted and the convention's own prose uses (a narrowed predicate must
+# keep every true positive, guard-4315). ABANDONED
+# counts as done ON PURPOSE: abandoned work is not work to spend a window on, and
+# a false ready is the costly error.
+_READY_WORD_RE = re.compile(r"(?<![A-Z0-9])YES(?![A-Z0-9])")
+_DONE_WORD_RE = re.compile(r"(?<![A-Z0-9])(?:DONE|TOMBSTONE[DS]?|ABANDONED)(?![A-Z0-9])")
+
 
 def _cell_says_done(cell: str) -> bool:
     """True when the readiness cell is a tombstone rather than a readiness claim.
@@ -117,12 +130,11 @@ def _cell_says_done(cell: str) -> bool:
     tokens ("DONE ... do not re-run" alongside a stale bold YES elsewhere in the
     row), and reading it as ready would re-admit finished work.
     """
-    upper = cell.upper()
-    return "DONE" in upper or "TOMBSTONE" in upper
+    return bool(_DONE_WORD_RE.search(cell.upper()))
 
 
 def _cell_says_ready(cell: str) -> bool:
-    return "YES" in cell.upper()
+    return bool(_READY_WORD_RE.search(cell.upper()))
 
 
 def parse_minutes(cell: str) -> Optional[int]:
@@ -144,6 +156,36 @@ def parse_minutes(cell: str) -> Optional[int]:
     return int(m.group(1))
 
 
+def _split_cells(rest: str) -> List[str]:
+    """Split a table row on its UNESCAPED pipes, the way GFM does.
+
+    A backslash escapes the character after it, so `\\|` is a pipe inside a cell
+    and `\\\\|` is a backslash followed by a delimiter. Splitting on every raw
+    pipe instead shifted every later column by one per escaped pipe, and the
+    shifted readiness cell was then read out of the estimate column: measured on
+    the live manifest 2026-09-29, one row whose readiness cell says YES was read
+    as not-ready, and one tombstone as merely not-ready (g-115-7268, g-115-11307).
+    Cell text is returned unmodified, escapes included.
+    """
+    cells: List[str] = []
+    buf: List[str] = []
+    i = 0
+    while i < len(rest):
+        ch = rest[i]
+        if ch == "\\" and i + 1 < len(rest):
+            buf.append(rest[i:i + 2])
+            i += 2
+            continue
+        if ch == "|":
+            cells.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    cells.append("".join(buf))
+    return cells
+
+
 def parse_rows(markdown: str) -> List[Dict[str, Any]]:
     """Extract manifest rows from the convention's markdown.
 
@@ -151,7 +193,8 @@ def parse_rows(markdown: str) -> List[Dict[str, Any]]:
     OUTCOME tables keyed by the same Q-ids (`| Q2 | ✅ 4/4 passed ... |`), so a
     row is only admitted when it has the manifest table's 7-column shape. The
     outcome tables are 2-column, which is what separates them -- not their
-    position in the file, which moves every time a window is held.
+    position in the file, which moves every time a window is held. Columns are
+    split on unescaped pipes only (see _split_cells).
     """
     rows: List[Dict[str, Any]] = []
     for line in markdown.splitlines():
@@ -159,7 +202,7 @@ def parse_rows(markdown: str) -> List[Dict[str, Any]]:
         if not m:
             continue
         qid, rest = m.group(1), m.group(2)
-        cells = [c.strip() for c in rest.split("|")]
+        cells = [c.strip() for c in _split_cells(rest)]
         # Trailing empty cell from the row's closing pipe.
         if cells and not cells[-1]:
             cells.pop()
@@ -208,7 +251,8 @@ def render_stamp(result: Dict[str, Any], now_iso: str) -> str:
     return (
         f"**Last evaluated: {now_iso} — {result['verdict']}** — {result['reason']}. "
         f"({counts['ready']} ready / {result['total_ready_minutes']} min, "
-        f"{counts['stale_row']} stale-row, {counts['tombstoned']} tombstoned; "
+        f"{counts['stale_row']} stale-row, {counts['tombstoned']} tombstoned, "
+        f"{counts['unverifiable']} unverifiable; "
         f"auto-written by `core/scripts/quiesce-ripeness-check.sh --update-verdict`.)"
     )
 
@@ -240,10 +284,15 @@ def evaluate(
 ) -> Dict[str, Any]:
     """Score the manifest and return a ripeness verdict.
 
-    `goal_status` maps goal-id -> {"status": str, "priority": str}. A row whose
-    goal is absent from the map is NOT treated as terminal: an unreadable goal is
-    unknown, not done, and dropping it would quietly shrink the batch (rb-245 --
-    a zero produced by a failed lookup reads identically to a real zero).
+    `goal_status` maps goal-id -> {"status": str, "priority": str}. A ready
+    row whose goal is absent from the map, or that names no goal at all, is NOT
+    treated as terminal and is NOT counted as ready either: it is `unverifiable`,
+    excluded from the ready minutes and named in the payload with its reason
+    (g-115-7268). Such a row can never be caught as stale -- the failure this
+    module exists for -- so counting it would let finished or never-filed work
+    call a window. It is named rather than dropped, so a failed lookup never
+    reads as a real zero (rb-245). A goal the live queue has evicted also lands
+    here; an eviction-aware lookup (g-115-7310) would let it resolve instead.
 
     `quiesce_deferred` is the list of goal ids frozen on
     `precondition_unmet:fleet_quiesced_window`, which the convention names as an
@@ -282,9 +331,10 @@ def evaluate(
             ),
             "counts": {
                 "rows_parsed": len(rows), "ready": 0, "stale_row": 0,
-                "tombstoned": 0, "not_ready": 0, "unscoreable_estimate": 0,
+                "tombstoned": 0, "not_ready": 0, "unverifiable": 0,
+                "unscoreable_estimate": 0,
             },
-            "ready": [], "stale_row": [], "unscoreable_estimate": [],
+            "ready": [], "stale_row": [], "unverifiable": [], "unscoreable_estimate": [],
             "quiesce_deferred_goals": list(quiesce_deferred),
         }
 
@@ -292,6 +342,7 @@ def evaluate(
     stale: List[Dict[str, Any]] = []
     tombstoned: List[Dict[str, Any]] = []
     not_ready: List[Dict[str, Any]] = []
+    unverifiable: List[Dict[str, Any]] = []
     unscoreable: List[Dict[str, Any]] = []
 
     for r in rows:
@@ -303,13 +354,18 @@ def evaluate(
             continue
         gid = r["goal_id"]
         live = goal_status.get(gid) if gid else None
-        if live and str(live.get("status")) in TERMINAL:
-            r["live_status"] = live.get("status")
+        if not live:
+            # Fail toward NOT-ready: nothing can show this row's work has not
+            # already run (see the docstring).
+            r["unverifiable_reason"] = (
+                "goal id resolves to no record" if gid else "no goal id")
+            unverifiable.append(r)
+            continue
+        r["live_status"] = live.get("status")
+        if str(live.get("status")) in TERMINAL:
             stale.append(r)
             continue
-        if live:
-            r["live_status"] = live.get("status")
-            r["live_priority"] = live.get("priority")
+        r["live_priority"] = live.get("priority")
         if r["est_minutes"] is None:
             unscoreable.append(r)
         ready.append(r)
@@ -356,6 +412,7 @@ def evaluate(
             "stale_row": len(stale),
             "tombstoned": len(tombstoned),
             "not_ready": len(not_ready),
+            "unverifiable": len(unverifiable),
             "unscoreable_estimate": len(unscoreable),
         },
         "ready": [
@@ -368,6 +425,13 @@ def evaluate(
         "stale_row": [
             {k: r.get(k) for k in ("qid", "goal_id", "live_status", "est_minutes")}
             for r in stale
+        ],
+        # Named, never silently counted or dropped: a ready claim nothing can
+        # check ().
+        "unverifiable": [
+            {"qid": r["qid"], "goal_id": r["goal_id"], "est_minutes": r["est_minutes"],
+             "reason": r["unverifiable_reason"]}
+            for r in unverifiable
         ],
         "unscoreable_estimate": [
             {"qid": r["qid"], "goal_id": r["goal_id"], "est_raw": r["est_raw"]}

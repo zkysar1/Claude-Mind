@@ -372,6 +372,47 @@ def test_partial_aware_leaves_never_read_output_bare():
         f"a never-read file must print bare even in --partial-aware. got={r.stdout!r}")
 
 
+# ── 7. Q4: another ranged read never clears a decorative citation () ──
+#
+# The Q4 ranged-read message used to say "re-read the region that supports it";
+# it now asks for a whole-file Read with no offset or limit. This pins the claim
+# that text rests on, through the real Read hook and Q4's own predicate: a second
+# ranged read of the cited file leaves the citation PARTIAL, and one whole-file
+# read clears it. The unrelated whole-file read in the manifest is there only
+# because the predicate SKIPS (returns None) when no full read exists at all.
+
+_Q4_ANSWER = (
+    "import sys\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from q4_provenance_sample import retrieved_predicate\n"
+    "from ground_truth_citation import PARTIAL\n"
+    "p = retrieved_predicate(sys.argv[2])\n"
+    "v = None if p is None else p('node-key', sys.argv[3])\n"
+    "print('skip' if p is None else 'partial' if v is PARTIAL else 'yes' if v else 'no')\n"
+)
+
+
+def _q4_answer(env, token):
+    r = subprocess.run([sys.executable, "-c", _Q4_ANSWER, str(SCRIPT_DIR), SID, token],
+                       env=env, capture_output=True, text=True, timeout=60,
+                       cwd=str(PROJECT_ROOT))
+    assert r.returncode == 0, f"q4 predicate probe failed: {r.stderr[-600:]}"
+    return r.stdout.strip()
+
+
+def test_q4_another_ranged_read_leaves_a_citation_partial_and_a_whole_read_clears_it():
+    token = "core/scripts/iteration-close"
+    with _throwaway_agent(manifest_paths=[NARROW_SCOPE_FILE]) as env:
+        assert _q4_answer(env, token) == "no", "control: a never-read file must answer no"
+        for _ in range(2):  # the first ranged read, then the re-read the old text invited
+            rc, _o, _e = _record(CORE_SCRIPTS_FILE, env, offset=1, limit=40)
+            assert rc == 0, f"record hook must exit 0, got {rc}"
+        assert _q4_answer(env, token) == "partial"
+        rc, _o, _e = _record(CORE_SCRIPTS_FILE, env)
+        assert rc == 0, f"record hook must exit 0, got {rc}"
+        assert _q4_answer(env, token) == "yes"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Standalone runner (this file is ALSO pytest-collected; the runner exists so it
 # is not invisible to run-invisible-suites.sh)

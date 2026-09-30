@@ -117,6 +117,8 @@ session — never reconstructed from prior-session memory (per
    # Lane 1 writes more edits into a frozen file (class-B files:
    # /reconcile-owncloud-conflicts; tree nodes: guard-4778's fenced mirror_put
    # union — worked example in rb-9443). rc=2 = blind, not clean (guard-1947).
+   # rc=3 PULL-FAILING = fleet edits to the listed paths are not reaching this
+   # box: no wedge repair applies; leave those paths unedited until they pull.
    # The script's exit code is the gate (guard-399), not this comment.
 2. Read agents/<agent>/session/working-memory.yaml
 3. Bash: aspirations-read.sh --summary
@@ -965,13 +967,15 @@ uncommitted until a hand-sweep (measured: the g-115-6098 edit sat 01:05 →
 ```
 # 1. Commit THIS SESSION's churn with standard attribution. --session-sid
 #    scopes it (g-115-11148): outside agents/<agent>/, a path is committed
-#    only when an edit record carries this session's id, and every path left
-#    out is listed. Nothing else separates two sessions of the SAME agent on
+#    only when an edit record carries this session's id and no other writer
+#    changed the file after its last commit (g-115-11374), and every path
+#    left out is listed. Nothing else separates two sessions of the SAME agent on
 #    one checkout — the partner filters key on other agents, and with no
 #    in_flight goal the pre-claim mtime filter is off — so an unscoped call
 #    swept a sibling session's 23 half-done framework files (2026-09-27). A
 #    listed path that IS yours (a deletion, a command-made edit outside core/
-#    and .claude/) had no record: commit it by pathspec. A refused commit
+#    and .claude/, one made while a sibling's command was also running): check
+#    `git diff -- <path>` shows only your change, then commit it by pathspec. A refused commit
 #    restores the index. The script no-ops on a clean tree and filters
 #    sensitive patterns (.env*, *.key, ...) — run it unconditionally.
 #    --outcome deep is REQUIRED: the script no-ops on routine by design, and a
@@ -1012,6 +1016,8 @@ Bash: bash core/scripts/iteration-push.sh
 #    recipe), re-run until OK, and say so in the summary. Unstamped or another
 #    SID → someone else's stuck edit, not your failed encoding: file it in the
 #    MirrorWedgeProbe shape (g-115-11189) and say so. rc=2 (blind) is not clean.
+#    rc=3 (PULL-FAILING) is not a failed encoding: name the listed paths in the
+#    summary and leave them unedited until they pull (g-115-11323).
 #    Never lets a failure block the terminal call. Sibling of Phase 1 step 1b
 #    (entry) — entry catches a
 #    wedge before Lane 1 builds on it, exit catches one this session caused.

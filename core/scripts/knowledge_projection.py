@@ -529,6 +529,47 @@ def goal_handle(goal_id: str, secret: str, environment_id: str = "") -> str:
     return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:_GOAL_HANDLE_HEX]
 
 
+#: The knowledge-item kinds a member can address (g-335-1726): a wiki node, a hypothesis
+#: and a guardrail. The same three stores :func:`project` exposes by one predicate.
+KNOWLEDGE_ITEM_KINDS = ("node", "hypothesis", "guardrail")
+
+
+def item_handle(kind: str, item_id: str, secret: str, environment_id: str = "") -> str:
+    """An opaque, per-environment handle for one knowledge item — or ``""``.
+
+    The item-level sibling of :func:`goal_handle` (g-335-1726): it lets a member-facing
+    write ("correct THIS page", "forget THAT rule") name its target while the projection
+    keeps hiding hypothesis and guardrail ids. Same key, same width and the same three
+    properties as :func:`goal_handle`. The kind is its own message component, so a node, a
+    hypothesis and a guardrail that share an id never share a handle, and an item message
+    (two NULs) can never equal a goal message (one NUL).
+
+    Fails closed on EVERY message component (guard-6312): an unknown kind, or an empty id,
+    secret or ``environment_id``, returns ``""``. So does a NUL inside the id or the
+    environment, which could otherwise forge the separator.
+    """
+    k = str(kind or "").strip()
+    iid = str(item_id or "").strip()
+    key = str(secret or "")
+    env = str(environment_id or "").strip()
+    if k not in KNOWLEDGE_ITEM_KINDS or not iid or not key or not env:
+        return ""
+    if "\x00" in iid or "\x00" in env:
+        return ""
+    msg = f"{env}\x00{k}\x00{iid}".encode("utf-8")
+    return hmac.new(key.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:_GOAL_HANDLE_HEX]
+
+
+def _node_key(node: Mapping[str, object]) -> str:
+    """A wiki node's id, read the way :func:`project` publishes its ``key``."""
+    return str(node.get("key") or node.get("id") or "").strip()
+
+
+def _record_id(record: Mapping[str, object]) -> str:
+    """A hypothesis's or guardrail's id. Both stores carry ``id`` (measured 2026-09-30)."""
+    return str(record.get("id") or "").strip()
+
+
 def _exposed_goal(
     goal: Mapping[str, object], redactor: "Redactor"
 ) -> dict[str, object] | None:
@@ -768,6 +809,39 @@ class ProjectedBundle:
         }
 
 
+def _exposed_knowledge(
+    tree_nodes: Iterable[Mapping[str, object]],
+    hypotheses: Iterable[Mapping[str, object]],
+    guardrails: Iterable[Mapping[str, object]],
+) -> tuple[list[Mapping[str, object]], frozenset[str], list[Mapping[str, object]], list[Mapping[str, object]]]:
+    """THE exposure predicate for the three addressable knowledge stores.
+
+    Returns ``(nodes, allow, hypotheses, guardrails)``: the exposed records of each store
+    and the domain allowlist they were cut with. :func:`project` publishes exactly these
+    records and :func:`resolve_item_handle` addresses exactly these records, so what a
+    member can SEE and what a member can ADDRESS are one set by construction (rb-10157,
+    the same tie :func:`_exposed_goal` makes for goals).
+    """
+    nodes = [n for n in tree_nodes if is_domain_tree_node(str(n.get("category") or n.get("file") or ""))]
+    allow = domain_categories(nodes)
+    hyps = [h for h in hypotheses if is_exposed_by_category(h, allow)]
+    guards = [g for g in guardrails if is_exposed_by_category(g, allow)]
+    return nodes, allow, hyps, guards
+
+
+def _with_handle(
+    row: dict[str, object], kind: str, item_id: str, secret: str, environment_id: str
+) -> None:
+    """Add ``handle`` to a projected row when :func:`item_handle` yields one.
+
+    No key at all otherwise (an unprovisioned box, or an id-less record), so a consumer
+    reads a missing handle as "not addressable" rather than meeting an empty string.
+    """
+    handle = item_handle(kind, item_id, secret, environment_id)
+    if handle:
+        row["handle"] = handle
+
+
 def project(
     *,
     tree_nodes: Iterable[Mapping[str, object]],
@@ -782,15 +856,19 @@ def project(
     program_body: str = "",
     goal_handle_secret: str = "",
     environment_id: str = "",
+    item_handle_secret: str = "",
 ) -> ProjectedBundle:
     """Filter + redact all four stores into a :class:`ProjectedBundle`.
 
     Every input is an already-parsed iterable of records (store I/O lives in the CLI
     wrapper, so this core is pure and unit-testable). The domain allowlist is derived
     from the exposed tree, then applied to the applies_to-less stores.
+
+    ``item_handle_secret`` adds an opaque ``handle`` to each exposed wiki node,
+    hypothesis and guardrail row (:func:`item_handle`, g-335-1726). Empty by default, so
+    an existing caller keeps its exact shape.
     """
-    nodes = [n for n in tree_nodes if is_domain_tree_node(str(n.get("category") or n.get("file") or ""))]
-    allow = domain_categories(nodes)
+    nodes, allow, hyps, guards = _exposed_knowledge(tree_nodes, hypotheses, guardrails)
 
     bundle = ProjectedBundle()
     # Keyword-only with defaults, so every existing caller keeps its exact behaviour and
@@ -820,19 +898,24 @@ def project(
                 "last_updated": str(n.get("last_updated") or ""),
             }
         )
-    for h in hypotheses:
-        if is_exposed_by_category(h, allow):
-            bundle.hypotheses.append(
-                {
-                    "statement": redactor(str(h.get("claim") or h.get("title") or "")),
-                    "horizon": str(h.get("horizon") or ""),
-                    "status": str(h.get("stage") or ""),
-                    "outcome": redactor(str(h.get("outcome") or "")),
-                }
-            )
-    for g in guardrails:
-        if is_exposed_by_category(g, allow):
-            bundle.guardrails.append({"rule": redactor(str(g.get("rule") or ""))})
+        _with_handle(bundle.tree[-1], "node", _node_key(n), item_handle_secret, environment_id)
+    for h in hyps:
+        bundle.hypotheses.append(
+            {
+                "statement": redactor(str(h.get("claim") or h.get("title") or "")),
+                "horizon": str(h.get("horizon") or ""),
+                "status": str(h.get("stage") or ""),
+                "outcome": redactor(str(h.get("outcome") or "")),
+            }
+        )
+        _with_handle(
+            bundle.hypotheses[-1], "hypothesis", _record_id(h), item_handle_secret, environment_id
+        )
+    for g in guards:
+        bundle.guardrails.append({"rule": redactor(str(g.get("rule") or ""))})
+        _with_handle(
+            bundle.guardrails[-1], "guardrail", _record_id(g), item_handle_secret, environment_id
+        )
     for r in reasoning:
         # Reasoning-bank entries carry BOTH a reliable applies_to AND a category. Require
         # both: applies_to ∈ {domain, any} AND a domain-allowlisted category. applies_to
@@ -852,6 +935,46 @@ def project(
     return bundle
 
 
+def resolve_item_handle(
+    handle: str,
+    *,
+    tree_nodes: Iterable[Mapping[str, object]],
+    hypotheses: Iterable[Mapping[str, object]],
+    guardrails: Iterable[Mapping[str, object]],
+    secret: str,
+    environment_id: str = "",
+) -> tuple[str, str] | None:
+    """Resolve an inbound item handle back to exactly ONE ``(kind, id)``, or ``None``.
+
+    The box-side half of :func:`item_handle`, with :func:`resolve_goal_handle`'s rules:
+    recompute over the records this box holds, walking ONLY the exposed set
+    (:func:`_exposed_knowledge`), so a handle for anything the projection hides
+    resolves to nothing. Every branch that is not "exactly one exposed item matches"
+    returns ``None``: an unknown handle, a missing secret or environment, and two
+    different items sharing a handle. The caller is a write path against a member's
+    data, so a near-miss must never be picked.
+    """
+    want = str(handle or "").strip().lower()
+    if not want or not secret:
+        return None
+    nodes, _allow, hyps, guards = _exposed_knowledge(tree_nodes, hypotheses, guardrails)
+    found: tuple[str, str] | None = None
+    for kind, records, id_of in (
+        ("node", nodes, _node_key),
+        ("hypothesis", hyps, _record_id),
+        ("guardrail", guards, _record_id),
+    ):
+        for record in records:
+            iid = id_of(record)
+            computed = item_handle(kind, iid, secret, environment_id)
+            if computed and hmac.compare_digest(computed, want):
+                # A repeated record for the SAME item is not ambiguity; two items are.
+                if found is not None and found != (kind, iid):
+                    return None
+                found = (kind, iid)
+    return found
+
+
 __all__ = [
     "Redactor",
     "redact",
@@ -867,6 +990,9 @@ __all__ = [
     "project_goals",
     "goal_handle",
     "resolve_goal_handle",
+    "KNOWLEDGE_ITEM_KINDS",
+    "item_handle",
+    "resolve_item_handle",
     "SELF_EXPOSED_FM_FIELDS",
     "PROGRAM_EXPOSED_FM_FIELDS",
     "PROGRAM_PUBLIC_OPEN",

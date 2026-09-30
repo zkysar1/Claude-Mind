@@ -406,6 +406,19 @@ def test_CONTROL_a_fully_retrieved_citation_still_passes():
     assert analyze(_PARTIAL_TEXT, retrieved=lambda k, v: True) == []
 
 
+def test_the_partial_remedy_asks_for_the_read_the_predicate_credits():
+    """. The ranged-read message said "re-read the region that supports
+    it", but read_tracker() credits FULL reads only, so that re-read (another
+    ranged Read) came back with this same finding: on the worker fleet one close
+    went unread, partial, then PASS. The text must ask for the read that clears
+    it and must not invite one that cannot. The predicate half of that claim is
+    pinned end to end in test_context_reads_partial.py."""
+    from ground_truth_citation import PARTIAL
+    detail = analyze(_PARTIAL_TEXT, retrieved=lambda k, v: PARTIAL)[0].detail
+    assert "with no offset or limit" in detail, detail
+    assert "re-read the region" not in detail, detail
+
+
 def test_a_pass_count_ratio_is_not_a_source_token():
     """A slash-joined run of bare numbers is a ratio, not a citation.
 

@@ -1,4 +1,4 @@
-"""POST /v1/spark-questions/{increment,promote}.
+"""POST /v1/spark-questions/{increment,increment-batch,promote}.
 
 Daemonises the two BESPOKE spark-question write commands from
 core/scripts/spark-questions.py:
@@ -7,6 +7,7 @@ core/scripts/spark-questions.py:
     yield_rate recompute. The generic store/increment handler only supports
     nested-prefix counters; spark-questions needs the flat-field + derived
     yield_rate recompute, so it stays bespoke (spark-questions.py:183-218).
+    increment-batch applies many of those bumps in ONE locked rewrite.
   - cmd_promote: candidate -> active-question reformat + id change
     (spark-questions.py:224-274).
 
@@ -182,6 +183,86 @@ def increment(ctx) -> "Response":  # type: ignore[name-defined]
 
 
 # ---------------------------------------------------------------------------
+# POST /v1/spark-questions/increment-batch
+# ---------------------------------------------------------------------------
+
+def increment_batch(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/spark-questions/increment-batch
+    body {"increments": [{"rec_id": "<id>", "field": "<times_asked|sparks_generated>"}, ...]}
+
+    Applies every increment of one spark phase in ONE locked rewrite, so the
+    phase costs one rewrite of spark-questions.jsonl (one object version on a
+    versioned remote store) instead of one per counter bump. Measured
+    g-115-11231: 40 of 40 sampled versions were single-record bumps, about 23
+    per spark phase.
+
+    Each entry is applied exactly as `increment` applies it, in order, so the
+    file ends byte-identical to the same calls made one at a time. A malformed
+    entry refuses the whole batch before the file is read. An entry whose
+    record is missing or is not a question is SKIPPED and reported, as that
+    single call would have been refused, and the rest still apply. When
+    nothing applies, nothing is written.
+    """
+    from ..server import Response
+
+    try:
+        body = json.loads(ctx.body.decode("utf-8")) if ctx.body else {}
+    except (ValueError, AttributeError):
+        return Response.error(400, "invalid_body", "request body must be JSON")
+    increments = body.get("increments") if isinstance(body, dict) else None
+    if not isinstance(increments, list) or not increments:
+        return Response.error(
+            400, "invalid_body",
+            "request body must be a JSON object with a non-empty 'increments' list")
+    pairs = []
+    for n, entry in enumerate(increments):
+        entry = entry if isinstance(entry, dict) else {}
+        rec_id = entry.get("rec_id")
+        if not isinstance(rec_id, str) or not rec_id.strip():
+            return Response.error(400, "missing_param",
+                                  f"increments[{n}]: 'rec_id' required")
+        field = entry.get("field")
+        if field not in _INCREMENTABLE_FIELDS:
+            return Response.error(
+                400, "invalid_field",
+                f"increments[{n}]: can only increment 'times_asked' or "
+                f"'sparks_generated', got: {field}")
+        pairs.append((rec_id.strip(), field))
+
+    touched: Dict[str, Dict[str, Any]] = {}
+    skipped: List[Dict[str, str]] = []
+
+    def _modifier(items: List[Dict[str, Any]]) -> None:
+        for rec_id, field in pairs:
+            result = _find_record_by_id(items, rec_id)
+            if result is None:
+                skipped.append({"rec_id": rec_id, "field": field,
+                                "reason": f"Record {rec_id} not found"})
+                continue
+            idx, rec = result
+            if rec.get("type") != "question":
+                skipped.append({"rec_id": rec_id, "field": field,
+                                "reason": f"Record {rec_id} is not a question "
+                                          f"(type={rec.get('type')})"})
+                continue
+            rec[field] = rec.get(field, 0) + 1
+            rec["yield_rate"] = round(
+                rec.get("sparks_generated", 0) / max(rec.get("times_asked", 0), 1), 4)
+            items[idx] = rec
+            touched[rec_id] = rec
+        if not touched:
+            raise ValueError("no increment applied: "
+                             + "; ".join(s["reason"] for s in skipped))
+
+    err = _locked_modify(ctx, _modifier,
+                         f"spark-increment-batch {len(pairs)} increments")
+    if err is not None:
+        return err
+    return Response.json({"ok": True, "applied": len(pairs) - len(skipped),
+                          "records": list(touched.values()), "skipped": skipped})
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/spark-questions/promote
 # ---------------------------------------------------------------------------
 
@@ -275,4 +356,5 @@ def _framework_sync_note(ctx, candidate_id: str, new_id: str) -> Optional[str]:
 
 def register(routes) -> None:
     routes[("POST", "/v1/spark-questions/increment")] = increment
+    routes[("POST", "/v1/spark-questions/increment-batch")] = increment_batch
     routes[("POST", "/v1/spark-questions/promote")] = promote

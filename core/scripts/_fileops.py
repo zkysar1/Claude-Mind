@@ -2501,7 +2501,7 @@ def locked_write_yaml(path, data):
         release_lock(lock_path)
 
 
-def locked_modify_yaml(path, modifier_fn, initial=None):
+def locked_modify_yaml(path, modifier_fn, initial=None, *, skip_if_unchanged=False):
     """Atomic read-modify-write on a YAML file. Holds the lock across the
     ENTIRE cycle, closing the race where two agents read the same baseline
     and the second writer clobbers the first.
@@ -2513,6 +2513,13 @@ def locked_modify_yaml(path, modifier_fn, initial=None):
         same object, or construct a new dict.
       initial: Dict to use as the starting state when the file does not
         exist. If None and the file is missing, the modifier receives {}.
+      skip_if_unchanged: When True and the file EXISTED at the in-lock read,
+        a modifier result equal to what was read writes nothing: no history
+        snapshot, no rewrite, no changelog line (g-115-11231). Under own-cloud
+        every rewrite is a new object version, and re-writing unchanged
+        heartbeat fields grew a 7 KB team-state shard into tens of MB of
+        store metadata. A missing file still materializes. Off by default,
+        so every other caller keeps writing on every call.
 
     Returns:
       The data written to the file (modifier_fn's return value).
@@ -2540,6 +2547,8 @@ def locked_modify_yaml(path, modifier_fn, initial=None):
         # _rmw_with_conflict_retry re-invokes _cycle so each retry re-refreshes
         # (new fence token), re-reads the peer's write, and re-applies
         # modifier_fn on top. Single transparent pass on LocalBackend.
+        skipped = [False]  # set by the LAST _cycle pass; read after the retry loop
+
         def _cycle():
             # s3 reroute: force-fresh the local cache from the backend before the
             # in-lock read so the read-modify-write sees the latest remote state
@@ -2581,9 +2590,17 @@ def locked_modify_yaml(path, modifier_fn, initial=None):
                 # Here it is REQUIRED — without it, an empty YAML file produces
                 # data=None which crashes modifier_fn / _validate_no_surrogates.
                 # Verified by  (2026-05-08).
+                # skip_if_unchanged baseline: a deep copy (modifiers mutate in
+                # place) of what was PARSED from the file, which the refresh
+                # above made the current remote state. An empty file parses to
+                # None and takes the `initial` seed below, so it gets no
+                # baseline and still materializes.
+                before = (copy.deepcopy(data)
+                          if skip_if_unchanged and data is not None else None)
                 if data is None:
                     data = dict(initial) if initial is not None else {}
             else:
+                before = None
                 data = dict(initial) if initial is not None else {}
 
             # Modify
@@ -2602,6 +2619,10 @@ def locked_modify_yaml(path, modifier_fn, initial=None):
             # tmp file or saving a .history/ snapshot of the corrupted attempt.
             _validate_no_surrogates(new_data, path)
 
+            skipped[0] = before is not None and new_data == before
+            if skipped[0]:
+                return new_data
+
             # Write inside the same lock
             if base_dir:
                 save_history(path, base_dir, agent)
@@ -2616,7 +2637,7 @@ def locked_modify_yaml(path, modifier_fn, initial=None):
 
         new_data = _rmw_with_conflict_retry(path, _cycle)
 
-        if base_dir:
+        if base_dir and not skipped[0]:
             append_changelog(base_dir, agent, path, "edit")
         return new_data
     finally:

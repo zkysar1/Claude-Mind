@@ -168,22 +168,32 @@ def test_wholesale_guard_does_not_fire_when_manifest_names_no_goals():
     is empty' — otherwise it refuses every valid goal-less manifest."""
     md = HEADER + row("Q2", "**`daemon_integration` pytest subset**", "~45 min", "**YES**")
     res = evaluate(md, {})
-    assert res["verdict"] == "GO" and res["counts"]["ready"] == 1
+    # Scored, not refused. The row itself is unverifiable since  --
+    # nothing can show its work has not already run -- so it is named, not
+    # counted. (This asserted GO / ready 1 until then.)
+    assert res["verdict"] == "HOLD"
+    assert res["unverifiable"] == [
+        {"qid": "Q2", "goal_id": None, "est_minutes": 45, "reason": "no goal id"}]
 
 
 def test_partial_lookup_success_still_scores():
     """Only a TOTAL failure refuses. One resolved goal proves the lookup works,
-    so the rest are genuinely unknown and keep the permissive treatment."""
+    so the rest are genuinely unknown -- named as unverifiable, never counted
+    (g-115-7268; this asserted GO / ready 2 until then)."""
     md = HEADER + row("Q1", "**`g-1-1`**", "~20 min", "**YES**")
     md += row("Q2", "**`g-9-9` — unreadable**", "~20 min", "**YES**")
     res = evaluate(md, {"g-1-1": {"status": "pending"}})
-    assert res["verdict"] == "GO" and res["counts"]["ready"] == 2
+    assert res["verdict"] == "HOLD" and res["total_ready_minutes"] == 20
+    assert res["counts"]["ready"] == 1
+    assert res["unverifiable"] == [{"qid": "Q2", "goal_id": "g-9-9", "est_minutes": 20,
+                                    "reason": "goal id resolves to no record"}]
 
 
 def test_unknown_goal_is_not_treated_as_terminal():
-    """An unreadable goal is unknown, not done. Dropping it would quietly
-    shrink the batch, and a zero from a failed lookup reads exactly like a
-    real zero (rb-245)."""
+    """An unreadable goal is unknown, not done: it is never reported as a stale
+    row. Nor is it counted, since nothing can check it (g-115-7268) -- and it is
+    named rather than dropped, because a zero from a failed lookup reads exactly
+    like a real zero (rb-245)."""
     # The map must be NON-empty (one other goal resolved), or the
     # wholesale-lookup-failure guard fires instead — that guard keys on "no
     # named goal resolved at all", which is a different condition from "this
@@ -193,34 +203,58 @@ def test_unknown_goal_is_not_treated_as_terminal():
     md += row("Q2", "**`g-1-1` — resolvable**", "~5 min", "**YES**")
     res = evaluate(md, {"g-1-1": {"status": "pending"}})
     assert res["verdict"] != "CANNOT-EVALUATE"
-    assert res["counts"]["ready"] == 2 and res["counts"]["stale_row"] == 0
+    assert res["counts"]["stale_row"] == 0
+    assert res["counts"]["ready"] == 1 and res["total_ready_minutes"] == 5
+    assert [u["goal_id"] for u in res["unverifiable"]] == ["g-999-99"]
+
+
+def test_an_unverifiable_row_and_an_escaped_pipe_can_mask_each_other_in_the_total():
+    """Why the check is row-by-row, not a total ().
+
+    The two defects fixed together move minutes in OPPOSITE directions: a
+    dangling id inflated the batch, an escaped pipe deflated it. On this pair
+    the old parser and the new one agree on the total and the verdict, and
+    disagree on WHICH row is ready -- so only a row-level assertion sees it.
+    """
+    md = HEADER + row("Q1", "**`g-1-1`** — power down", "~30 min", "**YES** for the next window",
+                      why="`journalctl -o cat \\| grep print_timing` shows the fault")
+    md += row("Q2", "**`g-9-9`** — typo'd id", "~30 min", "**YES**")
+    res = evaluate(md, {"g-1-1": {"status": "pending"}})
+    assert res["total_ready_minutes"] == 30 and res["verdict"] == "GO"
+    assert [r["qid"] for r in res["ready"]] == ["Q1"]
+    assert [u["qid"] for u in res["unverifiable"]] == ["Q2"]
 
 
 # --------------------------------------------------------------------------
 # criterion (a)
 # --------------------------------------------------------------------------
 
+# These rows name a live goal. A goal-less "item" row is unverifiable since
+#  and never reaches the ready set, so it would pin nothing here.
+LIVE = {"g-1-1": {"status": "pending"}, "g-1-9": {"status": "pending"}}
+
+
 def test_criterion_a_fires_at_the_floor_not_above_it():
-    md = HEADER + row("Q1", "item", f"~{BATCH_FLOOR_MINUTES} min", "**YES**")
-    assert evaluate(md, {})["criterion_a"] is True
+    md = HEADER + row("Q1", "**`g-1-1`** item", f"~{BATCH_FLOOR_MINUTES} min", "**YES**")
+    assert evaluate(md, LIVE)["criterion_a"] is True
 
 
 def test_criterion_a_holds_below_the_floor():
-    md = HEADER + row("Q1", "item", f"~{BATCH_FLOOR_MINUTES - 1} min", "**YES**")
-    res = evaluate(md, {})
+    md = HEADER + row("Q1", "**`g-1-1`** item", f"~{BATCH_FLOOR_MINUTES - 1} min", "**YES**")
+    res = evaluate(md, LIVE)
     assert res["criterion_a"] is False and res["verdict"] == "HOLD"
 
 
 def test_not_ready_rows_do_not_count_toward_the_floor():
-    md = HEADER + row("Q1", "item", "~10 min", "**YES**")
-    md += row("Q9", "item", "~90 min", "not yet — blocked on a measurement")
-    res = evaluate(md, {})
+    md = HEADER + row("Q1", "**`g-1-1`** item", "~10 min", "**YES**")
+    md += row("Q9", "**`g-1-9`** item", "~90 min", "not yet — blocked on a measurement")
+    res = evaluate(md, LIVE)
     assert res["total_ready_minutes"] == 10 and res["verdict"] == "HOLD"
 
 
 def test_unscoreable_estimate_is_reported_not_silently_zero():
-    md = HEADER + row("Q1", "item", "TBD", "**YES**")
-    res = evaluate(md, {})
+    md = HEADER + row("Q1", "**`g-1-1`** item", "TBD", "**YES**")
+    res = evaluate(md, LIVE)
     assert res["counts"]["unscoreable_estimate"] == 1
     assert res["unscoreable_estimate"][0]["qid"] == "Q1"
     # It still sits in the ready set -- it is ready, just uncounted.
@@ -357,6 +391,77 @@ def test_tombstoned_rows_are_counted_separately_from_not_ready():
     md += row("Q9", "item", "~30 min", "no — needs a measurement first")
     c = evaluate(md, {})["counts"]
     assert c["tombstoned"] == 1 and c["not_ready"] == 1 and c["ready"] == 0
+
+
+def test_stamp_reports_unverifiable_rows():
+    md = HEADER + row("Q2", "**`daemon_integration` pytest subset**", "~45 min", "**YES**")
+    assert "1 unverifiable" in render_stamp(evaluate(md, {}), "2026-09-29T18:00:00")
+
+
+# --- readiness words are WHOLE words () ---------------------------
+# As substrings, 'fresh-eyes' read as YES and 'UNDONE' as DONE.
+
+def _flags(ready_cell):
+    r = parse_rows(HEADER + row("Q1", "**`g-1-1`**", "~30 min", ready_cell))[0]
+    return r["done"], r["ready_claimed"]
+
+
+def test_eyes_is_not_yes():
+    assert _flags("NO — needs a fresh-eyes review first") == (False, False)
+    assert _flags("not until someone has eyes on the rollback") == (False, False)
+
+
+def test_undone_is_not_done():
+    # With a real YES beside it, the substring matcher tombstoned a READY row:
+    # the wrong direction is not only false-ready.
+    assert _flags("**YES** — re-run the UNDONE half") == (False, True)
+    assert _flags("UNDONE") == (False, False)
+
+
+def test_the_readiness_shapes_the_manifest_uses_still_match():
+    # The true positives a narrowed predicate must keep (guard-4315).
+    assert _flags("**YES** for the next window: nothing needs buying") == (False, True)
+    assert _flags("`WINDOW-READY: YES`") == (False, True)
+    assert _flags("DONE - do not re-run") == (True, False)
+    assert _flags("✅ **DONE 2026-07-26 — tombstone, do not re-run.**") == (True, False)
+    assert _flags("**YES** (2026-09-13) … ROW RETIRED / TOMBSTONE") == (True, False)
+    assert _flags("tombstoned 2026-08-10, do not re-run") == (True, False)
+    assert _flags("retired with the other tombstones") == (True, False)
+
+
+def test_abandoned_counts_as_done_on_purpose():
+    # 'ABANDONED' holds DONE as a substring, so the old matcher tombstoned it by
+    # accident. Kept deliberately: abandoned work is not window work, and a
+    # false ready is the costly error.
+    assert _flags("**YES** — ABANDONED 2026-09-01, superseded by Q12") == (True, False)
+
+
+def test_an_underscore_separates_words():
+    # guard-1679: `_` is a word character, so a \b boundary misses a snake_case
+    # segment. The boundary class excludes it on purpose.
+    assert _flags("WINDOW_READY_YES") == (False, True)
+    assert _flags("status_DONE") == (True, False)
+
+
+# --- escaped pipes () ----------------------------------------------
+
+def test_an_escaped_pipe_stays_inside_its_cell():
+    # Measured live 2026-09-29: an escaped pipe in an earlier column shifted
+    # every later one, and a row whose readiness cell says YES was read from its
+    # estimate cell as not-ready.
+    md = HEADER + row("Q17", "**`g-1-1`** — power down", "~30 min", "**YES** for the next window",
+                      why="`journalctl -o cat \\| grep print_timing` shows the fault")
+    r = parse_rows(md)[0]
+    assert (r["shape"], r["who"], r["est_minutes"]) == ("1", "agent", 30)
+    assert r["ready_claimed"] is True
+
+
+def test_an_escaped_backslash_does_not_escape_the_pipe_after_it():
+    # GFM: `\\` is an escaped backslash, so the pipe after it still delimits.
+    # A lookbehind for a backslash would glue the two cells together.
+    md = HEADER + "| Q1 | **`g-1-1`** | why | 1 | C:\\\\| ~30 min | **YES** |\n"
+    r = parse_rows(md)[0]
+    assert (r["who"], r["est_minutes"], r["ready_claimed"]) == ("C:\\\\", 30, True)
 
 
 # --- criterion (b) defer predicate (, 2026-09-05) -------------------

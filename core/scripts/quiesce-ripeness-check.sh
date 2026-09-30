@@ -190,12 +190,14 @@ else:
     print('quiesce ripeness: %s' % res['verdict'])
     print('  reason      : %s' % res['reason'])
     print('  ready       : %d row(s), %d min (floor %d)' % (c['ready'], res['total_ready_minutes'], res['batch_floor_minutes']))
-    print('  rows parsed : %d (tombstoned %d, not-ready %d, stale-row %d)'
-          % (c['rows_parsed'], c['tombstoned'], c['not_ready'], c['stale_row']))
+    print('  rows parsed : %d (tombstoned %d, not-ready %d, stale-row %d, unverifiable %d)'
+          % (c['rows_parsed'], c['tombstoned'], c['not_ready'], c['stale_row'], c['unverifiable']))
     for r in res['ready']:
         print('    READY %s %s %s min %s' % (r['qid'], r['goal_id'] or '-', r['est_minutes'], r['live_status'] or ''))
     for r in res['stale_row']:
         print('    STALE %s %s -- manifest says ready, goal is %s' % (r['qid'], r['goal_id'], r['live_status']))
+    for r in res['unverifiable']:
+        print('    UNVERIFIABLE %s %s -- manifest says ready, not counted: %s' % (r['qid'], r['goal_id'] or '-', r['reason']))
     for r in res['unscoreable_estimate']:
         print('    NO-EST %s %s -- %r' % (r['qid'], r['goal_id'], r['est_raw']))
     if deferred:

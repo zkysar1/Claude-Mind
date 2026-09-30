@@ -737,12 +737,17 @@ def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
         # park) but the ORBIT advances — one more consecutive park means the next
         # full poll is due later ( part 4).
         _advance_park_orbit(data)
+        # last_parked_at is the MOST RECENT park, where parked_at stays the first.
+        # parked-body-gate.py measures an open re-poll and an operator command
+        # against it, so a re-park closes the re-poll that led to it ().
+        data["last_parked_at"] = _now_iso_local()
         _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
         return "already-parked"
     if state != "active":
         return "not-active"
     data["body_state"] = "parked"
     data["parked_at"] = _now_iso_local()
+    data["last_parked_at"] = data["parked_at"]
     data["park_count"] = 0
     _advance_park_orbit(data)
     _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
@@ -808,6 +813,9 @@ def resume_body(sid: str, agent: str, project_root: Path | None = None) -> str:
     # back at the base interval ( part 4).
     data.pop("park_count", None)
     data.pop("park_next_poll_at", None)
+    # And the park gate's stamps with them: a later park starts closed ().
+    data.pop("last_parked_at", None)
+    data.pop("repoll_opened_at", None)
     _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
     # : same reason as park_body -- direct manifest write, so its own
     # mirror. Leaving a resumed Body's carrier reading `parked` would suppress a
@@ -878,6 +886,23 @@ def park_due(sid: str, agent: str, project_root: Path | None = None) -> tuple[bo
     if remaining <= 0:
         return True, 0
     return False, remaining
+
+
+def open_repoll(sid: str, agent: str, project_root: Path | None = None) -> bool:
+    """Stamp repoll_opened_at on a parked Body whose park check answered DUE.
+
+    parked-body-gate.py lets a parked Body work only inside an open re-poll: the
+    DUE answer opens it, and the next park (last_parked_at) closes it again. A
+    turn that never ran the park check therefore stays gated (g-375-104).
+    Returns False, writing nothing, when the Body is not parked.
+    """
+    data = read_manifest(sid, agent, project_root)
+    if data.get("body_state") != "parked":
+        return False
+    data["repoll_opened_at"] = _now_iso_local()
+    _, session_dir, _ = _agent_paths(agent, sid, project_root)
+    _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
+    return True
 
 
 def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
@@ -1547,6 +1572,16 @@ def main(argv=None):
             # (guard-4697). Errors return 2/3 — neither branch — and a broken
             # probe therefore reads as DUE at the caller (fail toward polling).
             due, remaining = park_due(args.sid, args.agent)
+            if due:
+                # DUE opens the re-poll parked-body-gate.py lets through
+                # (). The stamp never changes the verdict: if it cannot
+                # be written the gate stays closed, and its deny names this same
+                # command, so the next park check writes it.
+                try:
+                    open_repoll(args.sid, args.agent)
+                except Exception as e:  # noqa: BLE001 -- the verdict must stand
+                    print(f"body-manifest: re-poll stamp not written: {e}",
+                          file=sys.stderr)
             print("due" if due else "not-due")
             print(remaining)
             return 0 if due else 1

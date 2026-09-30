@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "ObservationReceived": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash $CLAUDE_PROJECT_DIR/core/scripts/observation-received-hook.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

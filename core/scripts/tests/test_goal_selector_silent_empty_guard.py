@@ -258,6 +258,74 @@ def test_field_flag_is_consumed_and_never_forwarded_to_python(tmp_path):
     assert r.stdout.strip() == "argv2=select argv3="
 
 
+# Git Bash capture-path conversion (). The fake cygpath below hands
+# the capture path back UNCONVERTED, which only a POSIX python can open, so
+# these two skip under native Windows python -- where the real cygpath and the
+# five path-reading --field tests above drive the real conversion end to end.
+# Gate on the PYTHON, never on shutil.which("cygpath"): a cygpath on PATH is not
+# evidence of Windows (a Linux box can carry a passthrough shim of it), and that
+# gate silently skipped both tests on exactly such a box. The fake shadows any
+# shim, since the stub dir is first on PATH. Without these the branch is dead
+# code off Windows, and a regression stays invisible until a Windows box runs
+# the suite (these five reds surfaced 2026-09-02 and were fixed 2026-09-29).
+_POSIX_PYTHON_ONLY = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="native Windows python cannot open the fake cygpath's unconverted MSYS "
+           "path; the real cygpath and the path-reading --field tests cover it here")
+
+
+def _stub_cygpath(binddir, suffix=""):
+    """A fake `cygpath` beside the python3 stub, so the Git Bash branch runs on
+    Linux. Logs its argv; echoes the path back, appending `suffix` only to the
+    capture file -- so a non-empty suffix breaks exactly the path python reads."""
+    log = binddir / "cygpath.argv"
+    log.write_text("")  # exists even if never called: a clean assert, not a FileNotFoundError
+    fake = binddir / "cygpath"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> \"{log.as_posix()}\"\n"
+        "for p; do :; done\n"
+        'case "$p" in\n'
+        f"  *goal-selector-out.*) printf '%s\\n' \"$p{suffix}\" ;;\n"
+        "  *) printf '%s\\n' \"$p\" ;;\n"
+        "esac\n"
+    )
+    fake.chmod(0o755)
+    return log
+
+
+@_POSIX_PYTHON_ONLY
+def test_field_converts_the_capture_path_with_cygpath_m(tmp_path):
+    """_platform.sh exports MSYS_NO_PATHCONV=1 on Git Bash, so the MSYS mktemp
+    path reached NATIVE python3 unconverted and the five path-reading --field
+    tests failed 'not JSON' (a FileNotFoundError) on DESKTOP-O91DLK2. With
+    cygpath present the wrapper must call `cygpath -m` -- never -w, whose
+    backslashes bash eats (guard-581) -- on the capture file, and still extract."""
+    payload = '[{"goal_id":"g-1-1","score":9.9}]'
+    binddir = _stub_python(tmp_path, f"    printf '%s' '{payload}'; exit 0")
+    log = _stub_cygpath(binddir)
+    r = _run(binddir, args=("select", "--field", "goal_id"))
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    assert r.stdout.strip() == "g-1-1"
+    calls = [c for c in log.read_text().splitlines() if "goal-selector-out." in c]
+    assert len(calls) == 1 and calls[0].startswith("-m "), log.read_text()
+
+
+@_POSIX_PYTHON_ONLY
+def test_field_opens_the_cygpath_output_not_the_raw_mktemp_path(tmp_path):
+    """The discriminating half. Were python3 still handed $OUT_TMP, a cygpath
+    naming a MISSING file would be ignored and extraction would succeed; it must
+    fail loud instead, naming that file -- so the extractor opens exactly what
+    cygpath returned."""
+    payload = '[{"goal_id":"g-1-1","score":9.9}]'
+    binddir = _stub_python(tmp_path, f"    printf '%s' '{payload}'; exit 0")
+    _stub_cygpath(binddir, suffix=".missing")
+    r = _run(binddir, args=("select", "--field", "goal_id"))
+    assert r.returncode == 1, (r.returncode, r.stdout, r.stderr)
+    assert "No such file" in r.stderr and ".missing" in r.stderr, r.stderr
+    assert r.stdout.strip() == ""
+
+
 def test_other_args_still_forward_after_the_args_refactor(tmp_path):
     """The ARGS[@] rewrite must not drop ordinary passthrough argv."""
     binddir = _stub_python(tmp_path, '    printf "ARGV:%s,%s" "$2" "$3"; exit 0')

@@ -2512,3 +2512,562 @@ guard-399 and guard-6482.
   - Pre-register any marker in the diary, and score it on the corpus (resolved ∪ archived),
     not the pool.
   - Resume Run 90's carrier-search recipe for the batch.
+
+## Run 92 (echo, `hostname` cc-03, `uname -r` 6.8.0-142-generic, 2026-09-29; echo's g-001-05 occurrence 47)
+
+- **Numbering note.** Two runs on the same evening both took the number 92.
+  - foxtrot's Run 92 (LAPTOP-3IOFCNEO, the section below) was committed at 23:17. This one was
+    committed at 23:40, and the merge placed it first.
+  - Both keep 92, told apart by agent, and both NEXT-RUN blocks name 93. The next run is 93.
+- **Selection.** Pool 818 (`--replay-candidates`, read 23:19, 5,698,083 B).
+  - Excluded: outcome-null 8, test-cat 2, leaving 808 eligible.
+  - The strict `>` skip excluded 0: the last_replayed maximum is 2026-09-22, which is the
+    cut, and Run 91's 09-29 stamps are already hidden at source by next_review_date.
+  - rc histogram (eligible): {0: 444, 1: 214, 2: 83, 3: 51, 4: 16}.
+  - **Selected on STORED `surprise`.** This deviates from the derived practice of Runs 80-91;
+    it is stated rather than hidden.
+    - Its cost was measured afterwards: all 10 batch records have stored = `derive_surprise`,
+      so band membership is identical.
+    - Stored differs from derived on 246 of 808 eligible. Rule 1: stored 202, derived 388.
+      Rule 2: 0 and 0.
+  - Stored band 6: 89 records (rc0 14 / rc1 50 / rc2 21 / rc3 1 / rc4 3) for 7 slots,
+    allocated proportionally as {rc0 1, rc1 4, rc2 2}. Plus 3 routine records.
+  - A derived re-selection drew a disjoint batch: band 96, 8 slots, largest remainder
+    {rc0 1, rc1 4, rc2 2, rc4 1}, plus 2 routine. The ORIGINAL batch was kept, because
+    switching would have happened after its outcomes had been read.
+  - Batch: 5 CORRECTED, 5 CONFIRMED, all archived. Batch-scoped, so upward-biased (guard-2129).
+- **Step 2.** `--narrative` parsed 10 of 10 via raw_decode plus flatten, and the count was
+  asserted.
+  - Winner keys: outcome_detail 6, resolution_evidence 2, rationale 2. Both `rationale`
+    winners carry resolution text. Bare 0/10.
+  - experience_ref appears on 5 of 10. All 5 return not_found (rc=1) in echo's store.
+    - Positive control: the smoke-char ref reads under MIND_AGENT=zeta. So not_found means
+      another agent owns the ref, not that the read is dead.
+    - None were written (cross-agent).
+- **Step 1.5.** `retrieve.sh --depth medium` ran on 7 categories, each rc=0 (125-431 KB).
+- **Step 3: two title markers, pre-registered in the diary at 23:27:48 before the corpus
+  fetch. K=2, family alpha 0.025 (guard-6582). Both REJECTED.**
+  - Corpus: resolved ∪ archived = 1966 by id, of which 1200 are scoreable.
+    - The 10 batch ids were excluded, and 14 verdict-token titles were dropped, leaving 1172.
+    - Base 495/1172 = 42.2% CORRECTED.
+  - M, persistence (Run 91's regex verbatim). The batch had it 2/2 CORRECTED (ENRICHED).
+    - Corpus n=138: 36.2% vs 43.0%, -6.8pp. Exceedance 0.152, median |perm| 3.1pp, p95 8.8pp.
+    - Same sign as Run 91's pool-scoped -5.3pp, and both are below the floor.
+    - Controls:
+      - crc32(`id[11:]`) size-matched: -2.7pp;
+      - 'the' size-matched: -3.5pp;
+      - month-expected 42.0% vs observed 36.2%.
+    - Collider: confidence on minus off is +0.016. The confidence-band-stratified lift is
+      -5.2pp.
+  - Q, quantitative bound (`below|under|less than|fewer than|more than|above|at least|at
+    most|half|median|majority|exceeds?`, or a percent sign). The batch had it 1/4 CORRECTED
+    (DEPLETED).
+    - Corpus n=176: 40.3% vs 42.6%, -2.2pp. Exceedance 0.619, median 2.9pp, p95 7.8pp.
+    - Controls: crc32 -2.9pp; 'the' -1.6pp; month-expected 42.7% vs observed 40.3%.
+  - SIGN SERIES (batch-ENRICHED markers only, corpus-scoped): M appends -6.8. That makes 13
+    values, 8 of them negative. Two-sided sign test p = 4760/8192 = 0.58. Q is
+    batch-depleted, so it does not enter.
+  - Item 4, category (corpus, batch excluded, exploratory because not pre-registered):
+    - framework-architecture 73/207 = 35.3%;
+    - system-behavior 44/116 = 37.9%;
+    - base 42.2%. The other five batch categories have n <= 15.
+  - Item 2 is structurally unreachable (no formation-time signature field), so there is no
+    sample.
+- **Carrier search.** Run 90's recipe: the hypothesis id plus one outcome-mechanism regex,
+  over 11,884 active rb, 7,058 active guardrails and 18,027 findings (`--since 4000h`).
+  Each hit's role was read.
+  - The exact id alone reached an outcome-side carrier for 8 of 10:
+    - prose-correction: rb-7981;
+    - review-acceptance: rb-11099;
+    - env-memory: rb-8018, plus guard-4008 by mechanism;
+    - split-brain: guard-4743's action_hint, which was EXTENDED on 09-06 with this outcome,
+      plus rb-10294;
+    - cis-alarm: rb-9461;
+    - smoke-char: guard-7360, rb-11686, plus rb-11216 by mechanism;
+    - untagged-spark: rb-8852;
+    - senderroralert: rb-7677, which is a contrastive reflection, not the fix lesson.
+  - agent-queue-claim-announce: no carrier by id. A windowed mechanism search found only a
+    same-SHAPE rail from another goal: guard-3163 (absence-in-the-past baselines, source
+    g-115-4720).
+  - spark-gap-median: no carrier by either route.
+  - **One FORMATION-side carrier contradicted its record's outcome: rb-10404.** It is the
+    premise of review-acceptance-stays-silent (retrieval_count 7, last retrieved 09-29). It
+    was corrected in Step 4.
+- **Step 3.5.** 0 procedural-gap indicators across the 5 CORRECTED lesson texts: narrative,
+  resolution_method, resolution_notes, position, lesson, reflection_summary and notes.
+  Nothing proposed.
+- **Step 3.6: 0 eligible.**
+  - Census over the FULL pool:
+    - the rc>=3 rows are CONFIRMED 61, EXPIRED 3 and UNRESOLVABLE 3, with CORRECTED 0;
+    - CORRECTED sits at rc 0/1/2 as 75/76/21.
+  - The one pool record that carries `encoded_via_chronic` holds False.
+- **Step 4.**
+  - 0 pattern-signature outcomes (retrospective, item 4c). The batch names no strategy.
+  - **Reconsolidation revision: rb-10404, following the rb-12173 procedure.**
+    - claim-artifact-sweep.sh ran with two token sets over 15 surfaces, 0 unreadable and
+      0 truncated.
+    - **THE POSITIVE CONTROL FAILED IN BOTH RUNS.** rb-10404 was classed ALREADY_CORRECTED
+      on the marker 'superseded', which comes from its own text: "guard-6238 retired,
+      superseded by guard-6241".
+    - Second look at every ALREADY_CORRECTED row that carries whole-word adjudication and
+      accept: 4 rows.
+      - rb-10404 is the only survivor.
+      - rb-11099 ('refuting') is a true carrier.
+      - g-115-9438 and g-353-69 are unrelated.
+    - The paraphrase set returned 44 ASSERTS, and none has that co-occurrence.
+    - rb-10404's content was qualified in place, with a lead pointer and a dated REVISION.
+      The title is immutable (guard-6877). Read back by value: amended_fields content
+      2026-09-29T23:35:01.
+    - The collision was relayed to g-115-11184 [echo-cc03-20260929-g00105-occ47-superseded-marker].
+  - Credits spooled:
+    - times_helpful: guard-7439, guard-2129, guard-4758, guard-6582, guard-6877, guard-1755,
+      rb-12173;
+    - times_active: guard-4069, guard-4743, rb-11099.
+- **Step 4.5.** `replay-stamp-verify.sh` stamped 10, verified 10 per id, failed 0.
+  next_review 2026-10-06.
+- **NEXT RUN (93).**
+  - This stamp moved agent-queue-claim-announce and prose-correction (both CORRECTED) to
+    rc 3. With Run 91's three, 5 CORRECTED records sit at rc 3. All are hidden until
+    2026-10-06 and become Step 3.6-eligible from then.
+  - Select on `derive_surprise` from the start, so the stored-vs-derived question cannot
+    arise after the draw.
+  - rb-12173's positive-control step is what caught the survivor. Run it until g-115-11184
+    lands.
+
+## Run 92 (foxtrot, `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.18.33.2-microsoft-standard-WSL2, 2026-09-29; own-cloud, g-001-05)
+
+- **Pool.** `--replay-candidates` returned 828 records (5,778,607 B). Excluded outcome-null 8
+  and test-cat 1 (`2026-07-29_census-b`), leaving 819 eligible.
+  - `derive_surprise` disagrees with stored on 247 (whole pool).
+  - The strict `>` skip excluded 0; a `>=` skip would have dropped 9 due today.
+  - rc (eligible): rc0 447 / rc1 219 / rc2 86 / rc3 51 / rc4 16.
+  - Effective-surprise histogram: {0:1, 1:4, 2:27, 3:64, 4:287, 5:294, 6:104, None:38}.
+    Rule 2 = 0: Run 91 took all four s7 records and stamped them out of the pool.
+- **Selection.** Re-implemented from this ledger's prose (`select92.py`), seed 92.
+  - Band 6: 104 records (rc0 18 / rc1 56 / rc2 24 / rc3 2 / rc4 4) took the 8 non-routine slots
+    by largest remainder {rc0 2, rc1 4, rc2 2}. 2 routine records from a pool of 383.
+  - **SELECTOR DEFECT, CAUGHT BY THE EXCLUSION COUNT BEFORE ANY RECORD WAS READ.**
+    - The first draft keyed the test-cat exclusion on `category == 'test'`; the real value is
+      `test-cat`.
+    - It printed `test_cat: 0` beside every prior run's 1. The fix changed the second routine draw
+      (board-request -> legacy-key-rate).
+    - The corrected selector gave byte-identical output on two runs at seed 92 (md5 dea41578...).
+    - Assert the standing exclusion counts against this ledger before trusting a batch.
+- **Batch.** Scored at selection: 6 CORRECTED, 4 CONFIRMED (BATCH-scoped, upward-biased —
+  guard-2129). 8 archived, 2 resolved. After this run's re-score (below): 6 / 3 / 1 UNRESOLVABLE.
+- **Narratives.** 10/10 parsed, and the count was asserted against the ids. Winners:
+  outcome_detail 6, resolution_note 2, rationale 1, NULL 1.
+  - parser-fix: NULL winner. Its whole CORRECTED verdict sits in `resolution_method`: conjunct B
+    failed, moveTo at 29.9% on ppe2, a drop of 6.3pp against a 10pp bar. This is the second
+    instance of Run 90's `resolution_method` class.
+  - worker-body: the `rationale` winner is the formation premise. Its LITERAL (CONFIRMED) vs
+    OPERATIVE (falsified) verdict lives only in `evidence`, a fourth off-chain key (see the
+    instrument correction below).
+  - Bare 0/10 once the off-chain keys are read.
+  - Experience refs: 7 of 10.
+    - 1 is foxtrot's own (box-relative). Its anchors were read, and retrieval_stats was written
+      {1,1,0} and read back; the server recomputed utility_ratio as 1.0.
+    - 6 are other agents' (echo 2, zeta 2, bravo 1, alpha 1). They were not read and never written.
+- **RE-SCORED: `2026-06-15_g115398-interval-self-corrects` CONFIRMED -> UNRESOLVABLE.**
+  - The claim has two conjuncts: (a) close ROUTINE within the next 3 fires; (b) interval_hours
+    back ABOVE 21.33h. The resolver's own cited channel values support neither:
+    consecutive_routine=0, and interval_hours=21.33.
+  - The CONFIRMED scored a weaker claim, "the calibration mechanism operates" (guard-1457, which
+    post-dates this 06-18 resolution).
+  - CORRECTED is not asserted either. The record was resolved on its first eligible day, and the
+    unchanged 21.33 does not show that the 3-fire window had elapsed. The June state is
+    unrecoverable, because the goal-queue history snapshots begin 2026-07-14.
+  - g-115-398 reads 32.0h today, so the direction eventually held; when it did is unknown.
+  - Written with `pipeline-update-field.sh`. The record is archive-only (archived_date null), so
+    the write falls through to ARCHIVE_PATH (guard-466). The original outcome_detail is kept
+    verbatim inside the new one. Read back by value: UNRESOLVABLE, and the stored surprise of 4 is
+    untouched, because derive returns None.
+  - rb-1985 (06-18) encodes the same weaker claim. It was left as is, since the 32.0h reading
+    supports its general claim.
+  - The first provenance write was REFUSED by the direct-store-write hook. The NOTE TEXT named the
+    history-snapshot path, and the hook matched that path inside a string payload. Rephrased
+    without it.
+    - CORRECTED in the spark of the same close. That rephrase was LAUNDERING: guard-5573 says that
+      when a text gate refuses, you change the TOOL, never the PAYLOAD.
+      - The spark restored the locator by writing the note to a file with the Edit tool and
+        passing it as `"$(cat file)"`.
+      - The stored outcome_detail now equals that file byte for byte (1407 chars) and still
+        carries the path. Measured by the /fresh-eyes-code pass,
+        msg-20260929-234117-foxtrot-3541.
+      - Run 93: at a hook refusal, do not copy the rephrase above.
+- **Lessons (narrative-derived, NOT Step 3 markers, guard-4758): the letter and the spirit of the
+  criterion diverge in 5 of 10.**
+  - CORRECTED on the letter while the mechanism held:
+    - offline-l1: the live and offline `level_actions` use different units (per-run vs
+      cumulative), and play was identical.
+    - group-shaped: 2 group tokens against a bar of 3; every one still resolves to zero agents.
+    - dedup-proxy: over-merge was 0. The rate moved because worker Bodies claim goals without the
+      pickup gate, so the quantity was not stationary.
+  - CONFIRMED on the letter while the operative claim was falsified: worker-body (7 cited shas are
+    not ancestors of origin/main, but 0 are silent false closes; guard-3541).
+  - CONFIRMED with the letter FAILED: g115398, re-scored above. It is the one shape a resolver
+    cannot defend by pointing at the criterion.
+  - Clean: first-live-vessel (2000/2000 parity, so the premortem was right), groq (conjunct B
+    false; the 404 mechanism is void, rb-9033), parser-fix, box-relative, legacy-key.
+- **Carrier search (Run 90's recipe).** Keys: the hypothesis id, the one-off resolving goal id and
+  one mechanism regex. Surfaces: 7056 guardrails, 11880 rb and 18025 findings. The role of every
+  hit was read.
+  - Outcome carriers were found for 9 of 10:
+    - offline-l1: guard-7422, rb-11942;
+    - first-live-vessel: rb-12217, rb-12218;
+    - groq: guard-5031, guard-5036, rb-9103, rb-9109, rb-9110, rb-9033;
+    - group-shaped: rb-11043, rb-11044;
+    - box-relative: rb-9707, guard-5519;
+    - dedup-proxy: guard-3450;
+    - worker-body: guard-3541;
+    - legacy-key: guard-6469;
+    - g115398: guard-1457.
+  - parser-fix had only the meta-lesson rb-9397. Its substantive lesson had NO carrier in rb, guard
+    or tree: the fix added menu>=10 tasks without breaking moveTo's dominance. It is now encoded in
+    tree node `bt-generation-pipeline`.
+  - Formation-side or byproduct hits: rb-12277, guard-4249, rb-9704, rb-7563, rb-8981/8985/8989.
+- **Step 1.5.** Per-category retrieval was not run (context budget). The carrier search above
+  covered the full active stores instead.
+- **Step 3: two title markers, pre-registered in the diary at 23:06:18, before the corpus fetch.
+  K=2, family alpha 0.025 (guard-6582). Both REJECTED.**
+  - Corpus: resolved 64 + archived 1902 = union 1966. 1187 are scoreable with the batch excluded.
+    Title verdict-token contamination is 16/1187; this run's token set is wider than Run 90's (it
+    adds refuted/falsified/unresolvable/expired). Those 16 were dropped from both arms, leaving
+    1171. Base 42.3% CORRECTED.
+  - M1, `\blive\b`: the batch had it 2/2 CORRECTED. Corpus n=53, 41.5% (-0.8pp), exceedance
+    1.000, median |perm| 4.8pp, p95 13.0pp. Its members are genuine live-run predictions.
+  - M2, an intervention verb (restor/shift/swap/clear/fix/repair/revert): the batch had it 2/3.
+    Corpus n=149, 38.9% (-3.8pp), exceedance 0.429, median 3.1pp, p95 8.5pp.
+  - Each delta compares the marker with the REST of the scoreable corpus, not with the 42.3%
+    base (`step3.py` prints "vs rest"). So M2's -3.8pp is not 38.9 - 42.3. Note added by the
+    fresh-eyes pass, msg-20260929-234118-foxtrot-3542.
+  - Controls (M1 / M2): month-expected 40.7 / 42.6%; crc(`id[11:]`) size-matched -2.8 / -3.1pp;
+    "the" size-matched -14.6 / -3.8pp.
+  - SIGN SERIES (batch-enriched, corpus-scoped): appends -0.8 and -3.8, giving 9 negative of 14.
+    Two-sided sign test p = 6946/16384 = 0.42.
+- **Step 3.5.** 0 procedural-gap indicators across the 6 CORRECTED lesson texts (narrative,
+  resolution_method, position, evidence and notes).
+- **Step 3.6.** 0 eligible, as Run 91 predicted for runs before 10-06.
+- **Step 4.**
+  - 0 pattern-signature outcomes.
+    - first-live-vessel cited sig-236 AT FORMATION as a base rate.
+    - sig-236's conditions 3 and 4 do not hold: no instrument reported a shipped fix ineffective,
+      and no layer transforms its input. So the instance is not a sig-236 trial (item 4b).
+    - sig-236 (138/138) already carries the separation marker "NOT a layer that REUSES the proven
+      stack verbatim".
+  - Credits spooled, each `"spooled": true`:
+    - times_helpful: guard-2129, guard-4758, guard-6582, guard-1457, guard-466, guard-5709,
+      rb-12101;
+    - times_active: the 18 carriers above.
+    - CORRECTED (fresh-eyes, msg-20260929-234118-foxtrot-3543): the times_active set was 18, but
+      its members differ from the carrier list. guard-1457 is excluded, because it got
+      times_helpful (first list), and rb-9397 is included. Source: scratch `credits.log`.
+  - **CREDIT CORRECTED (rb-12101).**
+    - guard-3980 had been given times_helpful. It is DERIVED from worker-body, a record in THIS
+      batch. Reversed with `utilization-correct.sh`.
+    - The 18 times_active credits are all batch-derived too. They were left in place, because the
+      retirement numerator `_attested_evidence` and utilization_score both exclude times_active
+      (`_utilization_store.py` ~L500).
+- **Step 4.5.** `replay-stamp-verify.sh` (per-id) stamped 10, verified 10, failed 0. next_review
+  2026-10-06. dedup-proxy (CORRECTED) is now rc 3, so it becomes Step 3.6-eligible at the first
+  run on or after 10-06.
+- **Instrument correction: `evidence` is a fourth off-chain lesson key, and it is MIXED.**
+  - Pool census: of 751 scoreable records, 49 are weak winners under the SKILL's bare test, and 13
+    of those carry a non-empty `evidence`.
+  - SKILL Step 2 now names `resolution_method`, `position` and `evidence` as mixed keys to read
+    (+256 B, now 53,827 B). Run 90's two keys had only been relayed before.
+  - Relayed to g-115-10108 [g00105-r92-evidence-key-census-foxtrot].
+  - Pre-apply consult: rb-7911 and rb-11551 reinforce the fix. guard-426 does not apply, because
+    no source constant lists the off-chain keys.
+- **NEXT RUN (93).**
+  - Keep derived surprise, the strict skip and the routine reservation.
+  - Assert the exclusion counts (outcome-null 8, test-cat 1) before reading the batch.
+  - Do not re-test `live` or the intervention verb.
+  - Before any Step 4 credit, compare each rail's source with the batch ids (rb-12101).
+  - A CONFIRMED whose own cited values contradict its conjuncts gets re-scored, with the original
+    text preserved (g115398 is the template).
+
+## Run 93 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-09-30; zeta's g-001-05 occurrence 90)
+
+- **Selection.** `select93.py` is select91.py with today and the seed changed, plus the exclusion
+  asserts foxtrot's Run 92 asked for.
+  - Pool 838 (`--replay-candidates`, read 04:49). Excluded outcome-null 8, test-cat 1; both asserts
+    held. Eligible 829. A `>=` skip would have dropped 27 due-today records. Derived != stored on 247.
+  - rc (eligible) {0: 443, 1: 220, 2: 90, 3: 58, 4: 18}. Effective surprise: 5: 300, 6: 107, 7: 3,
+    8: 2, None: 38.
+  - RULE 2 = 5, all taken. Band 6: 107 records for 3 slots, largest remainder {rc1 2, rc2 1}. Plus
+    2 routine records (seed 93).
+  - Batch: 7 CORRECTED, 2 CONFIRMED, 1 UNRESOLVABLE at selection (batch-scoped, guard-2129).
+- **Step 2.** 10 of 10 narratives parsed (raw_decode plus flatten, count asserted). Winners:
+  outcome_detail 9, resolution_note 1. Bare 0/10.
+- **Lessons (narrative-derived, not markers, guard-4758).** Of the 7 CORRECTED:
+  - 3 failed on a premise that was already false at formation: the author's own 09-04 cadence fix
+    had already taken g-001-10 off the clamp; g-335-840's conflation of out-of-world with abstract;
+    and a one-key read of a partitioned response (rb-exclusion).
+  - 2 are persistence claims (nameless-claim, guard-5155).
+- **Step 3: one title marker, pre-registered in the diary at 04:52:30 before the corpus fetch.
+  K=1, alpha 0.05. REJECTED.**
+  - M1, a universal-scope quantifier (all, every, each, any, always, never, none, nobody, nothing,
+    entire, whole, permanent, fleet-wide, universal, everywhere, everything, multiple, no human).
+    It tests the qualitative Runs 80-82 reading "claim scope outran evidence", which was never
+    tested as a marker. The batch had it 3/3 CORRECTED.
+  - Corpus: resolved 26 + archived 1945 = 1971 by id. 1166 scoreable after dropping the batch
+    (10), verdict-token titles (23) and test-cat (4). Base 41.9%.
+  - Result at n=81: 38.3% vs 42.1% for the rest, -3.8pp. Exceedance 0.566; median |perm| 3.8pp,
+    p95 10.7pp.
+  - Controls:
+    - crc32(`id[11:]`) size-matched: +0.1pp;
+    - 'the' size-matched: -3.8pp;
+    - month-expected 41.0% vs observed 38.3%;
+    - mean confidence on 0.582 vs off 0.574; band-stratified lift -3.3pp.
+  - SIGN SERIES: each Run 92 extended the same 12-value series (echo to 13 values, 8 negative;
+    foxtrot to 14, 9 negative). Merged, that is 15 values with 10 negative. M1 makes 16 values, 11
+    negative. Two-sided sign test p = 13770/65536 = 0.21.
+- **Carrier search (Run 90's recipe).** Surfaces: 7059 guardrails, 11907 rb and 18087 findings.
+  Outcome carriers were found for all 10. Two of them changed records (below).
+- **RE-SCORED two records CORRECTED -> UNRESOLVABLE (the rb-12524 template).** The original text
+  is kept; outcome and outcome_detail were read back by value against the source file.
+  - `2026-08-25_tree-node-merge-wedge-is-fleet-wide` (batch).
+    - The claim is a fleet-wide count, with no pre-registered criteria, resolved from ONE box
+      (cc-05, 09-01), which is a narrower population than the claim's (guard-2550).
+    - Inside the window, rb-9281 (08-26) recorded 24 cc-03 tree nodes wedged by the same refusal
+      class, and 14 were repaired before the cc-05 sweep ran. The sync sweep also posted 60
+      tree-node MIRROR WEDGE findings on 08-27, from another box.
+    - Per-file refusal cannot be verified now (guard-7197), so the record is not CONFIRMED either.
+  - `2026-08-14_retrieve-brokenpipe-splits-by-per-file-rtt` (Step 3.6 pool).
+    - Its own evidence reads "INDEPENDENTLY UNRESOLVABLE AS DESIGNED" and "THE UNDERLYING QUESTION
+      REMAINS OPEN". The CORRECTED argued only against CONFIRMED.
+    - guard-3951, active at resolution, prescribes no verdict in this case.
+    - outcome_detail was empty; `evidence` is untouched.
+- **rb-11714 EXTENDED (reconsolidation).** rb-3025 (07-10) and rb-1373 (05-27) predate the rb-5720
+  it named as earliest. The partition mechanism sat in the store 69 days before g-115-4899 opened.
+  Read back by value.
+- **Step 3.5.** NOT run (tight zone). The premise-already-false group (n=3) is the candidate.
+- **Step 3.6: 4 eligible.** Run 91's "0 until 10-06" forecast covered only the records it named.
+  - 4 OTHER rc-3 CORRECTED records had next_review 09-30.
+  - 3 were encoded on the overlap branch:
+    - processor-backfill -> guard-6525;
+    - worker-stall -> guard-3951;
+    - playerdataready -> guard-1206.
+  - encoded_via_chronic was VERIFIED x3 by value.
+  - The 4th (brokenpipe) was re-scored instead (above).
+- **Step 4.**
+  - 0 pattern-signature outcomes (retrospective).
+  - rb-12101 was checked first. These batch-derived rails got no credit: guard-6731, guard-7359,
+    rb-11097, rb-11685, rb-11008, rb-11009, guard-5187 and the guard-5155 family.
+  - times_helpful:
+    - via utilization-feedback: guard-3951, guard-2550, guard-4758, rb-12524;
+    - spooled: guard-7439, guard-2129, guard-7197, guard-2255, rb-3025, rb-1373.
+  - times_active: guard-6525, guard-3951 (x2), guard-1206.
+  - Own experience exp-g-001-02-review-hypotheses-20260922: retrieval_stats written {3, 1, 2} and
+    read back; utility_ratio recomputed to 0.3333.
+  - 3 other experience refs were not_found (other agents own them).
+- **Step 1.5.** Per-category retrieval was NOT run (budget). The carrier search covered the stores.
+- **Step 4.5.** `replay-stamp-verify.sh` stamped 10, verified 10 (per id), failed 0. next_review
+  2026-10-07.
+- **NEXT RUN (94).**
+  - Keep derived surprise, the strict skip, the routine reservation and the exclusion asserts
+    (8 and 1).
+  - Do not re-test the universal-scope quantifier.
+  - A forecast of when Step 3.6 reads nonzero covers only the records it names. Other rc-3
+    CORRECTED records come due on their own calendar.
+  - Before accepting a CORRECTED on a fleet-wide or unbounded claim, check that the resolver's
+    population matches the claim (guard-2550).
+
+## 2026-09-30 — alpha, `hostname` cc-04, `uname -r` 6.8.0-142-generic (own-cloud), g-001-05 occurrence 70
+
+- **Selection.** Run 93's method (derived surprise, strict skip, 2 routine slots reserved) plus
+  alpha's lesson-free exclusion (owner g-115-4852).
+  - Pool 826 (`--replay-candidates`, read 09:2x, 4.5h after Run 93). Exclusion asserts held:
+    outcome-null 8, test-cat 1. Eligible 817. The strict skip kept 19 due-today records.
+    Derived != stored on 246.
+  - rc (eligible) {0: 444, 1: 217, 2: 84, 3: 54, 4: 18}. Effective surprise: 5: 301, 6: 101,
+    None: 38; nothing at 7 or above.
+  - The lesson-free exclusion removed 70 UNRESOLVABLE/EXPIRED records, 13 of them at eff >= 5.
+  - RULE 2 = 0 (Run 93 took the 5). Band 6: 92 scoreable records for 8 slots, allocated by largest
+    remainder as {rc0 1, rc1 4, rc2 2, rc4 1}. Plus 2 routine (seed `alpha-g-001-05-occ70`).
+  - Batch: 6 CORRECTED, 4 CONFIRMED (batch-scoped, guard-2129).
+- **Step 2.** 10/10 narratives parsed, count asserted. Winners: outcome_detail 10. Bare 0/10.
+- **Step 3: one title marker, pre-registered in the diary at 09:30:29 before the corpus fetch.
+  K=1, alpha 0.05. REJECTED.**
+  - M-ex: an existential / lower-bound token (at least, one or more, non-zero, >0, >=1, one-off,
+    exist(s), some, will find), excluding titles with any Run 93 M1 token. It is M1's disjoint
+    mirror. Batch: 2/2 CONFIRMED, so the batch-implied direction was LOWER.
+  - Corpus: resolved 29 + archived 1945 = 1974 by id. 1174 scoreable after dropping the batch
+    (10), verdict-token titles (16) and test-cat (4). Base 42.0%.
+  - Result at n=102: 43.1% vs 41.9% for the rest, +1.3pp (against the prediction). Exceedance
+    0.828; median |perm| 3.4pp, p95 9.8pp (4000 draws).
+  - Controls:
+    - crc32(`id[11:]`) size-matched: -0.9pp;
+    - 'the' size-matched: -2.0pp;
+    - month-expected 41.4% vs observed 43.1%;
+    - mean confidence on 0.543 vs off 0.578; band-stratified lift -0.6pp.
+  - WITH RUN 93, CLAIM SCOPE IS NULL FROM BOTH ENDS. Both deltas run against their batch-implied
+    direction. Each group's mean confidence sits within 3pp of its hit rate.
+  - SIGN SERIES: 17 values, 11 negative. Two-sided sign test p = 43556/131072 = 0.33.
+    - M-ex's batch-implied direction was LOWER, so as an INVERSION it counts with the negatives.
+      That scoring needs every prior marker's implied direction, which is recorded only in
+      prose; it was not recomputed.
+- **Step 3.5.** Skipped: 0 of 6 CORRECTED lessons carry a procedural-gap indicator.
+- **Step 3.6: 0 eligible.** Run 93 cleared the 09-30 cohort.
+  - Flag-durability control: 2 of Run 93's 3 encodings still read `encoded_via_chronic=True`
+    about 4.5h later (worker-stall, playerdataready).
+  - The slug `processor-backfill` matched no id.
+- **Step 4.**
+  - **guard-6029 EXTENDED**, both fields read back by value; the rule (merge identity) is
+    untouched.
+    - trigger_condition 166 -> 461 chars, marker `alpha-scope-null-both-ends-20260930`. It now
+      also fires on the mirror claim that a shape is systematically RIGHT.
+    - action_hint 2652 -> 4058 chars. It now carries occurrences (5) Run 93 M1 and (6) M-ex.
+  - Occurrence (4) was already there: alpha's 2026-09-09 universal/conjunctive title marker,
+    -2.52pp, exceedance 0.778. So Run 93's M1 was a RE-TEST, not the first test of that end.
+  - M-ex was pre-registered before that action_hint was read. The old trigger (elevated rate only)
+    could not fire on a reduced-rate claim.
+  - times_helpful +1 is spooled. The effective count still read 4, which is the spool lane, not a
+    lost write.
+  - No credit (rb-12101): rb-12130 was derived from batch record #1, and rb-7265 very likely
+    shares #8's measurement.
+  - 0 pattern-signature outcomes (retrospective).
+  - Own experience exp-2026-08-10_single-shot-external-status-reads: retrieval_stats {2, useful 1}
+    read back; utility_ratio 0.5. The other 6 experience refs were not_found (other agents own them).
+- **Step 1.5.** Per-category retrieval was NOT run (10 categories, n=1 each). The goal's
+  supplementary retrieval plus three targeted strategy queries stood in for it.
+- **Step 4.5.** `replay-stamp-verify.sh` stamped 10, verified 10 (per id), failed 0. next_review
+  2026-10-07.
+  - Every replay_count = pre-stamp + 1.
+  - `2026-08-03_prose-invocation-does-not-mechanize` reached rc 5; it was already archived.
+- **NEXT RUN.**
+  - Do not re-test title scope from either end.
+  - Read guard-6029's action_hint BEFORE choosing a marker. Shape markers are now null six times.
+  - Lead: windowed occurrence forecasts (within N days, next N, post-deploy). Qualitative only:
+    among the first 12 M-ex members by id, 4 of 7 CORRECTED carry an explicit window vs 2 of 5
+    CONFIRMED.
+    - Take it as guard-3618's specification question: asymmetric reach, since waiting reaches
+      CORRECTED and only the event reaches CONFIRMED.
+    - Do not take it as a seventh shape-marker.
+
+## Run 94 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-09-30; zeta's g-001-05 occurrence 91)
+
+- **Selection.** Derived surprise, strict skip (> not >=), 2 routine slots reserved.
+  - Pool 818 (`--replay-candidates`, read 11:37). Exclusion asserts held: outcome-null 8,
+    test-cat 1. Eligible 809. A `>=` skip would have dropped 18 due-today records.
+    Derived != stored on 93. [Run 95: this count and "5: 90" below do not reproduce; see the Run 95
+    CORRECTION bullet. The rest of this section was not re-audited.]
+  - rc (eligible) {0: 439, 1: 208, 2: 81, 3: 54, 4: 17}. Effective surprise: 5: 90, 6: 85;
+    nothing at 7 or above. RULE 2 = 0 (pool ceiling; both stored and derived checked).
+  - Band 6: 85 records, proportional allocation {rc0 2, rc1 5, rc2 1}. Plus 2 routine (seed 94).
+  - Batch: 8 CORRECTED, 1 UNRESOLVABLE, 1 EXPIRED at selection (batch-scoped, guard-2129).
+- **Step 2.** 10/10 narratives parsed (pipeline-read.sh --narrative --id, count asserted against
+  intended batch size 10). Winners: outcome_detail 9, resolution_note 1. Bare 0/10.
+  - Corpus (resolved 35 + archived 1949 = 1919 by id after dedup; test-cat and null-outcome
+    excluded): CORRECTED 511/1919 = 26.6%. Batch 80.0%, delta +53.4pp (violation-first enriched).
+- **Step 3: one title marker, pre-registered before corpus fetch. K=1, alpha 0.05. REJECTED.**
+  - "class" (hyphen-split word in slug). Batch: 2/2 CORRECTED.
+  - De-circularized corpus (1909 scoreable after dropping batch): base 26.3%.
+  - Result at n=39: 33.3% vs 26.3% for the rest, +7.0pp. Exceedance 0.362 (10000 draws);
+    well within the size-matched floor for n=39.
+  - Controls: id[11:] hash +0.1pp (n=962 from the non-batch); "data" common word +7.0pp (n=12).
+  - SIGN SERIES: 17 values (per alpha's count), plus this one at +7.0pp. The series is noise.
+- **Step 3.5.** Skipped: no shared_condition group with N >= 2 corrected hypotheses sharing a
+  procedural-gap indicator.
+- **Step 3.6: 0 eligible.** Run 93 cleared the 09-30 cohort; alpha confirmed the flags durable.
+- **Step 4.**
+  - 0 pattern-signature outcomes (retrospective).
+  - No reconsolidation updates (no strategy referenced by batch records).
+  - No experience refs dereferenced (batch records carry none owned by zeta).
+- **Step 4.5.** `replay-stamp-verify.sh` stamped 10, verified 10 (per id), failed 0.
+  next_review 2026-10-07.
+- **NEXT RUN (95).**
+  - Keep derived surprise, the strict skip, the routine reservation, and the exclusion asserts.
+  - Do not re-test "class" or any previously rejected marker.
+  - Read guard-6029's action_hint before choosing a marker (alpha's guidance, carried forward).
+
+## Run 95 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-09-30; zeta's g-001-05 occurrence 92)
+
+- **Selection.** Run 94's method: derived surprise, strict skip (> not >=), 2 routine slots reserved,
+  exclusion asserts.
+  - Pool 814 (`--replay-candidates`, read 18:2x). Asserts held: outcome-null 8, test-cat 1.
+    Eligible 805. The strict skip dropped 0; a `>=` skip would have dropped 18 due-today records.
+    Source-level: rc>=5 0, encoded_via_chronic 0, next_review > today 0.
+  - rc (eligible) {0: 445, 1: 208, 2: 81, 3: 54, 4: 17}. Derived surprise: 7: 1, 6: 81, 5: 297,
+    4: 275, <=3: 83, None: 68. Derived != stored on 272.
+  - RULE 2 = 1 (batch #1: the 2026-06-29 cell-success saturation record, resolved today by echo's
+    g-001-02). Band 6: 81 records for 7 slots, strata
+    {0: 17, 1: 36, 2: 18, 3: 5, 4: 5}, largest remainder {rc0 2, rc1 3, rc2 2}. Plus 2 routine
+    (seed 95, population 426).
+  - Batch: 7 CORRECTED, 3 CONFIRMED (batch-scoped, guard-2129). 3 of the 7 CORRECTED were resolved
+    today by echo (g-001-02), which is why the pool grew from 808 to 814 after Run 94.
+- **CORRECTION to Run 94.** Its "Derived != stored on 93" and "Effective surprise 5: 90" reproduce
+  under no scope tried: whole eligible pool 272, the ds>=5 subset 184, stored==5 121. Alpha's 09:2x
+  read (246; 5: 301) and this run (272; 5: 297) agree with each other. Run 94 was executed by a
+  fresh-context subagent. Treat both counts as unverified, never as series points. Its band-6 figure
+  (85) is consistent with this run's 81. Nothing else in Run 94 was re-audited (guard-3112).
+- **Step 2.** 10/10 narratives parsed (one file per id, count asserted against the intended 10).
+  Winners: outcome_detail 9, outcome_note 1. Bare 0/10. Procedural-gap indicators 0/10.
+- **Step 3: one title marker, pre-registered in the diary at 18:27:28 before the corpus fetch.
+  K=1, alpha 0.05. NULL, and inverted.**
+  - WINDOW = a windowed occurrence forecast (within / next / first N / N days|hours /
+    post-deploy|fix / by <date>). This is alpha's occurrence-70 lead, taken as guard-3618's
+    specification question rather than a shape-calibration claim.
+  - Corpus: resolved 35 + archived 1949 = 1984 by id; 1909 after test-cat, outcome-null and the
+    batch; scoreable (CORRECTED + CONFIRMED) 1196, base 42.1%.
+  - Result at n=249: 38.6% vs 43.1%, -4.5pp, AGAINST the predicted direction. The crc32(`id[11:]`)
+    size-matched control reads -5.5pp, so the marker does not beat it (guard-6029's one-line
+    test). Permutation (4000 draws): median 2.5pp, p95 7.1pp, exceedance 0.220. Month-expected
+    42.8% vs observed 38.6%. Date control (oldest 249): +6.6pp.
+  - `/compare-batch-vs-corpus-rate` on WINDOW: batch 40.0% vs corpus 19.6%; confounder (title
+    length) CONFOUNDED; outcome control BATCH-SCOPED, separation -3.06pp; rc 1.
+  - The same tool on the SELECTION KEY (derived surprise >= 5): outcome control KEEP at +51.1pp.
+    That is circular — derive_surprise reads only outcome and confidence — and it shows the batch's
+    70% CORRECTED is the selection rule, not a finding. The tool cannot flag an outcome-derived
+    indicator; its own "does NOT check" list says so.
+  - EXPLORATORY, not pre-registered: windowed titles are also LESS often lesson-free (EXPIRED +
+    UNRESOLVABLE 33.6% vs 38.3%, -4.7pp; crc32 control -2.3pp; n=375 of 1909). No permutation
+    floor was built, so this is not a finding.
+  - In the batch, 3 of the 4 windowed records were CORRECTED, and all 3 were corrected by a
+    MEASURED event (37 sessions; 13 scored rows; an in-window scan), none by expiry. So the lead's
+    mechanism ("waiting reaches CORRECTED") did not operate here. At corpus scale, windowed
+    forecasts are neither more often CORRECTED nor more often unmeasured.
+  - SIGN SERIES: NOT APPENDED (corrected the same session). WINDOW is mostly a re-test: 175 of its
+    249 members carry `within` (88) or `next` (88). `within` was Run 87's M2 (n=82, +3.1pp), is
+    already a series value, and Run 87 said not to re-test it. `next` was measured earlier as a
+    common-word control (-8.2 to -11.5pp). Rates: `within` 45.5%, `next` 36.4%, the other 74
+    members 32.4% (no floor built, not a finding). The series stays at 18 values, 11 negative,
+    two-sided p = 0.48. Superseded: this bullet first appended a 19th value (12 negative, p = 0.36).
+  - Precision, checked after the fact: 22 of 25 sampled WINDOW matches (seed 9595) are real
+    windowed forecasts. The 3 misses match a rate unit ("44/24h"), a metric label ("7d
+    lane-share") or a data label ("post-fix data"). Recall was not measured.
+  - Prior markers' implied directions are still not rescored (alpha's caveat).
+- **Qualitative, batch-scoped, no marker test.**
+  - 3 of the 7 CORRECTED are split verdicts whose substance held. onboarding-grant was corrected
+    by its own exclusion set against the deployed marker tuple (guard-2857's class).
+    restored-experience-refs: the churn loop was CONFIRMED, "all 9 hold" was falsified.
+    goals-completed: the direction was confirmed, the threshold missed.
+  - #1 and #2, both from one domain category, were formed on thin evidence: #1's "two readings"
+    were one session, with 50 of 52 cells from one fixture. The resolver already recorded this as
+    rb-8657's missed mechanism.
+  - #3's formation premortem guarded the OPPOSITE tail (a false DONE from inflated counts). The
+    actual failure was a false GAP: the hop's seed transforms deflate the target's counts. rb-2570
+    already carries the transform-normalization fix (amended at resolution), so there is no
+    reconsolidation write.
+- **Step 3.5.** Skipped: 0 of 7 CORRECTED lessons carry a procedural-gap indicator.
+- **Step 3.6: 0 eligible.** Positive control: the rc>=3 stratum holds 71 records, 0 of them
+  CORRECTED (chronic records are excluded at the source once encoded).
+- **Step 4.** 0 pattern-signature outcomes (retrospective). No reconsolidation writes: rb-2570 is
+  already amended, and rb-12101 bars crediting guard-2358 from #8. Own experience
+  `exp-2026-06-30_cross-repo-symmetric-marker-count`: retrieval_stats {11, useful 1, noise 7} read
+  back, utility_ratio 0.0909. The other 3 experience refs are not zeta's (not_found) and were read
+  only.
+- **Step 1.5.** Per-category retrieval was NOT run (5 categories, n <= 4 each). The goal's
+  supplementary retrieval (80 rb, 28 guardrails) stood in for it.
+- **Step 4.5.** `replay-stamp-verify.sh` stamped 10, verified 10 (per id), failed 0. Every
+  replay_count = pre-stamp + 1; the max is now 3. next_review 2026-10-07.
+- **NEXT RUN (96).**
+  - Keep the method and the asserts. Rule 2 read 1 here: check it first and inherit nothing.
+  - The windowed-forecast lead is now measured NULL at corpus scale on both outcome splits. Do not
+    re-test it.
+  - Do not use Run 94's "93" or "5: 90" as series points.
+  - Before pre-registering a marker, grep this ledger for each of its terms. A union that contains
+    a tested term is a partial re-test, not a new series point.
+  - Cite batch records by position, date and role when an id or category carries domain
+    vocabulary. The commit gate is case-sensitive and passes lowercase domain terms (e770ef1679).

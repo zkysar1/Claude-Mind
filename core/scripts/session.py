@@ -42,10 +42,13 @@ VALID_SIGNALS = {
     # /observe on a vessel. BLOCKER class — an environment change unblocks work
     # even inside an approved quiescence sleep, which is the whole point: a
     # resident that cannot wake on its world changing is not perceiving it.
-    # Written ONLY by the vessel's /observe on kind:'change' (never a heartbeat)
-    # and never in assistant mode, where no loop sleeps and nothing reads it
-    # (guard-1806). Adding a signal here is a 7-site change, NOT the 3 guard-374
-    # names — see the SIGNAL SYNC SITES block in interruptible-sleep.sh.
+    # Written ONLY by observation-received-hook.sh, which the vessel runs as its
+    # ObservationReceived hook on kind:'change' (never a heartbeat), and never
+    # in reader or assistant mode, where no loop sleeps and nothing reads it
+    # (guard-1806). The vessel's built-in wake writes it only in a workspace
+    # that declares no such hook. Adding a signal here is a 7-site change, NOT
+    # the 3 guard-374 names — see the SIGNAL SYNC SITES block in
+    # interruptible-sleep.sh.
     "perception-received",
 }
 # Runtime session modes — values written to session/agent-mode and read by

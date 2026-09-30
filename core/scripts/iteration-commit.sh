@@ -545,16 +545,32 @@ fi
 # a command-made edit outside core/ and .claude/, a record written before records
 # carried `sid`) is left uncommitted even when it IS this session's — listed,
 # never silently dropped ().
+#
+# A record for this session is not enough when ANOTHER writer also changed the
+# file after its last commit (): git stages whole files, so the commit
+# would ship that change too. Such a path is CONTESTED and left out, listed with
+# who else wrote it: another session's sid, `ambiguous` (the Bash recorder saw
+# two sessions' commands running when it changed), or `unattributed` (no session
+# was running a command; also every record from before records carried `sid`).
+# A record older than the file's last commit is already in HEAD and counts for
+# nothing, so the stale rows a ledger keeps for files committed by pathspec do
+# not block later commits.
 declare -A session_authored_paths=()
+declare -A session_contested_paths=()
 if [[ $SESSION_SCOPE -eq 1 ]]; then
   session_log="$REPO/agents/$MIND_AGENT/session/uncommitted-edits.jsonl"
   if [[ -f "$session_log" ]]; then
-    while IFS= read -r recorded_path; do
+    while IFS=$'\t' read -r scope_tag recorded_path contested_by; do
       recorded_path="${recorded_path%$'\r'}"
+      contested_by="${contested_by%$'\r'}"
       [[ -z "$recorded_path" ]] && continue
-      session_authored_paths["$recorded_path"]=1
+      if [[ "$scope_tag" == "C" ]]; then
+        session_contested_paths["$recorded_path"]="${contested_by:-another writer}"
+      else
+        session_authored_paths["$recorded_path"]=1
+      fi
     done < <(LOG_PATH="$session_log" SESSION_SID_E="$SESSION_SID" XAGENT_SCRIPTS="$REPO/core/scripts" XAGENT_ROOT="$REPO" $PYLAUNCH - <<'PYEOF' || true
-import json, os, sys
+import json, os, subprocess, sys
 # Same path normalizer as the two log consumers above (rb-1405 SSOT).
 sys.path.insert(0, os.environ.get("XAGENT_SCRIPTS", ""))
 try:
@@ -564,6 +580,7 @@ except Exception:
         return p
 proot = os.environ.get("XAGENT_ROOT", "")
 sid = os.environ.get("SESSION_SID_E", "")
+own, others = set(), {}
 try:
     with open(os.environ.get("LOG_PATH", ""), "r", encoding="utf-8") as f:
         for line in f:
@@ -574,10 +591,45 @@ try:
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(entry, dict) and entry.get("sid") == sid and entry.get("file"):
-                print(_normalize_rel_path(entry["file"], proot))
+            if not (isinstance(entry, dict) and entry.get("file")):
+                continue
+            path = _normalize_rel_path(entry["file"], proot)
+            if entry.get("sid") == sid:
+                own.add(path)
+                continue
+            osid = entry.get("sid") or ""
+            who = osid[:8] if osid else ("ambiguous" if entry.get("candidates") else "unattributed")
+            try:
+                mtime = int(entry.get("mtime"))
+            except (TypeError, ValueError):
+                mtime = None
+            others.setdefault(path, []).append((mtime, who))
 except OSError:
     pass
+
+
+def last_commit(path):
+    """Time of the last commit touching path; None when never committed or unreadable."""
+    try:
+        r = subprocess.run(["git", "-C", proot, "log", "-1", "--format=%ct", "--", path],
+                           capture_output=True, text=True, timeout=30)
+        return int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip() else None
+    except Exception:
+        return None
+
+
+# One line per path this session recorded: A = stage it, C = contested.
+for path in sorted(own):
+    rows = others.get(path)
+    if rows:
+        since = last_commit(path)
+        # Same-second or undatable counts as live: a wrongly kept path is
+        # listed, a wrongly staged one ships another writer's change.
+        live = sorted({who for m, who in rows if since is None or m is None or m >= since})
+        if live:
+            print(f"C\t{path}\t{', '.join(live)}")
+            continue
+    print(f"A\t{path}")
 PYEOF
 )
   fi
@@ -739,6 +791,7 @@ declare -a cross_agent_partner_uncommitted_log=()  # : files recorded in OTHER a
 declare -a committer_authored_exempt=()  # : files retained despite partner in_flight because committer's OWN uncommitted-edits.jsonl proves first-person authorship
 declare -a committer_authored_log_exempt=()  # : files retained despite a partner ALSO recording them in uncommitted-edits.jsonl, because the committer's OWN log proves first-person authorship (the own-log check the  partner-log filter previously lacked — asymmetry with the  concurrent-partner filter)
 declare -a session_excluded=()  # : under --session-sid, paths outside agents/<agent>/ that no record ties to this session
+declare -a session_contested=()  # : under --session-sid, this session's paths that another writer also changed since their last commit ("path|who")
 
 while IFS= read -r line; do
   [[ -z "$line" ]] && continue
@@ -884,7 +937,11 @@ while IFS= read -r line; do
   # leaves no record, so outside the agent's own dir it is listed, not staged.
   if [[ $SESSION_SCOPE -eq 1 && "$path" != agents/"$MIND_AGENT"/* ]]; then
     if [[ -z "${session_authored_paths["$path"]:-}" ]]; then
-      session_excluded+=("$path")
+      if [[ -n "${session_contested_paths["$path"]:-}" ]]; then
+        session_contested+=("$path|${session_contested_paths["$path"]}")
+      else
+        session_excluded+=("$path")
+      fi
       continue
     fi
   fi
@@ -1151,11 +1208,11 @@ if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 && ${#staged_del_f
   # AND aggregate the totals. Replaces the prior mutually-exclusive branches
   # which dropped the partner-uncommitted-log message when other filters also
   # fired ().
-  total=$(( ${#cross_agent_uncommitted[@]} + ${#cross_agent_concurrent_partner[@]} + ${#cross_agent_partner_uncommitted_log[@]} + ${#cross_agent_files[@]} + ${#skipped_files[@]} + ${#session_excluded[@]} ))
+  total=$(( ${#cross_agent_uncommitted[@]} + ${#cross_agent_concurrent_partner[@]} + ${#cross_agent_partner_uncommitted_log[@]} + ${#cross_agent_files[@]} + ${#skipped_files[@]} + ${#session_excluded[@]} + ${#session_contested[@]} ))
   if [[ $total -eq 0 ]]; then
     echo "[$SCRIPT_NAME] skip: no uncommitted changes for $MIND_AGENT (after filters)"
   else
-    echo "[$SCRIPT_NAME] skip: all uncommitted files filtered (total=$total: ${#cross_agent_uncommitted[@]} pre-claim, ${#cross_agent_concurrent_partner[@]} concurrent-partner, ${#cross_agent_partner_uncommitted_log[@]} partner-log, ${#cross_agent_files[@]} namespace, ${#skipped_files[@]} sensitive, ${#session_excluded[@]} not-this-session; committer=$MIND_AGENT)" >&2
+    echo "[$SCRIPT_NAME] skip: all uncommitted files filtered (total=$total: ${#cross_agent_uncommitted[@]} pre-claim, ${#cross_agent_concurrent_partner[@]} concurrent-partner, ${#cross_agent_partner_uncommitted_log[@]} partner-log, ${#cross_agent_files[@]} namespace, ${#skipped_files[@]} sensitive, ${#session_excluded[@]} not-this-session, ${#session_contested[@]} also-changed-by-another; committer=$MIND_AGENT)" >&2
     for f in "${cross_agent_uncommitted[@]}"; do echo "  filtered (cross-agent-uncommitted): $f" >&2; done
     for entry in "${cross_agent_concurrent_partner[@]}"; do
       IFS='|' read -r cp_path cp_partner cp_iso <<< "$entry"
@@ -1168,6 +1225,10 @@ if [[ ${#staged_files[@]} -eq 0 && ${#rm_only_files[@]} -eq 0 && ${#staged_del_f
     for f in "${cross_agent_files[@]}"; do echo "  filtered (cross-agent): $f" >&2; done
     for f in "${skipped_files[@]}"; do echo "  filtered (sensitive): $f" >&2; done
     for f in "${session_excluded[@]}"; do echo "  filtered (not-this-session): $f" >&2; done
+    for entry in "${session_contested[@]}"; do
+      IFS='|' read -r sc_path sc_by <<< "$entry"
+      echo "  filtered (also-changed-by-another): $sc_path (other: $sc_by)" >&2
+    done
   fi
   exit 0
 fi
@@ -1235,6 +1296,15 @@ fi
 if [[ ${#session_excluded[@]} -gt 0 ]]; then
   echo "[$SCRIPT_NAME] WARN: session scope left ${#session_excluded[@]} path(s) UNCOMMITTED — no edit record ties them to session $SESSION_SID (committer=$MIND_AGENT). Each is another session's work in progress, or a change no recorder sees (a deletion, a command-made edit outside core/ and .claude/):" >&2
   for f in "${session_excluded[@]}"; do echo "  filtered (not-this-session): $f" >&2; done
+fi
+if [[ ${#session_contested[@]} -gt 0 ]]; then
+  echo "[$SCRIPT_NAME] WARN: session scope left ${#session_contested[@]} path(s) UNCOMMITTED — session $SESSION_SID changed each one, but another writer also changed it after its last commit, and a file is staged whole (committer=$MIND_AGENT):" >&2
+  for entry in "${session_contested[@]}"; do
+    IFS='|' read -r sc_path sc_by <<< "$entry"
+    echo "  filtered (also-changed-by-another): $sc_path (other: $sc_by)" >&2
+  done
+fi
+if [[ ${#session_excluded[@]} -gt 0 || ${#session_contested[@]} -gt 0 ]]; then
   echo "[$SCRIPT_NAME] HINT: if one IS yours, confirm \`git diff -- <path>\` shows only your change, then commit it by pathspec: git commit -m MSG -- <path> (guard-836)." >&2
 fi
 

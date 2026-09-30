@@ -26,6 +26,7 @@
 #                                            core/scripts/peer_surface.py
 #                                            core/scripts/git_ref_claim.py
 #                                            core/scripts/liveness_check.py
+#                                            core/scripts/body_diary_carrier.py
 #
 #      peer_surface.py added 2026-08-14 (): board_write.py's post
 #      handler now imports suspected_routing_tags from it for the routing-tag
@@ -44,6 +45,13 @@
 #      the daemon keeps serving the OLD partner-liveness verdicts that
 #      check-team-state-before-silent.md depends on. Surfaced by
 #      test_daemon_import_surface.py as an UNOWNED red during an unrelated merge.
+#
+#      body_diary_carrier.py added 2026-09-30 (, reducer carrier drain on
+#      hostname cc-04). It arrived with worker carrier 7659f585 ():
+#      _fleet_diary.py (matched by 'core/scripts/_*.py') lazily imports it, and
+#      mind_api/src/endpoints/skill_discovery.py lazily imports _fleet_diary, so
+#      the module is in the daemon's surface while its own path was not. Caught by
+#      test_daemon_import_surface.py in the scoped run that consumed the carrier.
 #
 #      predicate.py + aspirations.py added 2026-08-08 (, reducer pass on
 #      hostname cc-04, uname -r 6.8.0-136-generic). Both entered the daemon surface
@@ -195,6 +203,7 @@ DAEMON_PATHSPEC=(
     core/scripts/peer_surface.py
     core/scripts/git_ref_claim.py
     core/scripts/liveness_check.py
+    core/scripts/body_diary_carrier.py
 )
 
 # --print-pathspec: emit the boundary, one entry per line, exit 0. For consumers
@@ -234,6 +243,14 @@ fi
 # still work (it walks up to find .git) but the pathspec `mind_api/src` would
 # resolve relative to the WRONG cwd in some git versions. Don't shorten it.
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# git.exe needs a native path (). post-commit and post-merge run with
+# MSYS_NO_PATHCONV=1 inherited from iteration-close.sh (_platform.sh), so MSYS
+# no longer rewrites the /c/... pwd form, `git -C` answers "not a git
+# repository", and the fail-toward-restart exit below recycled the daemon after
+# every Windows loop commit. One cygpath call; none off Windows.
+if command -v cygpath >/dev/null 2>&1; then
+    PROJECT_ROOT="$(cygpath -m "$PROJECT_ROOT")"
+fi
 GIT=(git -C "$PROJECT_ROOT")
 
 # Resolve BASE to a commit. A bad/unknown/absent ref must fail TOWARD

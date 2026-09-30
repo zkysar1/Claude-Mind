@@ -21,7 +21,11 @@
 # Exit: 0 healthy (or not an own-cloud box — n/a, printed); 1 WEDGED or DRIFT
 # (act: /reconcile-owncloud-conflicts for class-B files, guard-4778's fenced
 # mirror_put recipe for tree nodes — rb-9443 has the worked example);
-# 2 indeterminate (could not decide — say so, never read as healthy).
+# 2 indeterminate (could not decide — say so, never read as healthy);
+# 3 PULL-FAILING (check 1 only, ): fleet edits to the listed paths
+# are not reaching THIS box. Not a wedge, so the rc=1 repairs do not apply: fix
+# the per-path error mirror-health prints, and leave those paths unedited here
+# until a pull brings them. A DRIFT from check 2 sets 1, which outranks 3.
 #
 # Usage: bash core/scripts/mirror-integrity-check.sh [--since <iso>] [--no-drift]
 #   --since   session_start override (default: wm-read.sh session_start)
@@ -58,10 +62,10 @@ case "$MHRC" in
     0) ;;
     1) case "$MH" in
            "mirror-health: pull-failing"*)
-               echo "mirror-integrity: PULL-FAILING — fleet edits to the files listed above are NOT reaching this box; its copies are stale or missing (g-115-11323)" ;;
+               echo "mirror-integrity: PULL-FAILING — fleet edits to the files listed above are NOT reaching this box; its copies are stale or missing (g-115-11323)"; RC=3 ;;
            *)
-               echo "mirror-integrity: WEDGED — tree edits from this box are NOT reaching the fleet; repair before claiming anything is ENCODED (rb-9443, guard-4778)" ;;
-       esac; RC=1 ;;
+               echo "mirror-integrity: WEDGED — tree edits from this box are NOT reaching the fleet; repair before claiming anything is ENCODED (rb-9443, guard-4778)"; RC=1 ;;
+       esac ;;
     *) echo "mirror-integrity: streak verdict INDETERMINATE (rc=$MHRC) — not evidence of health"; [ "$RC" = 0 ] && RC=2 ;;
 esac
 

@@ -154,11 +154,13 @@ Options:
                       session must become current WITHOUT publishing its state
                       as a side effect of starting (g-115-3871).
   --ff-only           OUT-OF-LOOP SYNC TICK (g-115-11070), for a root crontab.
-                      Fetch, then FAST-FORWARD ONLY: a clean tree strictly behind
-                      origin advances; a dirty tree, a merge in progress or a
-                      non-fast-forward is LOGGED and left alone. Never commits,
-                      never pushes (overrides --push-worker-ref), exits above
-                      every merge site. A caller running this from cron must
+                      Fetch, then a clean tree strictly behind origin takes a
+                      FAST-FORWARD. A dirty tree or a non-fast-forward runs the
+                      loop's --no-push integrate instead, but ONLY when
+                      tick_claim_probe.py answers that this box's worker Body
+                      holds no claim (g-375-96); otherwise it is LOGGED and left
+                      alone, as is a merge in progress. Never pushes (overrides
+                      --push-worker-ref). A caller running this from cron must
                       first check that this help text lists the flag: an older
                       copy of this script only WARNS on an unknown arg and would
                       run a full merge+push.
@@ -511,18 +513,54 @@ if [ "$NO_FETCH" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   fi
 fi
 
-# --- FF-ONLY SYNC TICK () -----------------------------------------
+# --- FF-ONLY SYNC TICK (, ) ------------------------------
 # The out-of-loop floor. Syncing was a side effect of the loop, so a box running
 # none (an idle container, an assistant seat) never pulled: measured 2026-09-27
 # (alpha, cc-10, census over ssh rack + lxc exec) 11 of 25 Mind clones sat 137-303
 # commits behind. Everything above -- the index.lock skip, the tree-lock gate, the
-# throttled fetch -- is shared with the loop's own call. This block takes ONLY a
-# fast-forward and exits above every merge site, the self-heal commit and the push.
-# A dirty tree or a non-fast-forward is LOGGED, never resolved: that is the loop
-# integrate's job, which can self-heal what it owns, while a cron cannot know whose
-# work a dirty path is (rb-3399: never naive-union agent-dir stores from a cron).
+# throttled fetch -- is shared with the loop's own call.
+#
+# A clean tree that is only behind takes a fast-forward here and exits above every
+# merge site, the self-heal commit and the push. It does so under a running unit too:
+# measured harmless, 0 of 20 mid-unit fast-forwards touched a file their unit read,
+# ran or edited ().
+#
+# A dirty tree or a non-fast-forward is the loop integrate's job, which can
+# self-heal what the Body owns, while a cron cannot know whose work a dirty path is
+# (rb-3399: never naive-union agent-dir stores from a cron). Log-only left a Body
+# stale between units: measured 2026-09-30 (), zc-02 sat 2.29 h behind
+# while every tick refused on its own store file. So the tick now hands exactly
+# those two shapes to the loop's own --no-push integrate, and ONLY when
+# tick_claim_probe.py answers that this box's worker Body holds no claim. Between
+# units that is the integrate the loop runs at its next boundary, only sooner.
+# Every other probe answer keeps the log-only line, with the answer appended.
 # --no-optional-locks: a background status must not take index.lock under a live
 # session's git command.
+#
+# _ip_tick_no_claim: 0 only when the probe answers `none`. _IP_TICK_WHY carries the
+# probe's line for the log. MIND_AGENT is exported to the probe's agent when unset,
+# because the self-heal scopes "self" by it and a cron carries none.
+# ITERATION_PUSH_CLAIM_PROBE (tests only) names a script to run in the probe's place.
+_IP_TICK_HANDOFF=0
+_IP_TICK_WHY=""
+_ip_tick_no_claim() {
+  local _out _verdict _agent _evidence
+  if [ -n "${ITERATION_PUSH_CLAIM_PROBE:-}" ]; then
+    _out="$(bash "$ITERATION_PUSH_CLAIM_PROBE" --repo "$REPO")"
+  else
+    _out="$(python3 "$SCRIPT_DIR/tick_claim_probe.py" --repo "$REPO")"
+  fi
+  _out="${_out%%$'\n'*}"
+  _IP_TICK_WHY="${_out:-no answer}"
+  # read splits on whitespace, so a bare "none" leaves _agent EMPTY; a prefix strip
+  # would have handed back "none" itself as the agent name.
+  read -r _verdict _agent _evidence <<<"$_out"
+  [ "$_verdict" = none ] || return 1
+  case "$_agent" in ''|-|*[!A-Za-z0-9_-]*) return 1;; esac
+  if [ -n "${MIND_AGENT:-}" ] && [ "$MIND_AGENT" != "$_agent" ]; then return 1; fi
+  export MIND_AGENT="$_agent"
+  return 0
+}
 if [ "$FF_ONLY" = 1 ]; then
   if [ -e "$GITDIR/MERGE_HEAD" ]; then
     log "ff-only tick: a merge is in progress (MERGE_HEAD) — log only"; soft_exit 0
@@ -531,35 +569,43 @@ if [ "$FF_ONLY" = 1 ]; then
   if [ "$_FF_ST_RC" -ne 0 ]; then
     log "ff-only tick: git status failed rc=${_FF_ST_RC} — log only: $(printf '%s' "$_FF_DIRTY" | tail -n 1)"; soft_exit 1
   fi
-  if [ -n "$_FF_DIRTY" ]; then
-    log "ff-only tick: tree dirty ($(printf '%s\n' "$_FF_DIRTY" | wc -l | tr -d ' ') tracked path(s): $(printf '%s\n' "$_FF_DIRTY" | head -5 | cut -c4- | tr '\n' ' ')) — log only, the merge is the loop's"
-    soft_exit 0
-  fi
   _FF_BEHIND="$(git -C "$REPO" rev-list --count "HEAD..$UPSTREAM" 2>/dev/null || echo "")"
   _FF_AHEAD="$(git -C "$REPO" rev-list --count "$UPSTREAM..HEAD" 2>/dev/null || echo "")"
   for _FF_N in "$_FF_BEHIND" "$_FF_AHEAD"; do
     case "$_FF_N" in ''|*[!0-9]*) log "ff-only tick: cannot count HEAD against $UPSTREAM — log only"; soft_exit 1;; esac
   done
-  if [ "$_FF_BEHIND" -eq 0 ]; then
+  # _FF_WHY names the two shapes a fast-forward cannot take.
+  _FF_WHY=""
+  if [ -n "$_FF_DIRTY" ]; then
+    _FF_WHY="tree dirty ($(printf '%s\n' "$_FF_DIRTY" | wc -l | tr -d ' ') tracked path(s): $(printf '%s\n' "$_FF_DIRTY" | head -5 | cut -c4- | tr '\n' ' '))"
+  elif [ "$_FF_BEHIND" -eq 0 ]; then
     log "ff-only tick: up to date with $UPSTREAM (ahead ${_FF_AHEAD})"; soft_exit 0
+  elif [ "$_FF_AHEAD" -gt 0 ]; then
+    _FF_WHY="NOT a fast-forward (ahead ${_FF_AHEAD}, behind ${_FF_BEHIND})"
   fi
-  if [ "$_FF_AHEAD" -gt 0 ]; then
-    log "ff-only tick: NOT a fast-forward (ahead ${_FF_AHEAD}, behind ${_FF_BEHIND}) — log only, the merge is the loop's"
-    soft_exit 0
-  fi
-  if [ "$DRY_RUN" = 1 ]; then
+  if [ -n "$_FF_WHY" ]; then
+    # Behind 0 leaves nothing to integrate, so the probe is asked only when behind > 0.
+    if [ "$_FF_BEHIND" -gt 0 ] && _ip_tick_no_claim; then
+      log "ff-only tick: $_FF_WHY; claim probe: $_IP_TICK_WHY — running the loop's --no-push integrate (g-375-96)"
+      _IP_TICK_HANDOFF=1
+    else
+      log "ff-only tick: $_FF_WHY — log only, the merge is the loop's${_IP_TICK_WHY:+ (claim probe: $_IP_TICK_WHY)}"
+      soft_exit 0
+    fi
+  elif [ "$DRY_RUN" = 1 ]; then
     log "ff-only tick (dry-run): would fast-forward ${_FF_BEHIND} commit(s) to $UPSTREAM"; soft_exit 0
+  else
+    _FF_FROM="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    _FF_OUT="$(git -C "$REPO" merge --ff-only -q "$UPSTREAM" 2>&1)"; _FF_RC=$?
+    if [ "$_FF_RC" -eq 0 ]; then
+      log "ff-only tick: fast-forwarded ${_FF_BEHIND} commit(s) ${_FF_FROM}..$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
+      soft_exit 0
+    fi
+    # git refuses rather than overwrite (an untracked file in the way, a race with a
+    # write that landed after the status check), so a refusal leaves the tree as it was.
+    log "ff-only tick: merge --ff-only refused rc=${_FF_RC} — log only: $(printf '%s' "$_FF_OUT" | tail -n 1)"
+    soft_exit 1
   fi
-  _FF_FROM="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
-  _FF_OUT="$(git -C "$REPO" merge --ff-only -q "$UPSTREAM" 2>&1)"; _FF_RC=$?
-  if [ "$_FF_RC" -eq 0 ]; then
-    log "ff-only tick: fast-forwarded ${_FF_BEHIND} commit(s) ${_FF_FROM}..$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
-    soft_exit 0
-  fi
-  # git refuses rather than overwrite (an untracked file in the way, a race with a
-  # write that landed after the status check), so a refusal leaves the tree as it was.
-  log "ff-only tick: merge --ff-only refused rc=${_FF_RC} — log only: $(printf '%s' "$_FF_OUT" | tail -n 1)"
-  soft_exit 1
 fi
 
 # --- Integrate-defer streak escalation () ---------------------------
@@ -679,6 +725,14 @@ _ip_log_conflict_paths() {
 
 _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort), $2 = blocking paths (defer lanes)
   local f n=0 since="" first="" _rest=""
+  # A tick-driven integrate () leaves the streak alone. Its escalation
+  # directive prints ONCE per streak, and worker-loop Phase -0.3 is the reader that
+  # acts on it; printed into the cron's log instead it would reach no one. The loop's
+  # own integrate at its next boundary meets the same blocker and counts it there.
+  if [ "${_IP_TICK_HANDOFF:-0}" = 1 ]; then
+    log "tick-driven integrate did not land (${1:-unknown}); the defer streak is left to the loop's own integrate"
+    return 0
+  fi
   f="$(_ip_streak_file)"
   [ -z "$f" ] && return 0
   if [ -f "$f" ]; then

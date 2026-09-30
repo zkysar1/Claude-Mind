@@ -823,6 +823,21 @@ guard-742 parity by construction):
   `in-flight`, and `clear-in-flight` land in that agent's row file (row
   writes also stamp `row_updated`/`row_updated_by`). All other fields
   route to the core file exactly as before.
+- **Row writes that change nothing are dropped, and `last_active` has a
+  600 s floor** (g-115-11231; under own-cloud every rewrite is a new store
+  version). A row `update` whose result equals the stored row writes
+  nothing (`skip_if_unchanged`). A `set` of `last_active` less than 600 s
+  newer than the stored value counts as unchanged
+  (`_team_state.last_active_write_is_floored`), so `last_active` advances
+  at most once per 600 s and can read up to ~600 s older than the agent's
+  real activity. The gates reading it use windows of 60 minutes or more,
+  and the claim-holder check (`_cross_box_holder_is_live`) adds the floor
+  to its window so a live holder keeps its full 60 minutes. The
+  selector's handoff take-back penalty (full under 30 minutes of partner
+  silence, a soft score) can move by at most about 0.4 of its 2.5. A new
+  reader must allow for the lag. Other fields, whole-row sets, the
+  dedicated in-flight/clear writers, and a stamp older than the stored
+  one write as before.
 - **Composed reads**: `team-state-read.sh` / `GET /v1/team-state/read` /
   `read_state()` overlay row files onto the core document — per-agent
   WHOLE-ROW newest-wins (same side-pick semantics as

@@ -144,6 +144,11 @@ $PYLAUNCH "$CORE_ROOT/scripts/my-new-script.py" "$@"
   `python3` (the `_paths.sh` shim where one was generated). It reads
   `$OSTYPE`, so a call costs one subshell, not a
   `uname` fork.
+- On a hot path (a hook, anything run on every tool call), write
+  `rt_python_launcher_into PYLAUNCH || PYLAUNCH=python3` instead. It sets the
+  variable in your shell with the same value and exit code, and skips the
+  subshell. Measured on Git Bash: ~10 ms per call against ~55 ms for the `$(...)`
+  form (g-115-11513).
 - Leave `$PYLAUNCH` unquoted so `py -3` splits into two words.
 - Plain `python3` is also correct in a script that sources `_paths.sh` first,
   because the shim covers Windows. `$PYLAUNCH` keeps Windows on the same

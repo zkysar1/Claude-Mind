@@ -111,7 +111,13 @@ def resolve(goal_id, world=None):
                     out.update(disposition=disp, status=g.get("status"),
                                aspiration_id=asp.get("id"), source=fname,
                                title=g.get("title"),
-                               outcome_note=g.get("outcome_note") or "")
+                               outcome_note=g.get("outcome_note") or "",
+                               # Who closed it. A record joined to this goal after
+                               # its aspiration was archived reads the closer here
+                               # (close-review-queue.py stats, ).
+                               completed_by=g.get("completed_by"),
+                               completed_by_role=g.get("completed_by_role"),
+                               completed_by_sid=g.get("completed_by_sid"))
                     return out
 
     # No record anywhere. The census is the tombstone store.

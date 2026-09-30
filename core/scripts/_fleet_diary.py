@@ -151,6 +151,29 @@ def read_agent_diary(
         return None, "error"
 
 
+def _body_carrier_lines(agent_name: str, backend) -> list:
+    """This agent's worker-Body diary rows (), from the carrier under
+    `world/body-diaries/<agent>/`.
+
+    Worker Bodies cannot push their agent-tree diary writes (the claim fence —
+    see `body_diary_carrier`'s docstring), so each Body mirrors its rows to a
+    Body-owned world carrier; this is the read side that unions those rows back
+    into the agent's stream. FAIL-OPEN: any carrier problem returns `[]` — the
+    carrier is additive, and a carrier hiccup must not cost the agent-wide read
+    that this helper existed to make authoritative.
+
+    The world root is this module's `WORLD_DIR` (the same name the roster half
+    reads, so one patch/redirect covers both halves).
+    """
+    try:
+        import body_diary_carrier as _bdc
+
+        return _bdc.read_carrier_lines(
+            agent_name, world_dir=WORLD_DIR, backend=backend)
+    except Exception:  # noqa: BLE001 — additive lane, never fatal
+        return []
+
+
 def read_fleet_diaries(
     base: Optional[Path] = None,
 ) -> Iterator[tuple[str, str]]:
@@ -169,12 +192,36 @@ def read_fleet_diaries(
     `local_only` flag would only add a way for the production path to be
     silently disabled.
 
-    Provenance is discarded here on purpose: this iterator's callers analyse
+    PROVENANCE IS DISCARDED HERE ON PURPOSE: this iterator's callers analyse
     content and have no destructive branch. `read_agent_diary` is the entry
-    point for anyone who does.
+    point for anyone who does — and its `(text, provenance)` contract is
+    untouched by the carrier union below (peer_liveness and the sweep's
+    keep-signal branch on it).
+
+    WORKER-BODY ROWS ARE UNIONED IN (g-306-555). The authoritative agent-wide
+    diary holds only the reducer's rows: a worker Body's appends are stranded
+    box-local by the agent-tree claim fence and mirror to
+    `world/body-diaries/<agent>/<sid>.jsonl` instead. Without the union, every
+    content consumer of this iterator (the scorer-override audit,
+    skill-discovery) is blind to Body decisions — the measured incident is in
+    `body_diary_carrier`'s docstring. Carrier rows are VERBATIM diary rows
+    (identical serialization to the agent-wide file), so a row present in BOTH
+    is skipped from the carrier half and can never double-count; the
+    agent-wide half is always yielded exactly as read (no dedup there —
+    changing it would alter consumers' retry-collapse accounting).
     """
     backend = _get_backend()
     for name in fleet_agent_names(base):
         text, _provenance = read_agent_diary(name, base, backend=backend)
-        if text:
+        if not text:
+            continue
+        carrier = _body_carrier_lines(name, backend)
+        if not carrier:
             yield name, text
+            continue
+        existing = {ln.strip() for ln in text.splitlines() if ln.strip()}
+        extra = [ln for ln in carrier if ln not in existing]
+        if not extra:
+            yield name, text
+            continue
+        yield name, text.rstrip("\n") + "\n" + "\n".join(extra) + "\n"

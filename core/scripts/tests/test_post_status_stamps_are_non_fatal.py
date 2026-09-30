@@ -31,8 +31,18 @@ from pathlib import Path
 CORE_ROOT = Path(__file__).resolve().parent.parent.parent
 CLOSE_SH = CORE_ROOT / "scripts" / "iteration-close.sh"
 
-# Every field stamped AFTER the status write. Each must be non-fatal.
-NON_FATAL_STAMPS = ("completed_date", "outcome_class", "completed_by_role")
+# Every field stamped AFTER the status write via a SEPARATE writer. Each must be
+# non-fatal.
+#
+# `completed_date` was dropped from this tuple on 2026-09-29 ( re-anchor):
+# commit 958185c126 (, 2026-08-31) deliberately REMOVED do_verify's separate
+# completed_date stamp — the daemon's 6a cascade () now stamps completed_date
+# INSIDE the status write itself. So there is no separate completed_date writer to be
+# non-fatal or to be ordered, and the two loop tests below were red on every platform
+# since ~2026-09-01 looking for a writer that no longer exists by design. Do NOT restore
+# it here; `test_completed_date_rides_the_status_write_not_a_separate_stamp` below pins
+# the  design so a future re-addition is caught.
+NON_FATAL_STAMPS = ("outcome_class", "completed_by_role")
 
 WRITER = "aspirations-update-goal.sh"
 STATUS_WRITE = '"$GOAL_ID" status "$GOAL_STATUS"'
@@ -136,6 +146,22 @@ def test_stamps_are_ordered_after_the_status_write():
             f"the {field} stamp (offset {at}) precedes the status write "
             f"(offset {status_at})"
         )
+
+
+def test_completed_date_rides_the_status_write_not_a_separate_stamp():
+    """ design pin (). completed_date is stamped INSIDE the
+    status write (daemon 6a cascade, g-115-5069), NOT by a separate do_verify
+    writer. Commit 958185c126 removed the separate stamp on purpose; this test
+    fails if one is ever re-added, which would double-write the field and re-open
+    the stale-anchor red this file's NON_FATAL_STAMPS loops used to carry."""
+    lines = _do_verify_body().splitlines()
+    assert _writer_line_index(lines, "completed_date") is None, (
+        "do_verify has re-acquired a SEPARATE completed_date writer via "
+        f"{WRITER}. Since g-358-36 the field rides the status write itself "
+        "(daemon 6a cascade, g-115-5069); a separate stamp double-writes it. If "
+        "the daemon cascade was genuinely removed, re-add completed_date to "
+        "NON_FATAL_STAMPS instead of stamping it bare (g-115-8624)"
+    )
 
 
 def _recovery_verify_branch() -> str:

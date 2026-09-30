@@ -1845,7 +1845,7 @@ class MirrorWedgeProbe(Probe):
             # up, so the close has to be able to run without it. Cost is one
             # local JSONL read per tick (no daemon, early-returns on no match);
             # the subprocess only runs when a closable goal actually exists.
-            closed = self._close_wedge_goal()
+            closed = self._close_wedge_goal(v)
             if self.fired or closed.get("closed"):
                 events.append(Event(
                     probe=self.name, event="mirror_wedge_cleared", severity="info",
@@ -1988,8 +1988,13 @@ class MirrorWedgeProbe(Probe):
         except Exception as e:  # noqa: BLE001 — filing failure must not kill the event
             return {"filed": False, "goal_id": None, "error": f"{type(e).__name__}: {e}"}
 
-    def _close_wedge_goal(self) -> dict:
+    def _close_wedge_goal(self, verdict: str = "healthy") -> dict:
         """Retire the goal THIS probe filed, once the wedge it describes is gone.
+
+        `verdict` is the mirror-health verdict this tick observed. Both
+        `healthy` and `pull-failing` clear a wedge, and the note must name the
+        one actually seen (g-115-11323 fresh-eyes: it said "healthy" on every
+        pull-failing close).
 
         The probe filed and never closed, so its goals outlived their condition:
         measured 2026-08-11, three were open fleet-wide at 7, 14 and 17 days,
@@ -2045,10 +2050,14 @@ class MirrorWedgeProbe(Probe):
                 # the mirror-health verdict; state that, and let `status` carry the
                 # close. ( fresh-eyes.)
                 note = (f"agent-watchdog MirrorWedgeProbe observed mirror-health "
-                        f"healthy on {self.ctx.agent_name}'s box, so the wedge this "
+                        f"{verdict} on {self.ctx.agent_name}'s box, so the wedge this "
                         f"goal was filed for is gone"
                         + (f" (cleared after {self.consecutive_wedged} wedged tick(s))"
                            if self.consecutive_wedged else "")
+                        + (". pull-failing means no file is at the wedge threshold; "
+                           "the pull errors it reports are a separate condition, "
+                           "which mirror-health.sh names"
+                           if verdict == "pull-failing" else "")
                         + ". No investigation was performed — the condition resolved on "
                           "its own. The probe is retiring this goal as `skipped`; if the "
                           "status still reads open, that write did not land and the goal "

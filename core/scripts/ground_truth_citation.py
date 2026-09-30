@@ -354,12 +354,20 @@ def analyze(text: str, retrieved=None, expressible=None) -> list:
             # read-before-edit.md Rule 4 already distinguishes ("has not been
             # Read this session" vs "was Read only in part this session
             # (ranged read)"), so the vocabulary is the framework's, not new.
+            #
+            # THE REMEDY MUST ASK FOR WHAT THE PREDICATE CREDITS (). It
+            # said "re-read the region that supports it", but read_tracker()
+            # credits FULL reads only, so that re-read -- another ranged Read --
+            # returned this same finding. Measured on the worker fleet: one close
+            # went unread, partial, then PASS, and worker Bodies pass offset or
+            # limit on most Reads.
             findings.append(Finding(
                 "decorative-citation", cl.start_line, cl.end_line,
                 f"cited but retrieved ONLY IN PART this session (ranged read): "
-                f"{cited}. A ranged peek is not evidence for the claim -- "
-                "re-read the region that supports it. Same severity as "
-                "uncited; the difference is what to DO about it.", sample))
+                f"{cited}. A ranged peek is not evidence for the claim, and "
+                "another ranged read never clears this: Read the whole file, "
+                "with no offset or limit. Same severity as uncited; the "
+                "difference is what to DO about it.", sample))
         elif expressible is not None and not any(
                 expressible(k, v) for k, v in checkable):
             # THE THIRD VERDICT (). Not a softer decorative-citation --

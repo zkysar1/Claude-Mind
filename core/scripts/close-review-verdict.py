@@ -50,9 +50,26 @@ the defects live only in a verdict artifact that nothing reads at claim time, so
 the next Body to pick the goal up re-derives them or misses them — "blocks the
 close" without "routes the rework" is a stall, not a review.
 
+A FAILED ROUTING IS RETRIED WITHOUT A SECOND VERDICT (g-375-85). Lock contention on
+the shared goal store failed 2 of 3 routings in one review cycle, and re-running the
+verdict command, as the writer's own error advised, appended a second identical
+entry to the ledger: the marker makes the NOTE idempotent, never the verdict. So
+routing retries the writer's transient failures with a bounded backoff, and a
+failure that survives them names `--route-only`, which routes the reviewer's
+recorded verdict and writes nothing.
+
 INDEPENDENCE IS THE GATE'S TO DEFINE. `--closer` is checked through the gate's
 own `independence_defect`, imported rather than reimplemented, so "who counts as
 independent" has exactly one definition in the tree.
+
+THE RECORD NAMES ITS CLOSER (g-375-55). A written verdict carries the goal's
+`completed_by`, `completed_by_role` and `completed_by_sid`, copied from the goal
+record at write time. Without them the pass rate per closer role had to be joined
+through the goal record, and a goal leaves the live store when its aspiration is
+archived or when it is evicted, so its verdict fell out of its role's rate. A goal
+not found live at write time leaves the fields absent, loudly: nothing is guessed.
+Older verdicts got the fields once, from goal records that still existed, in the
+g-375-84 backfill (each entry marked `closer_backfilled_at`).
 """
 from __future__ import annotations
 
@@ -65,6 +82,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -104,6 +122,10 @@ FIDELITY_CHECK = "source-fidelity"
 #: citations-MATCH (), the complement of the id-set diff above: the
 #: artifact asserts A -> B where the cited source asserts B -> A.
 DIRECTION_CHECK = "direction-fidelity"
+
+#: The goal-record fields a written verdict copies, so a reader attributes it to its
+#: closer without a join that archival or eviction can break ().
+CLOSER_FIELDS = ("completed_by", "completed_by_role", "completed_by_sid")
 
 
 def _gate():
@@ -356,6 +378,18 @@ def build_verdict(*, goal_id: str, reviewer: str, fidelity: dict,
     }
 
 
+#: goal-field-append.sh exit codes worth another attempt (): 6, a write that
+#: an independent read shows did not land (how a lock timeout on the shared goal
+#: store surfaces), and 9, a concurrent modification. A retry is safe because that
+#: writer re-reads the field and skips an append whose marker already stands, and it
+#: overwrites the field with a value composed from that read (rb-9350). Any other
+#: code is a real refusal and is reported at once.
+ROUTE_RETRY_RCS = frozenset({6, 9})
+#: Seconds to wait before each retry. The shared lock itself waits 10 s before it
+#: gives up, so the worst case spends about 90 s here, against a REJECT left unrouted.
+ROUTE_BACKOFF_S = (5, 15, 30)
+
+
 def route_marker(findings: list, verdict: str = "REJECT") -> str:
     """The idempotency marker for a routed REJECT.
 
@@ -427,21 +461,78 @@ def route_findings(goal_id: str, source: str, reviewer: str, findings: list,
               file=sys.stderr)
         return False
     cmd = route_command(goal_id, source, reviewer, findings, verdict)
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
-        print(f"close-review-verdict: ROUTING FAILED ({exc.__class__.__name__}: {exc}) "
-              f"— the {verdict} is on disk but the goal record was NOT annotated. "
-              f"Append the findings by hand.", file=sys.stderr)
-        return False
+    for attempt, wait in enumerate((0, *ROUTE_BACKOFF_S), start=1):
+        if wait:
+            print(f"close-review-verdict: routing attempt {attempt - 1} failed "
+                  f"(rc={proc.returncode}); retrying in {wait}s", file=sys.stderr)
+            time.sleep(wait)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"close-review-verdict: ROUTING FAILED ({exc.__class__.__name__}: {exc}) "
+                  f"— the {verdict} is on disk but the goal record was NOT annotated. "
+                  f"{reroute_advice(goal_id, source, reviewer)}", file=sys.stderr)
+            return False
+        if proc.returncode not in ROUTE_RETRY_RCS:
+            break
     if proc.returncode != 0:
-        print(f"close-review-verdict: ROUTING FAILED (rc={proc.returncode}) — the "
-              f"{verdict} is on disk but the goal record was NOT annotated:\n"
-              f"{proc.stderr.strip()}", file=sys.stderr)
+        # The writer's own advice ("Re-run the identical command ...") is right for
+        # ITS command and wrong for this one, so that one sentence is cut: the only
+        # retry this message names must be the one that writes no second verdict.
+        # The rest stays, including the writer's warning against a history restore.
+        cause = re.sub(r"\s*Re-run the identical command[^.]*\.", "", proc.stderr.strip())
+        after = f" after {attempt} attempts" if attempt > 1 else ""
+        print(f"close-review-verdict: ROUTING FAILED (rc={proc.returncode}){after} — the "
+              f"{verdict} is on disk but the goal record was NOT annotated:\n{cause}\n"
+              f"{reroute_advice(goal_id, source, reviewer)}", file=sys.stderr)
         return False
     print(f"close-review-verdict: findings routed into {goal_id} progress_note "
           f"({route_marker(findings, verdict)})")
     return True
+
+
+def reroute_advice(goal_id: str, source: str, reviewer: str) -> str:
+    """The retry for a failed routing that appends no second verdict ()."""
+    return (f"Re-route with: close-review-verdict.py --goal {goal_id} --reviewer "
+            f"{reviewer} --route-to-goal {source} --route-only. Do NOT re-run the "
+            f"verdict command: it appends a second, identical verdict entry.")
+
+
+def route_only(goal_id: str, reviewer: str, source: str) -> int:
+    """Route the findings of this reviewer's CURRENT verdict, writing no verdict.
+
+    The retry for a ROUTING FAILED (g-375-85). It routes exactly the recorded
+    findings, so the marker, a digest of them, is the one the failed attempt would
+    have written. Only the current verdict, and only this reviewer's: a newer
+    verdict by someone else means this review was superseded, and routing it would
+    annotate the goal with a review that no longer stands.
+    """
+    current = _gate().read_verdict(_gate().verdict_path(goal_id))
+    if not isinstance(current, dict):
+        print(f"close-review-verdict: NOTHING ROUTED — no verdict is recorded for "
+              f"{goal_id}.", file=sys.stderr)
+        return 1
+    by = str(current.get("reviewer") or "").strip()
+    if by.lower() != reviewer.strip().lower():
+        print(f"close-review-verdict: NOTHING ROUTED — the current verdict for {goal_id} "
+              f"is by {by or 'nobody named'}, not {reviewer}, so yours was superseded.",
+              file=sys.stderr)
+        return 1
+    verdict = str(current.get("verdict") or "")
+    if verdict == "APPROVE":
+        print(f"close-review-verdict: NOTHING ROUTED — the current verdict for {goal_id} "
+              f"is a plain APPROVE, which has nothing to route.", file=sys.stderr)
+        return 1
+    ok = route_findings(goal_id, source, by, list(current.get("findings") or []),
+                        verdict=verdict)
+    return 0 if ok else 4
+
+
+def closer_of(goal_id: str) -> dict:
+    """The CLOSER_FIELDS of the goal record, read live through the gate's `load_goal`
+    (one definition of the lookup), or {} when no live record is found."""
+    goal = _gate().load_goal(goal_id, "world")
+    return {k: goal[k] for k in CLOSER_FIELDS if goal.get(k)}
 
 
 def write_verdict(goal_id: str, payload: dict) -> Path:
@@ -538,6 +629,10 @@ def main(argv=None) -> int:
                     help="on a WRITTEN REJECT, append the findings to the goal's "
                          "progress_note via goal-field-append.sh, so the rework "
                          "lands in the record instead of only in this artifact")
+    ap.add_argument("--route-only", action="store_true",
+                    help="after a ROUTING FAILED: route the findings of your current "
+                         "recorded verdict and write NO verdict entry. Needs "
+                         "--route-to-goal; takes no verdict flag, --finding or --write")
     ap.add_argument("--write", action="store_true",
                     help="write the artifact; without this the verdict is only reported")
     args = ap.parse_args(argv)
@@ -547,6 +642,15 @@ def main(argv=None) -> int:
         if not (sep and cid.strip()) or len(reason.strip().splitlines()) != 1:
             ap.error(f"--citation {raw!r}: expected <id>=<one-line role reason>")
         citations[cid.strip()] = reason.strip()
+
+    if args.route_only:
+        if not args.route_to_goal:
+            ap.error("--route-only needs --route-to-goal <world|agent>")
+        if args.approve or args.approve_with_notes or args.reject or args.write \
+                or args.finding:
+            ap.error("--route-only routes the verdict already recorded; it takes no "
+                     "verdict flag, --finding or --write")
+        return route_only(args.goal, args.reviewer, args.route_to_goal)
 
     source = _read(args.source_file, args.source_text, "source")
     artifact = _read(args.artifact_file, args.artifact_text, "artifact")
@@ -622,6 +726,12 @@ def main(argv=None) -> int:
             return 1
 
     if args.write:
+        closer = closer_of(args.goal)
+        if not closer:
+            print(f"close-review-verdict: no live goal record for {args.goal} at write "
+                  f"time, so the verdict does not name its closer (stats resolves it "
+                  f"through the archive)", file=sys.stderr)
+        payload.update(closer)
         p = write_verdict(args.goal, payload)
         print(f"close-review-verdict: {payload['verdict']} written -> {p}")
         # REJECT only, and only once the artifact exists. An APPROVE has nothing

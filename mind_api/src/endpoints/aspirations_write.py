@@ -6864,7 +6864,7 @@ def _cross_box_holder_is_live(ctx, agent_name: str, goal_id: str,
         scripts_dir = str(ctx.paths.project_root / "core" / "scripts")
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
-        from _team_state import read_shard_authoritative
+        from _team_state import LAST_ACTIVE_WRITE_FLOOR_S, read_shard_authoritative
         # Fails open to the LOCAL mirror on any backend error (documented
         # contract). That degradation cannot manufacture a refusal on its
         # own: a stale mirror fails the freshness gate below and permits the
@@ -6881,7 +6881,11 @@ def _cross_box_holder_is_live(ctx, agent_name: str, goal_id: str,
         except (ValueError, TypeError):
             return False  # unparseable -> ambiguous -> never refuse
         age_s = (datetime.now() - la).total_seconds()
-        if age_s > (float(stale_minutes) * 60.0):
+        # The writer floors last_active (): a live holder's stored
+        # stamp can trail its latest heartbeat by up to the floor. Without this
+        # allowance a holder silent for stale_minutes minus 10 would already
+        # read as stale here and lose its in-flight goal to a takeover.
+        if age_s > (float(stale_minutes) * 60.0 + LAST_ACTIVE_WRITE_FLOOR_S):
             return False  # STALE is ambiguous, never grounds to refuse
         in_flight = row.get("in_flight")
         if not isinstance(in_flight, dict):
@@ -8940,12 +8944,24 @@ def meta_update(ctx) -> "Response":  # type: ignore[name-defined]
             # Read existing or create default.
             if meta_path.exists():
                 data = json.loads(meta_path.read_text(encoding="utf-8"))
+                before = json.dumps(data, sort_keys=True)
             else:
                 data = dict(_DEFAULT_META)
+                before = None
 
             # Apply updates.
             for field, value in updates.items():
                 data[field] = value
+
+            #  (f): an update that changes no field writes nothing:
+            # no rewrite, no history snapshot, no changelog row. Under
+            # own-cloud every rewrite is a new store version, and 67 of 275
+            # versions of this key in one day carried no change (most from the
+            # date-only last_updated in iteration-close). Compared as canonical
+            # JSON, not with ==, because Python's == treats true as 1 and 5 as
+            # 5.0. A missing file still materializes.
+            if before is not None and json.dumps(data, sort_keys=True) == before:
+                return Response.json({"ok": True, "data": data})
 
             # Atomic write via _fileops helper (same retry policy as
             # locked_write_json but we already hold the lock).

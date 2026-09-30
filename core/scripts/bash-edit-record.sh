@@ -22,18 +22,25 @@
 # SIGNAL — a cursor (last scan epoch) in the agent-wide session/ dir, shared
 # by every session of the agent. On each Bash PostToolUse,
 # record neutral framework files whose mtime is NEWER than the cursor (i.e.
-# files this agent's just-finished command touched) then advance the cursor.
-# mtime-delta (NOT a cumulative `git status`) bounds attribution to THIS
-# command's window; cumulative recording would absorb pre-existing partner WIP
-# into this agent's OWN log and re-include it at commit time (),
-# causing the very over-inclusion this prevents. First run of a session sets
-# the cursor and records nothing (no prior window to bound the delta).
+# files changed since any session of this agent last ran this hook) then
+# advance the cursor. mtime-delta (NOT a cumulative `git status`) bounds
+# recording to recent changes; cumulative recording would absorb pre-existing
+# partner WIP into this agent's OWN log and re-include it at commit time
+# (), causing the very over-inclusion this prevents. First run of a
+# session sets the cursor and records nothing (no prior window to bound the delta).
 #
-# SESSION STAMP () — each record carries `sid`, the session whose
-# Bash call observed the change; iteration-commit.sh --session-sid keys on it.
+# SESSION STAMP (, ) — each record carries `sid`, the
+# session that made the change; iteration-commit.sh --session-sid keys on it.
 # The cursor is shared, so a change is recorded ONCE, by the first session whose
-# command ends after it: the session that ran the writing command, unless
-# another session's command ended while that command was still running.
+# command ends after it, and that session is often NOT the writer: a session
+# running a long command was stamped with every sibling edit made meanwhile. So
+# the stamp comes from the in-flight WINDOWS in _bash_inflight.py instead.
+# bash-agent-inject opens one per command, this hook closes its own, and a change
+# goes to the ONE session of this agent whose command was running when the file
+# changed. Several such sessions: sid "" plus `candidates` (ambiguous). None:
+# sid "" (a background job, a Write edit, another agent). --session-sid stages
+# neither. Rows dedup on (file, mtime): on file alone, one stale row for a file
+# hid every later change to it.
 #
 # NO GIT — the scan is a filesystem mtime walk, never `git status`/`git
 # ls-files`. Adding a git command to every Bash call across all agents would
@@ -56,7 +63,22 @@ source "$SCRIPT_DIR/_paths.sh" 2>/dev/null || exit 0
 # bash-agent-inject stamps the COMMAND env, not the hook env. Resolve the agent
 # from the payload's session_id exactly like tree-sync-check.sh does.
 input=$(cat 2>/dev/null) || exit 0
-session_id=$(printf '%s' "$input" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null || echo "")
+# session_id|window-key. The key hashes the command text, which here is the text
+# bash-agent-inject emitted; a failure to derive it leaves the key empty and the
+# recorder running.
+_ids=$(printf '%s' "$input" | SDIR="$SCRIPT_DIR" python3 -c "
+import sys, os, json
+d = json.load(sys.stdin)
+try:
+    sys.path.insert(0, os.environ.get('SDIR', ''))
+    from _bash_inflight import command_key
+    key = command_key((d.get('tool_input') or {}).get('command') or '')
+except Exception:
+    key = ''
+print(d.get('session_id', '') or '', key, sep='|')" 2>/dev/null || echo "")
+_ids="${_ids%$'\r'}"
+session_id="${_ids%%|*}"
+cmd_key="${_ids#*|}"
 
 agent="${MIND_AGENT:-}"
 if [ -z "$agent" ] && [ -n "$session_id" ]; then
@@ -110,8 +132,9 @@ printf '%s\n' "$now_epoch" > "$cursor_path" 2>/dev/null || true
 # .claude/rules). goal_id is left empty: the partner filter keys only on `file`;
 # a team-state round-trip per Bash call is not worth the hot-path latency.
 LOGP="$log_path" CUR="$cursor_epoch" NOWE="$now_epoch" PROOT="$PROJECT_ROOT" SID="$session_id" \
+    KEY="$cmd_key" SDIR="$SCRIPT_DIR" SROOT="$(agent_sessions_root "$agent" 2>/dev/null)" \
     python3 - <<'PYEOF' 2>/dev/null || true
-import os, json, re, time
+import os, json, re, sys, time
 
 # A session id is a uuid; anything else is dropped rather than written.
 sid = os.environ.get("SID", "").strip()  # a Windows python may leave a trailing \r
@@ -122,10 +145,32 @@ logp = os.environ["LOGP"]
 cur = int(os.environ["CUR"])
 nowe = int(os.environ["NOWE"])
 
+# Close this command's window first so its start counts below; every window
+# still open is a command some session of this agent is running right now.
+# Without the module nothing is credited to anyone (sid ""), never the old
+# first-to-finish stamp: a missing record is listed at commit, a wrong one ships.
+try:
+    sys.path.insert(0, os.environ.get("SDIR", ""))
+    import _bash_inflight
+    attribute = _bash_inflight.attribute
+    sroot = os.environ.get("SROOT", "").strip()
+    key = os.environ.get("KEY", "").strip()
+    own_start = (_bash_inflight.close_window(os.path.join(sroot, sid), key)
+                 if sroot and sid and key else None)
+    windows = _bash_inflight.open_windows(sroot) if sroot else []
+    if own_start is not None:
+        windows.append((sid, own_start))
+except Exception:
+    windows = []
+    def attribute(mtime, windows):
+        return "", []
+
 scan_roots = [os.path.join(proot, "core"), os.path.join(proot, ".claude")]
 SKIP_DIRS = {".git", ".python-shim", "__pycache__", "node_modules", ".pytest_cache"}
 
-# Dedup against what is already logged (the Write/Edit recorder + prior runs).
+# Dedup on (file, mtime) against what is already logged (the Write/Edit
+# recorder + prior runs). A change already recorded, by its writer's own
+# recorder, keeps that record's sid.
 seen = set()
 try:
     with open(logp, "r", encoding="utf-8") as f:
@@ -134,7 +179,8 @@ try:
             if not line:
                 continue
             try:
-                seen.add(json.loads(line).get("file"))
+                e = json.loads(line)
+                seen.add((str(e.get("file") or "").replace("\\", "/"), int(e.get("mtime"))))
             except Exception:
                 pass
 except FileNotFoundError:
@@ -159,12 +205,14 @@ for root in scan_roots:
             if m <= cur or m > nowe + 2:
                 continue
             rel = os.path.relpath(fp, proot).replace("\\", "/")
-            if rel in seen:
+            if (rel, m) in seen:
                 continue
-            seen.add(rel)
-            new_entries.append(
-                {"file": rel, "mtime": m, "edit_ts": now_iso, "goal_id": "", "sid": sid}
-            )
+            seen.add((rel, m))
+            rec_sid, cands = attribute(m, windows)
+            entry = {"file": rel, "mtime": m, "edit_ts": now_iso, "goal_id": "", "sid": rec_sid}
+            if cands:
+                entry["candidates"] = cands
+            new_entries.append(entry)
 
 if new_entries:
     try:

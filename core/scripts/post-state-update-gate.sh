@@ -34,6 +34,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_python_launcher.sh"
 PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 . "$SCRIPT_DIR/_platform.sh"
+# _platform.sh converts the _paths.sh roots but not SCRIPT_DIR, and it has just
+# exported MSYS_NO_PATHCONV=1: python must get the native form or it opens
+# C:\c\..., and both python steps below died silently on Windows ().
+SCRIPT_DIR_NATIVE="$SCRIPT_DIR"
+if command -v cygpath >/dev/null 2>&1; then SCRIPT_DIR_NATIVE="$(cygpath -m "$SCRIPT_DIR")"; fi
 
 OUTCOME_CLASS="${1:-}"
 CORE_FILE_THRESHOLD=3
@@ -359,7 +364,7 @@ REVIEW_EXTRA_FILES=$(printf '%s\n' "$CHANGED" | grep '^mind_api/src/' || true)
 # drops paths attributable to non-self agents. Fail-open at every layer —
 # any error retains the original list (biases over-firing). Also filter
 # UNTRACKED so partner-untracked scripts don't trigger NEW_SCRIPT.
-ATTRIB_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_cross_agent_attribution_filter.py"
+ATTRIB_HELPER="$SCRIPT_DIR_NATIVE/_cross_agent_attribution_filter.py"
 # Skipped under committed scope (COMMIT_SHA_VALID=yes): the committed set is
 # already this-agent-only (iteration-commit filtered it pre-commit), and
 # re-filtering fresh-mtime committed files would reintroduce the Source-1
@@ -700,7 +705,7 @@ if [ -n "$REASONS" ]; then
     EXISTING_JSON="${COOLDOWN_JSON:-$(bash "$SCRIPT_DIR/wm-read.sh" fresh_eyes_last_fire --json 2>/dev/null || echo "null")}"
     CURRENT_SET="$CURRENT_SET" EXISTING_JSON="$EXISTING_JSON" \
     COOLDOWN_HOURS="${COOLDOWN_HOURS:-12}" \
-    PROJECT_ROOT="$PROJECT_ROOT" SCRIPT_DIR="$SCRIPT_DIR" \
+    PROJECT_ROOT="$PROJECT_ROOT" SCRIPT_DIR="$SCRIPT_DIR_NATIVE" \
     python3 - <<'PYEOF' 2>/dev/null | bash "$SCRIPT_DIR/wm-set.sh" fresh_eyes_last_fire >/dev/null 2>&1 || true
 import json, os, sys
 from datetime import datetime, timedelta
