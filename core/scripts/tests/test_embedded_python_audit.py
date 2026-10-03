@@ -484,3 +484,139 @@ def test_unquoted_expansion_matches_measured_bash_semantics():
     assert expand(r'\\$') == r'\$'
     # A lone trailing backslash is literal, not an IndexError.
     assert expand("tail\\") == "tail\\"
+
+
+# ---------------------------------------------------------------------------
+# : a heredoc nested in a double-quoted remote-exec string.
+#
+# The opener `remote_exec "python3 - <<'PYEOF'` sits inside a double-quoted
+# argument, so bash sees NO local heredoc and the closing line is `PYEOF")`,
+# never a bare `PYEOF`. `bash -n` parses it clean. The scanner used to report
+# "block never closes" for it: a standing false FAIL that every deferrable tier
+# re-reported each iteration. These tests pin BOTH directions -- the nested shape
+# passes, and every way the lane must still fail still fails.
+# ---------------------------------------------------------------------------
+
+NESTED_FIXTURE = """#!/usr/bin/env bash
+eff=$(remote_exec "python3 - <<'PYEOF'
+import json
+print(json.dumps({'ok': True}))
+PYEOF")
+echo "$eff"
+"""
+
+
+def test_heredoc_nested_in_double_quoted_remote_exec_is_not_unterminated(tmp_path):
+    f = write(tmp_path, "nested.sh", NESTED_FIXTURE)
+    assert bash_n(f) in (0, None), "fixture must itself be valid bash"
+    rc, out = run_audit(tmp_path)
+    assert rc == 0, out
+    data = json.loads(out)
+    assert data["findings"] == [], out
+    # Counted, never silent: the block is in the total AND reported as uncompiled.
+    assert data["total_blocks"] == 1, out
+    assert data["nested_not_compiled"] == 1, out
+
+
+def test_genuinely_unterminated_local_heredoc_still_fails(tmp_path):
+    """POSITIVE CONTROL: the lane can still fail on a heredoc that never closes."""
+    write(tmp_path, "unterminated.sh", """#!/usr/bin/env bash
+python3 - <<'PYEOF'
+import json
+print(json.dumps({'ok': True}))
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    assert "never closes" in out, out
+    assert json.loads(out)["nested_not_compiled"] == 0, out
+
+
+def test_nested_opener_with_no_closer_at_all_still_fails(tmp_path):
+    """The nested leniency needs a tag-plus-quote closer. Without one the block is
+    still unterminated, so a half-deleted nested block cannot hide."""
+    write(tmp_path, "nested-no-closer.sh", """#!/usr/bin/env bash
+eff=$(remote_exec "python3 - <<'PYEOF'
+import json
+print(json.dumps({'ok': True}))
+)
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    assert "never closes" in out, out
+
+
+def test_tag_plus_quote_closer_outside_a_quote_is_not_a_closer(tmp_path):
+    """OVER-APPLICATION CONTROL: `PYEOF"` closes a heredoc only when its opener is
+    inside an open double quote. On a plain local heredoc bash never closes it,
+    so it must stay a FAIL."""
+    write(tmp_path, "typo-closer.sh", """#!/usr/bin/env bash
+python3 - <<'PYEOF'
+import json
+PYEOF"
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    assert "never closes" in out, out
+
+
+def test_single_quoted_opener_with_double_quote_closer_is_not_nested(tmp_path):
+    """The quote KINDS must match: an opener inside a SINGLE-quoted string does not
+    take a double-quote closer, so this stays a FAIL."""
+    write(tmp_path, "single-open.sh", """#!/usr/bin/env bash
+eff=$(remote_exec 'python3 - <<PYEOF
+import json
+PYEOF"
+)
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    assert "never closes" in out, out
+
+
+def test_bare_tag_inside_a_command_substitution_is_still_compiled(tmp_path):
+    """COVERAGE CONTROL: an opener inside `"$(` has an open double quote on its line
+    but is a REAL local heredoc closing on a bare tag. It must keep being compiled
+    (the live corpus carries a dozen of these), so a broken body still fails."""
+    write(tmp_path, "cmdsub.sh", """#!/usr/bin/env bash
+out="$(python3 - <<'PYEOF'
+def broken(:
+    return 1
+PYEOF
+)"
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    assert "SyntaxError" in out, out
+    assert json.loads(out)["nested_not_compiled"] == 0, out
+
+
+def test_blocks_after_a_nested_block_are_still_scanned(tmp_path):
+    """The nested block ends at its OWN closer, so a later block's bare tag is not
+    swallowed and a real defect after it is still found."""
+    write(tmp_path, "nested-then-broken.sh", NESTED_FIXTURE + """python3 - <<'PYEOF'
+def broken(:
+    return 1
+PYEOF
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 1, out
+    data = json.loads(out)
+    assert data["total_blocks"] == 2, out
+    assert data["nested_not_compiled"] == 1, out
+    assert len(data["findings"]) == 1 and "SyntaxError" in data["findings"][0]["reason"], out
+
+
+def test_nested_body_is_not_compiled_as_written(tmp_path):
+    """The nested body is double-quote text: the local shell rewrites it (`$SID` is
+    expanded, escaped quotes collapse) before the remote side sees it, so compiling
+    it AS WRITTEN would report a SyntaxError on a block that runs correctly. It is
+    skipped, and the skip is reported."""
+    write(tmp_path, "nested-expansion.sh", """#!/usr/bin/env bash
+eff=$(remote_exec "python3 - <<'PYEOF'
+x = $SID
+print(x)
+PYEOF")
+""")
+    rc, out = run_audit(tmp_path)
+    assert rc == 0, out
+    assert json.loads(out)["nested_not_compiled"] == 1, out

@@ -68,9 +68,13 @@ investigation weight set replaces the standard set.
 All weights AND the pass_threshold live in
 `core/config/memory-pipeline.yaml::curator_gate`. Read at call time.
 
-Failure (curator_score < pass_threshold): write the candidate to
-`curator_overflow` WM slot — consolidation re-considers it at session
-end with full context.
+Failure (curator_score < pass_threshold): APPEND the candidate to
+`agents/<agent>/session/overflow-queue.yaml` via
+`py -3 core/scripts/overflow-queue-append.py` — the store
+/aspirations-consolidate's Step 0.1 triage + Overflow Queue Management
+re-considers at the next consolidation (g-115-11580: the former
+`curator_overflow` WM slot had no reader, was replaced on a second
+write, and was age-evicted after 120 min).
 
 ## Section C — Tree Write Steps
 

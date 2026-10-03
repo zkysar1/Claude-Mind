@@ -282,11 +282,30 @@ class AgentPathResolver:
         agents/delta/local-paths.conf sorted before omni's, making agent-less
         daemon requests — including /v1/admin/health — resolve agent='delta'
         and raise WORLD_PATH-unresolved, which read as a daemon-down 500 and
-        triggered a kill-and-respawn death spiral)."""
-        for conf in sorted(self._agents_root().glob("*/local-paths.conf")):
-            if _parse_conf(conf).get("WORLD_PATH"):
-                return conf.parent.name
-        return ""
+        triggered a kill-and-respawn death spiral).
+
+        It also passes over an agent whose SERVED roots are unresolved or do
+        not exist (g-115-11554), because _resolve_uncached refuses those: a
+        stale throwaway conf sorting first would otherwise fail every
+        agent-less request that touches paths. The probe asks _resolve_src,
+        never the raw WORLD_PATH: an env override or a .mind-data/ root is
+        served instead of the conf's value, so it is the same for every
+        candidate, and a missing one is refused for all of them, which is the
+        point. When no candidate passes, the first one with a WORLD_PATH is
+        returned, so the refusal names a real agent."""
+        first = ""
+        for conf_path in sorted(self._agents_root().glob("*/local-paths.conf")):
+            conf = _parse_conf(conf_path)
+            if not conf.get("WORLD_PATH"):
+                continue
+            first = first or conf_path.parent.name
+            world_src = self._resolve_src(conf, "MIND_WORLD", "WORLD_PATH", "world")
+            meta_src = self._resolve_src(conf, "MIND_META", "META_PATH", "meta")
+            if world_src and meta_src and not self._missing_roots(
+                    absolutize(world_src, self.project_root),
+                    absolutize(meta_src, self.project_root)):
+                return conf_path.parent.name
+        return first
 
     def _resolve_uncached(self, agent_name: str) -> AgentPaths:
         """Compute paths for `agent_name` without touching the cache.
@@ -313,41 +332,14 @@ class AgentPathResolver:
                 if conf:
                     break
 
-        # asp-330 M1 (): .mind-data/ local storage root. Symmetric to
-        # _paths.py _resolve_tier and the _paths.sh .mind-data/ block (3 resolver
-        # layers, no shared code). When PROJECT_ROOT/.mind-data/ exists it is the
-        # local storage root by convention (world -> .mind-data/world,
-        # meta -> .mind-data/meta); an optional .mind-data/.env.local overrides
-        # per-tier paths. GATED on the dir existing, so a configured daemon
-        # (external local-paths.conf, no .mind-data/) resolves exactly as before.
-        mind_data = self.project_root / ".mind-data"
-        md_env = (
-            _parse_conf(mind_data / ".env.local")
-            if mind_data.is_dir() and (mind_data / ".env.local").exists()
-            else {}
-        )
-
-        def _resolve_src(env_key: str, conf_key: str, subdir: str) -> Optional[str]:
-            # 1. env override -> 2/3. .mind-data/ (.env.local | bare default, when
-            # the dir exists) -> 4. local-paths.conf -> None (caller raises).
-            val = os.environ.get(env_key)
-            if val:
-                return val
-            if mind_data.is_dir():
-                val = md_env.get(conf_key)
-                if val:
-                    return val
-                return str(mind_data / subdir)
-            return conf.get(conf_key)
-
-        world_src = _resolve_src("MIND_WORLD", "WORLD_PATH", "world")
+        world_src = self._resolve_src(conf, "MIND_WORLD", "WORLD_PATH", "world")
         if not world_src:
             raise RuntimeError(
                 f"agent_paths: WORLD_PATH unresolved for agent={agent_name!r} "
                 f"(no MIND_WORLD env, no .mind-data/ root, no WORLD_PATH in "
                 f"local-paths.conf). Plan v1 step 0.1: no PROJECT_ROOT/world fallback."
             )
-        meta_src = _resolve_src("MIND_META", "META_PATH", "meta")
+        meta_src = self._resolve_src(conf, "MIND_META", "META_PATH", "meta")
         if not meta_src:
             raise RuntimeError(
                 f"agent_paths: META_PATH unresolved for agent={agent_name!r} "
@@ -362,6 +354,23 @@ class AgentPathResolver:
 
         world = absolutize(world_src, self.project_root)
         meta = absolutize(meta_src, self.project_root)
+        # : a root that resolves but does not exist is refused, not
+        # served. Measured on a Windows box: a daemon recycled from a shell that
+        # exported MSYS_NO_PATHCONV=1 served a phantom, empty C:/c/... world for
+        # 7 minutes with rc=0 and empty results, and one write landed there. A
+        # refusal is never cached (resolve() caches only successes), so the
+        # next request re-resolves once the root exists.
+        missing = self._missing_roots(world, meta)
+        if missing:
+            raise RuntimeError(
+                "agent_paths: "
+                + "; ".join(f"{name} root {path} does not exist" for name, path in missing)
+                + f" (agent={agent_name!r}). Refusing to serve it: a missing root "
+                "reads as an empty store, so every read answers 'nothing found' and a "
+                "write lands in a tree nobody reads (g-115-11554). Create the root "
+                "(init-world.sh / init-meta.sh) or fix MIND_WORLD / MIND_META / "
+                "local-paths.conf."
+            )
         agent_dir = self._agent_dir(agent_name)
 
         return AgentPaths(
@@ -371,3 +380,41 @@ class AgentPathResolver:
             agent=agent_dir,
             project_root=self.project_root,
         )
+
+    def _resolve_src(self, conf: Dict[str, str], env_key: str, conf_key: str,
+                     subdir: str) -> Optional[str]:
+        """The root a request is served from: 1. env override -> 2/3.
+        .mind-data/ (.env.local | bare default, when the dir exists) ->
+        4. local-paths.conf -> None (the caller raises).
+
+        asp-330 M1 (g-330-01): .mind-data/ local storage root. Symmetric to
+        _paths.py _resolve_tier and the _paths.sh .mind-data/ block (3 resolver
+        layers, no shared code). When PROJECT_ROOT/.mind-data/ exists it is the
+        local storage root by convention (world -> .mind-data/world,
+        meta -> .mind-data/meta); an optional .mind-data/.env.local overrides
+        per-tier paths. GATED on the dir existing, so a configured daemon
+        (external local-paths.conf, no .mind-data/) resolves exactly as before.
+        """
+        val = os.environ.get(env_key)
+        if val:
+            return val
+        mind_data = self.project_root / ".mind-data"
+        if mind_data.is_dir():
+            env_local = mind_data / ".env.local"
+            val = (_parse_conf(env_local) if env_local.exists() else {}).get(conf_key)
+            if val:
+                return val
+            return str(mind_data / subdir)
+        return conf.get(conf_key)
+
+    @staticmethod
+    def _missing_roots(world: Path, meta: Path) -> "list[tuple[str, Path]]":
+        """The served roots that do not exist, as (name, path) ().
+
+        Local storage only: under own-cloud the local tree is a read-through
+        cache, so a missing directory proves nothing about the store (guard-980).
+        """
+        if os.environ.get("STORAGE_BACKEND", "local").strip().lower() == "own-cloud":
+            return []
+        return [(name, path) for name, path in (("world", world), ("meta", meta))
+                if not path.is_dir()]

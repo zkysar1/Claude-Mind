@@ -510,6 +510,115 @@ def test_guard_set_field_immutable_rule(running_daemon):
     assert "immutable_field" in body
 
 
+# ---------------------------------------------------------------------------
+# set-field erase mode ( u3b): the one write that may change `rule`
+# ---------------------------------------------------------------------------
+
+_ERASED = "Forgotten by the member on 2026-10-03."
+
+
+def _retired_guard(port: int, guard_id: str) -> None:
+    """A guardrail a member forgot: appended, then retired, as the forget retires it."""
+    _post(port, "/v1/store/append", {"store": "guardrails"},
+          json.dumps(_guard_rec(id=guard_id)).encode("utf-8"))
+    _post(port, "/v1/store/set-field", {"store": "guardrails", "id": guard_id,
+                                        "field": "status", "value": "retired"})
+
+
+def _erase(port: int, store: str, record_id: str, field: str, value: str = _ERASED):
+    return _post_err(port, "/v1/store/set-field", {"store": store, "id": record_id, "field": field,
+                                                   "value": value, "erase": "1"})
+
+
+def _guard_on_disk(project_root: Path, guard_id: str) -> dict:
+    return next(r for r in _read_jsonl(_guard_path(project_root)) if r["id"] == guard_id)
+
+
+def test_guard_set_field_erase_blanks_the_rule_of_a_retired_record(running_daemon):
+    project_root, port = running_daemon
+    _retired_guard(port, "guard-200")
+    before = _guard_on_disk(project_root, "guard-200")
+
+    status, body = _erase(port, "guardrails", "guard-200", "rule")
+
+    assert status == 200, body
+    assert json.loads(body)["record"]["rule"] == _ERASED
+    after = _guard_on_disk(project_root, "guard-200")
+    assert (after["rule"], after["status"], after["created"]) == (_ERASED, "retired", before["created"])
+    assert after["trigger_condition"] == before["trigger_condition"], "only the field asked for changed"
+
+
+def test_guard_set_field_erase_refuses_a_record_that_is_not_retired(running_daemon):
+    project_root, port = running_daemon
+    _post(port, "/v1/store/append", {"store": "guardrails"},
+          json.dumps(_guard_rec(id="guard-201")).encode("utf-8"))
+    before = _guard_on_disk(project_root, "guard-201")
+
+    status, body = _erase(port, "guardrails", "guard-201", "rule")
+
+    assert status == 409 and "erase_not_retired" in body
+    assert _guard_on_disk(project_root, "guard-201") == before, "a rule in force is never erased"
+
+
+@pytest.mark.parametrize("field", ["created", "trigger_condition", "status", "id"])
+def test_guard_set_field_erase_mode_is_for_the_rule_only(running_daemon, field):
+    project_root, port = running_daemon
+    _retired_guard(port, "guard-202")
+    before = _guard_on_disk(project_root, "guard-202")
+
+    status, body = _erase(port, "guardrails", "guard-202", field)
+
+    assert status == 400 and "not_erasable" in body
+    assert _guard_on_disk(project_root, "guard-202") == before
+
+
+def _other_backend():
+    return object()
+
+
+def _no_backend():
+    raise RuntimeError("the backend cannot be built")
+
+
+@pytest.mark.parametrize("backend", [_other_backend, _no_backend], ids=["a-merging-backend", "an-unbuildable-backend"])
+def test_guard_set_field_erase_is_refused_where_the_store_can_be_merged(running_daemon, monkeypatch, backend):
+    """A rule edited in place forks the record at a cross-box merge (rb-5511), so the erase is
+    allowed where nothing merges the store and refused wherever that cannot be shown."""
+    from mind_api.src.endpoints import store as store_endpoints
+
+    project_root, port = running_daemon
+    _retired_guard(port, "guard-203")
+    before = _guard_on_disk(project_root, "guard-203")
+    monkeypatch.setattr(store_endpoints, "get_backend", backend)
+
+    status, body = _erase(port, "guardrails", "guard-203", "rule")
+
+    assert status == 409 and "erase_not_local" in body
+    assert _guard_on_disk(project_root, "guard-203") == before
+
+
+def test_the_rule_is_still_immutable_without_the_erase_mode(running_daemon):
+    project_root, port = running_daemon
+    _retired_guard(port, "guard-204")
+    before = _guard_on_disk(project_root, "guard-204")
+
+    status, body = _post_err(port, "/v1/store/set-field", {"store": "guardrails", "id": "guard-204",
+                                                           "field": "rule", "value": _ERASED, "erase": "0"})
+
+    assert status == 400 and "immutable_field" in body
+    assert _guard_on_disk(project_root, "guard-204") == before
+
+
+@pytest.mark.parametrize("field", ["created", "title"])
+def test_a_store_with_no_erase_mode_keeps_its_identity_fields_locked(running_daemon, field):
+    """reasoning-bank keys a record on created and title: the erase flag unlocks neither."""
+    _, port = running_daemon
+
+    status, body = _erase(port, "reasoning-bank", "rb-001", field, "2099-01-01T00:00:00")
+
+    assert status == 400 and "not_erasable" in body
+
+
 def test_guard_set_field_rejects_dotted(running_daemon):
     _, port = running_daemon
     status, body = _post_err(port, "/v1/store/set-field",

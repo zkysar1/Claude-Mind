@@ -23,9 +23,16 @@ from pathlib import Path, PureWindowsPath
 _MSYS_DRIVE_RE = re.compile(r"^/([A-Za-z])(?:/(.*))?$")
 
 
-def absolutize(value: str, project_root: Path) -> Path:
+def absolutize(value: str, project_root: Path, *, is_windows=None, exists=None) -> Path:
     """Coerce a path string to an absolute Path; treat Windows drive-letter
     prefix as absolute regardless of host OS interpretation.
+
+    Stage 0 (g-115-11554): on a Windows host an MSYS-form root (`/c/...`) is
+    first translated to `C:/...` by `normalize_msys_path`, and only when that
+    target exists. Without it, stage 2 anchors `/c/X` to the project's drive,
+    so a daemon recycled from a shell that exported MSYS_NO_PATHCONV=1 served
+    a phantom, empty `C:\\c\\X` world with no error. `is_windows` / `exists`
+    are the same test-only seams `normalize_msys_path` takes.
 
     Two-stage defense (g-115-733):
       1. Drive-letter detection via `PureWindowsPath`. Catches the case
@@ -44,6 +51,7 @@ def absolutize(value: str, project_root: Path) -> Path:
     Per `.claude/rules/path-resolution.md` and
     `world/knowledge/tree/system/system-constraints-loop/external-path-resolution-cruft.md`.
     """
+    value = normalize_msys_path(str(value), is_windows=is_windows, exists=exists)
     # Stage 1: drive-letter detection independent of host OS Path flavor.
     if PureWindowsPath(value).is_absolute():
         p = Path(value)

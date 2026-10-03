@@ -6,7 +6,8 @@ WHAT IT IS. Two read-only views over the same artifacts the blocking close-revie
 reads (`close-review-gate.py`, g-357-40) and its producer writes (`close-review-verdict.py`,
 g-357-41):
 
-  list   the closures by an UNCALIBRATED closer role (config: `close_review_gate.
+  list   the open REVIEW REQUESTS no verdict answers yet (REVIEW REQUESTS below), then
+         the closures by an UNCALIBRATED closer role (config: `close_review_gate.
          review_closer_roles`, today `[worker]`) that no independent verdict covers yet,
          ranked so the reviewer spends its budget where a defect costs most — tier 2
          first (`goal_close_risk_tier.classify`, the gate's own classifier), then HIGH
@@ -36,6 +37,22 @@ so alpha's own reducer must not review them: `list` partitions candidates by the
 reviewer and leaves same-mind closures for another agent's cycle, and the count it
 reports for them is the honest "coverage I do not have" (guard-1760).
 
+REVIEW REQUESTS (g-375-116). coordination.md's Review Gate has a closer post a
+`review-request` and set `review_requested` on the goal, and has a peer pick it up. The
+only reader was aspirations-all-blocked Step B0, which runs only when a peer's whole queue
+is blocked and reads 12 hours of posts. Measured 2026-10-02: 40 goals carried
+review_requested and none had a verdict, while this lane had written 160 for worker
+closures. So `list` reads the goal field, the durable half of a request, and offers the
+requests first, sharing the cap: an open one holds its tier-2 close until a verdict exists,
+and a closed one was closed on the promise of a later review. A request has no age window,
+since it stands until a verdict answers it, and it drops out when its goal is skipped,
+superseded, expired or decomposed. A verdict answers only a request made at or before it
+(g-375-119): while any verdict counted, a REJECT, then rework, then a fresh request was
+never offered again, and the tier-2 close it held waited for good. Its closer is the mind
+that did the work (completed_by, else executed_by, else claimed_by), and the reviewer
+passes it as `--closer`. A request that names none is declined and counted, never listed:
+independence that cannot be established is unproven.
+
 RELAXING NEVER MEANS ZERO (g-375-82). A role that passes the relax rule MOVES to
 `review_sampled_roles`: a deterministic `review_sample_rate` share of its closures (default
 0.2) stays in `list`, and `stats` keeps reporting its pass rate. Dropping the role outright
@@ -57,6 +74,21 @@ an id in its aspiration's census, so its role is gone: `stats` counts such a ver
 its own bucket, beside "closer's role not reviewed" and "goal record not found
 anywhere", and none of the three is folded into a role's rate.
 
+COVERAGE AND WHAT AGED OUT (g-375-38). A pass rate says nothing about the closures nobody
+reviewed, and `list` cannot count those: a closure past --since-hours lands in
+`skipped.too_old` beside history the lane never could have seen, and once eviction takes
+it (`aspirations_eviction.age_days`, 3 days, the same 72 hours) or its aspiration is
+archived, the live query drops it without a trace. So `stats` reports, per role:
+`coverage`, the reviewed share of every closure inside the lane's lifetime, printed beside
+approve_rate so a relax_ok reading carries its denominator, and the unreviewed rest split
+by where each one went: still in the window, aged out, archived, evicted. The lane starts
+at the role's first verdict, and its reach `--since-hours` before that, because the first
+run already listed that far back. An unreviewed closure from before the reach predates the
+lane and is counted apart from the misses. A role with no verdict yet has no start, so
+nothing it holds is called pre-lane. Evicted closures are counted from the census key
+`evicted_by_closer_role`, which only goals evicted since g-375-38 carry: an earlier
+eviction kept no role, and no count here includes those.
+
 REPORT-ONLY, ALWAYS. This never mutates a goal, never writes a verdict, never blocks
 anything. The verdict is the reviewer's to assert through `/fresh-eyes-close`.
 """
@@ -69,13 +101,15 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+
+from _goal_census import census_closer_role_ids  # noqa: E402
 
 #: The config key (under `close_review_gate:` in core/config/aspirations.yaml) naming the
 #: closer roles whose closures this lane reviews. One list, one concept: the roles listed
@@ -102,6 +136,11 @@ SAMPLE_SEED = "close-review-sample-v1"
 
 TERMINAL_NOT_CLOSED = ("pending", "in-progress", "blocked", "skipped", "expired",
                        "decomposed", "superseded")
+
+#: The statuses in which a review request still wants its verdict: open (the close waits on
+#: it) or completed (closed on the promise of a later review). On any other status the
+#: request is moot.
+REQUEST_STATUSES = ("pending", "candidate", "in-progress", "blocked", "completed")
 
 
 # ─── shared definitions, loaded from the gate (one definition each) ────────────
@@ -212,6 +251,34 @@ def load_closures(role: str) -> list[dict]:
         return []
 
 
+def load_requests() -> tuple[list[dict], str | None]:
+    """Every goal carrying `review_requested` in a status that still wants the review
+    (REQUEST_STATUSES), through the query API, and the error text if the read failed. The
+    API has no has-field filter, so this reads those statuses in full and keeps the
+    requested goals (measured 2026-10-02: one call, under 3 s, 4,339 goals). Loud, like
+    load_closures, and the error also reaches the listing, because an unreadable store and
+    a world with no open request must not print the same."""
+    script = SCRIPT_DIR / "aspirations-query.sh"
+    try:
+        from _runtime_bash import bash_cmd  # type: ignore
+        res = subprocess.run(
+            bash_cmd(script, "--goal-status", ",".join(REQUEST_STATUSES), "--full"),
+            capture_output=True, text=True, timeout=300,
+        )
+        if res.returncode != 0 or not res.stdout.strip():
+            err = f"store read failed rc={res.returncode} {res.stderr.strip()[:200]}"
+            print(f"close-review-queue: requests {err}", file=sys.stderr)
+            return [], err
+        rows = json.loads(res.stdout)
+        if not isinstance(rows, list):
+            raise TypeError(f"the query returned a {type(rows).__name__}, not a list")
+        return [r for r in rows if isinstance(r, dict) and r.get("review_requested")], None
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        print(f"close-review-queue: requests store read error {err}", file=sys.stderr)
+        return [], err
+
+
 def resolve_unattributed(goal_ids: list[str],
                          world: str | None = None) -> tuple[dict[str, dict], str | None]:
     """goal_id -> goal-resolve.py's answer (disposition live | archived | evicted | unknown,
@@ -233,6 +300,43 @@ def resolve_unattributed(goal_ids: list[str],
         return {}, err
 
 
+def load_out_of_live(roles: list[str], world: str | None = None
+                     ) -> tuple[list[dict], dict[str, set[str]], str | None]:
+    """What load_closures cannot see (): the closures of `roles` still listed in an
+    archived aspiration, and per role the evicted ids the census kept, over the live store
+    and the archive. -> (archived closures, {role: evicted ids}, error text or None). Read
+    through goal-resolve.py's reader, the one this script already uses for both stores.
+    Loud, like load_closures: a read that failed must not look like a lane with no misses."""
+    if not roles:
+        return [], {}, None
+    try:
+        world = world or str(_gate().WORLD_DIR or "")
+        if not world:
+            raise RuntimeError("no world directory")
+        mod = _resolver()
+        # The eager pull never re-pulls an archive (goal-resolve.py, ).
+        from _fresh_read import refresh_for_read  # type: ignore
+        refresh_for_read(Path(world, "aspirations-archive.jsonl"), label="close-review-queue")
+        archived: list[dict] = []
+        evicted: dict[str, set[str]] = {r: set() for r in roles}
+        for fname in ("aspirations.jsonl", "aspirations-archive.jsonl"):
+            for asp in mod._iter_aspirations(world, fname):
+                if not isinstance(asp, dict):
+                    continue
+                for role, ids in census_closer_role_ids(asp).items():
+                    if role in evicted:
+                        evicted[role].update(ids)
+                if fname == "aspirations-archive.jsonl":
+                    archived.extend(g for g in asp.get("goals") or []
+                                    if isinstance(g, dict) and _closer_role(g) in evicted)
+        return archived, evicted, None
+    except Exception as exc:
+        err = f"{type(exc).__name__}: {exc}"
+        print(f"close-review-queue: archive and census read failed ({err}); coverage not "
+              f"computed", file=sys.stderr)
+        return [], {}, err
+
+
 def completed_at(goal: dict) -> str:
     """The closure stamp: `completed_at` (full timestamp) or `completed_date` (a day)."""
     return str(goal.get("completed_at") or goal.get("completed_date") or "")
@@ -251,12 +355,97 @@ def closure_stamp(goal: dict) -> str:
     return stamp + "T00:00:00" if len(stamp) == 10 else stamp
 
 
+def _is_recurring(goal: dict) -> bool:
+    return goal.get("recurring") is True or str(goal.get("recurring") or "").lower() == "true"
+
+
+def _priority_rank(goal: dict) -> int:
+    return {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(str(goal.get("priority") or "").upper(), 3)
+
+
 def rank_key(goal: dict, tier: int) -> tuple:
     """Tier 2 first, then HIGH priority, then the newest closure."""
-    prio = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(str(goal.get("priority") or "").upper(), 3)
     stamp = closure_stamp(goal)
-    return (0 if tier == 2 else 1, prio, "~" if not stamp else
+    return (0 if tier == 2 else 1, _priority_rank(goal), "~" if not stamp else
             "".join(chr(0x10FFFF - ord(c)) for c in stamp))
+
+
+def request_rank_key(goal: dict, tier: int) -> tuple:
+    """An open goal first (its close waits on the verdict), then tier 2, then HIGH
+    priority, then the oldest request (it has waited longest)."""
+    is_open = str(goal.get("status") or "").lower() != "completed"
+    return (0 if is_open else 1, 0 if tier == 2 else 1, _priority_rank(goal),
+            str(goal.get("review_requested")))
+
+
+def executor_of(goal: dict) -> str:
+    """The mind whose work a review request asks about: who closed the goal, else who
+    executed it, else who claimed it. An agent name (independence is the name, never the
+    session), or "" when the record names none."""
+    for key in ("completed_by", "executed_by", "claimed_by"):
+        name = str(goal.get(key) or "").strip()
+        if name:
+            return name
+    return ""
+
+
+def _row(goal: dict, tier: dict) -> dict:
+    """What a listed goal carries: what the reviewer reads and hands to the producer."""
+    return {
+        "goal_id": goal_id_of(goal),
+        "asp_id": goal.get("asp_id") or goal.get("aspiration_id"),
+        "title": str(goal.get("title") or "")[:160],
+        "priority": goal.get("priority"),
+        "tier": tier["tier"],
+        "tier_reasons": tier["reasons"],
+        "completed_by": goal.get("completed_by"),
+        "completed_by_role": goal.get("completed_by_role"),
+        "completed_by_sid": goal.get("completed_by_sid"),
+        "completed_at": completed_at(goal),
+        "commit_sha": goal.get("commit_sha"),
+    }
+
+
+def select_requests(goals: list[dict], *, reviewed: set[str], reviewer: str) -> dict:
+    """Pure: the review requests a reviewer may answer, ranked, and the ones it may not.
+
+    A request is a goal carrying `review_requested`. It is listed while no verdict answers it
+    (`reviewed`, which answered_ids builds: a verdict answers only a request made at or before
+    it) and its status still wants one (REQUEST_STATUSES; any other status is moot), with no
+    age window. Its closer is executor_of(goal). A request whose closer is the reviewer is
+    partitioned out and counted, as a same-mind closure is, and one that names no closer is
+    declined and counted, never listed: independence that cannot be established is
+    unproven (coordination.md)."""
+    tier_mod = _tier()
+    eligible: list[tuple[tuple, dict, dict, str]] = []
+    same_mind: list[str] = []
+    no_closer: list[str] = []
+    skipped = {"moot": 0, "reviewed": 0}
+    for g in goals:
+        gid = goal_id_of(g)
+        if not gid or not g.get("review_requested"):
+            continue
+        if str(g.get("status") or "").lower() not in REQUEST_STATUSES:
+            skipped["moot"] += 1
+            continue
+        if gid in reviewed:
+            skipped["reviewed"] += 1
+            continue
+        closer = executor_of(g)
+        if not closer:
+            no_closer.append(gid)
+            continue
+        if closer.lower() == reviewer.strip().lower():
+            same_mind.append(gid)
+            continue
+        tier = tier_mod.classify(g)
+        eligible.append((request_rank_key(g, tier["tier"]), g, tier, closer))
+    eligible.sort(key=lambda t: t[0])
+    rows = [dict(_row(g, tier), kind="request", closer=closer, status=g.get("status"),
+                 review_requested=g.get("review_requested"))
+            for _, g, tier, closer in eligible]
+    return {"rows": rows, "eligible_total": len(eligible), "same_mind": same_mind,
+            "no_closer": no_closer, "skipped": skipped}
 
 
 def select_candidates(goals: list[dict], *, reviewed: set[str], now: datetime,
@@ -285,7 +474,7 @@ def select_candidates(goals: list[dict], *, reviewed: set[str], now: datetime,
         if str(g.get("status") or "").lower() != "completed":
             skipped["not_completed"] += 1
             continue
-        if g.get("recurring") is True or str(g.get("recurring") or "").lower() == "true":
+        if _is_recurring(g):
             skipped["recurring"] += 1
             continue
         if closure_stamp(g) < cutoff:
@@ -304,21 +493,8 @@ def select_candidates(goals: list[dict], *, reviewed: set[str], now: datetime,
         tier = tier_mod.classify(g)
         eligible.append((rank_key(g, tier["tier"]), g, tier))
     eligible.sort(key=lambda t: t[0])
-    rows = []
-    for _, g, tier in eligible[:cap]:
-        rows.append({
-            "goal_id": goal_id_of(g),
-            "asp_id": g.get("asp_id") or g.get("aspiration_id"),
-            "title": str(g.get("title") or "")[:160],
-            "priority": g.get("priority"),
-            "tier": tier["tier"],
-            "tier_reasons": tier["reasons"],
-            "completed_by": g.get("completed_by"),
-            "completed_by_role": g.get("completed_by_role"),
-            "completed_by_sid": g.get("completed_by_sid"),
-            "completed_at": completed_at(g),
-            "commit_sha": g.get("commit_sha"),
-        })
+    rows = [dict(_row(g, tier), kind="closure", closer=g.get("completed_by"))
+            for _, g, tier in eligible[:cap]]
     return {
         "candidates": rows,
         "eligible_total": len(eligible),
@@ -334,6 +510,52 @@ def reviewed_ids(goals: list[dict]) -> set[str]:
     for g in goals:
         gid = goal_id_of(g)
         if gid and gate.read_verdict(gate.verdict_path(gid)) is not None:
+            out.add(gid)
+    return out
+
+
+def _instant(stamp: Any) -> datetime | None:
+    """A stamp as a naive UTC datetime, or None when it is not an ISO timestamp. The fleet
+    writes naive UTC (measured 2026-10-02: all 44 review_requested stamps and all 178 verdict
+    reviewed_at stamps, to the second). A stamp with a zone is converted to UTC, because
+    comparing an aware time with a naive one raises. Any field value reads as a time or as
+    None, never as a crash: one bad record must not stop the listing for every reviewer."""
+    try:
+        when = datetime.fromisoformat(stamp)
+        if when.tzinfo is not None:
+            when = when.astimezone(timezone.utc).replace(tzinfo=None)
+    except (TypeError, ValueError, OverflowError):  # not a string, not ISO, past year 1..9999
+        return None
+    return when
+
+
+def answers(verdict: Any, requested: Any) -> bool:
+    """Whether a goal's current verdict answers its review request (): the verdict
+    was written at or after `review_requested`. A closer sets the field again when it asks
+    again, so a verdict from before the ask, such as the REJECT that sent the work back, does
+    not answer it.
+
+    Two stamps can be unreadable, and each fails toward the request being answered once:
+      * the request's: any verdict answers it, the rule before g-375-119. No verdict could
+        ever be shown to come after it, so as unanswered it would be listed forever.
+      * the verdict's (or an entry that is not a record): it answers nothing. The request is
+        listed once more, and the reviewer's next verdict carries a stamp, because
+        close-review-verdict.py writes one on every entry."""
+    if not isinstance(verdict, dict):
+        return False
+    asked, done = _instant(requested), _instant(verdict.get("reviewed_at"))
+    return asked is None or (done is not None and done >= asked)
+
+
+def answered_ids(requests: list[dict]) -> set[str]:
+    """The requests a verdict answers (`answers`), compared against the CURRENT verdict, the
+    gate's own reading: the trail is append-only, so its last entry is its newest."""
+    gate = _gate()
+    out: set[str] = set()
+    for g in requests:
+        gid = goal_id_of(g)
+        if gid and answers(gate.read_verdict(gate.verdict_path(gid)),
+                           g.get("review_requested")):
             out.add(gid)
     return out
 
@@ -396,7 +618,7 @@ def role_stats(verdicts: dict[str, dict], goals_by_id: dict[str, dict],
     `sampled`, whose pass rate is measured over its sample."""
     gate = _gate()
     resolved = resolved or {}
-    per: dict[str, list[tuple[str, str]]] = {r: [] for r in roles}
+    per: dict[str, list[tuple[str, str, str]]] = {r: [] for r in roles}
     # A role is not a model: a `worker` closure may come from a Claude Body or a local
     # Qwen one, and the goal record carries no model field. The closing SESSION is the
     # finest key it does carry, so the per-sid split lets a reader separate the
@@ -428,7 +650,7 @@ def role_stats(verdicts: dict[str, dict], goals_by_id: dict[str, dict],
             continue
         via[source] += 1
         verdict = str(v.get("verdict") or "")
-        per[role].append((str(v.get("reviewed_at") or ""), verdict))
+        per[role].append((str(v.get("reviewed_at") or ""), verdict, gid))
         sid8 = str(record.get("completed_by_sid") or "?")[:8]
         row = by_sid.setdefault(f"{role}/{sid8}", {"reviewed": 0, "approved": 0, "rejected": 0})
         row["reviewed"] += 1
@@ -439,7 +661,7 @@ def role_stats(verdicts: dict[str, dict], goals_by_id: dict[str, dict],
                            "unattributed": {k: sorted(x) for k, x in unattributed.items()}}
     for role, items in per.items():
         items.sort()  # reviewed_at ascending; an absent stamp sorts first (oldest)
-        seq = [v for _, v in items]
+        seq = [v for _, v, _ in items]
         n = len(seq)
         approved = sum(1 for v in seq if gate.releases_close(v))
         rejected = sum(1 for v in seq if v == "REJECT")
@@ -454,8 +676,71 @@ def role_stats(verdicts: dict[str, dict], goals_by_id: dict[str, dict],
             "approve_rate": round(rate, 3),
             "recent": seq[-RELAX_RECENT:],
             **relax_rule(n, rate, seq),
+            # The lane's start for this role (its first verdict) and the closures it
+            # reviewed: coverage_report's inputs.
+            "lane_start": next((at for at, _, _ in items if at), None),
+            "reviewed_ids": sorted(gid for _, _, gid in items),
         }
     return out
+
+
+def coverage_report(role: str, *, live: list[dict], archived: list[dict],
+                    evicted_ids: set[str], reviewed: set[str], verdict_ids: set[str],
+                    lane_start: str | None, now: datetime, since_hours: float,
+                    sampled: bool = False, sample_rate: float = DEFAULT_SAMPLE_RATE) -> dict:
+    """Pure: the reviewed share of `role`'s closures inside the lane's lifetime, and where
+    each unreviewed one went (g-375-38).
+
+    `reviewed` holds the ids role_stats attributed to the role. Every other completed,
+    non-recurring closure of the role without a verdict is unreviewed: `in_window` while
+    `list` can still offer it, `aged_out` once past the window, `archived` once its
+    aspiration left the live query, `evicted` once only the census holds its id. A closure
+    from before the lane's reach (`since_hours` before `lane_start`) predates the lane and
+    stays out of the coverage. An undated closure and an evicted id (the census keeps no
+    time) never predate it, because over-counting a miss is the safe error. For a relaxed
+    role only its sample is due a review, so the rest are neither misses nor population."""
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    cutoff = (now - timedelta(hours=since_hours)).strftime(fmt)
+    reach = None
+    if lane_start:
+        try:
+            reach = (datetime.strptime(lane_start[:19], fmt)
+                     - timedelta(hours=since_hours)).strftime(fmt)
+        except ValueError:
+            reach = None  # an unreadable start bounds nothing: no closure predates it
+
+    def due(gid: str) -> bool:
+        return gid not in verdict_ids and (not sampled or in_sample(gid, sample_rate))
+
+    unreviewed: dict[str, list[str]] = {"in_window": [], "aged_out": [], "archived": [],
+                                        "evicted": []}
+    predates: list[str] = []
+    seen: set[str] = set()
+    for where, goals in (("live", live), ("archived", archived)):
+        for g in goals:
+            gid = goal_id_of(g)
+            if (not gid or gid in seen or _closer_role(g) != role or _is_recurring(g)
+                    or str(g.get("status") or "").lower() != "completed" or not due(gid)):
+                continue
+            seen.add(gid)
+            stamp = closure_stamp(g)
+            if reach and stamp and stamp < reach:
+                predates.append(gid)
+            elif where == "archived":
+                unreviewed["archived"].append(gid)
+            else:
+                unreviewed["in_window" if stamp >= cutoff else "aged_out"].append(gid)
+    unreviewed["evicted"] = [gid for gid in evicted_ids if gid not in seen and due(gid)]
+    population = len(reviewed) + sum(len(ids) for ids in unreviewed.values())
+    return {
+        "lane_start": lane_start,
+        "reach_start": reach,
+        "covered": len(reviewed),
+        "population": population,
+        "coverage": round(len(reviewed) / population, 3) if population else None,
+        "unreviewed": {k: sorted(ids) for k, ids in unreviewed.items()},
+        "predates_lane": sorted(predates),
+    }
 
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -466,22 +751,47 @@ def _print_list(result: dict, roles: list[str], reviewer: str, since_hours: floa
           f"since={since_hours}h eligible={result['eligible_total']} cap={result['cap']} "
           f"same_mind_left_for_another_agent={len(result['same_mind'])} "
           f"skipped={result['skipped']}")
+    req = result.get("requests") or {}
+    print(f"  review requests: eligible={req.get('eligible_total', 0)} "
+          f"same_mind_left_for_another_agent={len(req.get('same_mind') or [])} "
+          f"declined_no_closer={len(req.get('no_closer') or [])} skipped={req.get('skipped')}"
+          + (f" READ FAILED ({req['read_error']})" if req.get("read_error") else ""))
     for r in result["candidates"]:
-        print(f"  {r['goal_id']} [{r['asp_id']}] tier={r['tier']} {r['priority']} "
-              f"by={r['completed_by']}/{str(r['completed_by_sid'] or '')[:8]} "
-              f"at={r['completed_at']} — {r['title'][:90]}")
+        if r.get("kind") == "request":
+            state = "closed" if str(r.get("status") or "").lower() == "completed" else "open"
+            print(f"  {r['goal_id']} [{r['asp_id']}] REQUEST {state} tier={r['tier']} "
+                  f"{r['priority']} closer={r['closer']} requested={r['review_requested']} "
+                  f"— {r['title'][:90]}")
+        else:
+            print(f"  {r['goal_id']} [{r['asp_id']}] tier={r['tier']} {r['priority']} "
+                  f"by={r['completed_by']}/{str(r['completed_by_sid'] or '')[:8]} "
+                  f"at={r['completed_at']} — {r['title'][:90]}")
         for reason in r["tier_reasons"]:
             print(f"      · {reason}")
     if not result["candidates"]:
-        print("  (no unreviewed closure this reviewer may review)")
+        print("  (no review request or unreviewed closure this reviewer may review)")
 
 
 def _print_stats(stats: dict) -> None:
     for role, s in stats["roles"].items():
         review = "full" if s["review"] == "full" else f"sampled@{s['sample_rate']}"
+        cov = s.get("coverage")
         print(f"role={role} review={review}: reviewed={s['reviewed']} "
               f"approved={s['approved']} rejected={s['rejected']} other={s['other']} "
-              f"approve_rate={s['approve_rate']} recent={s['recent']} relax_ok={s['relax_ok']}")
+              f"approve_rate={s['approve_rate']} coverage="
+              + (f"{cov['covered']}/{cov['population']}={cov['coverage']}" if cov else "unknown")
+              + f" recent={s['recent']} relax_ok={s['relax_ok']}")
+        if cov:
+            u = cov["unreviewed"]
+            print(f"    unreviewed in the lane (first verdict {cov['lane_start'] or 'none yet'}, "
+                  f"reach from {cov['reach_start'] or 'the first closure'}): "
+                  f"in_window={len(u['in_window'])} aged_out={len(u['aged_out'])} "
+                  f"archived={len(u['archived'])} evicted={len(u['evicted'])}; "
+                  f"predates the lane={len(cov['predates_lane'])}")
+            missed = sorted(u["aged_out"] + u["archived"] + u["evicted"])
+            if missed:
+                more = f" +{len(missed) - 12} more" if len(missed) > 12 else ""
+                print(f"      out of list's reach, never reviewed: {' '.join(missed[:12])}{more}")
         if s["review"] == "full" and s["relax_ok"]:
             print(f"    · relaxable: move it to {SAMPLED_KEY}, where a sample stays reviewed; "
                   f"never drop it")
@@ -503,20 +813,27 @@ def _print_stats(stats: dict) -> None:
     if stats.get("resolution_error"):
         print(f"    goal resolution FAILED ({stats['resolution_error']}): the not-resolved "
               f"verdicts may belong to a listed role")
+    if stats.get("coverage_error"):
+        print(f"    coverage NOT computed: the archive and census read failed "
+              f"({stats['coverage_error']})")
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    ls = sub.add_parser("list", help="unreviewed closures this reviewer may review, ranked")
+    ls = sub.add_parser("list", help="open review requests, then unreviewed closures, this "
+                                     "reviewer may review, ranked")
     ls.add_argument("--roles", nargs="*", default=None,
                     help=f"closer roles; default: close_review_gate.{CONFIG_KEY} from config")
     ls.add_argument("--since-hours", type=float, default=72.0)
     ls.add_argument("--cap", type=int, default=3)
     ls.add_argument("--reviewer", default=None, help="defaults to $MIND_AGENT")
     ls.add_argument("--json", action="store_true")
-    st = sub.add_parser("stats", help="pass rate per closer role + the relax-rule verdict")
+    st = sub.add_parser("stats", help="pass rate and coverage per closer role + the relax-rule "
+                                      "verdict")
     st.add_argument("--roles", nargs="*", default=None)
+    st.add_argument("--since-hours", type=float, default=72.0,
+                    help="the window `list` uses; past it a closure has aged out")
     st.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
@@ -544,6 +861,17 @@ def main(argv=None) -> int:
                                    since_hours=args.since_hours, reviewer=reviewer,
                                    cap=args.cap, sampled_roles=set(sampled),
                                    sample_rate=sample_rate)
+        # Review requests go first and share the cap (): an open one holds its close
+        # until a verdict exists, and every one was asked for. A goal that is both a request
+        # and a closure is offered once, as the request.
+        requests, requests_error = load_requests()
+        req = select_requests(requests, reviewed=answered_ids(requests), reviewer=reviewer)
+        asked = {r["goal_id"] for r in req["rows"]}
+        result["candidates"] = (req["rows"] + [r for r in result["candidates"]
+                                               if r["goal_id"] not in asked])[:args.cap]
+        result["requests"] = {"eligible_total": req["eligible_total"],
+                              "same_mind": req["same_mind"], "no_closer": req["no_closer"],
+                              "skipped": req["skipped"], "read_error": requests_error}
         result.update({"roles": roles, "sampled_roles": sampled, "sample_rate": sample_rate,
                        "reviewer": reviewer, "since_hours": args.since_hours})
         if args.json:
@@ -561,6 +889,18 @@ def main(argv=None) -> int:
                        sample_rate=sample_rate, resolved=resolved)
     if resolution_error:
         stats["resolution_error"] = resolution_error
+    # The closures nobody reviewed: the live ones above, plus what the live query cannot
+    # see ().
+    archived, evicted, coverage_error = load_out_of_live(roles + sampled)
+    if coverage_error:
+        stats["coverage_error"] = coverage_error
+    else:
+        for role, s in stats["roles"].items():
+            s["coverage"] = coverage_report(
+                role, live=goals, archived=archived, evicted_ids=evicted.get(role, set()),
+                reviewed=set(s["reviewed_ids"]), verdict_ids=set(verdicts),
+                lane_start=s["lane_start"], now=datetime.now(), since_hours=args.since_hours,
+                sampled=role in sampled, sample_rate=sample_rate)
     stats["artifacts_dir"] = str(artifacts_dir())
     if args.json:
         print(json.dumps(stats, ensure_ascii=False, indent=1))

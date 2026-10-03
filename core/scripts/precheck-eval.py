@@ -438,12 +438,40 @@ def cmd_zombies(args, config, compact):
 # Phase 0.5.1 — Pipeline depth (executable goal count)
 # ─────────────────────────────────────────────────────────────────────────
 
+def _ready(g, completed_ids, now):
+    """Not deferred into the future, and every blocked_by id is completed."""
+    du = _parse_iso(g.get("deferred_until"))
+    if du is not None and du > now:
+        return False
+    # blocked_by is POLYMORPHIC (bare str on some goals) — iterating a
+    # string yields per-character phantom ids (guard-5479). Route through
+    # the SSOT normalizer rather than re-deriving the isinstance guard.
+    blocked_by = norm_blocked_by(g.get("blocked_by"))
+    return not blocked_by or all(b in completed_ids for b in blocked_by)
+
+
+def _candidate_tier_on(config):
+    """The §8 candidate_tier block when it is switched ON, else None.
+
+    goal-intake-management.md §8: a missing block or key reads as OFF. A
+    block that is not a mapping, or an `enabled` that is not literally True,
+    reads as OFF too — the starvation fail-safe must never arm by accident.
+    """
+    ct = config.get("candidate_tier")
+    if isinstance(ct, dict) and ct.get("enabled") is True:
+        return ct
+    return None
+
+
 def cmd_pipeline_depth(args, config, compact):
     """Count executable goals; flag if below low-water-mark.
 
     Executable = pending AND (deferred_until null or past) AND all blocked_by
     IDs are in the completed set. The orchestrator acts on `thin_pipeline`
     by invoking /create-aspiration from-self.
+
+    With candidate_tier ON the §4 starvation fail-safe decides instead
+    (_pipeline_depth_tiered, B3 g-353-66); with it OFF this output is unchanged.
     """
     lwm = config.get("pipeline_low_water_mark")
     if lwm is None:
@@ -458,6 +486,10 @@ def cmd_pipeline_depth(args, config, compact):
             if g.get("status") == "completed":
                 completed_ids.add(g.get("id"))
 
+    ct = _candidate_tier_on(config)
+    if ct is not None:
+        return _pipeline_depth_tiered(args, ct, active, completed_ids, now, lwm)
+
     executable = 0
     for asp in active:
         for g in asp.get("goals", []):
@@ -465,16 +497,8 @@ def cmd_pipeline_depth(args, config, compact):
             # the pipeline-depth health metric under-reports without this.
             if g.get("status") not in ("pending", "candidate"):
                 continue
-            du = _parse_iso(g.get("deferred_until"))
-            if du is not None and du > now:
-                continue
-            # blocked_by is POLYMORPHIC (bare str on some goals) — iterating a
-            # string yields per-character phantom ids (guard-5479). Route through
-            # the SSOT normalizer rather than re-deriving the isinstance guard.
-            blocked_by = norm_blocked_by(g.get("blocked_by"))
-            if blocked_by and not all(b in completed_ids for b in blocked_by):
-                continue
-            executable += 1
+            if _ready(g, completed_ids, now):
+                executable += 1
 
     flags = ["thin_pipeline"] if executable < lwm else []
     summary = (
@@ -488,6 +512,169 @@ def cmd_pipeline_depth(args, config, compact):
         "executable_count": executable,
         "threshold": lwm,
     }
+
+
+STARVATION_PROMOTED_BY = "starvation-failsafe"
+
+
+def _live_candidates():
+    """Every candidate-status goal, read LIVE through §2's grooming read path.
+
+    Returns (records, None) or (None, error). The compact carries no
+    created_at, so it cannot say which candidate is oldest; this read can.
+    """
+    try:
+        out, err, rc = _run_script(
+            ["aspirations-query.sh", "--goal-status", "candidate", "--full"],
+            timeout=60)
+    except Exception as e:  # noqa: BLE001 — fail-open, reported to the caller
+        return None, f"candidate read raised {type(e).__name__}: {e}"
+    if rc != 0:
+        return None, f"candidate read rc={rc}: {(err or '').strip()[-300:]}"
+    try:
+        records, _end = json.JSONDecoder().raw_decode(out.strip() or "[]")
+    except json.JSONDecodeError as e:
+        return None, f"candidate read unparseable ({len(out)} bytes): {e}"
+    if not isinstance(records, list):
+        return None, f"candidate read returned {type(records).__name__}, not a list"
+    return [r for r in records if isinstance(r, dict)], None
+
+
+def _promote_candidate(goal_id, source):
+    """candidate -> pending through the status-update path, which owns the
+    §2 transition table and appends the §5 ledger row. Returns (rc, error).
+
+    The row is stamped promoted_by=starvation-failsafe through the status
+    write's ledger channel (g-353-166), so spec §4 holds on the ledger itself
+    and groom.py's promote cap can exclude these rows from a grooming budget.
+    """
+    try:
+        _out, err, rc = _run_script(
+            ["aspirations-update-goal.sh", "--source", source, goal_id,
+             "status", "pending",
+             "--ledger-evidence",
+             json.dumps({"promoted_by": STARVATION_PROMOTED_BY})],
+            timeout=60)
+    except Exception as e:  # noqa: BLE001 — one failed write must not stop the batch
+        return -1, f"{type(e).__name__}: {e}"
+    return rc, (err or "").strip()[-300:]
+
+
+def _pipeline_depth_tiered(args, ct, active, completed_ids, now, lwm):
+    """§4 starvation fail-safe (goal-intake-management.md; B3, ).
+
+    Deterministic, no LLM (I4). `executable` counts PENDING goals only: a
+    candidate is not selector work, so counting it — as the flag-OFF path has
+    since g-353-82 — would hide the exact starvation this branch must catch.
+    `groomable` is FLEET-WIDE and uncooldowned (the g-353-62 review's remedy
+    for §4): every candidate in an active aspiration, no affinity partition,
+    no groom_touched_at cooldown.
+
+      executable >= lwm                -> healthy, nothing promoted
+      executable <  lwm, groomable > 0 -> promote the oldest promotable
+          candidates, min(auto_promote_batch, lwm - executable) of them, and
+          flag starvation_promoted (metric (e): sustained firing = bug). A
+          candidate whose own deferral or dependency leaves it unexecutable is
+          not promoted — promoting it cannot end the starvation.
+      executable <  lwm, groomable == 0 -> thin_pipeline (legacy generation)
+
+    I1 (fail open toward life): when the live read fails, or every promotion
+    write fails, the result falls back to thin_pipeline with failsafe_error.
+    """
+    batch = ct.get("auto_promote_batch")
+    if isinstance(batch, bool) or not isinstance(batch, int) or batch < 1:
+        raise KeyError("candidate_tier.auto_promote_batch (a positive int)")
+
+    executable = 0
+    groomable = 0
+    for asp in active:
+        for g in asp.get("goals", []):
+            status = g.get("status")
+            if status == "candidate":
+                groomable += 1
+            elif status == "pending" and _ready(g, completed_ids, now):
+                executable += 1
+
+    result = {
+        "subcommand": "pipeline-depth",
+        "candidate_tier": "on",
+        "flags": [],
+        "executable_count": executable,
+        "groomable_count": groomable,
+        "threshold": lwm,
+    }
+    if executable >= lwm:
+        result["summary"] = (f"pipeline-depth: healthy ({executable} executable, "
+                             f"{groomable} groomable candidate(s))")
+        return result
+
+    live, err = _live_candidates()
+    if live is None:
+        result["flags"] = ["thin_pipeline"]
+        result["failsafe_error"] = err
+        result["summary"] = (f"pipeline-depth: thin ({executable} executable < {lwm}); "
+                             f"starvation fail-safe could not read candidates — "
+                             f"falling back to generation (I1)")
+        return result
+    # Same scope as the executable count: candidates of ACTIVE aspirations.
+    # (source, id) because asp ids repeat across the world and agent queues.
+    active_keys = {(a.get("source") or "world", a.get("id")) for a in active}
+    live = [g for g in live
+            if ((g.get("source") or "world"), g.get("asp_id")) in active_keys]
+    result["groomable_count"] = groomable = len(live)  # the live read decides
+    if groomable == 0:
+        result["flags"] = ["thin_pipeline"]
+        result["summary"] = (f"pipeline-depth: thin ({executable} executable < {lwm}, "
+                             f"0 groomable candidates)")
+        return result
+
+    k = min(batch, lwm - executable)
+    promotable = sorted(
+        (g for g in live if _ready(g, completed_ids, now)),
+        key=lambda g: (str(g.get("created_at") or ""),
+                       str(g.get("goal_id") or g.get("id") or "")))
+    picks = [(str(g.get("goal_id") or g.get("id")), g.get("source") or "world")
+             for g in promotable[:k]]
+    result.update({"promotable_count": len(promotable), "promote_limit": k,
+                   "promoted_by": STARVATION_PROMOTED_BY})
+
+    if not getattr(args, "apply", False):
+        result["flags"] = ["starvation_promoted"]
+        result["would_promote"] = [gid for gid, _src in picks]
+        result["summary"] = (f"pipeline-depth: starving ({executable} executable < {lwm}, "
+                             f"{groomable} groomable) — would promote {len(picks)} "
+                             f"(dry run; pass --apply)")
+        return result
+
+    promoted, failed = [], []
+    for gid, src in picks:
+        rc, perr = _promote_candidate(gid, src)
+        if rc == 0:
+            promoted.append(gid)
+        else:
+            failed.append({"goal_id": gid, "source": src, "rc": rc, "error": perr})
+    result["promoted"] = promoted
+    if failed:
+        result["promote_failed"] = failed
+    log_script_decision("precheck-eval", {
+        "subcommand": "pipeline-depth",
+        "promoted_by": STARVATION_PROMOTED_BY,
+        "executable": executable, "threshold": lwm, "groomable": groomable,
+        "promote_limit": k, "promoted": promoted,
+        "failed": [f["goal_id"] for f in failed],
+    })
+    if picks and not promoted:
+        result["flags"] = ["thin_pipeline"]
+        result["failsafe_error"] = f"all {len(picks)} promotion write(s) failed"
+        result["summary"] = (f"pipeline-depth: thin ({executable} executable < {lwm}); "
+                             f"every starvation promote failed — falling back to "
+                             f"generation (I1)")
+        return result
+    result["flags"] = ["starvation_promoted"]
+    result["summary"] = (f"pipeline-depth: starving ({executable} executable < {lwm}, "
+                         f"{groomable} groomable) — promoted {len(promoted)} of "
+                         f"{len(picks)} (limit {k})")
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -739,13 +926,20 @@ def cmd_consolidation(args, config, compact):
 # Phase 0.5c — Unproductive cycle detection
 # ─────────────────────────────────────────────────────────────────────────
 
-def _has_recent_reports(asp_id, recent_goals, age_days):
+def _has_recent_reports(asp_id, recent_goals, age_days, source=None):
     """Whether any agents/<agent>/temp/*.md was filed within
     `age_days` for this aspiration or any of its `recent_goals`. Filename
     substring match against aspiration id OR goal id. Walks every agent's
     temp/ dir under PROJECT_ROOT/agents/ (N-agent safe — not
     hardcoded to alpha/bravo; Phase 2.5.D layout). Briefings moved reports/
     -> temp/ in the file-model normalization; reports/ was abolished 2026-06-02.
+
+    Also counts an experience record named for one of `recent_goals`
+    (agents/<agent>/experience/exp-<goal-id>[-slug].md) -- the per-goal
+    learning artifact the temp-only scan never saw. Goal ids are per-queue
+    (guard-6492): unless `source == "world"` only the bound agent's
+    experience/ is scanned; a world goal can be executed by any agent, so
+    every agent's is.
 
     Origin: g-115-188. The cycle detector's zero_learning_velocity branch
     flagged actively-shipping aspirations that produced reports/commits but
@@ -766,6 +960,7 @@ def _has_recent_reports(asp_id, recent_goals, age_days):
     agents_parent = Path(PROJECT_ROOT) / "agents"
     if not agents_parent.is_dir():
         return False
+    own_agent = AGENT_DIR.name if AGENT_DIR is not None else None
     for entry in agents_parent.iterdir():
         if not entry.is_dir():
             continue
@@ -788,6 +983,21 @@ def _has_recent_reports(asp_id, recent_goals, age_days):
                     return True
                 if any(gid and gid in name_lc for gid in recent_ids):
                     return True
+        # Experience records. The name boundary is `exp-<id>` then end or '-',
+        # so g-1-5 never claims exp-g-1-58-* (rb-3603: a counted subset misses
+        # the classes whose output is another artifact).
+        exp_dir = entry / "experience"
+        if recent_ids and (source == "world" or entry.name == own_agent) and exp_dir.is_dir():
+            for rec in exp_dir.glob("exp-*.md"):
+                stem = rec.stem.lower()
+                if not any(stem == "exp-" + gid or stem.startswith("exp-" + gid + "-")
+                           for gid in recent_ids):
+                    continue
+                try:
+                    if datetime.fromtimestamp(rec.stat().st_mtime) >= cutoff:
+                        return True
+                except OSError:
+                    continue
     return False
 
 
@@ -997,6 +1207,17 @@ def cmd_cycles(args, config, compact):
                     if all_product:
                         continue
 
+                    # Record-level opt-out, the contract aspiration-trajectory.py
+                    # applies to its plateau flags: a queue whose normal operating
+                    # point is ~0 learning velocity (an inbox or upkeep aspiration)
+                    # carries plateau_exempt: true. Strict boolean -- a truthy string
+                    # keeps detection ON. Only this velocity branch honours it;
+                    # repeated_failure is not a velocity signal. Aspiration-level
+                    # keys survive the compact projection (only goal keys are
+                    # filtered), so unlike a goal tag this is not a dead branch.
+                    if asp.get("plateau_exempt") is True:
+                        continue
+
                     # : completion-ratio gate. A near-complete
                     # aspiration consolidating its final goals will
                     # naturally have all recent goals in the same
@@ -1031,7 +1252,9 @@ def cmd_cycles(args, config, compact):
                                 # Suppress when <agent>/temp/*.md exist for
                                 # this aspiration or its recent goals — those
                                 # ARE substantive learning artifacts.
-                                if not _has_recent_reports(asp.get("id"), recent, report_age_days):
+                                # (also counts an experience record named for a recent goal)
+                                if not _has_recent_reports(asp.get("id"), recent, report_age_days,
+                                                           source=asp.get("source")):
                                     cycle_reason = "zero_learning_velocity"
                         except json.JSONDecodeError:
                             pass

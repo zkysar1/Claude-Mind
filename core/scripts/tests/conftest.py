@@ -108,6 +108,15 @@ os.environ["MIND_ALLOW_TMP_OWNCLOUD_PUT"] = "1"
 # firings_paths() so it is correct under either flag value.
 os.environ.pop("GATE_FIRINGS_SEGMENTED", None)
 
+# The tree-index retrieval spool is a PER-BOX deployment flag too: settings.json
+# env sets it fleet-wide since , and `retrieve.load_tree_nodes` branches
+# on it. Pin it OFF for the session so a hermetic test sees the legacy in-request
+# bump its assertions were written against; the lane tests opt in with
+# monkeypatch.setenv(SPOOLED_ENV, "1") (test_tree_retrieval_spool_lane). Same
+# shape as the pin above: the box's live setting must not decide what a hermetic
+# test observes.
+os.environ.pop("TREE_RETRIEVAL_SPOOLED", None)
+
 # Hermetic embedding index (). Sibling of the STORAGE_BACKEND pin
 # above and for the same reason: a test can redirect the STORE to a tmp path,
 # but retrieve.py's `_embedding_blend` calls `cosine_scores(query)` with no
@@ -165,6 +174,30 @@ os.environ["MIND_EMBEDDING_INDEX_DIR"] = str(
 # into the module cache for the rest of the session.
 os.environ.pop("MIND_WORLD", None)
 os.environ.pop("MIND_META", None)
+
+# : POP the forked-Body identity vars for the whole pytest session,
+# so a run launched from a worker-Body shell (or any shell with the
+# bash-agent-inject export) cannot leak the LIVE Body identity into tests.
+# MIND_SID keys the iteration checkpoint: loop-state-save.py::_checkpoint_path
+# resolves body_state_path(MIND_AGENT, "iteration-checkpoint.json"), which is
+# Body-keyed at agents/<agent>/sessions/<MIND_SID>/... whenever MIND_SID is
+# set AND a forked working-memory.yaml exists for it. A test that runs the REAL
+# aspirations-claim.sh (mind_api wrapper tests, or any main()-style file this
+# runner delegates) would otherwise anchor the LIVE session's checkpoint to a
+# fixture goal on every successful claim — the exact defect this goal fixes.
+#
+# POP, never pin: the vars are per-SESSION identity. There is no correct
+# ambient value for a test to hold, and no test reads the ambient value —
+# every claim-driving test passes its sid explicitly (query param or its own
+# env). Unset is the production shape on every non-Body launch context
+# (reducer boxes, CI, cron: the inject hook exports these on worker boxes
+# only), the same reason MIND_WORLD / MIND_META are cleared above.
+# MIND_CHECKPOINT_PATH is the dedicated test seam () that lets a
+# test redirect the checkpoint to its tmp root; the ambient value has no
+# legitimate meaning either, so it is scrubbed with the identity vars.
+for _body_leak in ("MIND_SID", "BODY_WM_PATH", "BODY_ROLE",
+                   "MIND_CHECKPOINT_PATH"):
+    os.environ.pop(_body_leak, None)
 
 # Pre-import _paths to lock AGENT_DIR into the module cache before any test
 # module pops MIND_AGENT. Without this, a test that pops the env BEFORE

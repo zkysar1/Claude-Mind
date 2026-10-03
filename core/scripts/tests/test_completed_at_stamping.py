@@ -150,9 +150,10 @@ def test_normalize_still_clears_defer_state():
     ASP._normalize_terminal_goal(goal)
     assert goal["defer_reason"] is None
     assert goal["defer_reason_set_at"] is None
-    assert "blocker_ref" not in goal
-    assert "blocked_since" not in goal
-    assert "deferred_until" not in goal
+    # Cleared to None, never popped (): a popped key comes back
+    # from any peer copy at the next merge.
+    for key in ("blocker_ref", "blocked_since", "deferred_until"):
+        assert key in goal and goal[key] is None, key
     # And the new behavior: completed_at stamped
     assert goal["completed_at"] is not None
 

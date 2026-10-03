@@ -189,6 +189,30 @@ bash "$SCRIPT_DIR/local-backend-staleness-check.sh" || true
 # hygiene must never perturb session start.
 bash "$SCRIPT_DIR/history-vacuum-tick.sh" >/dev/null 2>&1 || true
 
+# ─── Step 2.76: embedding-index session-start tick () ─────────────
+# A box that never runs the loop and never serves a retrieve stayed on the token
+# baseline for good: embedding-index-freshness.py returns at "no index" from both
+# of its other call sites (iteration-close's productivity-check and the daemon's
+# /v1/retrieve), so only an operator ever built the first index. --session-start
+# does what those may not: with the semantic blend on, the encoder stack
+# importable and no index, it claims the attempt atomically and spawns the
+# initial build DETACHED; with the stack missing it says so. Either way it prints
+# ONE line, and STDOUT IS KEPT HERE ON PURPOSE (Step 2.6 is the precedent): the
+# agent sees it at session start, which the daemon's spawn.log never reached.
+# stderr goes to the build's own log rather than /dev/null, for Step 2.8's reason
+# (guard-1680). Silent when the blend is off or an index exists. Unconditional
+# like Steps 2.7-2.8, so SOURCE=compact also reaches it: a long worker session
+# can be provisioned after it started. Fail-open + the chain's `|| true`
+# contract: a retrieval nicety must never perturb session start.
+(
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/_paths.sh" 2>/dev/null || true
+  _ei="$SCRIPT_DIR/embedding-index-freshness.py"
+  command -v cygpath >/dev/null 2>&1 && _ei="$(cygpath -w "$_ei" 2>/dev/null || echo "$_ei")"
+  mkdir -p "$SCRIPT_DIR/../logs" 2>/dev/null || true
+  python3 "$_ei" --session-start 2>>"$SCRIPT_DIR/../logs/embedding-index-update.log"
+) || true
+
 # ─── Step 2.8: late close of abandoned Body manifests () ─────────
 # A manifest leaves `active` only through its own session's stop hook, so a
 # power-down, an lxc stop or a killed pane leaves it `active` forever and the

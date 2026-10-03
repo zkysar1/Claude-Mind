@@ -390,3 +390,21 @@ def test_census_projection_is_inert_without_a_census():
             asp['archived_census'] = census
         shell = project_shell(asp)
         assert shell == {k: v for k, v in asp.items() if k != 'goals'}
+
+
+def test_summary_carries_no_closer_role_id_list():
+    """The closer-role id set () is as unbounded as evicted_ids and no
+    summary reader needs it, so the projection drops it without moving a count."""
+    from _goal_census import CLOSER_ROLE_KEY, census_by_status
+
+    corpus = make_census_corpus()
+    for asp in corpus:
+        asp['archived_census'][CLOSER_ROLE_KEY] = {
+            'worker': list(asp['archived_census']['evicted_ids']['completed'])}
+    summary, _ = build_summary(corpus)
+    by_id = {a['id']: a for a in summary}
+    for asp in corpus:
+        projected = by_id[asp['id']]
+        assert CLOSER_ROLE_KEY not in projected['archived_census']
+        assert census_by_status(projected) == census_by_status(asp)
+        assert asp['archived_census'][CLOSER_ROLE_KEY]   # the full compact keeps it

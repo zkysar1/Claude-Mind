@@ -131,7 +131,9 @@ def _goal(goal_id: str, status: str = "candidate", **extra) -> dict:
     return g
 
 
-def _make_world(tmp: Path, goal: dict) -> Path:
+def _make_world(tmp: Path, goal) -> Path:
+    """`goal` is one goal dict, or a list of them (a test that drives several
+    transitions through one daemon)."""
     world = tmp / "world"
     world.mkdir(parents=True, exist_ok=True)
     asp = {
@@ -142,7 +144,7 @@ def _make_world(tmp: Path, goal: dict) -> Path:
         "priority": "MEDIUM",
         "status": "active",
         "created": "2026-09-24T00:00:00",
-        "goals": [goal],
+        "goals": goal if isinstance(goal, list) else [goal],
     }
     (world / "aspirations.jsonl").write_text(
         json.dumps(asp, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -594,6 +596,263 @@ def test_pytest_suppression_waives_ledger_writes(tmp_path, monkeypatch):
                             new_status="pending") is True
     assert not (tmp_path / LEDGER_NAME).exists(), (
         "suppression must waive the write, not merely fail it")
+
+
+# ---------------------------------------------------------------------------
+# 7. THE CALLER CHANNEL () — the writer's half of the §5 row
+# ---------------------------------------------------------------------------
+#
+# A status write may carry `ledger_evidence` / `ledger_verdict` beside its value
+# (the way outcome_note rides). The starvation fail-safe stamps promoted_by on
+# its promote row through it, and groom's rb-route names its verdict through it.
+
+STARVATION = {"promoted_by": "starvation-failsafe"}
+
+
+def _body(new_status: str, evidence=None, verdict=None) -> dict:
+    body = {"value": new_status}
+    if evidence is not None:
+        body["ledger_evidence"] = evidence
+    if verdict is not None:
+        body["ledger_verdict"] = verdict
+    return body
+
+
+def test_pure_channel_accepts_the_stamp_and_the_named_verdict():
+    assert ct.caller_channel("pending") == (None, {}, None)
+    assert ct.caller_channel("pending", STARVATION) == (None, STARVATION, None)
+    assert ct.caller_channel("skipped", None, "rb-route") == ("rb-route", {}, None)
+    assert ct.caller_channel("skipped", None, "close-moot") == ("close-moot", {}, None)
+    assert ct.caller_channel("superseded", None, "merge") == ("merge", {}, None)
+
+
+@pytest.mark.parametrize("status,evidence,verdict,fragment", [
+    ("pending", ["promoted_by"], None, "must be an object"),
+    ("pending", "promoted_by", None, "must be an object"),
+    ("pending", {"promoted_by": "starvation-failsafe", "verdict": "merge"}, None, "not allowed"),
+    ("pending", {"agent": "alpha"}, None, "not allowed"),
+    ("pending", {"promoted_by": "Starvation Failsafe"}, None, "kebab-case"),
+    ("pending", {"promoted_by": ""}, None, "kebab-case"),
+    ("pending", {"promoted_by": 7}, None, "kebab-case"),
+    ("pending", {"promoted_by": "x" * 65}, None, "kebab-case"),
+    # a `$`-anchored .match() passes these (guard-1283): the stamp is compared by equality
+    ("pending", {"promoted_by": "starvation-failsafe\n"}, None, "kebab-case"),
+    ("pending", {"promoted_by": "x" * 64 + "\n"}, None, "kebab-case"),
+    ("pending", None, "rb-route", "does not fit"),
+    ("skipped", None, "promote", "does not fit"),
+    ("superseded", None, "close-moot", "does not fit"),
+    ("in-progress", None, "promote", "does not fit"),
+])
+def test_pure_channel_refuses_a_malformed_channel(status, evidence, verdict, fragment):
+    got_verdict, got_evidence, err = ct.caller_channel(status, evidence, verdict)
+    assert err and err.startswith("BLOCKED") and fragment in err, err
+    assert (got_verdict, got_evidence) == (None, {})
+    # one wording for both transports (guard-1189): no flag, header or HTTP talk
+    assert not any(w in err for w in ("--", "header", "HTTP", "flag")), err
+
+
+def test_pure_channel_evidence_cannot_displace_the_tables_own_keys():
+    """The closed key list is what keeps from/to/rule the table's."""
+    assert ct.CALLER_EVIDENCE_KEYS == ("promoted_by",)
+    for key in ("from", "to", "rule", "outcome_note"):
+        _v, _e, err = ct.caller_channel("pending", {key: "x"})
+        assert err and "not allowed" in err, (key, err)
+
+
+def test_cli_starvation_stamp_lands_on_the_one_promote_row():
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), _goal("g-995-20"))
+        res = _cli_update(world, "g-995-20", json.dumps(_body("pending", STARVATION)))
+        assert res.returncode == 0, res.stderr
+        assert _goal_in(world, "g-995-20")["status"] == "pending"
+        rows = _ledger_rows(world, "g-995-20")
+        assert len(rows) == 1, f"exactly ONE row for the transition: {rows!r}"
+        row = rows[0]
+        assert row["verdict"] == "promote"
+        assert row["evidence"]["promoted_by"] == "starvation-failsafe"
+        assert (row["evidence"]["from"], row["evidence"]["to"]) == ("candidate", "pending")
+        assert row["evidence"]["rule"], "the stamp must not displace the table's keys"
+
+
+@pytest.mark.parametrize("value", [
+    "pending",
+    json.dumps({"value": "pending", "outcome_note": "GROOM promote: real work"}),
+])
+def test_cli_grooming_promote_without_the_channel_carries_no_promoted_by(value):
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), _goal("g-995-21"))
+        res = _cli_update(world, "g-995-21", value)
+        assert res.returncode == 0, res.stderr
+        rows = _ledger_rows(world, "g-995-21")
+        assert len(rows) == 1 and rows[0]["verdict"] == "promote", rows
+        assert "promoted_by" not in rows[0]["evidence"], (
+            "a grooming promote must not read as a fail-safe promote")
+
+
+def test_cli_rb_route_verdict_is_named_on_its_row():
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), _goal("g-995-22"))
+        res = _cli_update(world, "g-995-22",
+                          json.dumps(_body("skipped", None, "rb-route")))
+        assert res.returncode == 0, res.stderr
+        rows = _ledger_rows(world, "g-995-22")
+        assert len(rows) == 1 and rows[0]["verdict"] == "rb-route", rows
+
+
+@pytest.mark.parametrize("evidence,verdict", [
+    (["x"], None),
+    ({"agent": "someone-else"}, None),
+    ({"promoted_by": "NOT KEBAB"}, None),
+    (None, "merge"),
+])
+def test_cli_a_malformed_channel_refuses_and_writes_nothing(evidence, verdict):
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), _goal("g-995-23"))
+        res = _cli_update(world, "g-995-23",
+                          json.dumps(_body("pending", evidence, verdict)))
+        assert res.returncode != 0 and "BLOCKED" in res.stderr, (
+            res.returncode, res.stderr)
+        assert _goal_in(world, "g-995-23")["status"] == "candidate", (
+            "a refused write must not mutate the store")
+        assert _ledger_rows(world, "g-995-23") == []
+
+
+def test_daemon_starvation_stamp_and_rb_route_verdict_land_on_their_rows():
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), [_goal("g-995-24"), _goal("g-995-25")])
+        with DaemonFixture(world, agent=AGENT) as df:
+            code, body = _daemon_update(df.port, "g-995-24", _body("pending", STARVATION))
+            assert code == 200, (code, body)
+            code, body = _daemon_update(df.port, "g-995-25",
+                                        _body("skipped", None, "rb-route"))
+            assert code == 200, (code, body)
+            (stamped,) = _ledger_rows(world, "g-995-24")
+            assert stamped["verdict"] == "promote"
+            assert stamped["evidence"]["promoted_by"] == "starvation-failsafe"
+            assert stamped["evidence"]["from"] == "candidate"
+            (routed,) = _ledger_rows(world, "g-995-25")
+            assert routed["verdict"] == "rb-route"
+            assert "promoted_by" not in routed["evidence"]
+
+
+def test_daemon_a_malformed_channel_is_a_400_that_writes_nothing():
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), _goal("g-995-26"))
+        with DaemonFixture(world, agent=AGENT) as df:
+            code, body = _daemon_update(df.port, "g-995-26",
+                                        _body("pending", {"agent": "someone-else"}))
+            assert code == 400 and body.get("error") == "invalid_ledger_channel", (code, body)
+            assert "not allowed" in str(body.get("detail", "")), body
+            assert _goal_in(world, "g-995-26")["status"] == "candidate"
+            assert _ledger_rows(world, "g-995-26") == []
+
+
+def test_a_channel_on_a_write_owing_no_row_is_ignored_not_refused():
+    """The channel is validated only when a §5 row is due. blocked -> pending is
+    no candidate transition, so a bad channel there changes nothing."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), _goal("g-995-27", status="blocked"))
+        with DaemonFixture(world, agent=AGENT) as df:
+            code, body = _daemon_update(df.port, "g-995-27",
+                                        _body("pending", {"agent": "someone-else"}))
+            assert code == 200, (code, body)
+            assert _goal_in(world, "g-995-27")["status"] == "pending"
+            assert _ledger_rows(world, "g-995-27") == []
+
+
+def _wrapper(df, world, *argv):
+    env = dict(os.environ)
+    env["STORAGE_BACKEND"] = "local"
+    env["MIND_WORLD"] = str(world)
+    env["MIND_AGENT"] = AGENT
+    env["MIND_SID"] = MY_SID
+    env["RT_DIR"] = str(df.runtime_dir)
+    return subprocess.run(
+        [BASH, UPDATE_WRAPPER.as_posix(), *argv],
+        capture_output=True, text=True, env=env, cwd=str(PROJECT_ROOT), timeout=120)
+
+
+def test_wrapper_flags_reach_the_ledger_row_through_the_daemon():
+    """The production door (guard-920): the flags ride the wrapper's body to the
+    live daemon, which stamps the row."""
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), [_goal("g-995-28"), _goal("g-995-29"),
+                                         _goal("g-995-30")])
+        with DaemonFixture(world, agent=AGENT) as df:
+            res = _wrapper(df, world, "--source", "world", "g-995-28", "status", "pending",
+                           "--ledger-evidence", json.dumps(STARVATION))
+            assert res.returncode == 0, (res.stderr, res.stdout[-300:])
+            res = _wrapper(df, world, "g-995-29", "status", "skipped",
+                           "--ledger-verdict", "rb-route")
+            assert res.returncode == 0, (res.stderr, res.stdout[-300:])
+            (stamped,) = _ledger_rows(world, "g-995-28")
+            assert stamped["verdict"] == "promote"
+            assert stamped["evidence"]["promoted_by"] == "starvation-failsafe"
+            (routed,) = _ledger_rows(world, "g-995-29")
+            assert routed["verdict"] == "rb-route"
+            # a value that is not JSON is sent as-is and the daemon refuses it
+            res = _wrapper(df, world, "g-995-30", "status", "pending",
+                           "--ledger-evidence", "not json")
+            assert res.returncode == 1 and "invalid_ledger_channel" in res.stderr, (
+                res.returncode, res.stderr)
+            assert _goal_in(world, "g-995-30")["status"] == "candidate"
+            assert _ledger_rows(world, "g-995-30") == []
+            # and a write that names no channel is the historical write
+            res = _wrapper(df, world, "g-995-30", "status", "pending")
+            assert res.returncode == 0, res.stderr
+            (plain,) = _ledger_rows(world, "g-995-30")
+            assert plain["verdict"] == "promote" and "promoted_by" not in plain["evidence"]
+
+
+def test_wrapper_refuses_the_flags_on_a_non_status_field_and_on_an_empty_value():
+    with tempfile.TemporaryDirectory() as tmpd:
+        world = _make_world(Path(tmpd), _goal("g-995-31"))
+        with DaemonFixture(world, agent=AGENT) as df:
+            res = _wrapper(df, world, "g-995-31", "title", "renamed",
+                           "--ledger-evidence", json.dumps(STARVATION))
+            assert res.returncode == 1 and "ride only a status write" in res.stderr, (
+                res.returncode, res.stderr)
+            res = _wrapper(df, world, "g-995-31", "status", "pending", "--ledger-evidence", "")
+            assert res.returncode == 2 and "needs a value" in res.stderr, (
+                res.returncode, res.stderr)
+            g = _goal_in(world, "g-995-31")
+            assert g["status"] == "candidate" and g["title"].startswith("candidate-table"), g
+            assert _ledger_rows(world, "g-995-31") == []
+
+
+def test_wrapper_help_lists_the_two_flags():
+    res = subprocess.run([BASH, UPDATE_WRAPPER.as_posix(), "--help"],
+                         capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=60)
+    text = (res.stdout or "") + (res.stderr or "")
+    assert res.returncode == 0
+    assert "--ledger-evidence" in text and "--ledger-verdict" in text, text
+
+
+CHANNEL_MARKERS = {
+    "evidence companion unwrap": 'companion_ledger_evidence = value.get("ledger_evidence")',
+    "verdict companion unwrap": 'companion_ledger_verdict = value.get("ledger_verdict")',
+    "shared validator import": "caller_channel as _ct_channel",
+    "validator call": "_ct_channel(",
+    "verdict falls back to the table": '_cc_verdict or _ct["verdict"]',
+    "evidence merge": "**_cc_evidence",
+}
+
+
+def test_both_status_update_paths_wire_the_channel_through_one_validator():
+    """guard-742 parity for the channel. The policy lives ONCE, in
+    gates/candidate_transition.py; each write path only calls it, and only when
+    a row is due."""
+    for path, pattern in ((CLI_PATH, r"^def cmd_update_goal\("),
+                          (DAEMON_PATH, r"^(async )?def update_goal\(")):
+        body = _func_span(path, pattern)
+        missing = [k for k, m in CHANNEL_MARKERS.items() if m not in body]
+        assert not missing, f"{path.name} is missing channel wiring {missing}"
+        assert body.index('if _ct["ledger"]:') < body.index("_ct_channel("), (
+            f"{path.name} validates the channel before it knows a row is due")
+    for path in (CLI_PATH, DAEMON_PATH):
+        text = path.read_text(encoding="utf-8")
+        assert "CALLER_EVIDENCE_KEYS" not in text and "VERDICTS_FOR_STATUS" not in text, (
+            f"{path.name} carries its own copy of the channel policy")
 
 
 # ---------------------------------------------------------------------------

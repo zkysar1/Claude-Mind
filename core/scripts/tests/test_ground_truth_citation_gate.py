@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -474,8 +475,20 @@ def test_CONTROL_digit_bearing_paths_are_not_mistaken_for_ratios():
     hyphenated slug with a number in it. If the exclusion keyed on "contains a
     digit" instead of "is all digits and slashes" it would delete genuine
     citations, which is the direction this gate must never fail in.
+
+    UPDATED 2026-10-03 (g-115-8858): the token list used to include
+    "runs/32023260302", an all-DIGIT run. That token now deliberately does NOT
+    match: the new grammar requires a letter (and a kebab segment, for the
+    slug form) because no file path, tree-node key or URL in this store
+    consists only of digits and slashes -- the same proof the _RATIO_RUN note
+    below uses for the ratio class, and the live-tree census measured zero
+    all-digit multi-segment node keys. The pin was repointed at a
+    letter-bearing token that still carries a full numeric segment
+    ("runs/32023260302-a"), which exercises the same property (a numeric
+    segment inside a genuine citation is not a ratio); the pure-digit form is
+    asserted DROPPED below so a future widening cannot resurrect it.
     """
-    for token in ("runs/32023260302", "core/scripts/q4-provenance-sample",
+    for token in ("runs/32023260302-a", "core/scripts/q4-provenance-sample",
                   "system/asp-115-tail", "v1/watch-2026"):
         line = (f"Globex Industries reported revenue of $2.1 billion in "
                 f"2025. [{token}]")
@@ -487,6 +500,10 @@ def test_CONTROL_digit_bearing_paths_are_not_mistaken_for_ratios():
         # real cluster was adjudicated rather than none forming at all.
         assert _kinds(analyze(text, retrieved=lambda k, v: False)) == [
             "decorative-citation"], token
+    # The pure-digit form is a ratio-shaped non-citation, not a node key.
+    line = ("Globex Industries reported revenue of $2.1 billion in 2025. "
+            "[runs/32023260302]")
+    assert source_tokens(line) == [], source_tokens(line)
 
 
 def test_a_ratio_beside_a_goal_id_falls_back_to_the_corpus_wide_policy():
@@ -514,3 +531,167 @@ def test_a_ratio_beside_a_goal_id_falls_back_to_the_corpus_wide_policy():
     # `not cl.source_tokens` branch does not fire either.
     for r in (True, False):
         assert analyze(text, retrieved=lambda k, v: r) == [], r
+
+
+# ---------------------------------------------------------------------------
+#  — the bare-fraction defect: the node-key grammar no longer parses
+# prose slash-compounds, rate units and shell syntax as tree-node keys, and no
+# longer truncates file-path citations at the first non-conforming segment.
+# ---------------------------------------------------------------------------
+#
+# The goal's verification outcomes, verbatim:
+#   1. _NODE_KEY no longer matches 48/57, 1155/1155, 389/391, pip/sol or
+#      collided/perceived
+#   2. a genuine tree node key still matches
+#   3. a test carries both the positive and the negative cases
+# Everything below is the pin for that. The grammar's reasoning (the rejected
+# remedies, the census numbers, the one dropped pinned token) lives on _NODE_KEY
+# in the module; the comments here point at the MEASUREMENTS, not the grammar.
+
+# Every negative is a token MEASURED in the goal's recorded instance list
+# (fractions, prose word-pairs, rate units, shell syntax, git refs) — not an
+# invented one. If any of these starts matching again, an author's closure note
+# containing it is one cluster away from a Q4 FAIL it could never remedy,
+# because Q4 has no override by design.
+_NEGATIVE_NODEKEY_TOKENS = (
+    "48/57", "1155/1155", "389/391",            # fractions (outcome 1, verbatim)
+    "pip/sol", "collided/perceived",            # prose pairs (outcome 1, verbatim)
+    "124/125", "0/0/0", "20/40/80", "6/6",      # pass-counts (the _RATIO_RUN class)
+    "191/h", "7/h",                             # rate units (measured 2026-09-25)
+    "adopt/drop", "posts/h", "world/board",     # the 2026-09-06 counter-evidence
+    "claim/complete", "ts/domain/listed",       #   (all four have a letter in
+    "unmeasured/lanes", "true/true/true",       #   every segment, so a letter
+    "owner/name", "membership/turnover",        #   rule cannot catch these)
+    "records/files",                            # the sealed-JSON instance (echo)
+    "dev/null",                                 # shell redirect (cc-09 instance)
+    "origin/main", "refs/heads/main",           # git refs
+    "stdout/stderr", "try/except", "and/or",    # prose compounds
+    "48/57/2026",                               # a ratio wearing a date
+)
+
+
+def test_OUTCOME_1_g8858_bare_fractions_and_prose_pairs_are_not_node_keys():
+    """Outcome 1, verbatim plus the full recorded instance list.
+
+    Each token must be EXTRACTED by nothing: source_tokens returns no node-key
+    for it (a url/goal-id alongside it is unaffected, but that is not the case
+    here). The non-vacuity arm below proves the old grammar WOULD have matched
+    these, so a future no-op "fix" (e.g. deleting the extractor entirely) fails
+    the positive test instead of passing both.
+    """
+    from ground_truth_citation import _NODE_KEY
+    for tok in _NEGATIVE_NODEKEY_TOKENS:
+        toks = [v for k, v in source_tokens(tok) if k == "node-key"]
+        assert toks == [], (tok, toks)
+    # NON-VACUITY: the OLD grammar (pre-fix, pinned here as a reference pattern,
+    # not imported from the module so the module cannot be edited to pass this)
+    # matched every one of them.
+    old = re.compile(
+        r"\b(?:world/knowledge/tree/)?[a-z0-9]+(?:-[a-z0-9]+)*"
+        r"(?:/[a-z0-9]+(?:-[a-z0-9]+)*)+(?:\.md)?\b")
+    for tok in _NEGATIVE_NODEKEY_TOKENS:
+        assert old.search(tok), (tok, "old grammar must have matched; the "
+                                    "negative pin would be vacuous")
+        assert not _NODE_KEY.search(tok), (tok, "new grammar re-matches a "
+                                               "recorded false positive")
+
+
+def test_OUTCOME_2_g8858_genuine_tree_node_keys_still_match():
+    """Outcome 2: a genuine tree node key still matches.
+
+    The keys below are drawn from the live tree census (2026-10-03): every
+    multi-segment live key contains a kebab segment, and the four shapes here
+    are the ones authors actually cite -- the bare slug, the store-root form
+    (guard-6054), the .md file form, and the digit-bearing slug (the class the
+    _RATIO_RUN control protects). The file-path citations are the second half
+    of the goal's scope (the truncation fix, appended 2026-09-29): the same
+    run, terminated by a known extension, must arrive WHOLE, not truncated at
+    the first non-conforming segment.
+    """
+    node_keys = (
+        "system/daemon-only-architecture",
+        "world/knowledge/tree/pearl-bridge",
+        "world/knowledge/tree/perception/pearl-bridge-pearl",
+        "system/asp-115-tail",                 # kebab + digit segment
+        "world/knowledge/tree/system/pytest-throwaway-citation-fixture.md",
+        "agents/alpha/self.md",                # file form, no kebab in last seg
+        "claude/rules/read-before-edit",       # the largest demotable class
+    )
+    file_paths = (
+        "core/scripts/wm-read.sh",             # the goal's own fixture (cc-05)
+        "core/scripts/wm.py",                  # the relayed .py variant
+        "ops/mind-sidecar/provision-env.sh",   # the  truncation
+        "core/scripts/q4_provenance_sample.py",  # underscore segment, .py
+        "core/scripts/ground_truth_citation.py",
+        "src/main/java/AyoServer/BudgetMeterVerticle.java",  # uppercase segs
+        "world/telemetry/ledger.jsonl",        # the external-world .jsonl class
+        "core/githooks/commit-msg",            # no extension, kebab: node form
+    )
+    for tok in node_keys + file_paths:
+        toks = [v for k, v in source_tokens(tok) if k == "node-key"]
+        assert toks == [tok], (tok, toks)
+    # The old grammar TRUNCATED the file forms: pin the regression direction so
+    # a "simpler" grammar that reverts to the old segment class fails here.
+    old = re.compile(
+        r"\b(?:world/knowledge/tree/)?[a-z0-9]+(?:-[a-z0-9]+)*"
+        r"(?:/[a-z0-9]+(?:-[a-z0-9]+)*)+(?:\.md)?\b")
+    for tok in ("core/scripts/wm-read.sh", "core/scripts/wm.py",
+                "ops/mind-sidecar/provision-env.sh"):
+        m = old.search(tok)
+        assert m is None or m.group(0) != tok, (
+            tok, "old grammar did not truncate this form; the positive pin "
+                 "for the truncation fix would be vacuous")
+
+
+def test_OUTCOME_3_g8858_a_cluster_with_only_a_prose_slash_pair_is_unadjudicated():
+    """Outcome 3, the cluster-level consequence.
+
+    The expensive shape the goal measured: a cluster whose ONLY node-key token
+    was a prose slash-compound used to come back decorative-citation and could
+    never be remedied (the manifest can never contain "pip/sol"). With the
+    compound no longer extracted the phantom is gone, so the verdict can no
+    LONGER be decorative: a fact line with no other source token at all gets
+    the honest missing-citation (the same directional improvement the
+    _RATIO_RUN note measured for pass-counts), and a line that DOES carry a
+    non-checkable token (a goal-id) falls into the pre-existing corpus-wide
+    `if not checkable: continue` policy -- no finding. The non-vacuity arm
+    proves a GENUINE uncited node key on the same line shape still comes back
+    decorative: the grammar narrowed the phantom class, it did not switch the
+    check off.
+    """
+    text = ("## Findings\n\n"
+            "Globex Industries employs 12,000 people as of 2025. The rollout "
+            "split pip/sol across the two lanes.\n")
+    # pre-fix this cluster was decorative-citation on the phantom "pip/sol";
+    # now the honest verdict, in either retrieved state.
+    for r in (True, False):
+        assert _kinds(analyze(text, retrieved=lambda k, v: r)) == [
+            "missing-citation"], r
+    # with a non-checkable token present, the pre-existing policy applies:
+    # the cluster has a source token but nothing checkable -> no finding.
+    text_goalid = ("## Findings\n\n"
+                   "Globex Industries employs 12,000 people as of 2025, per "
+                   "g-115-9059. The rollout split pip/sol across the lanes.\n")
+    assert analyze(text_goalid, retrieved=lambda k, v: False) == []
+    # NON-VACUITY: the identical line with a genuine, never-fetched node key
+    # still fails -- narrowing must not read as silencing.
+    text2 = ("## Findings\n\n"
+             "Globex Industries employs 12,000 people as of 2025. The rollout "
+             "split per system/daemon-only-architecture.\n")
+    assert _kinds(analyze(text2, retrieved=lambda k, v: False)) == [
+        "decorative-citation"]
+
+
+def test_g8858_a_rate_unit_in_a_sentence_is_not_a_citation():
+    """The 2026-09-25 measured variant: '$0.191/h' became the node-key
+    '191/h' and came back decorative. The digits/letters unit is the shape a
+    bare 'all-digit' exclusion cannot catch, so pin the prose sentence, not
+    just the token. Pre-fix the cluster was decorative on '191/h'; now the
+    honest missing-citation, in either retrieved state."""
+    line = ("Acme reported the daemon drew $0.191/h over the quarter, "
+            "$4.7/h at the measured peak.")
+    assert source_tokens(line) == [], source_tokens(line)
+    text = "## Findings\n\n" + line + "\n"
+    for r in (True, False):
+        assert _kinds(analyze(text, retrieved=lambda k, v: r)) == [
+            "missing-citation"], r

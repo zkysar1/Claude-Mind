@@ -72,6 +72,13 @@ class StoreSpec:
     recompute_on_fields: FrozenSet[str] = frozenset()
     # set-field rejects field if field or field.split('.')[0] in this set.
     immutable_fields: FrozenSet[str] = frozenset()
+    # set-field with erase=1 may write these fields although they are immutable
+    # ( u3b): a member's forget blanks a guardrail's rule this way once its undo
+    # window is over. Always a subset of immutable_fields. The write is refused unless the
+    # record is retired and the backend is the single-box LocalBackend, because an in-place
+    # edit of an identity field forks the record at a cross-box merge (rb-5511) and one box
+    # has no merge. Empty => the store has no erase mode (the default).
+    erasable_fields: FrozenSet[str] = frozenset()
     # increment requires field.startswith(this) ("utilization." for rb/guard).
     increment_prefix: str = ""
     # Valid increment counters (UTILIZATION_COUNTERS for rb/guard).
@@ -1013,6 +1020,8 @@ STORE_REGISTRY: Dict[str, StoreSpec] = {
         # them: a divergent rule SPLITS rather than merging. This makes the write
         # path agree with the merge design instead of silently disagreeing.
         immutable_fields=frozenset({"created", "rule"}),
+        #  u3b: the rule, and only on a retired record on a local backend (see StoreSpec).
+        erasable_fields=frozenset({"rule"}),
         increment_prefix="utilization.",
         increment_counters=UTILIZATION_COUNTERS | UTILIZATION_CORRECTION_COUNTERS,
         amend_stamp_field="amended_fields",

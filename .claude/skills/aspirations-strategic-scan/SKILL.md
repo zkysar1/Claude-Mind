@@ -994,6 +994,9 @@ FOR EACH f in filed:
 
 ## Phase S4.6: Skill-Reconsolidation Cadence (g-355-07)
 
+**READ-ONLY since 2026-10-02 (owner-approved): no `--apply`. It filed before the
+distinct-goal check could run; g-115-4215 owns the fix and the restore.**
+
 Turns the g-355-06 invocation->outcome join into ACTION on the SAME
 strategic-scan cadence as S4.5. `skill-evaluate reconsolidation` ranks skills by
 `failure_rate x (1 - quality_overall)` from the skill-attribution ledger;
@@ -1472,22 +1475,17 @@ in-span invocations against 4410-5193 totals, i.e. ~0.5-1.0% each, unchanged in 
 from every prior row.
 
 ```
-Bash: py -3 core/scripts/skill-evaluate.py reconsolidation --min-failures 2 --apply
+Bash: py -3 core/scripts/skill-evaluate.py reconsolidation --min-failures 2
 Parse the JSON result.
-FIRST: compute the distinct-failing-goal count described above and report it
-alongside the candidate count. A 1-goal (or near-1) denominator means REPORT THE
-CONFOUND and route nothing — do not read the rates as skill quality.
-Output: ">> Skill reconsolidation: {candidate_count} candidate(s) | {len(filed)} NEW filed | {len(suppressed_dedup)} dedup-suppressed"
+FIRST: compute the distinct-failing-goal count described above (n_distinct, not a
+JSON key) and report it alongside the candidate count. A 1-goal (or near-1)
+denominator means REPORT THE CONFOUND and route nothing — do not read the rates
+as skill quality.
+Output: ">> Skill reconsolidation: {candidate_count} candidate(s) | {n_distinct} distinct failing goal(s)"
 FOR EACH c in reconsolidation_candidates[:5]:
     Output: "  [{c.skill}] failure_rate={c.failure_rate} priority={c.reconsolidation_priority} recent={c.recent_failing_goals[:3]}"
-FOR EACH f in filed:
-    Output: "  filed {f.goal_id} (reconsolidate:{f.skill})"
-# Fail-open: reconsolidation reads the skill-attribution ledger + quality yaml
-# and files via the daemon; any error (ledger read failure, empty join, filing
-# timeout) is logged and the scan CONTINUES to S5. Never blocks the strategic
-# scan. A filing that times out but lands is self-corrected by next-cadence
-# exact-origin_signal dedup (idempotent). Advisory-only: filed goals REVIEW the
-# skill, never auto-modify it.
+# Files nothing. A candidate with 2+ distinct failing goals is evidence for g-115-4215.
+# Fail-open: any error is logged and the scan CONTINUES to S5.
 ```
 
 ## Phase S5: Signal Triage and Action
@@ -1572,7 +1570,7 @@ Bash: echo "Return to orchestrator -- continue to next phase"
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 1.5, conditional)
-- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `silent-gap-audit.py --apply` (Phase S4.5 — 4-detector + rb-245 + dedup orphaned-asset audit), `skill-evaluate.py reconsolidation --apply` (Phase S4.6 — failing-invocation skill reconsolidation, advisory Investigate goals, exact-origin_signal dedup), `/create-aspiration` (for MEDIUM signals)
+- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `silent-gap-audit.py --apply` (Phase S4.5 — 4-detector + rb-245 + dedup orphaned-asset audit), `skill-evaluate.py reconsolidation` (Phase S4.6 — failing-invocation skill reconsolidation, read-only until g-115-4215), `/create-aspiration` (for MEDIUM signals)
 - **Reads**: Aspiration compact data, experience entries, tree summary, reasoning bank, Self, config
 - **Writes**: Working memory (`last_strategic_scan`, `strategic_scan_signals`, `portfolio_health_signal` slots), investigation goals (HIGH signals), evolution log
 - **Source routing**: All `aspirations-*.sh` calls receive `--source {source}` from the orchestrator

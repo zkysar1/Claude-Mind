@@ -398,7 +398,7 @@ LIFECYCLE_DISPOSITIONS = {
             "cc-09 (SID a30b1a3e) where the stop left agent store churn uncommitted and unpushed "
             "until a user-invoked /encode-session shipped it."),
     "park-resume": LifecycleDisposition(
-        kind=WORKER_ONLY, target="body-manifest.py park / resume / park-due / park-expired",
+        kind=WORKER_ONLY, target="body-manifest.py park / resume / park-due / park-expired / rejoin-wait",
         why="The reducer has no parked state at all -- it stops or it runs. A worker parks to stay "
             "RESUMABLE while its reducer or its work supply is gone, and now also at user /stop. "
             "Parking is deliberately NOT a close and deliberately does NOT stage the Body's WM "

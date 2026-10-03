@@ -24,10 +24,19 @@ def test_forget_is_a_removal_with_no_field_writes() -> None:
         assert plan.ok and plan.remove and plan.writes == {}, (kind, plan)
 
 
+def test_undo_is_a_restore_with_no_field_writes() -> None:
+    """The record an undo plans against is the RETAINED record: the item is no longer exposed."""
+    for kind in EDIT_FIELDS:
+        plan = plan_knowledge_edit(kind, {"item_id": "reefs"}, "undo")
+        assert plan.ok and plan.restore and not plan.remove and plan.writes == {}, (kind, plan)
+    assert not plan_knowledge_edit("node", _NODE, "forget").restore
+    assert not plan_knowledge_edit("node", _NODE, "edit", "x").restore
+
+
 def test_unresolved_record_is_refused_the_same_for_every_op_and_kind() -> None:
     """A miss never says which handles exist: one refusal, whatever was asked."""
     for kind in EDIT_FIELDS:
-        for op in ("edit", "forget"):
+        for op in ("edit", "forget", "undo"):
             assert plan_knowledge_edit(kind, None, op, "x").refusal == "not_addressable"
             assert plan_knowledge_edit(kind, {}, op, "x").refusal == "not_addressable"
 
@@ -61,5 +70,20 @@ def test_an_edit_that_would_write_an_exposure_field_is_refused(monkeypatch) -> N
     """
     monkeypatch.setitem(ke.EDIT_FIELDS, "node", "category")
     assert plan_knowledge_edit("node", _NODE, "edit", "x").refusal == "forbidden_field"
+    # Positive control: an untouched kind still plans normally under the same patch.
+    assert plan_knowledge_edit("guardrail", _GUARD, "edit", "x").ok
+
+
+def test_the_forget_marker_is_a_field_no_edit_may_write(monkeypatch) -> None:
+    """The exposure cut reads ``forgotten_at``, and the table names it so the two cannot drift.
+
+    An edit that wrote it would hide an item the member never forgot, or bring back one they
+    did, so it is held to the same runtime check as every other exposure-read field.
+    """
+    from knowledge_projection import FORGOTTEN_FIELD
+
+    assert FORGOTTEN_FIELD in ke.EXPOSURE_READ_FIELDS
+    monkeypatch.setitem(ke.EDIT_FIELDS, "hypothesis", FORGOTTEN_FIELD)
+    assert plan_knowledge_edit("hypothesis", _HYP, "edit", "x").refusal == "forbidden_field"
     # Positive control: an untouched kind still plans normally under the same patch.
     assert plan_knowledge_edit("guardrail", _GUARD, "edit", "x").ok

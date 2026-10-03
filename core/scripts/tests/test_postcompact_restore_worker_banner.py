@@ -230,3 +230,52 @@ def test_the_runner_still_gets_the_full_banner(repo):
     assert "Re-enter /aspirations loop" in out
     assert "REASONING SNAPSHOT" in out and REDUCER_GOAL in out
     assert "worker Body" not in out
+
+
+def _owed_close_rows(root: Path) -> None:
+    """The box's agent-wide diary after `iteration-close --phase verify` ran for
+    GOAL and nothing after it: the close is owed (g-115-5048)."""
+    diary = root / _paths.AGENTS_PARENT_DIR / AGENT / "session" / "execution-diary.jsonl"
+    rows = [{"entry_type": kind, "phase": "phase-5-verify", "goal_id": GOAL,
+             "content": f"{kind} phase-5-verify", "timestamp": "2026-09-23T11:36:00"}
+            for kind in ("phase_start", "phase_end")]
+    with open(diary, "a", encoding="utf-8") as f:
+        f.write("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_a_worker_is_not_sent_to_finish_the_reducers_close(repo):
+    """A worker runs no iteration-close, and sending it to one is the reducer-only
+    re-entry guard-517/guard-463 forbid. So the close-owed branch must not reach it,
+    even when the box's diary holds a verify row for the goal it anchors."""
+    _queue(repo, "completed")
+    _owed_close_rows(repo)
+    out = _worker_banner(repo)
+    assert "STALE ANCHOR" in out
+    assert "CLOSE OWED" not in out
+    assert "orchestrator-entry-battery" not in out
+
+
+def test_the_runner_is_told_when_its_close_is_owed(repo):
+    """Positive control through the real hook, same fixture: the runner anchors a
+    terminal goal whose verify ran and nothing after it. The banner says the close
+    is owed, not that the anchor is stale."""
+    agent_dir = repo / _paths.AGENTS_PARENT_DIR / AGENT
+    (agent_dir / "session" / "running-session-id").write_text(
+        RUNNER_SID + "\n", encoding="utf-8")
+    (agent_dir / "session" / "compact-checkpoint.yaml").write_text(
+        "session_id: %s\nactive_context: {}\n" % RUNNER_SID, encoding="utf-8")
+    (agent_dir / "session" / "iteration-checkpoint.json").write_text(json.dumps({
+        "goal_id": GOAL, "aspiration_id": "asp-375", "source": "world",
+        "phase": "selected", "selected_at": "2026-09-23T11:35:00"}),
+        encoding="utf-8")
+    _bind(repo, RUNNER_SID)
+    _queue(repo, "completed")
+    _owed_close_rows(repo)
+    r = _run(repo, RUNNER_SID)
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    out = r.stdout
+    assert "CLOSE OWED" in out, (out, r.stderr)
+    assert ("no phase_end after that verify for "
+            "state-update, learning-gate, productivity-check.") in out
+    assert "STALE ANCHOR" not in out
+    assert "worker Body" not in out

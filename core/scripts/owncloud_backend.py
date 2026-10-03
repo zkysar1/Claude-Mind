@@ -70,12 +70,18 @@ from storage_backend import (
 # is flipped (OWNCLOUD_GZIP_STORES, allowlisted keys only). One implementation
 # shared with every raw-boto3 caller; see _owncloud_codec's module docstring.
 from _owncloud_codec import (
+    CodecError as _CodecError,
     decode_response as _codec_decode_response,
     head_plain_md5 as _codec_head_plain_md5,
     content_matches as _codec_content_matches,
     should_encode as _codec_should_encode,
     put_kwargs as _codec_put_kwargs,
+    META_PLAIN_MD5 as _CODEC_META_PLAIN_MD5,
 )
+# g-358-202 (U2c): the composite head+segment layout for the goal-queue store. The READ side is
+# always on for the allowlisted store (a head is joined with its segments, a plain object is
+# untouched), like the codec's decode; the writer is behind its own default-OFF flag (U2d: _store_put).
+import _owncloud_composite as _composite
 
 # g-328-21: module logger for CAS (If-Match compare-and-swap) conflict telemetry.
 # Emits the running 409/412 conflict rate when a coordination-store merge-reconcile
@@ -617,6 +623,12 @@ class OwnCloudBackend:
         # token (fix #3). Per-process; the DDB lock serializes RMW on a key, so
         # read-then-write within a held lock is sequential and this is race-free.
         self._etags: dict = {}
+        # g-358-202 U2d: S3 key -> (ETag, bytes) of the composite HEAD this process last read or
+        # wrote. _store_put plans a write against it only while that ETag is still the fence, so a
+        # write PUTs just the segments the head does not already name. _composite_warned holds the
+        # (key, reason) pairs it has already logged for a store the layout refused.
+        self._composite_heads: dict = {}
+        self._composite_warned: set = set()
         # local-path -> monotonic time of the last HeadObject freshness check.
         self._cache_check: dict = {}
         # S3 keys whose LAST _refresh saw the both-diverged state (local holds
@@ -804,6 +816,12 @@ class OwnCloudBackend:
 
     def _s3_key(self, path: PathLike) -> str:
         return f"{self._customer_prefix()}{self.env_id}/{self._rel(path)}"
+
+    def _rel_of_key(self, key: str) -> str:
+        """The env-scoped logical path (`_rel`) an S3 key was built from: the inverse of `_s3_key`,
+        or "" for a key outside this backend's `<customer>/<env_id>/` namespace."""
+        prefix = f"{self._customer_prefix()}{self.env_id}/"
+        return key[len(prefix):] if key.startswith(prefix) else ""
 
     def _lock_key(self, lock_path: PathLike) -> str:
         # The DDB lock key is the customer+env-scoped logical path of the lock
@@ -1071,6 +1089,51 @@ class OwnCloudBackend:
             self._cache_errors = getattr(self, "_cache_errors", 0) + 1
             return None
 
+    def _composite_whole(self, key: str, body: bytes, etag, local: Optional[Path] = None):
+        """g-358-202 (U2c): the READ half of the composite layout, one adapter for the three read
+        paths below. If `body` (the decoded object at `key`) is a composite HEAD of an allowlisted
+        store, return (the whole legacy file joined from its segment objects, the ETag of the head it
+        was joined from). Anything else comes back as (body, etag) untouched, so every other object
+        is byte-identical to the pre-composite backend.
+
+        The join, the bounded retry and the fence rule live in `_owncloud_composite.read_whole`,
+        shared with the raw-S3 readers; this supplies only its two I/O steps. `local` (passed by
+        `_refresh` alone) lets a segment the mirror already carries be reused after an md5 check
+        against the head's manifest, instead of fetched."""
+        if not _composite.is_head(body) or not _composite.reads_composite(self._rel_of_key(key)):
+            return body, etag
+        try:
+            local_raw = local.read_bytes() if local is not None else None
+        except OSError:
+            local_raw = None  # an unreadable mirror just means fetch every segment
+
+        def fetch_segment(name: str) -> bytes:
+            seg_key = _composite.segment_s3_key(key, name)
+            try:
+                obj = self.s3.get_object(Bucket=self.bucket, Key=seg_key)
+            except ClientError as e:
+                if e.response["Error"]["Code"] in _NOT_FOUND:
+                    raise _composite.SegmentMissing(seg_key) from e
+                _reraise_access_denied(e, "composite segment GetObject")
+                raise
+            try:
+                return _codec_decode_response(obj, key=seg_key)
+            except _CodecError as e:
+                raise _composite.IntegrityError(str(e)) from e
+
+        seen = [(body, etag)]  # the newest head read and its ETag: what a re-read replaces
+
+        def reread_head():
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+            seen[0] = (_codec_decode_response(obj, key=key), obj["ETag"])
+            return seen[0]
+
+        raw, joined_etag = _composite.read_whole(body, etag, fetch_segment, reread_head, local_raw=local_raw)
+        head, head_etag = seen[0]
+        if joined_etag == head_etag and _composite.is_head(head):
+            self._composite_heads[key] = (head_etag, head)  # the old head _store_put plans a write against
+        return raw, joined_etag
+
     def _refresh(self, path: PathLike, force_fresh: bool) -> Path:
         """Ensure the local cache file is current vs S3, returning its path. On a
         fresh-enough cache (within cache_ttl) and not force_fresh, skips the HEAD.
@@ -1196,6 +1259,10 @@ class OwnCloudBackend:
             # g-358-11: the mirror holds DECODED bytes — every consumer above
             # the backend keeps reading plaintext, whatever the encoding.
             body = _codec_decode_response(obj, key=key)
+        # g-358-202: a composite HEAD is not the file. Join it with its segments so the mirror, the
+        # baseline stamp and the fence below all describe the whole legacy file; `etag` follows the
+        # head the bytes were joined from. Anything but an allowlisted store's head passes through.
+        body, etag = self._composite_whole(key, body, etag, local)
         _atomic_write_local(local, body)
         self._etags[key] = etag
         # Reaching this line requires verdict=="download" or local-absent --
@@ -1474,7 +1541,10 @@ class OwnCloudBackend:
                     f"absent in S3 store: s3://{self.bucket}/{key}") from e
             _reraise_access_denied(e, "read_authoritative_bytes GetObject")
             raise
-        return _codec_decode_response(obj, key=key)  # g-358-11: plaintext out
+        body = _codec_decode_response(obj, key=key)  # g-358-11: plaintext out
+        # g-358-202: the WHOLE file, joined from a composite head's segments, still without
+        # touching the mirror.
+        return self._composite_whole(key, body, obj["ETag"])[0]
 
     def exists(self, path: PathLike) -> bool:
         try:
@@ -1808,6 +1878,57 @@ class OwnCloudBackend:
             return _codec_put_kwargs(body)
         return {"Body": body}
 
+    def _store_put(self, path: PathLike, key: str, body: bytes, kw: dict):
+        """The ONE PUT seam of the two write sites (_put, _merge_reconcile_put). `kw` is the
+        whole-object PUT they built (Bucket, Key, the codec's body kwargs, IfMatch or IfNoneMatch)
+        and `body` the PLAINTEXT store bytes; returns the response of the PUT that commits the write.
+
+        g-358-202 U2d. Unless the composite writer is on for this store (_composite.should_composite:
+        the OWNCLOUD_COMPOSITE_STORES flag names this env and the path is allowlisted) this is the
+        pre-U2d PUT, untouched. When it is on, the write is: each segment object the old head does not
+        already name, created if absent (immutable and content-addressed, so a 412 means the same bytes
+        are already there), THEN the head under the caller's fence. The head PUT is the only commit
+        point: a failure or a 412 before it leaves orphan segments and the old head exactly as it was.
+
+        The head is stored PLAIN and padded to HEAD_MIN_BYTES (a gzipped or small head would be inlined
+        into the key's metadata file with every retained version: outcome 6 condition C2, rb-12204),
+        and its plain-md5 metadata is the md5 of the JOINED bytes, which content_matches compares with
+        the local file. A segment is gzipped exactly when the store itself would be. A store under
+        MIN_RAW_BYTES, or one `split` refuses, goes whole; that PUT also reverts the layout, which every
+        reader tolerates (read_whole returns a whole object unchanged)."""
+        rel = self._rel(path)
+        if not _composite.should_composite(rel, self.env_id):
+            return self.s3.put_object(**kw)
+        plan = None
+        if len(body) >= _composite.MIN_RAW_BYTES:
+            held = self._composite_heads.get(key)
+            old_head = held[1] if held is not None and held[0] == kw.get("IfMatch") else None
+            try:
+                plan = _composite.plan_write(old_head, body)
+            except _composite.NotSplittable as exc:
+                if (key, str(exc)) not in self._composite_warned:
+                    self._composite_warned.add((key, str(exc)))
+                    _LOG.warning("owncloud composite: %s goes whole, the layout refused it: %s", key, exc)
+        if plan is None:
+            return self.s3.put_object(**kw)
+        encode = _codec_should_encode(rel, self.env_id)
+        for name, seg in plan.segments.items():
+            skw = dict(Bucket=self.bucket, Key=_composite.segment_s3_key(key, name), IfNoneMatch="*")
+            skw.update(_codec_put_kwargs(seg) if encode else {"Body": seg})
+            try:
+                self.s3.put_object(**skw)
+            except ClientError as e:
+                if e.response["Error"]["Code"] not in _PRECONDITION:
+                    _reraise_access_denied(e, "composite segment PutObject")
+                    raise
+        head = _composite.pad_head(plan.head)
+        hkw = {k: v for k, v in kw.items() if k not in ("Body", "ContentEncoding", "Metadata")}
+        hkw["Body"] = head
+        hkw["Metadata"] = {_CODEC_META_PLAIN_MD5: hashlib.md5(body).hexdigest()}
+        r = self.s3.put_object(**hkw)
+        self._composite_heads[key] = (r["ETag"], head)
+        return r
+
     def _put(self, path: PathLike, body: bytes, *,
              local_is_source: bool = False) -> WriteResult:
         # local_is_source=True (mirror_put, g-115-7257): `body` was READ FROM the
@@ -1992,7 +2113,7 @@ class OwnCloudBackend:
             # 412, so both count in the conflict-rate denominator.
             self._cas_writes += 1
         try:
-            r = self.s3.put_object(**kw)
+            r = self._store_put(path, key, body, kw)
         except ParamValidationError as e:
             # botocore < 1.35 rejects PutObject(IfMatch=...) CLIENT-SIDE, before
             # any network call — the exact failure the init preflight guards, but
@@ -2067,7 +2188,9 @@ class OwnCloudBackend:
                 return b"", None
             raise
         # g-358-11: merge handlers see PLAINTEXT; the ETag stays the CAS token.
-        return _codec_decode_response(obj, key=key), obj["ETag"]
+        # g-358-202: and the WHOLE file, joined from a composite head's segments, so a handler is
+        # never run over a segment; the token is that of the head the bytes were joined from.
+        return self._composite_whole(key, _codec_decode_response(obj, key=key), obj["ETag"])
 
     def _merge_reconcile_put(self, path: PathLike, key: str, local: Path,
                              body: bytes, handler,
@@ -2176,7 +2299,7 @@ class OwnCloudBackend:
                 kw["IfMatch"] = remote_etag  # CAS on the version we merged against
             self._cas_writes += 1  # g-328-21: each merge attempt is a fenced write
             try:
-                r = self.s3.put_object(**kw)
+                r = self._store_put(path, key, merged, kw)
             except ClientError as e:
                 if e.response["Error"]["Code"] in _PRECONDITION:
                     self._cas_conflicts += 1  # g-328-21: 412 during merge

@@ -67,6 +67,13 @@ from _retrieval_trace import segment_parent as _retrieval_trace_parent
 # (), never a third transcription. _goal_census imports nothing at all,
 # so it is safe at module level like the two above.
 from _goal_census import derive_progress as _derive_progress
+from _goal_census import CENSUS_ID_SET_KEYS as _CENSUS_ID_SET_KEYS
+# A member's forget/undo of a hypothesis is an EVENT the pipeline merge orders by its own stamp
+# ( u7a). The two field names and the statement fields a forget blanks each come from
+# the exposure module, one definition apiece; it is stdlib-only, so safe at module level.
+from knowledge_projection import FORGOTTEN_FIELD as _FORGOTTEN_FIELD
+from knowledge_projection import RESTORED_FIELD as _RESTORED_FIELD
+from knowledge_projection import item_text_fields as _item_text_fields
 
 # Ring-buffer ceiling for team-state.recent_completions. Kept in sync with
 # core/scripts/team-state.py MAX_RECENT_COMPLETIONS (not imported — that module
@@ -1106,7 +1113,11 @@ def _merge_goal(a: dict, b: dict) -> dict:
         decides their survival). Excludes _GOAL_EXPLICIT_MERGE, whose members
         already read from BOTH sides. Mirrors the loop _merge_aspiration_record
         has carried since g-115-4163, one level down.
-      - lastAchievedAt / last_substantive_at : strictly-newer wins (only advance)
+      - lastAchievedAt / last_substantive_at : strictly-newer wins (only advance),
+        EXCEPT that a CLEARED value (key present, None) on the base-pick winner
+        holds when that record's last_modified postdates the other side's value
+        (g-115-11591: the recurring=false cascade clears lastAchievedAt, and an
+        older peer copy must not bring it back)
       - achievedCount / longest* / substantive_* : numeric MAX (only grow)
       - created_at                            : OLDER wins (stable allocation ts)
       - status: recurring goals CYCLE (completed -> recover-recurring -> pending),
@@ -1137,7 +1148,7 @@ def _merge_goal(a: dict, b: dict) -> dict:
         otherwise picks the FIRST ARG between value-identical order-divergent
         copies, and dict(win) key order reaches the bytes).
     Every rule is a symmetric function of (a, b) -> both machines converge."""
-    win, _lose = _order_by_ts(a, b, "last_modified")
+    win, lose = _order_by_ts(a, b, "last_modified")
     out = dict(win)
     # Goal-level fields present on only ONE side survive the base-pick
     # (). ``out = dict(win)`` alone drops them wholesale, and the
@@ -1168,6 +1179,17 @@ def _merge_goal(a: dict, b: dict) -> dict:
         if va is None and vb is None:
             continue
         out[f] = va if (_newer(va, vb) or va == vb) else vb
+        # A CLEARED value is a deletion, not a missing timestamp ().
+        # Writers clear to None rather than pop, because a popped key comes back
+        # through the one-sided-key loop above. The clear holds on the record
+        # that won the base-pick, when it was stamped after the value it erases.
+        # An achievement newer than the clear still wins, an ABSENT key still
+        # sorts oldest, and a clear on the losing record defers to the winner's
+        # snapshot. No writer creates a None here, so a present None is a
+        # deliberate clear. Symmetric: win/lose come from _order_by_ts.
+        if (f in win and win[f] is None and lose.get(f) is not None
+                and _newer(win.get("last_modified"), lose[f])):
+            out[f] = None
     # Monotonic counters: MAX (ignore non-numeric / bool).
     for f in _GOAL_MAX_FIELDS:
         nums = [v for v in (a.get(f), b.get(f))
@@ -1562,6 +1584,9 @@ def _merge_archived_census(a_census, b_census):
         associative; sorted deduped lists for the byte-identical result). Ids
         are the post-cutover census ground truth AND the resurrection tombstone
         consumed by _merge_goals.
+      - ``evicted_by_closer_role`` : per-role goal-id SET UNION, exactly as
+        ``evicted_ids`` (g-375-38). A canonical-max pick would keep one box's
+        dict whole and drop every role entry only the other box wrote.
       - ``by_status``   : the FROZEN legacy count baseline. Per-status MIN when
         both sides carry the key (post-cutover only census REPAIRS mutate it,
         and repairs SHRINK — min converges to the most-repaired value, so a
@@ -1580,24 +1605,26 @@ def _merge_archived_census(a_census, b_census):
         return None
     if a is None or b is None:
         out = dict(a if a is not None else b)
-        ids = out.get("evicted_ids")
-        if isinstance(ids, dict):   # normalize shape even on the one-sided path
-            out["evicted_ids"] = {
-                s: sorted({str(x) for x in v})
-                for s, v in sorted(ids.items()) if isinstance(v, list) and v}
+        for key in _CENSUS_ID_SET_KEYS:   # normalize shape even on the one-sided path
+            ids = out.get(key)
+            if isinstance(ids, dict):
+                out[key] = {
+                    s: sorted({str(x) for x in v})
+                    for s, v in sorted(ids.items()) if isinstance(v, list) and v}
         return {k: out[k] for k in sorted(out)}
     out = {}
-    ids_a = a.get("evicted_ids") if isinstance(a.get("evicted_ids"), dict) else {}
-    ids_b = b.get("evicted_ids") if isinstance(b.get("evicted_ids"), dict) else {}
-    merged_ids = {}
-    for s in set(ids_a) | set(ids_b):
-        va = ids_a.get(s) if isinstance(ids_a.get(s), list) else []
-        vb = ids_b.get(s) if isinstance(ids_b.get(s), list) else []
-        u = sorted({str(x) for x in va} | {str(x) for x in vb})
-        if u:
-            merged_ids[s] = u
-    if merged_ids:
-        out["evicted_ids"] = {s: merged_ids[s] for s in sorted(merged_ids)}
+    for key in _CENSUS_ID_SET_KEYS:
+        ids_a = a.get(key) if isinstance(a.get(key), dict) else {}
+        ids_b = b.get(key) if isinstance(b.get(key), dict) else {}
+        merged_ids = {}
+        for s in set(ids_a) | set(ids_b):
+            va = ids_a.get(s) if isinstance(ids_a.get(s), list) else []
+            vb = ids_b.get(s) if isinstance(ids_b.get(s), list) else []
+            u = sorted({str(x) for x in va} | {str(x) for x in vb})
+            if u:
+                merged_ids[s] = u
+        if merged_ids:
+            out[key] = {s: merged_ids[s] for s in sorted(merged_ids)}
     bs_a = a.get("by_status") if isinstance(a.get("by_status"), dict) else {}
     bs_b = b.get("by_status") if isinstance(b.get("by_status"), dict) else {}
     merged_bs = {}
@@ -1614,7 +1641,7 @@ def _merge_archived_census(a_census, b_census):
     if merged_bs or "by_status" in a or "by_status" in b:
         out["by_status"] = {s: merged_bs[s] for s in sorted(merged_bs)}
     for k in sorted(set(a) | set(b)):
-        if k in ("evicted_ids", "by_status"):
+        if k in _CENSUS_ID_SET_KEYS or k == "by_status":
             continue
         va, vb = a.get(k), b.get(k)
         if va is None:
@@ -1820,6 +1847,39 @@ _PIPELINE_NEWER_FIELDS = ("last_reviewed", "outcome_date", "reflected_date")
 _PIPELINE_SET_DOMINATES_FIELDS = (
     "outcome", "surprise", "experience_ref", "outcome_detail")
 
+# --- a member's forget / undo of a hypothesis: ordered by EVENT ( u7a) ----------
+# knowledge-edit-apply.py forgets a hypothesis by stamping forgotten_at and blanking the
+# statement (claim, title), and undoes it by stamping restored_at FIRST, putting the statement
+# back, and clearing forgotten_at LAST. The base rule below cannot carry either. It picks by
+# stage and then by content, so a stale copy that was further along, or sorted greater, brought
+# the original statement back under the marker (2 of 4 probe statements, measured). A copy whose
+# marker was cleared holds no trace of the forget, and the side-only union would put a stale
+# marker back on it, so a stale copy that still held the forget beat the undo just the same.
+# The statement and the two stamps are therefore ONE group, taken whole from the copy whose
+# event is later and never mixed field by field, so a merge can only produce a state a writer
+# itself passed through. The group's order is a function of its content alone, which is what
+# keeps the fold associative: the winner of any set of copies is the greatest, however folded.
+_FORGET_GROUP = tuple(_item_text_fields("hypothesis")) + (_FORGOTTEN_FIELD, _RESTORED_FIELD)
+
+
+def _forget_event(rec: dict) -> tuple:
+    """Where one copy stands in a member's forget/undo history, as a tuple that sorts a copy
+    higher the further along it is. A record nobody forgot sorts under every record somebody did.
+
+    - the later of the two stamps (whole-second ISO, so text order is time order);
+    - hidden: the forget is the latest event. A tie hides, so when two boxes forget and undo in
+      the same second the member's forget stands;
+    - cleared: the marker is gone. That is how a finished undo differs from one that has stamped
+      restored_at and not yet cleared the marker, which carry the SAME stamp;
+    - the group's canonical form, so equal events still pick one copy from content alone and
+      never by which side was local (guard-907).
+    """
+    forgot = _ts_key(rec.get(_FORGOTTEN_FIELD))
+    restored = _ts_key(rec.get(_RESTORED_FIELD))
+    group = {name: rec[name] for name in _FORGET_GROUP if name in rec}
+    return (max(forgot, restored), 1 if forgot and forgot >= restored else 0,
+            0 if forgot else 1, _canon(group))
+
 # --- replay_metadata: field-wise, never whole-from-base () --------
 # A pipeline record's replay_metadata is a NESTED dict. _merge_pipeline_record
 # took it WHOLE from the content-tiebreak base, and a copy carrying
@@ -1897,6 +1957,9 @@ def _merge_pipeline_record(a: dict, b: dict) -> dict:
         taken whole from the content-tiebreak base (g-115-10679) — otherwise a
         flagless copy that sorts first drops encoded_via_chronic and regresses
         replay_count
+      - claim / title / forgotten_at / restored_at: ONE group, taken whole from the copy whose
+        member forget/undo event is later (_forget_event, g-335-1726 u7a). A record neither
+        side of which was ever forgotten skips this and merges exactly as before.
       - key order: canonicalized when the sides' key sequences diverged
         (_commutative_key_order, g-115-2355 — the equal-rank canon tiebreak
         otherwise picks the FIRST ARG between value-identical order-divergent
@@ -1936,6 +1999,17 @@ def _merge_pipeline_record(a: dict, b: dict) -> dict:
         out["replay_metadata"] = _merge_replay_metadata(
             ma if isinstance(ma, dict) else {},
             mb if isinstance(mb, dict) else {})
+    #  u7a: the forget/undo group is decided by its own event, after the base rules,
+    # which would otherwise take it whole from the base or union a cleared marker back from the
+    # other side. A key the winner lacks is dropped, and one it has keeps its place in `out`.
+    ea, eb = _forget_event(a), _forget_event(b)
+    if ea[0] or eb[0]:
+        winner = a if ea >= eb else b
+        for name in _FORGET_GROUP:
+            if name in winner:
+                out[name] = winner[name]
+            else:
+                out.pop(name, None)
     return _commutative_key_order(a, b, out)
 
 

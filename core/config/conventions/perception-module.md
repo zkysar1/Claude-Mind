@@ -500,7 +500,9 @@ narrator did not think to say.
 ### 9.2 The decision line
 
 The rule asks for exactly one recorded line per reacted-to percept, in the
-session's own record (working memory or journal — never a belief store):
+session's own record: the execution diary, by `execution-diary.sh append`
+(working memory and the journal also read as a reaction). Never a belief store,
+and never a body/finding channel, whose files are the member's surface:
 
 ```
 perception-reaction: unit=<unit> changed=<delta vs my last belief> decision=<act|fold|ignore> reason=<why>

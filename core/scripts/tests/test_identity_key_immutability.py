@@ -129,3 +129,24 @@ def test_goal_identity_is_deliberately_excluded():
         "(created_at, title) alone, `title` became an identity field on a store "
         "whose titles are edited routinely — re-derive this exemption.")
     assert "_goal_identity" not in IDENTITY_TO_STORE
+
+
+def test_the_erase_mode_unlocks_only_the_rule_and_only_what_a_forget_removes():
+    """The erase mode ( u3b) is the one write that may change an identity field, so each
+    store that has it is named here, and what it may reach is the member-visible text and nothing else.
+
+    It exists for a single box on the local backend, where no cross-box merge reads the edit as a new
+    record (the daemon refuses it anywhere else). A second store gaining one, or the guardrail's
+    growing past its rule (``created`` is the other half of its identity), is a decision to take here,
+    not a field added to a set."""
+    from knowledge_projection import item_text_fields  # noqa: PLC0415
+
+    with_erase = {name: set(spec.erasable_fields) for name, spec in STORE_REGISTRY.items()
+                  if spec.erasable_fields}
+
+    assert with_erase == {"guardrails": {"rule"}}
+    for name, fields in with_erase.items():
+        assert fields <= set(STORE_REGISTRY[name].immutable_fields), \
+            f"{name}: an erasable field is one that is otherwise locked"
+    assert with_erase["guardrails"] == set(item_text_fields("guardrail")), \
+        "one table: the fields a forget removes are the fields the store lets the erase reach"

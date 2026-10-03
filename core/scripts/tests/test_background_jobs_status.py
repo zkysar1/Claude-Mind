@@ -1,7 +1,7 @@
 """Regression tests for background-jobs.py check_job() status mapping.
 
 The completion_check exit-code -> status contract (run_completion_check docstring:
-0=completed, 1=still running, 2=failed, other=unknown) is load-bearing for ALL
+0=completed, 1=still running, 2=failed, 3=unmeasured, other=unknown) is load-bearing for ALL
 long-running background-job monitoring. Before g-115-16 the check_job() dead-PID
 branch mapped only 0 and 2; exit 1 ("still running") fell through to "unknown",
 which MONITOR-style consumers treat like "failed" -- false-failing a healthy
@@ -46,6 +46,7 @@ def _job(completion_check="stub"):
         (0, "completed"),
         (1, "running"),  # the  fix: previously fell through to "unknown"
         (2, "failed"),
+        (3, "unmeasured"),  # : previously "unknown", which MONITOR-style consumers read as failed
         (99, "unknown"),
     ],
 )

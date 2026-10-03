@@ -61,6 +61,11 @@ def _compute_drift_total():
         "reasoning_bank": audit.load_reasoning_bank(),
         "guardrails": audit.load_guardrails(),
         "pipeline": audit.load_pipeline(),
+        # : archive union — see the audit's build_id_sets. The
+        # ratchet's baseline counts what the AUDIT reports, so it must see
+        # the same id sets or it ratchets against a drift number the audit
+        # no longer produces.
+        "pipeline_archive": audit.load_pipeline_archive(),
         "pattern_signatures": audit.load_pattern_signatures(),
         "experience": audit.load_all_experiences(),
     }

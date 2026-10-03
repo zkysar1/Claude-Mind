@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -45,6 +46,10 @@ UNEVALUATABLE = {"type": "code_check", "target": "x"}
 UNCITED = "Widget Industries employs 12,000 people across its plants.\n"
 CITED_UNRESOLVABLE = ("Acme Corporation reported revenue of 4.2 billion in 2024,\n"
                       "per https://example.invalid/some-url.\n")
+# Per-session scratch paths, built from the dir name the advisory's predicate reads.
+from _paths import SESSIONS_DIRNAME  # noqa: E402
+SCRATCH = f"agents/charlie/{SESSIONS_DIRNAME}/57c55134e5b5429cbfa2dbd142b9574d/scratch/run.log"
+PROBE_OUT = f"agents/charlie/{SESSIONS_DIRNAME}/57c55134e5b5429cbfa2dbd142b9574d/scratch/probe.out"
 
 
 class Harness:
@@ -197,6 +202,88 @@ def test_a_q4_refusal_gives_each_finding_kind_its_own_remedy(tmp_path):
     assert "missing-citation:" in remedy and "decorative-citation:" in remedy, remedy
     assert "with no offset or limit" in remedy, remedy
     assert "cat or curl is invisible" not in remedy, remedy
+
+
+# ─── the session-scratch advisory reaches the closer () ────────────
+
+def test_each_session_scratch_citation_is_a_warning_and_a_cited_note_adds_none(tmp_path):
+    """The gate's advisory () prints on stderr, which the pre-flight reads
+    only for unreadable output, so the closer never saw it while the note could
+    still change. Now each citation in the gate's JSON line is one warning naming
+    the paragraph, the path and what is missing, and the verdict is unchanged: the
+    advisory never refuses. The control, on the same harness, is a note with the
+    lines quoted beside the path and the host named, and it adds no warning
+    (guard-4166)."""
+    bare = f"{GOOD_NOTE}\n\nThe run is kept at {SCRATCH}.\n\nThe probe output is {PROBE_OUT}."
+    r = run(Harness(tmp_path, note=bare))
+    ce = r["results"]["closure-evidence"]
+    assert (ce["state"], r["rc"]) == ("PASS", 0)
+    assert ce["findings"] == [
+        f"warning: paragraph 2 cites session scratch no other box can open: {SCRATCH} "
+        "(no lines inline beside it; the note names no host)",
+        f"warning: paragraph 3 cites session scratch no other box can open: {PROBE_OUT} "
+        "(no lines inline beside it; the note names no host)",
+        "warning: keep each path above as a pointer; beside it, quote in backticks the lines the "
+        f"claim rests on, and name the box as \"hostname {socket.gethostname()}\" (g-375-52, guard-7485)"]
+    cited = (f"{GOOD_NOTE}\n\nMeasured on hostname box-7: `VERDICT: CLEAN  TOTAL: 42 passed` "
+             f"by the suite run kept at {SCRATCH}.")
+    r = run(Harness(tmp_path, note=cited))
+    assert (r["results"]["closure-evidence"]["state"], r["rc"]) == ("PASS", 0)
+    assert r["results"]["closure-evidence"]["findings"] == []
+
+
+def test_a_skipped_table_check_keeps_its_warnings_and_a_faulted_advisory_is_one(
+        tmp_path, monkeypatch, capsys):
+    """The advisory reads the note whatever the table check decided, so a goal with
+    nothing to evidence still shows its warnings, and still reads SKIPPED, never
+    PASS. A faulted advisory is a warning too, so a check that did not run never
+    reads as a clean note (guard-2421). The faulted line comes from the real gate,
+    run in-process with its predicate made to raise as the gate's own test does,
+    so renaming the field on either side turns this red."""
+    h = Harness(tmp_path)
+    h.goal_json.write_text(json.dumps({"id": "g-1-1", "outcome_note": f"Kept at {SCRATCH} for review."}),
+                           encoding="utf-8")
+    r = run(h)
+    ce = r["results"]["closure-evidence"]
+    assert ce["state"] == "SKIPPED"
+    assert ce["findings"][0] == (f"warning: paragraph 1 cites session scratch no other box can open: "
+                                 f"{SCRATCH} (no lines inline beside it; the note names no host)")
+    spec = importlib.util.spec_from_file_location("closure_evidence_gate_cli",
+                                                  CORE_SCRIPTS / "closure-evidence-gate.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(cli, "scratch_citations", boom)
+    monkeypatch.setattr(cli, "_gate_log", lambda *a, **k: None)  # no gate-firing row is written
+    faulted = tmp_path / "faulted.json"
+    faulted.write_text(json.dumps({**GOAL, "outcome_note": f"{GOOD_NOTE}\n\nKept at {SCRATCH}."}),
+                       encoding="utf-8")
+    assert cli.main(["--goal", "g-1-1", "--goal-json", str(faulted)]) == 0
+    line = capsys.readouterr().out.strip().splitlines()[-1]
+    r = run(Harness(tmp_path, overrides={"closure-evidence-gate.py": (0, line, "")}))
+    ce = r["results"]["closure-evidence"]
+    assert (ce["state"], ce["findings"]) == ("PASS", [
+        "warning: the session-scratch advisory did not run (boom), so its silence says nothing "
+        "about the note"])
+
+
+def test_advisory_entries_this_cannot_read_are_one_warning_never_a_crash(tmp_path):
+    """Every other gate output this cannot read becomes a verdict, never a crash,
+    because a crash costs every other check's verdict (guard-2298). Advisory entries
+    of a shape it cannot read are one warning, and the table's verdict stands. The
+    real gate never writes these shapes, so the lines are canned; the well-formed
+    control is the first test in this section."""
+    for bad in (["x"], [{"paragraph": 1, "paths": [None], "missing": ["excerpt"]}], {"paragraph": 1}):
+        line = {"gate": "closure-evidence-gate", "decision": "pass", "goal_id": "g-1-1",
+                "note_source": "the record's outcome_note", "problems": [], "warnings": [],
+                "reason": None, "scratch_citations": bad}
+        r = run(Harness(tmp_path, overrides={"closure-evidence-gate.py": (0, json.dumps(line), "")}))
+        ce = r["results"]["closure-evidence"]
+        assert (ce["state"], r["rc"], len(ce["findings"])) == ("PASS", 0, 1), bad
+        assert ce["findings"][0].startswith(
+            "warning: the session-scratch advisory's entries could not be read ("), bad
 
 
 # ─── not-applied and could-not-run are never a pass ─────────────────────────

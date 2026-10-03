@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -160,6 +161,34 @@ def check_closure_evidence(goal_id: str, source: str, summary_file: Optional[str
         return unreadable("closure-evidence", rc, out, err)
     note = d.get("note_source") or "?"
     warns = [f"warning: {w}" for w in (d.get("warnings") or [])]
+    # The session-scratch advisory () speaks on the gate's stderr, which
+    # this check reads only when the output is unreadable, so a closer running the
+    # pre-flight never saw it while the note could still change. Each citation it
+    # found also rides the JSON line and becomes a warning here (). A
+    # faulted advisory is a warning too: a check that did not run is not a clean
+    # note (guard-2421). So are entries of a shape this cannot read, since a crash
+    # here would cost every other check's verdict (guard-2298).
+    said = {"excerpt": "no lines inline beside it", "host": "the note names no host"}
+    scratch = []
+    try:
+        for c in d.get("scratch_citations") or []:
+            paths = c.get("paths") or []
+            more = f" and {len(paths) - 2} more" if len(paths) > 2 else ""
+            scratch.append(f"warning: paragraph {c.get('paragraph')} cites session scratch no other "
+                           f"box can open: {', '.join(paths[:2])}{more} "
+                           f"({'; '.join(said.get(m, m) for m in c.get('missing') or [])})")
+    except (AttributeError, TypeError) as e:
+        scratch = ["warning: the session-scratch advisory's entries could not be read "
+                   f"({type(e).__name__}: {e}), so it is not shown"]
+    else:
+        if scratch:
+            scratch.append("warning: keep each path above as a pointer; beside it, quote in backticks "
+                           "the lines the claim rests on, and name the box as \"hostname "
+                           f"{socket.gethostname()}\" (g-375-52, guard-7485)")
+    warns += scratch
+    if d.get("scratch_advisory_error"):
+        warns.append("warning: the session-scratch advisory did not run "
+                     f"({d['scratch_advisory_error']}), so its silence says nothing about the note")
     if rc == 3 and d["decision"] == "block":
         return verdict("closure-evidence", FAIL, f"refused. Note checked: {note}",
                        list(d.get("problems") or []) + warns,
@@ -170,7 +199,7 @@ def check_closure_evidence(goal_id: str, source: str, summary_file: Optional[str
         return verdict("closure-evidence", PASS, f"every outcome row is evidenced. Note checked: {note}",
                        warns)
     if rc == 0 and d["decision"] == "noop":
-        return verdict("closure-evidence", SKIPPED, f"did not apply: {d.get('reason')}")
+        return verdict("closure-evidence", SKIPPED, f"did not apply: {d.get('reason')}", warns)
     if rc == 0 and d["decision"] == "error":
         return verdict("closure-evidence", ERROR, f"not checked: {d.get('reason')}")
     return unreadable("closure-evidence", rc, out, err, why=f", decision {d['decision']!r}")

@@ -76,6 +76,26 @@ def _run(wrapper, args, *, project_root: Path, agent: str = "alpha"):
     env["MIND_AGENT"] = agent
     env["MSYS_NO_PATHCONV"] = "1"
     env["RT_DIR"] = str(project_root / "mind_api" / "state")
+    # : pin the iteration-checkpoint redirect to the tmp tree.
+    # The REAL aspirations-claim.sh's _post_claim_effects pipes an anchor
+    # into loop-state-save.sh init on every successful world claim, and
+    # loop-state-save.py resolves its project root from its SCRIPT LOCATION
+    # (= the real repo; there is no env override seam — MIND_AGENT_DIR does
+    # not reach body_state_path, guard-2985). Unpinned, a successful claim as
+    # the real agent name writes the LIVE repo's
+    # agents/<agent>/session/iteration-checkpoint.json: even with MIND_SID
+    # scrubbed (the conftest pop above) the body-keyed channel dies but the
+    # agent-wide fallback still lands in the live repo (occ258(4)). The
+    # MIND_CHECKPOINT_PATH seam (loop-state-save.py::_checkpoint_path,
+    # read per call) points all four commands at this tmp file instead,
+    # mirroring the production layout inside the tmp root like
+    # `_seed_scorer_verdict` does for its sidecar. Hard-set (like RT_DIR,
+    # "the seam that actually holds"), not setdefault: the harness's tmp
+    # tree is the only correct target, and a different target means a
+    # different harness.
+    env["MIND_CHECKPOINT_PATH"] = str(
+        project_root / "agents" / agent / "session" / "iteration-checkpoint.json"
+    )
     # Production shape ALWAYS carries a sid (bash-agent-inject injects
     # MIND_SID into every hooked Bash call, and the claim endpoint's
     # missing_claim_sid gate refuses without one). The inject hook fails OPEN
@@ -83,6 +103,8 @@ def _run(wrapper, args, *, project_root: Path, agent: str = "alpha"):
     # tasks, cron, CI), so inheriting the session env makes these tests
     # flake on exactly those runs. Pin a deterministic sid instead of
     # depending on inheritance — setdefault keeps a test's own override.
+    # (Under the  conftest scrub the ambient value is gone, so
+    # this setdefault now always lands the deterministic sid.)
     env.setdefault("MIND_SID", "pytest-wrapper-harness-sid")
     proc = subprocess.run(
         [_bash(), wrapper.as_posix(), *args],

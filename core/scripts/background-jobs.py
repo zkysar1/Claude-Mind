@@ -138,7 +138,8 @@ def run_completion_check(cmd):
     """Run the registered completion_check command.
 
     Returns (exit_code, stdout). The command runs relative to PROJECT_ROOT.
-    Exit codes: 0 = completed, 1 = still running, 2 = failed, other = unknown.
+    Exit codes: 0 = completed, 1 = still running, 2 = failed, 3 = unmeasured (the check ran
+    but its host has no tool that could say whether the job is alive), other = unknown.
 
     The command is passed as a single string to bash -c (not split into args)
     because it may contain relative paths that need the cwd context.
@@ -266,6 +267,12 @@ def check_job(job):
             result["status"] = "running"
         elif exit_code == 2:
             result["status"] = "failed"
+        elif exit_code == 3:
+            # 3 = UNMEASURED: the check ran, but its host has no tool that could say whether
+            # the job is alive. It can claim neither "running" nor "failed", and "unknown" is
+            # the wrong bucket -- MONITOR-style consumers read that like "failed" and retire
+            # a job that may be healthy (; the exit-1 mistake of  again).
+            result["status"] = "unmeasured"
         else:
             result["status"] = "unknown"
         result["check_output"] = output

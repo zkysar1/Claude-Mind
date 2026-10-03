@@ -3060,13 +3060,27 @@ def _post_remove_sweep_dangling(removed_slugs):
     if not repair_py.exists():
         return
     import subprocess
+    # : pass an EXPLICIT env naming THIS process's own world. The
+    # child re-resolves _paths.WORLD_DIR from MIND_WORLD at its own import,
+    # so without this it resolves the caller's ambient world whenever the
+    # caller re-pointed the world for the parent's tree write (a test's tmp
+    # fixture) — and --apply then NULLS refs in THAT world's live stores.
+    # tree.py's WORLD_DIR is import-time-fixed, so mirroring it into the
+    # child keeps the sweep hermetic against the tree write it cleans up.
+    # MIND_META is forwarded only when set (same import-time resolution;
+    # the child's own resolution is the default otherwise).
+    sweep_env = dict(os.environ)
+    if WORLD_DIR is not None:
+        sweep_env["MIND_WORLD"] = str(WORLD_DIR)
+    if META_DIR is not None:
+        sweep_env["MIND_META"] = str(META_DIR)
     try:
         # sys.executable bypasses the Windows python3 → Microsoft-Store-stub
         # trap (CLAUDE.md "Python Invocation"). Capture output so the
         # cleanup's stdout doesn't pollute tree.py's JSON output.
         result = subprocess.run(
             [sys.executable, str(repair_py), "--apply"],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=sweep_env,
         )
         # Repair exit codes: 0 = clean OR applied. Anything else is a real
         # error worth surfacing; --apply never returns 1 (that's dry-run only).

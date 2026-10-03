@@ -117,9 +117,25 @@ BASH = resolve_bash()
 _WIN_ARG_UNSAFE = "\"'{}"
 _WIN_QUOTED_BACKSLASH_RUN = re.compile(r'\\{2,}(?=[^"\\])')
 
+# A FOURTH class is LENGTH (, measured on ZDS 2026-09-28): MSYS globs
+# every word that holds whitespace (list2cmdline quoted it), one of
+# ? * [ " ' ( ) { }, or a leading ~, and the glob cuts that word to 8,186
+# CHARACTERS with argc unchanged and rc=0. A plain word with none of those
+# arrived whole at 12,000, and the same value sent on stdin arrived whole.
+_WIN_GLOB_CUT_LEN = 8186
+_WIN_GLOBBED_WORD = re.compile(r"[\s?*\[\"'(){}]")
+
+
+def _win_arg_truncated(value: str) -> bool:
+    """True when the MSYS glob would cut this argument to 8,186 characters."""
+    return len(value) > _WIN_GLOB_CUT_LEN and (
+        value.startswith("~") or bool(_WIN_GLOBBED_WORD.search(value)))
+
 
 def _win_arg_corrupts(value: str) -> bool:
     """True when Windows will silently alter this argument in transit."""
+    if _win_arg_truncated(value):
+        return True
     if any(ch.isspace() for ch in value):
         # list2cmdline quotes it: measured safe for quotes and braces, not for a backslash run
         return bool(_WIN_QUOTED_BACKSLASH_RUN.search(value))
@@ -149,7 +165,11 @@ def bash_cmd(script, *args) -> "list[str]":
             if not _win_arg_corrupts(value):
                 continue
             shown = value if len(value) <= 120 else value[:117] + "..."
-            if any(ch.isspace() for ch in value):
+            if _win_arg_truncated(value):
+                bad = "%d characters" % len(value)
+                where = "over 8,186 characters, with whitespace, a glob character or a leading ~"
+                mode = "TRUNCATE this value to its first 8,186 characters (argc unchanged, rc=0)"
+            elif any(ch.isspace() for ch in value):
                 bad = "\\\\"
                 where = "a run of 2+ backslashes, in a value that has whitespace"
                 mode = "COLLAPSE each backslash pair in that run to one"
@@ -180,7 +200,7 @@ def bash_cmd(script, *args) -> "list[str]":
                 "       MIND_BASH_ALLOW_UNSAFE_ARGS=1 to accept the corruption knowingly.\n"
                 "\n"
                 "  Do NOT 'fix' this by adding a space to the value — that changes the data.\n"
-                "  Detail: guard-5633, g-115-8409, g-115-11460."
+                "  Detail: guard-5633, g-115-8409, g-115-11460, g-115-11615."
                 % (i + 1, shown, bad, where, mode)
             )
     return [BASH, Path(script).as_posix(), *argv]

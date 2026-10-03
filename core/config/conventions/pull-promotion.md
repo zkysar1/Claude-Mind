@@ -234,6 +234,52 @@ Three properties hold it honest, and none may be dropped:
 (`_record_half`); the log dir is resolved by calling the runner's own
 `run-full-suite.py --print-out-dir`, never by re-deriving its default layout.
 
+### C4 baseline differential (normative, opt-in)
+
+**The question:** what should C4 do on a deployment whose own suite is already red
+BEFORE the adoption, for reasons that deployment owns (assumptions the framework's
+tests make about a roster, a world or a box it does not have)? Strict C4 cannot
+answer yes there, so every adoption rolls back and the deployment falls further
+behind the release train.
+
+**The decision:** `--c4-baseline` adds a second way to pass C4: the question C4
+exists to answer, "did THIS adoption add a red?":
+
+```bash
+python3 core/scripts/framework_pull.py --adopt --c4-baseline
+```
+
+Strict runs first. Only if it is red does the executor spend a second suite run, on
+the pre-adopt commit, on the same box, in a pinned worktree. Green requires ALL of:
+
+1. **Both runs concluded.** Each chunked verdict is `CLEAN` or `GENUINE`. `INVALID`
+   (contended, tree-moved, hung) or a missing verdict is red; its failures are not
+   evidence.
+2. **No new red.** Every failing pytest node id of the adopt-commit run also failed on
+   the pre-adopt run. Ids are FULL (`[param]` included) and are read from
+   `<log-dir>/chunk-*.log`, never from the runner's stdout, which lists failing
+   files and no node ids.
+3. **No framework-owned half is red.** `halves.jsonl` was read and neither
+   `invisible` nor `deferred` recorded a failing rc. A red `domain` half is
+   reported, not gating, as under strict C4.
+
+Fail-safe direction, same as the domain-half decision: any case where the evidence
+cannot prove "no new reds" is RED, with the reason in the verify step's
+`baseline_refused` (a `GENUINE` verdict beside an empty failing set, unreadable
+`halves.jsonl`, a baseline run that did not conclude). Cheap refusals run before the
+second suite run is paid for.
+
+What it does NOT do: it does not run unless asked (the default stays strict); it does
+not hide the reds the baseline already carried (`baseline_reds` is reported); a test
+that exists only in the new release counts as new (nothing can baseline it); a test
+that flakes red only on the adopt run blocks until a re-run.
+
+An adoption verified this way is marked: the verify step carries `c4_mode`,
+`post_reds`, `baseline_reds` and `new_reds` (first 50), and `installed-release.yaml`
+gains `c4_mode: baseline-differential` and `baseline_reds`, because `verified: true`
+alone cannot tell it from a strict pass. Measurement and the alternatives rejected:
+`core/config/rationale/c4-baseline-differential.md`.
+
 ### Rollback is framework-SCOPED, and adopt checkpoints first (normative, g-360-17)
 
 `rollback()` used to be `git reset --hard <pre_sha>`. On a Mind whose loop is

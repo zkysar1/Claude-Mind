@@ -684,7 +684,7 @@ the first firing per session actually reads the file into context.)
 
 **Recurring-goal shortcut**: when the just-executed goal has `recurring: true`,
 collapse steps 1, 2, 4, 5 into a single call:
-`Bash: recurring-close.sh <goal-id> <routine|deep> [--source world|agent] [--summary "..."] [--tree-updated] [--tree-updated-override] [--artifacts-count N] [--encoding-score X] [--findings-count N]`
+`Bash: recurring-close.sh <goal-id> <routine|deep> --source <world|agent> [--summary "..."] [--tree-updated] [--tree-updated-override] [--artifacts-count N] [--encoding-score X] [--findings-count N]`
 
 The five § STATE-UPDATE quality flags (g-115-3192) are forwarded to the wrapped
 `--phase state-update` ONLY. Pass them on THIS call for a deep close — guard-1235

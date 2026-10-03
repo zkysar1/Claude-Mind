@@ -45,10 +45,11 @@ the slices when the narration is what you are about to act on.
    and a delta needs two readings. A perception you never compared is a
    perception you cannot have learned anything from.
 
-3. **NOTE the change, if it changed and matters.** Record one decision line
-   in the execution diary, working memory, or journal:
+3. **NOTE the change, if it changed and matters.** Record one decision line in
+   the execution diary with this command — never through a body/finding
+   channel, whose files are the member's surface:
    ```
-   perception-reaction: unit=<unit> envelope=<id> changed=<delta vs my last belief> decision=<act|fold|ignore> reason=<why>
+   echo '{"entry_type":"decision","goal_id":"<unit>","content":"perception-reaction: unit=<unit> envelope=<id> changed=<delta vs my last belief> decision=<act|fold|ignore> reason=<why>"}' | bash core/scripts/execution-diary.sh append
    ```
    `envelope=` copies the frame's second line — omit it on an older frame
    that has none — and `reason=` stays last, since it runs to end of line.
@@ -94,13 +95,10 @@ the slices when the narration is what you are about to act on.
   frame, the checker)
 - `guard-6621@ayoai-mind` — this rule's retrieval layer. Guard ids are
   PER-WORLD: downstream, match its opening "COMPARE BEFORE YOU REACT".
-- `core/scripts/perception_reaction.py` — the checker behind the fixture test
-  (`core/scripts/tests/test_perception_reaction.py`)
 - `.claude/rules/verify-before-assuming.md` — a perception is not a
   verification signal; `.claude/rules/retrieve-before-deciding.md` point 6
   (acting on an inbound signal) is where rule 2's comparison comes from
 - `.claude/rules/knowledge-freshness.md` / `core/config/conventions/learning-routing.md`
   — where a MEASURED fact goes, and why a perception is not one
-- Origin: ZDS-Mind tree node `perception-bridge-pearl` § 18.4 and its ruling
-  set (ZDS-world guardrail ids — those ids name DIFFERENT guardrails in this
-  world, so they are deliberately not cited as local); filed as g-373-09.
+- Origin: ZDS-Mind tree node `perception-bridge-pearl` § 18.4; filed as
+  g-373-09. Cross-world guardrail ids: `perception-module.md` § 9.4.

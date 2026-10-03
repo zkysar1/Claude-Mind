@@ -21,6 +21,8 @@ subprocess is touched.
 from __future__ import annotations
 
 import importlib.util
+import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -173,3 +175,39 @@ def test_population_dict_does_not_crash(ratchet, monkeypatch):
     bd = _read(ratchet)[ratchet.KEY]["history"][-1]["breakdown"]
     assert bd["call_sites"] == 537
     assert bd["write_wrappers"] == 80
+
+
+# --- the remedy a REGRESSED line prints ---------------------------------------
+
+def test_regression_message_names_a_command_the_audit_accepts(ratchet, monkeypatch, capsys):
+    """The remedy must be a command the audit has and that NAMES the arrivals.
+
+    It used to print `--list-unverified 20`, an arbitrary 20 of the unverified sites, so a
+    +1 could be seen and never chased. Each flag the message tells an operator to type is
+    checked against the audit's own --help, so a renamed flag cannot leave the message
+    pointing at nothing.
+    """
+    _run(ratchet, _audit(464, 73), monkeypatch)
+    capsys.readouterr()
+    _run(ratchet, _audit(466, 71), monkeypatch)
+    out = capsys.readouterr().out
+    assert "REGRESSED" in out
+    assert "--list-unverified" not in out
+    cmd = re.search(r"`(bash core/scripts/unchecked-write-audit\.sh[^`]*)`", out)
+    assert cmd, out
+    flags = re.findall(r"--[a-z][a-z-]*", cmd.group(1))
+    assert "--new-since" in flags
+    helptext = subprocess.run(
+        [sys.executable, str(CORE_SCRIPTS / "unchecked-write-audit.py"), "--help"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
+    for flag in flags:
+        assert flag in helptext, flag
+
+
+def test_audit_reads_the_baseline_entry_this_ratchet_writes(ratchet):
+    """`--new-since baseline` looks the entry up by key; the key lives in both files."""
+    spec = importlib.util.spec_from_file_location(
+        "unchecked_write_audit_for_key", CORE_SCRIPTS / "unchecked-write-audit.py")
+    audit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audit)
+    assert audit.BASELINE_KEY == ratchet.KEY

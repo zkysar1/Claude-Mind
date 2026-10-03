@@ -170,3 +170,34 @@ def test_default_index_dir_when_env_and_arg_both_absent(tmp_path, monkeypatch):
     # arm) FAILS. Both mutants die on this single line, which is what makes the
     # delenv above load-bearing rather than ceremonial.
     assert landed == tmp_path / "mind_api" / "state" / "retrieval-embedding-index"
+
+
+# --- : the vendor dir is resolved at CALL time ----------------------
+
+def test_cosine_scores_resolves_the_vendor_dir_at_call_time(tmp_path, monkeypatch):
+    """A daemon that started before the stack was installed kept failing
+    `import numpy` until a restart, because the vendor dir was appended to
+    sys.path once, at import. A scoring call must pick up a dir that appeared
+    after the process started. Real ensure_vendor_path, nothing mocked."""
+    import sys
+    vendor = tmp_path / "py-installed-later"
+    monkeypatch.setenv("MIND_VENDOR_DIR", str(vendor))
+    monkeypatch.setattr(sys, "path", list(sys.path))   # restored on teardown
+    er.clear_caches()
+    assert str(vendor) not in sys.path
+    vendor.mkdir()                                      # installed after the process started
+    er.cosine_scores("q", index_dir=tmp_path / "no-index")   # degrades, but resolves first
+    assert str(vendor) in sys.path
+
+
+def test_vendor_dir_is_resolved_before_the_index_is_loaded(tmp_path, monkeypatch):
+    """Order is the point: _load_index is where numpy is imported, so a resolve
+    that ran after it would arrive too late."""
+    import _vendor_path as vp
+    order = []
+    monkeypatch.setattr(vp, "ensure_vendor_path", lambda: order.append("vendor") or True)
+    real_load = er._load_index
+    monkeypatch.setattr(er, "_load_index", lambda d: order.append("index") or real_load(d))
+    er.clear_caches()
+    er.cosine_scores("q", index_dir=tmp_path / "no-index")
+    assert order[:2] == ["vendor", "index"]

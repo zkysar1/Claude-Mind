@@ -81,7 +81,9 @@ def _normalize_terminal_goal(goal):
 
     Mirrors the field-clearing pattern at cmd_update_goal's defer_reason-
     cleared branch (~line 2182): set defer_reason and defer_reason_set_at to
-    None (preserve schema key presence); pop the optional companions.
+    None (preserve schema key presence); clear the optional companions to None
+    too, never pop them (g-115-11591: a popped key comes back from any peer copy
+    at the next merge). The daemon twin already clears to None.
 
     g-115-661 Layer 2: ALSO backfills `completed_at` when missing on terminal
     goals. The 533-goal completed_at=null gap (g-115-660 investigation)
@@ -100,9 +102,9 @@ def _normalize_terminal_goal(goal):
         goal["defer_reason"] = None
     if goal.get("defer_reason_set_at") is not None:
         goal["defer_reason_set_at"] = None
-    goal.pop("deferred_until", None)
-    goal.pop("blocker_ref", None)
-    goal.pop("blocked_since", None)
+    for key in ("deferred_until", "blocker_ref", "blocked_since"):
+        if key in goal:
+            goal[key] = None
 
     #  Layer 2: backfill completed_at when missing. Prefers
     # completed_date (parsed) over now() to preserve history for legacy
@@ -800,12 +802,20 @@ def find_aspiration_by_id(items, asp_id):
     return None
 
 def find_goal_in_aspirations(items, goal_id):
-    """Find a goal across all aspirations. Returns (asp_index, goal_index, aspiration) or None."""
+    """Find a goal across all aspirations. Returns (asp_index, goal_index, aspiration) or None.
+
+    The first NON-superseded copy wins over a same-id rehome pointer; a lone
+    pointer is still returned. Mirror of the daemon's _find_goal (g-353-65).
+    """
+    pointer = None
     for ai, asp in enumerate(items):
         for gi, goal in enumerate(asp.get("goals", [])):
             if goal.get("id") == goal_id:
-                return (ai, gi, asp)
-    return None
+                if goal.get("status") != "superseded":
+                    return (ai, gi, asp)
+                if pointer is None:
+                    pointer = (ai, gi, asp)
+    return pointer
 
 def find_recurring_goals(asp):
     """Return list of goals with recurring: true in an aspiration."""
@@ -1728,9 +1738,15 @@ def cmd_update_goal(args):
     # rb-428 sweeps that drive this CLI never send companions, so this is
     # shape-safety parity, not a live feature port).
     companion_note = None
+    companion_ledger_evidence = None
+    companion_ledger_verdict = None
     if field == "status" and isinstance(value, dict) and "value" in value:
         _cn = value.get("outcome_note")
         companion_note = _cn if isinstance(_cn, str) else None
+        # : the writer's half of the §5 candidate ledger row; the
+        # daemon twin unwraps the same two keys.
+        companion_ledger_evidence = value.get("ledger_evidence")
+        companion_ledger_verdict = value.get("ledger_verdict")
         value = value["value"]
 
     # UNKNOWN-FIELD GATE (). Twin of the daemon check in
@@ -2315,18 +2331,28 @@ def cmd_update_goal(args):
         _ct_row_due = None
         if field == "status":
             from gates.candidate_transition import (
-                evaluate as _ct_eval, append_ledger as _ct_ledger)
+                evaluate as _ct_eval, append_ledger as _ct_ledger,
+                caller_channel as _ct_channel)
             _ct = _ct_eval(goal.get("status"), value)
             if not _ct["allowed"]:
                 print(_ct["message"], file=sys.stderr)
                 sys.exit(1)
             if _ct["ledger"]:
+                # : the writer may name its verdict and stamp its own
+                # evidence (promoted_by); one shared validator, both paths.
+                _cc_verdict, _cc_evidence, _cc_err = _ct_channel(
+                    value, companion_ledger_evidence,
+                    companion_ledger_verdict)
+                if _cc_err:
+                    print(_cc_err, file=sys.stderr)
+                    sys.exit(1)
                 _ct_row_due = {
-                    "verdict": _ct["verdict"],
+                    "verdict": _cc_verdict or _ct["verdict"],
                     "new_status": value,
                     "agent": AGENT_DIR.name if AGENT_DIR else "unknown",
                     "evidence": {
                         "outcome_note": goal.get("outcome_note"),
+                        **_cc_evidence,
                     },
                     "ledger": _ct_ledger,
                 }
@@ -2992,16 +3018,20 @@ def cmd_update_goal(args):
                 # and deploy-hold-check.sh reads exactly that shape as the gate
                 # standing between an unvalidated change and an auto-deploying
                 # production repo. So the "orphan" premise above is false for
-                # that one consumer, and popping here silently disarms a live
+                # that one consumer, and clearing here silently disarms a live
                 # safety gate with no log line.
-                # An expired or expiry-less ref STILL pops -- "a lease nobody
+                # An expired or expiry-less ref is STILL cleared -- "a lease nobody
                 # renewed has ended" -- so orphan cleanup is unchanged for
                 # every ref that cannot prove it is still within its lease.
-                # The sibling pop in _normalize_terminal_goal is deliberately
+                # The sibling clear in _normalize_terminal_goal is deliberately
                 # NOT gated: a TERMINAL goal's ref is finished whatever its
                 # expiry says.
-                if not is_live_lease(goal.get("blocker_ref")):
-                    goal.pop("blocker_ref", None)
+                # Cleared to None, never popped (), as the daemon
+                # copy does: a popped key comes back from any peer copy that
+                # still holds it at the next merge.
+                if ("blocker_ref" in goal
+                        and not is_live_lease(goal.get("blocker_ref"))):
+                    goal["blocker_ref"] = None
         # CRITICAL — root-cause fix for the recurring-shape-leak bug. Do NOT remove this
         # cascade or move it to a caller. When recurring flips to falsy, interval_hours
         # and lastAchievedAt MUST drop here, at the data primitive, so any future caller
@@ -3012,9 +3042,13 @@ def cmd_update_goal(args):
         # line ~432) from treating the dead goal as "not yet due" between sweeps.
         # History fields (achievedCount, currentStreak, longestStreak) are preserved as
         # factual record. See plan improve-recurring-goals-kind-yao.md.
+        # "Drop" means clear to None, never pop (): a popped key came
+        # back from any pre-retirement peer copy at the next merge and rebuilt
+        # the very shape this cascade exists to prevent.
         if field == "recurring" and not value:
-            goal.pop("interval_hours", None)
-            goal.pop("lastAchievedAt", None)
+            for key in ("interval_hours", "lastAchievedAt"):
+                if key in goal:
+                    goal[key] = None
         # Auto-manage blocked_since timestamp alongside blocked_by.
         # parse_value() already converted "[]" → [] so `if value` is sufficient.
         if field == "blocked_by":

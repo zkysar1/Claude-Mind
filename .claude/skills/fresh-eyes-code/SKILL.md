@@ -377,7 +377,7 @@ If called from g-248-07 or g-248-08:
 
 ```
 summary = "reviewed N files, {F} findings ({inv} invalidates, {con} constrains, {ena} enables, {inf} informs)"
-Bash: bash core/scripts/recurring-close.sh {goal-id} {routine|deep} --summary "<summary>"
+Bash: bash core/scripts/recurring-close.sh {goal-id} {routine|deep} --source {source} --summary "<summary>"
 # deep if any finding.severity in [invalidates, constrains]; routine otherwise
 ```
 

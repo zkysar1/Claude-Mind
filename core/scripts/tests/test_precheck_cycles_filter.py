@@ -30,15 +30,27 @@ runs cmd_cycles on a projection-shaped compact, not hand-injected dicts.
    g-115-2171 (genuine failures lacked it too, pre-writer) — making it truthful
    at claim time is the prerequisite. test_never_attempted_skips_no_cycle pins it.
 
+4. zero_learning_velocity counts a goal-id-named experience record
+   (agents/<agent>/experience/exp-<goal-id>[-slug].md) as a learning artifact,
+   skips an aspiration marked plateau_exempt: true (the contract
+   aspiration-trajectory.py already applies), and treats Alert: titles as
+   primitives. The tests at the end of this file pin each, with the
+   negative controls (no artifact, stale record, boundary miss, other
+   queue) that keep the detector live (rb-3603, rb-2346, guard-6492).
+
 Refs: g-115-1211 (audit + removal), g-115-615 (the dead synthetic exclusion),
 g-001-220 (the live Unblock: exclusion), g-002-23 (migration FP discovery),
 g-115-2175 (never-attempted exclusion + claim-time attempt marker),
-rb-1320 (repeated_failure is advisory noise).
+rb-1320 (repeated_failure is advisory noise), g-115-11657 (item 4).
 """
 
 import ast
 import importlib.util
+import os
 import sys
+import tempfile
+import time
+import typing
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -335,6 +347,204 @@ def test_missing_work_class_velocity_cycle_fires():
     print("PASS: missing work_class -> zero_learning_velocity unchanged (legacy safe)")
 
 
+# --- Artifact scan, plateau_exempt and Alert: (experience records, aspiration opt-out, triage prefix) ---
+
+_WINDOW = [{"id": f"g-test-{i}"} for i in range(3)]
+
+
+def _in_tree(files, fn):
+    """Run fn() with precheck-eval's PROJECT_ROOT/AGENT_DIR pointed at a throwaway
+    tree. files: {relative path: age in days (0 = fresh)}; the bound agent is alpha."""
+    saved = (pe.PROJECT_ROOT, pe.AGENT_DIR)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "agents" / "alpha").mkdir(parents=True)
+        for rel, age_days in files.items():
+            f = root / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("x", encoding="utf-8")
+            if age_days:
+                t = time.time() - age_days * 86400
+                os.utime(f, (t, t))
+        pe.PROJECT_ROOT, pe.AGENT_DIR = root, root / "agents" / "alpha"
+        try:
+            return fn()
+        finally:
+            pe.PROJECT_ROOT, pe.AGENT_DIR = saved
+
+
+def _has_reports(files, source="world"):
+    return _in_tree(files, lambda: pe._has_recent_reports("asp-test", _WINDOW, 7, source=source))
+
+
+def _with_velocity_zero(fn):
+    """Trajectory probe forced to velocity 0 but the REAL _has_recent_reports, so
+    the artifact scan is what decides fire vs no-fire (contrast
+    _with_zero_velocity_probe, which stubs the scan out)."""
+    orig_run = pe._run_script
+    pe._run_script = lambda cmd, timeout=60: ('{"current_velocity": 0}', "", 0)
+    try:
+        return fn()
+    finally:
+        pe._run_script = orig_run
+
+
+def _window_fixture(titles, **asp_extra):
+    """3 completed same-category goals with the given titles + 2 pending pads
+    (completion_ratio 0.6 < 0.8, so the g-001-12 gate does not mask the branch
+    under test) on a world-queue aspiration; asp_extra lands on the aspiration."""
+    goals = [{"id": f"g-test-{i}", "status": "completed", "title": t, "category": "product-parity"}
+             for i, t in enumerate(titles)]
+    goals += [{"id": f"g-test-p{i}", "status": "pending", "title": f"Fix: pending {i}",
+               "category": "product-parity"} for i in range(2)]
+    compact = _build_compact(goals)
+    compact["aspirations"][0]["source"] = "world"
+    compact["aspirations"][0].update(asp_extra)
+    return compact
+
+
+def _fires(compact, files):
+    """Whether cmd_cycles raises zero_learning_velocity at velocity 0 over `files`."""
+    result = _in_tree(files, lambda: _with_velocity_zero(lambda: _run_cycles(compact)))
+    return "zero_learning_velocity" in [c.get("reason") for c in result.get("cycles", [])]
+
+
+def test_experience_record_named_for_window_goal_counts():
+    """An experience record named exp-<goal-id>[-slug].md for a window goal is a
+    learning artifact -- the per-goal one the temp-only scan never saw."""
+    for name in ("exp-g-test-1-fix-thing.md", "exp-g-test-2.md"):
+        assert _has_reports({f"agents/alpha/experience/{name}": 0}), f"{name} should count"
+    print("PASS: exp-<goal-id>[-slug].md for a window goal counts as an artifact")
+
+
+def test_experience_name_boundary_and_other_goals_do_not_count():
+    """exp-g-test-10-* is not g-test-1's (the far side of the boundary), and a
+    record for a goal outside the window, or a non-exp .md, is not an artifact."""
+    for name in ("exp-g-test-10-other.md", "exp-g-other-1-x.md", "RECEIPT-g-test-1.md", "g-test-1.md"):
+        assert not _has_reports({f"agents/alpha/experience/{name}": 0}), f"{name} must not count"
+    both = {"agents/alpha/experience/exp-g-test-10-other.md": 0,
+            "agents/alpha/experience/exp-g-test-1-x.md": 0}
+    assert _has_reports(both), "positive control: the right record beside the boundary miss counts"
+    print("PASS: experience name boundary holds; other goals' records do not count")
+
+
+def test_aspiration_id_is_not_matched_against_experience_names():
+    """exp names are keyed by goal; a record whose slug merely mentions the
+    aspiration belongs to some other goal and does not count."""
+    assert not _has_reports({"agents/alpha/experience/exp-g-zzz-1-asp-test-note.md": 0})
+    print("PASS: aspiration id is matched against temp names only, not experience names")
+
+
+def test_stale_experience_record_does_not_count():
+    name = "agents/alpha/experience/exp-g-test-1-x.md"
+    assert _has_reports({name: 0}), "positive control: the fresh record counts"
+    assert not _has_reports({name: 30}), "a 30-day-old record is outside the 7-day signal window"
+    print("PASS: experience record older than report_signal_age_days does not count")
+
+
+def test_experience_scan_is_queue_scoped():
+    """guard-6492: goal ids are per-queue. A record in another agent's experience/
+    counts for a world-queue aspiration only; the bound agent's own counts for both."""
+    other = {"agents/bravo/experience/exp-g-test-1-x.md": 0}
+    own = {"agents/alpha/experience/exp-g-test-1-x.md": 0}
+    assert _has_reports(other, source="world")
+    assert not _has_reports(other, source="agent")
+    assert not _has_reports(other, source=None)
+    assert _has_reports(own, source="agent")
+    print("PASS: other agents' experience counts for world-queue aspirations only")
+
+
+def test_temp_report_scan_unchanged():
+    """The pre-existing temp/*.md filename match still decides on its own."""
+    assert _has_reports({"agents/alpha/temp/g-test-1-briefing.md": 0})
+    assert _has_reports({"agents/bravo/temp/asp-test-note.md": 0})
+    assert not _has_reports({"agents/alpha/temp/unrelated.md": 0})
+    print("PASS: temp/*.md goal-id / aspiration-id match unchanged")
+
+
+def test_window_with_experience_records_no_velocity_cycle():
+    """A window whose goals have goal-id-named experience records is not flagged
+    zero_learning_velocity; the same window with no artifact still is."""
+    compact = _window_fixture(["Fix: a", "Fix: b", "Fix: c"])
+    every = {f"agents/alpha/experience/exp-g-test-{i}-fix.md": 0 for i in range(3)}
+    assert not _fires(compact, every)
+    # one record in the window is enough: velocity is a window total, 0 only when nothing landed
+    assert not _fires(compact, {"agents/alpha/experience/exp-g-test-2-fix.md": 0})
+    # negative controls: nothing, a boundary miss + a stale record -> still flagged
+    assert _fires(compact, {})
+    assert _fires(compact, {"agents/alpha/experience/exp-g-test-10-fix.md": 0,
+                            "agents/alpha/experience/exp-g-test-1-fix.md": 30})
+    print("PASS: experience records suppress zero_learning_velocity; no artifact still fires")
+
+
+def test_cycles_passes_the_aspiration_queue_to_the_artifact_scan():
+    """The call site hands the aspiration's queue to the scan: a record in another
+    agent's experience/ clears a world-queue aspiration and not an agent-queue one."""
+    other = {"agents/bravo/experience/exp-g-test-1-fix.md": 0}
+    titles = ["Fix: a", "Fix: b", "Fix: c"]
+    assert not _fires(_window_fixture(titles), other)
+    assert _fires(_window_fixture(titles, source="agent"), other)
+    print("PASS: cmd_cycles scopes the experience scan by the aspiration's source")
+
+
+def test_alert_window_no_velocity_cycle():
+    """Alert: goals are operational triage with no learning intent: a window of
+    them is a primitive window (like Apply:/Batch:), a mixed window still fires."""
+    assert not _fires(_window_fixture(["Alert: job failed", "Alert: deadline watch", "Alert: job failed"]), {})
+    assert _fires(_window_fixture(["Alert: job failed", "Alert: deadline watch", "Fix: thing"]), {})
+    print("PASS: 3 Alert: goals -> no zero_learning_velocity; mixed window still fires")
+
+
+def test_alert_prefix_is_a_primitive_but_not_an_origin_signal_kind():
+    import _prefix_registry as reg
+    assert "Alert:" in reg.PRIMITIVE_PREFIXES
+    assert reg.signal_kind_for_title("Alert: job failed") is None
+    assert "alert" not in [k for _, k in reg.SIGNAL_KIND_PRIMITIVES]
+    print("PASS: Alert: registered in PRIMITIVE_PREFIXES, kept out of SIGNAL_KIND_PRIMITIVES")
+
+
+def test_plateau_exempt_aspiration_no_velocity_cycle():
+    """An aspiration marked plateau_exempt: true is not flagged zero_learning_velocity
+    (aspiration-trajectory.py honours the same record flag). Strict boolean."""
+    titles = ["Fix: a", "Fix: b", "Fix: c"]
+    assert _fires(_window_fixture(titles), {}), "control: the unmarked window fires"
+    assert not _fires(_window_fixture(titles, plateau_exempt=True), {})
+    for v in (False, "true", 1, None):
+        assert _fires(_window_fixture(titles, plateau_exempt=v), {}), f"{v!r} must keep detection on"
+    print("PASS: plateau_exempt is True -> no zero_learning_velocity; anything else keeps it")
+
+
+def test_plateau_exempt_does_not_exempt_repeated_failure():
+    goals = [
+        {"id": f"g-test-{i}", "status": "skipped", "title": f"Apply: something {i}",
+         "started": "2026-07-14T10:00:00", "category": "npc-cognition"}
+        for i in range(3)
+    ]
+    compact = _build_compact(goals)
+    compact["aspirations"][0]["plateau_exempt"] = True
+    reasons = [c.get("reason") for c in _run_cycles(compact).get("cycles", [])]
+    assert "repeated_failure" in reasons, f"plateau_exempt must not mask repeated_failure: {reasons}"
+    print("PASS: plateau_exempt does not suppress repeated_failure")
+
+
+def test_plateau_exempt_survives_the_real_aspiration_projection():
+    """ class: a cycles-side check on a field the compact projection
+    strips is a dead branch. Run the daemon's own _compact_aspiration and require
+    the aspiration-level flag to come through while goal tags do not."""
+    text = _DAEMON_ENDPOINT.read_text(encoding="utf-8")
+    node = next(n for n in ast.parse(text).body
+                if isinstance(n, ast.FunctionDef) and n.name == "_compact_aspiration")
+    ns = {"Dict": typing.Dict, "Any": typing.Any, "_COMPACT_GOAL_KEEP": _real_keep_set()}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "_compact_aspiration", "exec"), ns)
+    out = ns["_compact_aspiration"](
+        {"id": "asp-x", "plateau_exempt": True, "description": "d",
+         "goals": [{"id": "g-1", "title": "t", "tags": ["x"]}]}, "world")
+    assert out["plateau_exempt"] is True, f"plateau_exempt stripped by the projection: {out}"
+    assert out["source"] == "world" and "description" not in out
+    assert out["goals"] == [{"id": "g-1", "title": "t"}]
+    print("PASS: plateau_exempt survives the real aspiration projection")
+
+
 if __name__ == "__main__":
     test_all_unblock_skips_no_cycle()
     test_genuine_repeated_failure_still_detected()
@@ -345,5 +555,18 @@ if __name__ == "__main__":
     test_all_product_window_no_velocity_cycle()
     test_mixed_class_window_velocity_cycle_fires()
     test_missing_work_class_velocity_cycle_fires()
+    test_experience_record_named_for_window_goal_counts()
+    test_experience_name_boundary_and_other_goals_do_not_count()
+    test_aspiration_id_is_not_matched_against_experience_names()
+    test_stale_experience_record_does_not_count()
+    test_experience_scan_is_queue_scoped()
+    test_temp_report_scan_unchanged()
+    test_window_with_experience_records_no_velocity_cycle()
+    test_cycles_passes_the_aspiration_queue_to_the_artifact_scan()
+    test_alert_window_no_velocity_cycle()
+    test_alert_prefix_is_a_primitive_but_not_an_origin_signal_kind()
+    test_plateau_exempt_aspiration_no_velocity_cycle()
+    test_plateau_exempt_does_not_exempt_repeated_failure()
+    test_plateau_exempt_survives_the_real_aspiration_projection()
     print()
     print("ALL cmd_cycles FILTER TESTS PASS")

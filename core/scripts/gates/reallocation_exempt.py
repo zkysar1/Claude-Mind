@@ -95,9 +95,10 @@ def _hours_since(timestamp_str):
 def _interval_hours(goal):
     """Recurring interval in hours. Faithful to goal-selector.py::get_interval_hours:
     `interval_hours` first, else `remind_days * 24`, else 24. Returned RAW — a
-    store record can carry it as a string, so callers must coerce.
+    store record can carry it as a string, so callers must coerce. A cleared
+    interval_hours (None) reads as absent (g-115-11591).
     """
-    if "interval_hours" in goal:
+    if goal.get("interval_hours") is not None:
         return goal["interval_hours"]
     if "remind_days" in goal:
         return goal["remind_days"] * 24

@@ -47,6 +47,7 @@ from knowledge_projection import (  # noqa: E402
     Redactor,
     _node_key,
     _record_id,
+    handle_inputs_present,
     is_domain_tree_node,
     project,
     resolve_goal_handle,
@@ -161,20 +162,26 @@ def node_body_path(tree_dir: Path, file_rel: str) -> Path | None:
     return tree_dir.joinpath(*parts)
 
 
-def _read_node_body(tree_dir: Path, file_rel: str) -> str:
+def _read_node_body(tree_dir: Path, file_rel: str) -> tuple[str, bool]:
     """Read a node's ``.md`` body (front matter stripped, capped) for the export bundle.
 
-    Any read failure → ``""`` (a missing/unreadable body must never fail the export; the
-    node still carries its summary).
+    Returns ``(body, truncated)``. ``truncated`` is True when the body ran past
+    :data:`_NODE_BODY_CAP` and was cut to it. A cut body reads exactly like a whole one of
+    the cap's length, so only this reader can say which it is (g-335-1726 finding 7). It is
+    the member-edit applier's ``view_truncated`` test, applied to the same text.
+
+    Any read failure → ``("", False)`` (a missing/unreadable body must never fail the
+    export; the node still carries its summary).
     """
     path = node_body_path(tree_dir, file_rel)
     if path is None:
-        return ""
+        return "", False
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        return ""
-    return _strip_front_matter(text)[:_NODE_BODY_CAP]
+        return "", False
+    body = _strip_front_matter(text)
+    return body[:_NODE_BODY_CAP], len(body) > _NODE_BODY_CAP
 
 
 #: Where ``_tree.yaml`` is looked for, in preference order. The FIRST entry is the
@@ -272,7 +279,8 @@ def read_tree_nodes(
     title. ``category`` is taken from the node ``file`` path so the projection's
     system/-subtree suppression works on the reliable path segment. Each DOMAIN node also
     carries its full ``.md`` ``body`` (front matter stripped, capped) so the kid-facing UI
-    can render the article on click; framework (``system/``) node bodies are NOT read — the
+    can render the article on click, and ``body_truncated``, which says whether the cap cut
+    that body; framework (``system/``) node bodies are NOT read — the
     projection suppresses that subtree anyway, so skipping the read keeps framework bodies
     out of memory entirely (defense in depth) and halves the per-export file reads.
 
@@ -380,13 +388,18 @@ def read_tree_nodes(
         file_rel = str(node.get("file") or "")  # file path → top-level category + body source
         # Read the full body ONLY for domain nodes (see docstring — framework bodies are
         # suppressed downstream, so we never even load them).
-        body = _read_node_body(tree_dir, file_rel) if is_domain_tree_node(file_rel) else ""
+        body, body_truncated = (
+            _read_node_body(tree_dir, file_rel) if is_domain_tree_node(file_rel) else ("", False)
+        )
         out.append(
             {
                 "key": key,
                 "title": _humanize_key(key),
                 "summary": str(node.get("summary") or ""),
                 "body": body,
+                # True when ``body`` is the first _NODE_BODY_CAP characters of a longer one.
+                # project() reads it and never marks such a row ``unredacted``.
+                "body_truncated": body_truncated,
                 "parent": str(node.get("parent") or ""),
                 "children": [str(c) for c in (node.get("children") or []) if c],
                 "category": file_rel,
@@ -682,6 +695,19 @@ def resolve_item(
         if id_of(record) == item_id:
             return kind, item_id, record
     return None
+
+
+def handles_provisioned(env: Mapping[str, str] | None = None) -> bool:
+    """Whether THIS process can resolve any handle: the two values :func:`resolve_handle`
+    and :func:`resolve_item` read, under the rule the handle functions apply.
+
+    Both resolvers return ``None`` for an unprovisioned box exactly as for an unknown
+    handle, so a caller holding a member's queued write asks this first and leaves the
+    write queued rather than refusing it over a gap on this side (the inbound drain,
+    g-335-1726).
+    """
+    env = dict(os.environ if env is None else env)
+    return handle_inputs_present(env.get(_GOAL_HANDLE_SECRET_VAR, ""), env.get("ENVIRONMENT_ID", ""))
 
 
 # ── OKF markdown bundle (PEARL §10.5) ────────────────────────────────────────

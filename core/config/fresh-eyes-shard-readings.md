@@ -438,3 +438,20 @@ pointers live only in the `Handoff to N=` list, which every branch excludes.
 probe is correct again. Any forward `N=` written inside a value row re-arms the
 defect. The probe itself was NOT changed: the SKILL.md requires byte-identical
 branches, and a fix needs the rationale read first.
+
+## 2026-10-02 (zeta N=200, `hostname` cc-02, `uname -r` 6.8.0-142-generic, own-cloud, REDUCER) — branch 3 read a BACKWARD reference as the row's own N
+
+The mirror of the N=185 reading. My first draft of the N=200 row opened its first
+cell with "the 7 ids of N=199", and the Phase 2.0 probe run on the authoritative
+copy straight after the write returned **199**, not 200: branch 3 takes the FIRST
+`N=` in a `|` row, that was the backward reference, so the row read as the index it
+cited. Measured: the authoritative copy was 623,938 B / 327 lines in both reads,
+and the probe gave 199 before the reword and 200 after. The reword ("the 7 ids of
+N=199" to "the previous 7 ids") is the same 18 characters, so the byte count never
+moved and cannot tell the two states apart.
+
+**Write-side rule, extending N=185's:** no `|` row names ANY other index before its
+own N cell, forward or backward. **Read-side check, the half that caught it:**
+re-run the probe on the authoritative copy AFTER the row write and require it to
+return the N you wrote. A probe that returns the previous N after a successful
+write is this defect, not a stale cache. The probe stays byte-identical (g-115-10215).

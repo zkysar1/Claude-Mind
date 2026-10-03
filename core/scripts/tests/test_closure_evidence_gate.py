@@ -1,4 +1,4 @@
-"""Pins the closure-evidence gate ().
+"""Pins the closure-evidence gate () and its session-scratch advisory ().
 
 THE DEFECT: g-373-125 closed on narrative. Its outcome 2 required a unit to land
 "within 30s of the POST"; the note said "landed within ~5s" with no timestamp
@@ -26,7 +26,7 @@ PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
 from gates.closure_evidence import (  # noqa: E402
-    classify, evaluate, parse_rows, refusal_text, timestamps)
+    advisory_text, classify, evaluate, parse_rows, refusal_text, scratch_citations, timestamps)
 
 ROOTS = {"project": Path("/opt/mind"), "world": Path("/opt/mind/.mind-data/world"),
          "meta": Path("/opt/mind/.mind-data/meta"), "agents": Path("/opt/mind/agents")}
@@ -253,6 +253,87 @@ def test_the_refusal_is_short_and_carries_the_format_and_the_retry():
     assert "aspirations-query.sh --goal-field id g-373-125 --full" in text
 
 
+# ─── the session-scratch advisory () ─────────────────────────────
+#
+# Measured 2026-09-27: 14 of 39 close reviews flagged evidence that only the
+# closer's box could open. The positive cases cite a per-session path with
+# nothing a reviewer elsewhere can check; each quiet case is the same paragraph
+# with the missing part supplied, so a predicate that never fires fails here.
+
+GATED = "OUTCOME 1: MET — 42 lines written."
+LINES = "`TOTAL: 5112 passed, 0 failed`"
+
+
+def _cite(note, host=""):
+    return scratch_citations(note, sessions_dirname="sessions", hostname=host)
+
+
+def test_a_paragraph_citing_session_scratch_without_its_lines_or_a_host_fires():
+    found = _cite(f"{GATED}\n\nThe suite log is kept at {SCRATCH}.")
+    assert found == [{"paragraph": 2, "paths": [SCRATCH], "missing": ["excerpt", "host"]}]
+
+
+def test_the_verdict_line_and_the_host_beside_the_path_quiet_it():
+    """The goal's negative control."""
+    note = (f"{GATED}\n\nFull suite on hostname box-a: `VERDICT: CLEAN  TOTAL: 5112 passed, "
+            f"0 failed` from `bash core/scripts/run-full-suite.sh`, log kept at {SCRATCH}.")
+    assert _cite(note) == []
+
+
+def test_each_leg_fires_alone_and_a_bare_name_is_not_an_excerpt():
+    assert [f["missing"] for f in _cite(f"{GATED}\n\n{LINES} (log {SCRATCH}).")] == [["host"]]
+    host_only = f"{GATED}\n\nOn hostname box-a the log is {SCRATCH}."
+    assert [f["missing"] for f in _cite(host_only)] == [["excerpt"]]
+    a_name = f"{GATED}\n\nOn hostname box-a, `run_full_suite_v2` wrote {SCRATCH}."
+    assert [f["missing"] for f in _cite(a_name)] == [["excerpt"]]
+    # The lines must sit beside the path they back, not in another paragraph.
+    apart = f"{GATED}\n\n{LINES} on hostname box-a.\n\nLog: {SCRATCH}."
+    assert [(f["paragraph"], f["missing"]) for f in _cite(apart)] == [(3, ["excerpt"])]
+
+
+def test_this_box_hostname_names_the_host_as_a_whole_word():
+    note = f"{GATED}\n\nMeasured on box-q7: {LINES}, log {SCRATCH}."
+    assert [f["missing"] for f in _cite(note)] == [["host"]]
+    assert _cite(note, host="box-q7") == []
+    assert [f["missing"] for f in _cite(note, host="box-q")] == [["host"]]
+
+
+def test_a_host_flag_in_a_command_names_no_host():
+    flag = f"{GATED}\n\nRan `srv --host=127.0.0.1 --port 80`, log {SCRATCH}."
+    assert [f["missing"] for f in _cite(flag)] == [["host"]]
+    assert _cite(flag + " Measured on host=box-a.") == []  # control: a host label does
+
+
+def test_a_crlf_note_splits_into_the_same_paragraphs():
+    """A note written on Windows, or a CRLF summary on stdin, must not read as
+    one paragraph: the lines in paragraph 2 would then excuse the path in 3."""
+    apart = f"{GATED}\n\n{LINES} on hostname box-a.\n\nLog: {SCRATCH}."
+    lf = _cite(apart)
+    assert [(f["paragraph"], f["missing"]) for f in lf] == [(3, ["excerpt"])]
+    assert _cite(apart.replace("\n", "\r\n")) == lf
+
+
+def test_only_a_path_into_a_real_session_dir_fires():
+    fires = (SCRATCH, "agents/charlie/sessions/57c55134-e5b5-429c-bfa2-dbd142b9574d/cycle/run.log",
+             r"C:\mind\agents\charlie\sessions\57c55134e5b5429cbfa2dbd142b9574d\scratch\run.log")
+    for path in fires:
+        assert _cite(f"{GATED}\n\nSee {path} for details."), path
+    quiet = ("agents/<agent>/sessions/<SID>/scratch/suite.log",   # the convention, described
+             "agents/charlie/session/handoff.yaml",               # the synced cross-session dir
+             "src/app/sessions/handlers/login.ts",                # a product repo
+             "agents/charlie/sessions/57c55134e5b5429cbfa2dbd142b9574d/")  # the dir, not evidence
+    for path in quiet:
+        assert _cite(f"{GATED}\n\nSee {path} for details.") == [], path
+
+
+def test_the_advisory_text_names_the_paths_what_is_missing_and_the_fix():
+    text = advisory_text("g-1-1", _cite(f"{GATED}\n\nThe suite log is kept at {SCRATCH}."), "box-a")
+    assert "ADVISORY (g-375-52, never refuses)" in text and SCRATCH in text
+    assert "no lines inline beside it" in text and "The note names no host." in text
+    assert '"hostname box-a"' in text and "guard-7485" in text
+    assert len(text.encode("utf-8")) <= 2048
+
+
 # ─── the CLI ──────────────────────────────────────────────────────────────
 
 GATE = CORE_SCRIPTS / "closure-evidence-gate.py"
@@ -308,6 +389,54 @@ def test_cli_override_passes_and_writes_one_ledger_row(tmp_path):
     assert (rc, doc["decision"]) == (0, "override")
     rows = (tmp_path / "closure-evidence-overrides.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(rows) == 1 and json.loads(rows[0])["justification"] == "legacy close"
+
+
+def test_cli_advisory_rides_stderr_and_never_changes_the_verdict(tmp_path):
+    """. _cli asserts ONE JSON line on stdout, so an advisory printed
+    there fails every case below."""
+    rc, doc, err, _ = _cli(tmp_path, {**GOAL1, "outcome_note": f"{GATED}\n\nLog: {SCRATCH}."})
+    assert (rc, doc["decision"]) == (0, "pass")
+    assert "ADVISORY (g-375-52" in err and SCRATCH in err
+    cite = doc["scratch_citations"]
+    assert [c["paths"] for c in cite] == [[SCRATCH]] and "excerpt" in cite[0]["missing"]
+    # Control: the same close with the lines and the host beside the path is quiet.
+    quiet = f"{GATED}\n\nOn hostname box-a: {LINES}, log {SCRATCH}."
+    rc, doc, err, _ = _cli(tmp_path, {**GOAL1, "outcome_note": quiet})
+    assert (rc, doc["decision"]) == (0, "pass")
+    assert "ADVISORY" not in err and "scratch_citations" not in doc
+    # A refused close stays refused, and the refusal keeps the first screen.
+    rc, doc, err, _ = _cli(tmp_path, {**GOAL1, "outcome_note": f"done\n\nLog: {SCRATCH}."})
+    assert (rc, doc["decision"]) == (3, "block")
+    assert err.index("REFUSED") < err.index("ADVISORY (g-375-52")
+
+
+def test_a_fault_in_the_advisory_cannot_cost_the_verdict_and_never_reads_as_quiet(
+        tmp_path, monkeypatch, capsys):
+    """A raise there would exit 1, which do_verify reads as a gate fault and
+    proceeds past, so a refusal would be lost with it (guard-5430). And the JSON
+    line must tell a skipped check from a quiet one (guard-2421)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("closure_evidence_gate_cli", GATE)
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    cited = f"{GATED}\n\nLog: {SCRATCH}."
+    found, text, error = cli.scratch_advisory("g-1-1", cited)
+    assert found and "ADVISORY (g-375-52" in text and error == ""  # control: healthy
+
+    def boom(*a, **k):
+        raise RuntimeError("bad pattern")
+    monkeypatch.setattr(cli, "scratch_citations", boom)
+    assert cli.scratch_advisory("g-1-1", cited) == (
+        [], "closure-evidence-gate: session-scratch advisory skipped (bad pattern)", "bad pattern")
+    # Through main(), in-process; the gate-firing ledger is stubbed so no store is written.
+    monkeypatch.setattr(cli, "_gate_log", lambda *a, **k: None)
+    gj = tmp_path / "goal.json"
+    gj.write_text(json.dumps({**GOAL1, "outcome_note": cited}), encoding="utf-8")
+    assert cli.main(["--goal", "g-1-1", "--goal-json", str(gj)]) == 0
+    out = capsys.readouterr()
+    doc = json.loads(out.out.strip().splitlines()[-1])
+    assert doc["decision"] == "pass" and doc["scratch_advisory_error"] == "bad pattern"
+    assert "scratch_citations" not in doc and "advisory skipped (bad pattern)" in out.err
 
 
 # A legacy-codepage host (Windows without UTF-8 mode). An uncaught codec error
@@ -383,3 +512,7 @@ def test_iteration_close_runs_the_gate_before_the_status_write_for_every_role():
     assert "if [[ $_ceg_rc -eq 3 ]]; then" in src, "refuse on the dedicated code only (guard-5430)"
     assert "--override-closure-evidence)" in src
     assert '--override-closure-evidence \\"$OVERRIDE_CLOSURE_EVIDENCE\\"' in src
+    # stdout goes to the log; stderr must reach the closer, because the 
+    # advisory rides it.
+    call = src[gate:src.index("|| _ceg_rc=$?", gate)]
+    assert ">>" in call and "2>" not in call and "&>" not in call, call

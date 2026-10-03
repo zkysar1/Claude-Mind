@@ -172,8 +172,9 @@ ELSE:
                      --subjects-file <slot as JSON> --session-start <ISO> \
                      --census-file <(bash core/scripts/aspirations-read.sh \
                      --source world --active-compact)
-            rc 2 = broke (NEVER file), 3 = owned, 4 = MUST-READ: open the
-            id each such row names, test it (guard-5147). rc 0 =
+            BATCH rc (never 3): 2 = broke, NEVER file; 4 = a MUST-READ row; 0 =
+            no MUST-READ row, NOT no owner. Each ROW's verdict decides: open
+            the id a MUST-READ/DECLINE row names, test it (guard-5147). FILE =
             no LIVE owner only (guard-5278): re-run an AGED relay at HEAD
             (guard-7398), then file with the sq-013 origin_signal mapping and put
             "relayed by <agent> worker Body (spark_capture from <gid(entry)>),
@@ -977,6 +978,9 @@ When sq-009 (or sq-c09 experiential variant) fires, it creates a hypothesis goal
      a CI lint gate, rotating cloud credentials), so this carve-out would
      otherwise exempt each clause from the very case that produced it.
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
+   Add refuses a record missing any of the 9 `id` (YYYY-MM-DD_slug), `title`, `stage`, `horizon`, `type`,
+   `confidence`, `position` (YES/NO or a multi-word claim, never a stage or type name), `formed_date`,
+   `category` (REQUIRED_FIELDS, core/scripts/pipeline.py; guard-851, rb-8127).
    PUT THE ACTIVE-STAGE CONTRACT IN THIS PAYLOAD if you will move to active (2.4):
    `claim` (>=20 chars), `resolution_criteria`|`resolution_method`|`rationale` (>=10),
    and for horizon=short `measurement_channel` (>=5, naming what settles it).

@@ -53,6 +53,9 @@ if _ORIG_MIND_AGENT is not None:
     os.environ["MIND_AGENT"] = _ORIG_MIND_AGENT
 
 import _embedding_retrieval as er  # noqa: E402
+import _vendor_path as vp  # noqa: E402
+
+_REAL_STACK_PROBE = vp.stack_absent_reason
 
 
 def _cfg(blend=False, tree=False):
@@ -72,6 +75,15 @@ def _hermetic_index_dir(tmp_path, monkeypatch):
     er.clear_caches()
     yield
     er.clear_caches()
+
+
+@pytest.fixture(autouse=True)
+def _stack_present(monkeypatch):
+    # The verdicts in the first half of this file are about flags, the index and
+    # drift. Pin the stack probe to "present" so they never depend on what THIS
+    # box has installed; the  tests below put the real probe back or
+    # replace it.
+    monkeypatch.setattr(vp, "stack_absent_reason", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -133,3 +145,81 @@ def test_stats_absent_index_reports_dead_channel(tmp_path):
     assert d["exists"] is False
     assert d["channel"] == "DEAD"
     assert "index absent" in d.get("channel_reason", "")
+
+
+# --- : the verdict describes the SERVING PROCESS --------------------
+
+def _flags_on_with_index(monkeypatch):
+    _retrieve._RETRIEVAL_CFG_CACHE = _cfg(blend=True, tree=True)
+    monkeypatch.setattr(er, "index_available", lambda *a, **k: True)
+
+
+def test_dead_when_this_process_cannot_import_the_stack(monkeypatch):
+    """Flags on plus an index file read 'alive' while a daemon that started
+    before the stack was installed served every query token-only (ZDS cc-12,
+    2026-09-30)."""
+    _flags_on_with_index(monkeypatch)
+    monkeypatch.setattr(vp, "stack_absent_reason", lambda: "numpy is not importable")
+    v = _retrieve.embedding_channel_status()
+    assert v.startswith("DEAD"), v
+    assert "numpy is not importable" in v                    # the cause
+    assert "pip install --target ~/.ayoai-vendor/py" in v    # the remedy
+
+
+def test_stack_probe_runs_before_the_index_is_loaded(monkeypatch):
+    """The drift read loads the index (numpy) inside a swallow-all, so for a
+    process that cannot import numpy it answers 'no drift' and the verdict would
+    fall through to alive. A recorder, not a raising stub: the swallow-all would
+    eat the raise and the test would pass whatever the order."""
+    _flags_on_with_index(monkeypatch)
+    monkeypatch.setattr(vp, "stack_absent_reason", lambda: "numpy is not importable")
+    loads = []
+    monkeypatch.setattr(er, "_load_index", lambda d: loads.append(d) or (None, None, None))
+    assert _retrieve.embedding_channel_status().startswith("DEAD")
+    assert loads == []
+
+
+def test_dead_when_the_last_scoring_attempt_degraded(monkeypatch):
+    _flags_on_with_index(monkeypatch)
+    monkeypatch.setattr(er, "_last_degradation",
+                        {"reason": "encoder-or-runtime-error",
+                         "detail": "OSError: model files absent"})
+    v = _retrieve.embedding_channel_status()
+    assert v.startswith("DEAD"), v
+    assert "encoder-or-runtime-error" in v and "model files absent" in v
+
+
+def test_an_empty_query_record_is_not_evidence(monkeypatch):
+    """cosine_scores records an empty query (a no-op) without warning on it; the
+    status must not call the box dead because one caller passed ''."""
+    _flags_on_with_index(monkeypatch)
+    monkeypatch.setattr(er, "_last_degradation", {"reason": "empty-query", "detail": ""})
+    assert _retrieve.embedding_channel_status() == "alive"
+
+
+def test_alive_again_once_a_scoring_call_serves(monkeypatch):
+    """None is what a served cosine_scores leaves behind."""
+    _flags_on_with_index(monkeypatch)
+    monkeypatch.setattr(er, "_last_degradation", {"reason": "index-absent", "detail": "x"})
+    assert _retrieve.embedding_channel_status().startswith("DEAD")
+    monkeypatch.setattr(er, "_last_degradation", None)
+    assert _retrieve.embedding_channel_status() == "alive"
+
+
+def test_stack_installed_after_start_flips_dead_to_alive_without_restart(tmp_path, monkeypatch):
+    """The goal's outcome B through the REAL probe: a process that started with
+    no vendor dir reads DEAD; the stack appears; the next call reads alive, in
+    the same process. Unique stand-in module names keep the real numpy (already
+    loaded in this process) out of it."""
+    _flags_on_with_index(monkeypatch)
+    monkeypatch.setattr(vp, "stack_absent_reason", _REAL_STACK_PROBE)
+    monkeypatch.setattr(vp, "_STACK_MODULES", ("_g306574_np",))
+    monkeypatch.setattr(vp, "_ENCODER_BACKENDS", ("_g306574_enc",))
+    monkeypatch.setattr(sys, "path", list(sys.path))   # ensure_vendor_path appends to it
+    vendor = tmp_path / "py"                            # does not exist yet
+    monkeypatch.setenv("MIND_VENDOR_DIR", str(vendor))
+    assert _retrieve.embedding_channel_status().startswith("DEAD")
+    for name in ("_g306574_np", "_g306574_enc"):
+        (vendor / name).mkdir(parents=True)
+        (vendor / name / "__init__.py").write_text("", encoding="utf-8")
+    assert _retrieve.embedding_channel_status() == "alive"

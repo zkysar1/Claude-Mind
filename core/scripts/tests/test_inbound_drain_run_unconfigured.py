@@ -211,6 +211,35 @@ def test_missing_unconfigured_key_is_treated_as_zero(tmp_path):
     assert res["failed"] == []
 
 
+def test_a_busy_environment_is_counted_and_is_not_a_finding(tmp_path):
+    """: a drain that found the environment held by another drain left its records
+    queued for the next pass. That is the other drain working, not a stuck record, so it is
+    summed onto the result and raises no finding: one here would report every overlap of two
+    runs as a fault. The contrast is the two tests around it, whose counts are records no
+    drain will take until someone fixes the box."""
+    mod = _load_runner()
+    slot = _stub_slot(tmp_path, {"environments": [_env(busy=1)]})
+
+    res = mod.run(apply=True, slot_override=slot)
+
+    assert res["busy"] == 1, "the counter must be summed onto the result"
+    assert res["failed"] == [], "a busy environment is no finding"
+
+
+def test_unprovisioned_records_are_surfaced_as_a_finding(tmp_path):
+    """: a verb or knowledge edit the drain left queued because this box cannot
+    resolve handles. The finding names both variables, either of which is enough."""
+    mod = _load_runner()
+    slot = _stub_slot(tmp_path, {"environments": [_env(unprovisioned=2)]})
+
+    res = mod.run(apply=True, slot_override=slot)
+
+    assert res["unprovisioned"] == 2
+    assert len(res["failed"]) == 1, "an unprovisioned record must become a finding"
+    assert "KNOWLEDGE_HANDLE_SECRET" in _findings(res)
+    assert "ENVIRONMENT_ID" in _findings(res)
+
+
 def test_not_a_vessel_is_untouched(tmp_path):
     """The decline branch returns before the counters and must stay that way."""
     mod = _load_runner()
@@ -224,3 +253,41 @@ def test_not_a_vessel_is_untouched(tmp_path):
         "the not-a-vessel branch returns its own dict -- adding counters there "
         "would imply a drain ran when none did"
     )
+
+
+def test_a_failed_erase_is_surfaced_as_a_finding(tmp_path):
+    """ u4: an erase that did not finish after the undo window. The slot ends
+    `|| true; exit 0`, so this dict is the one channel that survives; a count with no finding
+    would read as a healthy `drained=0`."""
+    mod = _load_runner()
+    slot = _stub_slot(tmp_path, {"environments": [_env(erase_failed=2)]})
+
+    res = mod.run(apply=True, slot_override=slot)
+
+    assert res["erase_failed"] == 2
+    assert len(res["failed"]) == 1, "a failed erase must become a finding"
+    assert "2 erase(s)" in _findings(res) and "tries again" in _findings(res)
+    assert "still on disk" not in _findings(res), "a count cannot say which copy of the text is left"
+
+
+def test_an_erase_that_is_due_and_cannot_be_done_is_surfaced_as_a_finding(tmp_path):
+    mod = _load_runner()
+    slot = _stub_slot(tmp_path, {"environments": [_env(erase_pending=1)]})
+
+    res = mod.run(apply=True, slot_override=slot)
+
+    assert res["erase_pending"] == 1
+    assert len(res["failed"]) == 1
+    assert "cannot be completed" in _findings(res)
+
+
+def test_a_completed_erase_is_counted_and_raises_no_finding(tmp_path):
+    """The contrast: erasing is the job working, so it is summed and silent. A finding here would
+    report every pass that did its work as a fault."""
+    mod = _load_runner()
+    slot = _stub_slot(tmp_path, {"environments": [_env(erased=3), _env(erased=1)]})
+
+    res = mod.run(apply=True, slot_override=slot)
+
+    assert (res["erased"], res["erase_pending"], res["erase_failed"]) == (4, 0, 0)
+    assert res["failed"] == []

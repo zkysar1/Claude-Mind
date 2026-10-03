@@ -2,7 +2,8 @@
 
 Replaces `agents_root().glob("*/session/execution-diary.jsonl")` at the call
 sites that scan EVERY agent's diary. That glob has TWO independent defects on
-an own-cloud box, and fixing either one alone leaves the other live.
+an own-cloud box (g-115-4154, cc-02, 2026-07-31), and fixing either one alone
+leaves the other live.
 
 ENUMERATION. `execution-diary.jsonl` is `sync_tier: continuity`
 (`core/config/session-manifest.yaml`) and `OwnCloudBackend._machine_local()`
@@ -13,20 +14,21 @@ simply ABSENT locally until something reads it. A filesystem glob enumerates by
 what is on disk, so a cold box silently scans a subset of the fleet and reports
 the subset as if it were everyone. Measured on cc-02 (Linux 6.8.0-136-generic)
 2026-07-31 at filing time: 1 of 5 agents present locally while all 5 were live
-in S3, every one written within the preceding 15 minutes.
+in S3, every one written within the preceding 15 minutes (g-115-4154 filing).
 
 STALENESS. Enumeration succeeding does NOT mean the content is right, and this
-half is the one a warm cache hides. Measured on cc-02 2026-07-31T06:33 — same
-box, cache since warmed — the glob found 5 of 5 and 4 of those 5 DIVERGED from
-S3 (local/S3 bytes): alpha 36801/39669, bravo 59536/53382, echo 60782/55593,
-foxtrot 37796/36313. Three were LARGER locally, so this is not lagging appends.
+half is the one a warm cache hides. Measured on cc-02 2026-07-31T06:33
+(g-115-4154 filing) — same box, cache since warmed — the glob found 5 of 5
+and 4 of those 5 DIVERGED from S3 (local/S3 bytes): alpha 36801/39669,
+bravo 59536/53382, echo 60782/55593, foxtrot 37796/36313. Three were LARGER
+locally, so this is not lagging appends.
 Both call sites then read those local bytes directly, so a full-enumeration run
 still analyses stale content and looks perfectly healthy doing it.
 
-WHY A GLOB CANNOT BE FIXED BY SWAPPING THE READ. A filesystem glob has no
-backend equivalent — it decides who EXISTS from the mirror. So enumeration must
-come from a roster, and only then can each agent's diary path be read through
-the backend. This helper does both halves.
+WHY A GLOB CANNOT BE FIXED BY SWAPPING THE READ (g-115-4154). A filesystem
+glob has no backend equivalent — it decides who EXISTS from the mirror. So
+enumeration must come from a roster, and only then can each agent's diary
+path be read through the backend. This helper does both halves.
 
 ROSTER IS A UNION, DELIBERATELY. Team-state shard basenames (the live fleet
 roster, the same primary `owncloud-pull.sh --all-agents` uses) UNION agent-dir
@@ -198,22 +200,42 @@ def read_fleet_diaries(
     untouched by the carrier union below (peer_liveness and the sweep's
     keep-signal branch on it).
 
-    WORKER-BODY ROWS ARE UNIONED IN (g-306-555). The authoritative agent-wide
-    diary holds only the reducer's rows: a worker Body's appends are stranded
-    box-local by the agent-tree claim fence and mirror to
-    `world/body-diaries/<agent>/<sid>.jsonl` instead. Without the union, every
-    content consumer of this iterator (the scorer-override audit,
+    WORKER-BODY ROWS ARE UNIONED IN (g-306-555), ON THE PRODUCTION PATH ONLY.
+    The authoritative agent-wide diary holds only the reducer's rows: a worker
+    Body's appends are stranded box-local by the agent-tree claim fence and
+    mirror to `world/body-diaries/<agent>/<sid>.jsonl` instead. Without the
+    union, every content consumer of this iterator (the scorer-override audit,
     skill-discovery) is blind to Body decisions — the measured incident is in
     `body_diary_carrier`'s docstring. Carrier rows are VERBATIM diary rows
     (identical serialization to the agent-wide file), so a row present in BOTH
     is skipped from the carrier half and can never double-count; the
     agent-wide half is always yielded exactly as read (no dedup there —
     changing it would alter consumers' retry-collapse accounting).
+
+    THE UNION IS SKIPPED FOR A NON-DEFAULT `base` (g-306-575). The carrier root
+    is `world/body-diaries/<agent>` and `world/` is NOT derivable from the
+    agents root this `base` selects: in production the two are siblings under
+    different parents (the agents tree vs the external `world/` path from
+    `local-paths.conf`), and the `base` seam exists only for hermetic test
+    roots. Until this fix the carrier half read this module's `WORLD_DIR`
+    regardless of `base`, so a tmp-root read unioned the LIVE fleet's Body rows
+    into every hermetic test that names a real agent ('alpha') — the 9 reds of
+    g-306-575 (e.g. a test seeding 3 rows counting 49). A non-default `base`
+    therefore yields the agent-wide text verbatim and skips the union. A test
+    that needs the union exercises the production shape instead: `base=None`
+    with `agents_root`/`WORLD_DIR` patched to the tmp root (the
+    test_body_diary_carrier.py shape), which unions the carrier seeded under
+    that same tmp world and nothing outside it.
     """
     backend = _get_backend()
     for name in fleet_agent_names(base):
         text, _provenance = read_agent_diary(name, base, backend=backend)
         if not text:
+            continue
+        if base is not None:
+            # : a hermetic test root must not union live carrier rows
+            # in — the carrier root cannot be derived from this agents root.
+            yield name, text
             continue
         carrier = _body_carrier_lines(name, backend)
         if not carrier:

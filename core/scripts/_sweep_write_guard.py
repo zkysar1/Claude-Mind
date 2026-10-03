@@ -74,15 +74,22 @@ def _find_goal(items, goal_id):
     other is not a cosmetic slip: it raises AttributeError, which reads as "goal
     not found" and therefore as a REFUSAL — a wedge that looks exactly like the
     guard working correctly.
+
+    The first NON-superseded copy wins over a same-id rehome pointer (a lone
+    pointer is still returned) — mirror of the daemon's _find_goal (g-353-65).
     """
+    pointer = None
     for entry in items or []:
         asp = entry[0] if isinstance(entry, tuple) else entry
         if not isinstance(asp, dict):
             continue
         for g in (asp.get("goals") or []):
             if g.get("id") == goal_id:
-                return g
-    return None
+                if g.get("status") != "superseded":
+                    return g
+                if pointer is None:
+                    pointer = g
+    return pointer
 
 
 def reread_goal_authoritative(source, goal_id, *, read_aspirations, is_owncloud,

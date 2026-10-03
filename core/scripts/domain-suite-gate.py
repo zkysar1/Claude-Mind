@@ -23,12 +23,23 @@ WHAT IT DOES, in order (each step is cheap until the last):
      modified at or after the goal's claim → noop. The claim time is
      `claimed_at` on the goal record (read through aspirations-read.sh, never
      the store directly); `--since <iso>` overrides it; with neither readable
-     the window falls back to the last 6 hours and says so. mtime is the
-     honest trigger: Edit-tool writes to world/scripts do not pass through
-     _fileops, so the changelog cannot attribute them, and on a shared world
-     several Bodies edit the same tree — a red suite blocks all of their
-     verification regardless of who broke it, so the gate names the touched
-     files and leaves attribution to the reader.
+     the window falls back to the last 6 hours and says so (the agent queue
+     never claims, so there that fallback is the normal path).
+  2b. Of those files, keep only the ones THIS unit's sessions wrote (g-115-9084).
+     The tree is shared and fleet-synced, so mtime alone answers "did anyone
+     touch scripts/", not "did this goal": measured, about nine firings in ten
+     (an upper bound) were another session's file, and each cost the 900 s
+     bound for no verdict. The writer record is the per-agent edit log
+     (uncommitted-edits.jsonl, rows stamped with the session id by the
+     PostToolUse write hook); the changelog cannot attribute tool writes. The
+     ids matched are the closing process's own plus the claim's. No row for any
+     changed file → noop, naming the files it ignored. SKIP ONLY ON THAT
+     POSITIVE EVIDENCE: no session id, no log, or a world outside the project
+     root (where the hook records nothing) keeps the wide trigger and says why.
+     A write made through Bash, or on another box, is not in the log and reads
+     as someone else's: the one direction this can be wrong, said on the skip
+     line so the reader can run the suite. Why, and the measurements:
+     core/config/rationale/domain-suite-gate-own-writes.md.
   3. Run the domain suite: the world-provided hook
      $WORLD_PATH/scripts/run-domain-tests.sh when present (Pattern B,
      domain-hooks.md — core names the slot, the world fills it), else
@@ -90,7 +101,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from _paths import PROJECT_ROOT, WORLD_DIR  # noqa: E402
+from _paths import PROJECT_ROOT, WORLD_DIR, agent_dir  # noqa: E402
 from _gate_log import log as _gate_log  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402  guard-580/581: never a bare "bash", never str(Path)
 
@@ -102,6 +113,13 @@ FALLBACK_WINDOW = timedelta(hours=6)
 # One minute of slack under the claim stamp: a Body that edits in the same
 # minute it claims must not slip under the window on clock granularity.
 SLACK_SECONDS = 60
+# The per-agent log of every Write/Edit/MultiEdit a session made: one row per
+# tool write (file relative to the project root, mtime in epoch seconds,
+# edit_ts, goal_id, sid), written by uncommitted-edits-record.sh from the
+# PostToolUse hook. It is the one record of WHICH SESSION wrote a world script,
+# because the changelog does not see tool writes (; what it cannot
+# see: core/config/rationale/domain-suite-gate-own-writes.md).
+EDITS_LEDGER = "uncommitted-edits.jsonl"
 DEFAULT_TIMEOUT = 900
 # How long a timed-out runner gets between SIGTERM and SIGKILL ().
 # Enough for its EXIT trap to name the unit it was on; see run_suite.
@@ -310,15 +328,16 @@ def _parse_iso(text: str | None) -> datetime | None:
         return None
 
 
-def claimed_at(goal_id: str, source: str) -> datetime | None:
-    """The goal's claimed_at through aspirations-read.sh (daemon-routed).
+def claim_record(goal_id: str, source: str) -> dict | None:
+    """The goal's record through aspirations-read.sh (daemon-routed).
 
-    Returns None when the record or the stamp is unreadable — the caller
-    falls back to a bounded window (FALLBACK_WINDOW, 6h) and says so; the gate
-    never reads the store file directly. Both behaviours are this gate's
-    founding contract, stated in the commit that built it (g-353-75,
-    109b9f2725: "noop without ... a code file newer than the goal's claimed_at
-    (aspirations-read.sh; fallback 6h)").
+    Returns None when the record is unreadable — the caller falls back to a
+    bounded window (FALLBACK_WINDOW, 6h) and says so; the gate never reads the
+    store file directly. Both behaviours are this gate's founding contract,
+    stated in the commit that built it (g-353-75, 109b9f2725: "noop without ...
+    a code file newer than the goal's claimed_at (aspirations-read.sh;
+    fallback 6h)"). The record carries the claim's `claimed_at` (the window)
+    and the session ids that held it (whose writes `own_writes` keeps).
     """
     parts = goal_id.split("-")
     if len(parts) < 3 or parts[0] != "g":
@@ -334,8 +353,94 @@ def claimed_at(goal_id: str, source: str) -> datetime | None:
         return None
     for g in (doc.get("goals") or []) if isinstance(doc, dict) else []:
         if g.get("id") == goal_id:
-            return _parse_iso(g.get("claimed_at"))
+            return g
     return None
+
+
+# ─── whose write it was () ──────────────────────────────────────
+
+def unit_sessions(rec: dict | None) -> set[str]:
+    """The session ids that ran this unit: the closing process's own, plus the claim's.
+
+    MIND_SID is the id bash-agent-inject exports to every command, and the gate
+    runs inside the closing session, so it names the session that CLOSES. The
+    claim's two ids (claimed_by_sid, executed_by_sid) add the session that
+    started the unit when a restart handed it to another. A wider set only makes
+    the gate run MORE often, which is the safe direction.
+    """
+    ids = {os.environ.get("MIND_SID", "")}
+    if isinstance(rec, dict):
+        ids.update(str(rec.get(k) or "") for k in ("claimed_by_sid", "executed_by_sid"))
+    return {i.strip() for i in ids if i.strip()}
+
+
+def edits_ledger(agent: str | None) -> Path | None:
+    """This agent's edit log, or None when no agent is bound or its dir will not resolve."""
+    if not agent:
+        return None
+    try:
+        return agent_dir(agent) / "session" / EDITS_LEDGER
+    except Exception:  # noqa: BLE001 — no resolvable agent dir means no log, i.e. the wide trigger
+        return None
+
+
+def own_writes(scripts_dir: Path, since: datetime, sids: set[str], ledger: Path | None,
+               project_root: Path) -> tuple[set[str] | None, str]:
+    """(files under scripts_dir that this unit's sessions wrote since `since`, "") — paths relative to scripts_dir.
+
+    (None, why) when the edit log cannot speak for this tree; the caller then
+    keeps the wide mtime trigger. Skipping the suite needs POSITIVE evidence
+    that the changed files came from elsewhere, so every blind spot of the log
+    that this function CAN see answers None:
+      - no session id to match rows against;
+      - no log, or an unreadable one;
+      - a world that sits outside the project root: the recorder drops every
+        path outside it, so an empty answer there would mean "nothing recorded",
+        not "nothing written".
+    What it cannot see, a write made through Bash instead of a Write/Edit tool
+    and a write made on another box, reads as someone else's, so the answer is
+    an UPPER bound on peer files (rb-12528, rb-12529).
+    """
+    if not sids:
+        return None, "no session id for this close"
+    if ledger is None or not ledger.is_file():
+        return None, "this agent has no edit log"
+    prefixes: list[str] = []
+    for base, root in ((scripts_dir, project_root), (scripts_dir.resolve(), project_root.resolve())):
+        try:
+            p = base.relative_to(root).as_posix() + "/"
+        except ValueError:
+            continue
+        if p not in prefixes:
+            prefixes.append(p)
+    if not prefixes:
+        return None, "the world's scripts sit outside the project root, where the edit log records nothing"
+    cutoff = since.timestamp() - SLACK_SECONDS
+    needles = [p.encode("utf-8") for p in prefixes]
+    mine: set[str] = set()
+    try:
+        with open(ledger, "rb") as fh:
+            for raw in fh:
+                if not any(n in raw for n in needles):
+                    continue
+                try:
+                    row = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                sid, mt, f = row.get("sid"), row.get("mtime"), row.get("file")
+                if not isinstance(sid, str) or sid not in sids or not isinstance(f, str):
+                    continue
+                if isinstance(mt, bool) or not isinstance(mt, (int, float)) or mt < cutoff:
+                    continue
+                for p in prefixes:
+                    if f.startswith(p):
+                        mine.add(f[len(p):])
+                        break
+    except OSError as e:
+        return None, f"the edit log is unreadable ({type(e).__name__})"
+    return mine, ""
 
 
 # ─── the run ──────────────────────────────────────────────────────────────
@@ -615,7 +720,8 @@ def _emit(decision: str, goal_id: str, override: str | None, **fields) -> dict:
         _gate_log(GATE_ID, decision, caller="iteration-close.sh do_verify",
                   trigger_matched=bool(fields.get("touched")),
                   payload={"goal_id": goal_id, "runner": fields.get("runner"),
-                           "rc": fields.get("rc"), "touched": len(fields.get("touched") or [])},
+                           "rc": fields.get("rc"), "touched": len(fields.get("touched") or []),
+                           "peer_touched": len(fields.get("peer_touched") or [])},
                   override_reason=override if decision == "override" else None)
     except Exception:  # noqa: BLE001 — telemetry must never break the gate
         pass
@@ -626,23 +732,53 @@ def _emit(decision: str, goal_id: str, override: str | None, **fields) -> dict:
 # ─── main ─────────────────────────────────────────────────────────────────
 
 def evaluate(goal_id: str, source: str, since: datetime | None, override: str | None,
-             timeout: int, world_dir: Path | None) -> int:
+             timeout: int, world_dir: Path | None, *, ledger: Path | None = None,
+             project_root: Path | None = None) -> int:
     scripts_dir = _scripts_dir(world_dir)
     if scripts_dir is None or not has_domain_tests(scripts_dir):
         _emit("noop", goal_id, override, reason="no domain test suite under world scripts")
         return 0
 
     since_note = ""
+    rec = None
     if since is None:
-        since = claimed_at(goal_id, source)
+        rec = claim_record(goal_id, source)
+        since = _parse_iso((rec or {}).get("claimed_at"))
         if since is None:
             since = datetime.now() - FALLBACK_WINDOW
             since_note = " (claimed_at unreadable; used the last 6 hours)"
+    stamp = since.strftime("%Y-%m-%dT%H:%M:%S")
     touched = touched_since(scripts_dir, since)
     if not touched:
-        _emit("noop", goal_id, override, reason="no domain script modified since "
-              + since.strftime("%Y-%m-%dT%H:%M:%S") + since_note)
+        _emit("noop", goal_id, override, reason="no domain script modified since " + stamp + since_note)
         return 0
+
+    # Keep only the files THIS unit's sessions wrote (). mtime over a
+    # fleet-synced tree answers "did anyone touch it", and about nine closes in
+    # ten that fired were on a peer's file. The skip needs positive evidence
+    # (own_writes); any blind spot it can see keeps the wide trigger, and says
+    # why on the run line below. Why, and the failure direction chosen:
+    # core/config/rationale/domain-suite-gate-own-writes.md.
+    mine, unscoped_why = own_writes(scripts_dir, since, unit_sessions(rec),
+                                    ledger or edits_ledger(os.environ.get("MIND_AGENT")),
+                                    project_root or PROJECT_ROOT)
+    scope_note = ""
+    if mine is None:
+        scope_note = f" [not narrowed to this unit's own writes: {unscoped_why}]"
+    else:
+        peers = [t for t in touched if t[0] not in mine]
+        touched = [t for t in touched if t[0] in mine]
+        scope_note = ", all written by this unit's sessions"
+        if not touched:
+            peer_names = ", ".join(t[0] for t in peers[:3]) + (" ..." if len(peers) > 3 else "")
+            _emit("noop", goal_id, override, peer_touched=[t[0] for t in peers],
+                  reason=f"{len(peers)} domain script(s) changed since {stamp}{since_note}, none written by "
+                         f"this unit's sessions (the edit log has no row for them): {peer_names}")
+            print(f"[domain-suite-gate] not running the domain suite for {goal_id}: {len(peers)} domain "
+                  f"script(s) changed since {stamp}{since_note} ({peer_names}) and this unit's sessions wrote "
+                  "none of them. A write made through Bash is not in the edit log: if this unit wrote a "
+                  "domain script that way, run the suite yourself.", file=sys.stderr, flush=True)
+            return 0
 
     _, runner_label = runner_command(scripts_dir)
     roots = private_roots(world_dir)
@@ -659,7 +795,7 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         took = "under a minute" if last < 60 else f"{round(last / 60)} min"
         expect += f"; the last run on this box took {took}"
     print(f"[domain-suite-gate] running the world's domain suite before this close, because "
-          f"{len(touched)} domain script(s) changed since the claim ({names}). Expect {expect}. "
+          f"{len(touched)} domain script(s) changed since the claim ({names}){scope_note}. Expect {expect}. "
           "It is not hung: let it finish.", file=sys.stderr, flush=True)
     started = time.monotonic()
     rc, tail, failing, log = run_suite(scripts_dir, timeout, goal_id)

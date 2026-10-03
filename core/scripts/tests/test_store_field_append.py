@@ -17,6 +17,10 @@ What IS new, and therefore tested:
   5. idempotence-BEFORE-anchor ordering, a deliberate decision that a later
      reordering would silently invert
   6. STORES table integrity, so a third store cannot be added half-wired
+  7. the pipeline store's read shape, canaries and value coercion (g-001-828)
+  8. the write's value travels on stdin as UTF-8 bytes, never in argv, and a
+     failed verify restores PRE only while the field holds this run's value
+     (g-115-11615)
 """
 from __future__ import annotations
 
@@ -153,7 +157,7 @@ def _run_main(monkeypatch, pre, argv, write_calls=None):
     """Drive main() with the read stubbed and the write captured."""
     monkeypatch.setattr(sfa, "read_record", lambda store, rid: _fake_record(pre))
 
-    def _fake_run(cmd):
+    def _fake_run(cmd, **kw):
         if write_calls is not None:
             write_calls.append(cmd)
 
@@ -226,7 +230,7 @@ def test_anchor_present_proceeds(monkeypatch):
 
     monkeypatch.setattr(sfa, "read_record", _read)
 
-    def _fake_run(cmd):
+    def _fake_run(cmd, **kw):
         writes.append(cmd)
 
         class R:
@@ -331,8 +335,9 @@ def _stub_run(store_state, writes):
     the code path under test. A test that stubs `read_record` would pass
     identically with the pipeline entry deleted from STORES.
     """
-    def _run(cmd):
+    def _run(cmd, **kw):
         joined = " ".join(str(c) for c in cmd)
+        import json as _json
 
         class R:
             returncode = 0
@@ -340,18 +345,20 @@ def _stub_run(store_state, writes):
             stdout = ""
 
         if "pipeline-read.sh" in joined:
-            import json as _json
             R.stdout = _json.dumps(_pipeline_record(store_state["position"]))
         elif "pipeline-update-field.sh" in joined:
             writes.append(cmd)
-            # Pin the argv SHAPE before indexing it (fresh-eyes F2, guard-920).
+            # Pin the argv SHAPE before trusting it (fresh-eyes F2, guard-920).
             # `bash_cmd` returns [BASH, script, *args] and the call is
-            # _bash(write, record_id, field, new), so the composed value is cmd[-1]
-            # TODAY. A future trailing flag would make the stub capture the flag,
-            # and the byte-identity assertion below would then compare flag to flag
-            # and PASS — a silently weakened test. This assert turns that into a red.
-            assert len(cmd) == 5 and cmd[3] == "position", f"write argv shape changed: {cmd}"
-            store_state["position"] = cmd[-1]   # the composed value
+            # _bash(write, "--value-stdin", record_id, field) with the composed value
+            # on stdin (). If the value moved back into argv, the stub
+            # would still find something to store and the assertions below could
+            # pass, so this assert turns that change into a red.
+            assert list(cmd[2:]) == ["--value-stdin", "2026-09-15_some-hypothesis", "position"], (
+                f"write argv shape changed: {cmd}")
+            store_state["position"] = kw["input"]   # the composed value
+            # The wrapper prints the record its endpoint returned.
+            R.stdout = _json.dumps(_pipeline_record(store_state["position"]), indent=2)
         return R
     return _run
 
@@ -457,3 +464,156 @@ def test_compose_sentinel_defeats_the_pipeline_endpoints_value_coercion():
     assert _pw._parse_value("true") is True
     assert isinstance(_pw._parse_value("42"), int)
     assert isinstance(_pw._parse_value('{"a": 1}'), dict)
+
+
+# ── 8. the value on stdin, and the restore after a failed verify () ──
+#
+# On Windows, Git bash cuts an argv word holding whitespace at 8,186 characters
+# with rc=0. The composed value used to be the last argv word of the write, and
+# a value cut that way was kept when verification failed.
+
+import json as _json
+import subprocess as _subprocess
+
+
+@pytest.mark.parametrize("store,field", [
+    ("guardrails", "action_hint"),
+    ("reasoning-bank", "content"),
+    ("pipeline", "position"),
+])
+def test_the_write_sends_the_value_on_stdin_as_bytes_never_in_argv(monkeypatch, store, field):
+    """The real `_run` path down to subprocess.run, for every store.
+
+    Text mode would turn each \\n into \\r\\n on Windows, so the value must reach
+    subprocess.run as bytes, with no text= or encoding= keyword.
+    """
+    pre = "an existing note"
+    text = "first line\nsecond line — é " + "word " * 2000
+    composed = sfa.compose(pre, text.strip("\n"), "m-11615")
+    reads = {"n": 0}
+
+    def _read(st, rid):
+        reads["n"] += 1
+        # PRE, then the pre-write re-read, then the post-write read.
+        return {"id": rid, field: pre if reads["n"] <= 2 else composed}
+
+    calls = []
+
+    def _fake_subprocess_run(argv, **kw):
+        calls.append((list(argv), kw))
+        return _subprocess.CompletedProcess(argv, 0, _json.dumps({field: composed}).encode(), b"")
+
+    monkeypatch.setattr(sfa, "read_record", _read)
+    monkeypatch.setattr(sfa._gfa.subprocess, "run", _fake_subprocess_run)
+    assert sfa.main(["--store", store, "rid-1", field, "m-11615", text]) == sfa.RC_OK
+
+    assert len(calls) == 1, "only the write runs a process; the reads are stubbed"
+    argv, kw = calls[0]
+    assert argv[1].endswith(sfa.STORES[store]["write"]), argv
+    assert argv[2:] == ["--value-stdin", "rid-1", field], argv
+    assert not any("word word" in str(a) for a in argv), "the value leaked into argv"
+    assert kw["input"] == composed.encode("utf-8")
+    assert isinstance(kw["input"], bytes)
+    assert "text" not in kw and "encoding" not in kw, kw
+
+
+def _guard_store(state, writes, *, damage=None, after_write=None, respond=True):
+    """Stand in for `_run` on the guardrails store, keeping the real read_record.
+
+    A read returns ``state["v"]``. The first write stores ``damage(value)`` when a
+    damage function is given, and every later write stores its value as sent. A
+    write answers with the stored record, which is what the real wrapper prints.
+    ``after_write`` runs after the first write, to model another writer or a
+    re-read that lags.
+    """
+    def _run(cmd, **kw):
+        joined = " ".join(str(c) for c in cmd)
+
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        if "guardrails-read.sh" in joined:
+            R.stdout = _json.dumps({"id": "guard-1", "action_hint": state["v"]})
+        elif "guardrails-update-field.sh" in joined:
+            value = kw["input"]
+            writes.append(value)
+            stored = damage(value) if damage and len(writes) == 1 else value
+            state["v"] = stored
+            if respond:
+                R.stdout = _json.dumps({"id": "guard-1", "action_hint": stored}, indent=2)
+            if after_write and len(writes) == 1:
+                after_write(state)
+        return R
+    return _run
+
+
+def _append(monkeypatch, capsys, state, writes, **stub):
+    monkeypatch.setattr(sfa, "_run", _guard_store(state, writes, **stub))
+    with pytest.raises(SystemExit) as exc:
+        sfa.main(["--store", "guardrails", "guard-1", "action_hint", "m1", "new text"])
+    err = capsys.readouterr().err
+    # The rc=7 report is the last JSON object on stderr.
+    return exc.value.code, _json.loads(err[err.rindex('{\n  "ok": false'):])["error"]
+
+
+PRE = "an existing guardrail action hint, long enough to be cut " * 2
+
+
+def _cut(value):
+    """What the 8,186-character glob did: keep a prefix, lose the sentinel."""
+    return value[:len(value) // 2]
+
+
+def test_a_cut_write_is_restored_to_pre_while_the_field_still_holds_it(monkeypatch, capsys):
+    state, writes = {"v": PRE}, []
+    code, error = _append(monkeypatch, capsys, state, writes, damage=_cut)
+    assert code == sfa.RC_VERIFY_FAILED
+    assert writes == [sfa.compose(PRE, "new text", "m1"), PRE], "PRE was not written back"
+    assert state["v"] == PRE
+    assert "PRE was restored" in error and "re-read confirms it" in error, error
+
+
+def test_another_writers_value_is_never_overwritten(monkeypatch, capsys):
+    state, writes = {"v": PRE}, []
+
+    def _peer(s):
+        s["v"] = "a peer rewrote this field after the cut write"
+
+    code, error = _append(monkeypatch, capsys, state, writes, damage=_cut, after_write=_peer)
+    assert code == sfa.RC_VERIFY_FAILED
+    assert len(writes) == 1, "the restore overwrote another writer's value"
+    assert state["v"] == "a peer rewrote this field after the cut write"
+    assert "Another writer changed it" in error, error
+
+
+def test_a_sound_write_is_not_undone_when_only_the_re_read_disagrees(monkeypatch, capsys):
+    """The write's response shows a sound value, so a stale re-read is not damage."""
+    state, writes = {"v": PRE}, []
+
+    def _lagging_read(s):
+        s["v"] = PRE
+
+    code, error = _append(monkeypatch, capsys, state, writes, after_write=_lagging_read)
+    assert code == sfa.RC_VERIFY_FAILED
+    assert len(writes) == 1, "a sound write was undone"
+    assert "the write stored a sound value" in error, error
+
+
+def test_an_empty_pre_is_not_written_back(monkeypatch, capsys):
+    """The write wrappers refuse an empty value, so there is nothing to write back."""
+    state, writes = {"v": ""}, []
+    code, error = _append(monkeypatch, capsys, state, writes, damage=_cut)
+    assert code == sfa.RC_VERIFY_FAILED
+    assert len(writes) == 1
+    assert "the field was empty before this run" in error, error
+
+
+def test_no_restore_when_the_write_response_does_not_show_the_stored_value(monkeypatch, capsys):
+    state, writes = {"v": PRE}, []
+    code, error = _append(monkeypatch, capsys, state, writes, damage=_cut, respond=False)
+    assert code == sfa.RC_VERIFY_FAILED
+    assert len(writes) == 1
+    assert state["v"] == _cut(sfa.compose(PRE, "new text", "m1"))
+    assert "did not show what it stored" in error, error

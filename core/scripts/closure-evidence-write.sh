@@ -587,14 +587,32 @@ fi
 # RECURRING ONLY, and the narrowing is deliberate. The discriminator exists to
 # serve the supersede branch, which only runs on recurring goals; a one-shot goal
 # takes never-clobber and needs no marker. So a one-shot note still reaches the
-# record BYTE-EXACT, which is a contract this suite already pins
-# (test_writes_the_note_when_absent asserts the narrative is unaltered in
-# transit). Marking every write would have bought nothing and broken that.
+# record BYTE-EXACT (a worker Body's gains only its signature, below), which is
+# a contract this suite already pins (test_writes_the_note_when_absent asserts
+# the narrative is unaltered in transit). Marking every write would have bought
+# nothing and broken that.
 # NOT on the deferral path (). `_CE_DEFER_STAMPED` means SUMMARY is
 # the CALLER'S preserved artifact with a deferral line appended, not this
 # script's own narrative. CE_AUTO_MARK asserts authorship; adding it there would
 # claim this script wrote a note it deliberately declined to touch, and would
 # grant the next occurrence a supersede on the wrong evidence.
+#
+# A WORKER BODY'S NARRATIVE IS SIGNED HERE, never by the Body (): one
+# line naming its sid and this box, read from its own environment (why the writer
+# signs: _body_stamp.py). It goes before the auto-mark, beside the narrative it
+# signs, and the idempotency compare above still finds the bare summary. Not on
+# the deferral path, for the reason just given: SUMMARY is then the caller's
+# preserved note, which this Body did not write. The line is ASCII, as above. A
+# failure to sign is said aloud and the note is written unsigned.
+if [[ "${BODY_ROLE:-}" == "worker" && "${_CE_DEFER_STAMPED:-0}" -eq 0 ]]; then
+    if _ce_signed="$($PYLAUNCH "$SCRIPT_DIR/_body_stamp.py" line)"; then
+        [[ -n "$_ce_signed" ]] && SUMMARY="$SUMMARY
+
+$_ce_signed"
+    else
+        echo "$PREFIX could not sign this worker narrative (_body_stamp.py failed); writing it unsigned." >&2
+    fi
+fi
 if [[ "$_rec" -eq 1 && "${_CE_DEFER_STAMPED:-0}" -eq 0 ]]; then
     SUMMARY="$SUMMARY
 

@@ -1689,10 +1689,16 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
             pruned_count = len(to_prune)
 
             if not to_archive and pruned_count == 0 and stamped_count == 0:
+                # Same key set as the normal return below (fresh-eyes 2026-09-27,
+                # ): the idle path used to omit folded_count and
+                # archive_missing_count, so a caller branching on those keys saw
+                # a different shape depending on whether the sweep did anything.
                 return Response.json({
                     "ok": True,
                     "archived_count": 0,
                     "pruned_count": 0,
+                    "folded_count": 0,
+                    "archive_missing_count": 0,
                     "skipped_invalid": skipped_invalid,
                 })
 
@@ -1704,6 +1710,16 @@ def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
             if to_prune:
                 folded_count, archive_missing_count = _fold_tombstones_into_archive(
                     archive_path, base_dir, agent, to_prune)
+                # The fold APPENDS every pruned id that lacked an archive copy
+                # (archive_missing_count), so archive_ids — read at the top of
+                # the block — is stale for exactly those ids. Without this, the
+                # append-once loop below appends a SAME-ID row the fold just
+                # wrote, forming the duplicate group its own comment says
+                # cannot form (fresh-eyes 2026-09-28, ; guard-2449).
+                # Every pruned id has an archive copy by this point (missing
+                # ones were appended by the fold), so updating with the full
+                # prune set is safe.
+                archive_ids.update(t["id"] for t in to_prune)
 
             # Append each newly-flipped record to the archive file — once.
             # Ids already archived (tombstone re-sweeps, resurrection residue)

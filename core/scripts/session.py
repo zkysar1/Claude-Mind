@@ -246,7 +246,12 @@ def cmd_persona_set(args):
     if value not in VALID_PERSONA:
         print(f"ERROR: Invalid persona value '{value}'. Must be one of: {', '.join(sorted(VALID_PERSONA))}", file=sys.stderr)
         sys.exit(1)
-    write_file(SESSION_DIR / "persona-active", value)
+    path = SESSION_DIR / "persona-active"
+    # The file's mtime is the time of its last VALUE change. A reader compares it with a session
+    # document's save time to tell a ceremony still running from one that ended, so a second
+    # session re-asserting the value it already holds must not move it.
+    if read_file(path) != value:
+        write_file(path, value)
 
 
 # ---------------------------------------------------------------------------

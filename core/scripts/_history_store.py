@@ -118,16 +118,52 @@ def _now_iso():
 # Atomic write (idempotent for content-addressed names)
 # ---------------------------------------------------------------------------
 
+_WINDOWS_LONG_PATH_PREFIX = "\\\\?\\"
+
+
+def _windows_long_path(p):
+    """Wrap an ABSOLUTE Windows path in the extended-length prefix (\\?\\),
+    which bypasses the 259-char MAX_PATH limit on Win10 1607+. Returns str
+    paths unchanged on non-Windows platforms (where the prefix is
+    meaningless and would break the path).
+
+    g-115-11691 (ZDS DESKTOP-O91DLK2, LongPathsEnabled=0): the store's real
+    patch and manifest paths run 236+ chars under deep repo roots, and the tmp
+    suffix pushed them past 259 so the open() raised FileNotFoundError and
+    9,593 delta saves were silently dropped. The extended-length prefix
+    covers BOTH overflow routes at once: patches whose FINAL name fits but
+    whose tmp did not, and manifest or blob files whose FINAL name itself
+    exceeds
+    259 (14 deep knowledge-tree nodes measure 260-316 chars). A short tmp
+    name alone cannot cover the second route, so the prefix is the primary
+    fix and the short tmp (below) is the belt-and-suspenders layer for
+    anything without long-path capability.
+    """
+    if os.name != "nt":
+        return p
+    s = str(p)
+    if s.startswith(_WINDOWS_LONG_PATH_PREFIX):
+        return s
+    if not (len(s) >= 2 and s[1] == ":"):
+        return s  # relative path — the prefix is only legal on absolute ones
+    return _WINDOWS_LONG_PATH_PREFIX + s
+
+
 def _unique_tmp(target):
     """Return a unique-per-writer .tmp Path for target.
 
-    Defends against concurrent writers racing on the same content-addressed
-    blob (cross-file dedup case: two source files with identical content
-    both write to the same blob in parallel). Deterministic tmp names
-    collide; pid+random hex doesn't.
+    The tmp lives in the target's OWN directory with a short name
+    (.<16 hex>.tmp, 21 chars) — NOT the target's name plus a suffix.
+    g-115-11691: the old scheme appended 26-27 chars to an already-deep
+    content-addressed name, pushing patch temp paths past the 259-char
+    Windows MAX_PATH while the final names still fit; 9,593 saves failed
+    on the tmp open alone. A short name in the same directory keeps the
+    tmp path SHORT (same directory, short leaf) and is still unique per
+    writer (random hex), so the concurrent-writer dedup race the suffix
+    exists for is still defended against.
     """
-    suffix = f".{os.getpid()}-{os.urandom(8).hex()}.tmp"
-    return target.with_suffix(target.suffix + suffix)
+    name = f".{os.urandom(8).hex()}.tmp"
+    return _windows_long_path(target.parent / name)
 
 
 def _atomic_write_bytes(target, content_bytes):
@@ -191,6 +227,36 @@ def _gunzip_bytes(gzipped_bytes):
 # Delta encode / decode (line-based opcodes, serialized as gzip'd JSON)
 # ---------------------------------------------------------------------------
 
+def _encode_suffix(base_bytes, current_bytes):
+    """Pure-append fast path: if current_bytes is base_bytes with a tail
+    appended, encode ONLY the tail.
+
+    Returns:
+        bytes: gzip'd JSON {"format": "suffix_v1", "suffix": <tail text>}.
+        None: not an append, or the tail/base is not valid UTF-8.
+
+    O(n) (one startswith + one tail decode) versus difflib's O(n^2) over the
+    whole file, and carries NO size cap — this is what lets a store that has
+    outgrown DEFAULT_FULL_BLOB_MAX_SIZE still save cheaply when the edit was
+    an append (g-115-11650: every >5MB save wrote a whole-file gzip, e.g.
+    5.42 MB average over 2,550 saves of one 5.8 MB file). A suffix is always
+    smaller than the full content, so the savings-threshold check the
+    difflib path uses is unnecessary here (and would force a full-content
+    gzip — the exact cost this path exists to avoid).
+    """
+    if len(current_bytes) < len(base_bytes):
+        return None
+    if not current_bytes.startswith(base_bytes):
+        return None
+    try:
+        base_bytes.decode("utf-8")
+        tail = current_bytes[len(base_bytes):].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    obj = {"format": "suffix_v1", "suffix": tail}
+    return _gzip_bytes(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+
 def _encode_delta(base_bytes, current_bytes):
     """Compute a line-based delta from base_bytes to current_bytes.
 
@@ -229,9 +295,14 @@ def _encode_delta(base_bytes, current_bytes):
 
 
 def _apply_delta(base_bytes, delta_bytes):
-    """Apply a gzip'd-JSON delta to base_bytes; return reconstructed bytes."""
+    """Apply a gzip'd-JSON delta to base_bytes; return reconstructed bytes.
+
+    Two formats: lines_v1 (line opcodes, the difflib path) and suffix_v1
+    (pure-append tail, the size-cap-free fast path)."""
     delta_json = _gunzip_bytes(delta_bytes).decode("utf-8")
     delta = json.loads(delta_json)
+    if delta.get("format") == "suffix_v1":
+        return base_bytes + str(delta.get("suffix", "")).encode("utf-8")
     if delta.get("format") != "lines_v1":
         raise ValueError(f"Unknown delta format: {delta.get('format')!r}")
 
@@ -347,8 +418,18 @@ def save(file_path, content_bytes, base_dir, agent, summary="",
     prior_manifest = _read_manifest(prior_manifests[0]) if prior_manifests else None
 
     # Fast path: identical content to prior. Skip blob/patch write; just
-    # add a new manifest pointing at the same storage.
-    if prior_manifest is not None and prior_manifest.get("hash") == content_hash:
+    # add a new manifest pointing at the same storage. ONLY when the prior's
+    # storage is still reconstructable (encoding full/delta): a prior whose
+    # manifest was rewritten to encoding=dropped by a metadata-only vacuum no
+    # longer points at existing storage — inheriting that encoding would
+    # publish a fresh manifest whose restore() raises, while history-save
+    # still exits 0 (: 115/171 newest manifests dropped on cc-03).
+    # A dropped prior falls through to the encode path below, where the same
+    # encoding check makes can_try_delta false and the save writes a fresh
+    # full blob — the pre-vacuum content is re-anchored, restore works again.
+    if (prior_manifest is not None
+            and prior_manifest.get("hash") == content_hash
+            and prior_manifest.get("encoding") in ("full", "delta")):
         return _write_new_manifest(
             base_dir, file_path, agent, summary, content_bytes,
             content_hash=content_hash,
@@ -363,23 +444,41 @@ def save(file_path, content_bytes, base_dir, agent, summary="",
     chain_length = 0
     delta_bytes = None
 
+    # A delta is only worth attempting when the prior's storage is still
+    # reconstructable (full/delta) and the chain is below the anchor limit.
+    # The SIZE cap applies ONLY to the O(n^2) difflib delta below, NOT to the
+    # O(n) pure-append suffix fast path: an append stores just its tail, so a
+    # store that has outgrown DEFAULT_FULL_BLOB_MAX_SIZE still saves cheaply
+    # ( — every >5MB save was a whole-file gzip). A >5MB edit that
+    # is NOT a pure append still lands a full blob (byte-exact restore, the
+    # o2 regression control), so dropping the cap only widens what counts as
+    # a "cheap append", never what a large non-append costs.
     can_try_delta = (
         prior_manifest is not None
         and prior_manifest.get("encoding") in ("full", "delta")
         and prior_manifest.get("chain_length", 0) < anchor_interval - 1
-        and len(content_bytes) <= DEFAULT_FULL_BLOB_MAX_SIZE
     )
     if can_try_delta:
         try:
             prior_content = _resolve_chain(prior_manifest["hash"], base_dir)
-            candidate = _encode_delta(prior_content, content_bytes)
-            if candidate is not None:
-                full_gz_size = len(_gzip_bytes(content_bytes))
-                if len(candidate) < full_gz_size * DEFAULT_DELTA_SAVINGS_THRESHOLD:
-                    encoding = "delta"
-                    base_hash = prior_manifest["hash"]
-                    chain_length = prior_manifest.get("chain_length", 0) + 1
-                    delta_bytes = candidate
+            # (1) Pure-append fast path: content = prior + tail. O(n), no cap.
+            suffix = _encode_suffix(prior_content, content_bytes)
+            if suffix is not None:
+                encoding = "delta"
+                base_hash = prior_manifest["hash"]
+                chain_length = prior_manifest.get("chain_length", 0) + 1
+                delta_bytes = suffix
+            # (2) General line-diff, but only while under the size cap: difflib
+            # over many MB is slow and rarely beats a full gzip on non-appends.
+            elif len(content_bytes) <= DEFAULT_FULL_BLOB_MAX_SIZE:
+                candidate = _encode_delta(prior_content, content_bytes)
+                if candidate is not None:
+                    full_gz_size = len(_gzip_bytes(content_bytes))
+                    if len(candidate) < full_gz_size * DEFAULT_DELTA_SAVINGS_THRESHOLD:
+                        encoding = "delta"
+                        base_hash = prior_manifest["hash"]
+                        chain_length = prior_manifest.get("chain_length", 0) + 1
+                        delta_bytes = candidate
         except Exception as e:
             # Fall back to full blob, but log so silent regressions in
             # _encode_delta / _resolve_chain don't degrade the new store
@@ -392,13 +491,35 @@ def save(file_path, content_bytes, base_dir, agent, summary="",
             )
             encoding = "full"
 
-    # Write storage (idempotent).
-    if encoding == "full":
+    # Write storage (idempotent). If the DELTA write raises (the 
+    # mode: an OS error opening the temp patch path, e.g. a path-length
+    # limit), do NOT lose the snapshot — fall back to a full blob so the save
+    # still records ok=true with a restorable snapshot (o5). Only if the full
+    # write ALSO raises do we give up and re-raise: that is an honest
+    # ok=false (no snapshot is even physically possible), which the telemetry
+    # layer records. (Catching only OSError keeps a genuine encode/manifest
+    # bug from being papered over by a "successful" full fallback.)
+    try:
+        if encoding == "full":
+            _atomic_write_bytes(_blob_path(base_dir, content_hash),
+                                _gzip_bytes(content_bytes))
+        else:
+            _atomic_write_bytes(_patch_path(base_dir, content_hash, base_hash),
+                                delta_bytes)
+    except OSError as e:
+        if encoding == "full":
+            raise  # the full write itself failed — no snapshot is possible
+        print(
+            f"[_history_store] delta write failed for {file_path}: "
+            f"{type(e).__name__}: {e} — falling back to a full snapshot",
+            file=sys.stderr,
+        )
+        encoding = "full"
+        base_hash = None
+        chain_length = 0
+        delta_bytes = None
         _atomic_write_bytes(_blob_path(base_dir, content_hash),
                             _gzip_bytes(content_bytes))
-    else:
-        _atomic_write_bytes(_patch_path(base_dir, content_hash, base_hash),
-                            delta_bytes)
 
     return _write_new_manifest(
         base_dir, file_path, agent, summary, content_bytes,

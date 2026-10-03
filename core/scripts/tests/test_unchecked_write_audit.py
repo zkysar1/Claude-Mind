@@ -11,6 +11,13 @@ direction (guard-1470) -- and this audit reports CONFIRMED, so "it can also say
 CORRECTED" is exactly the claim a reader needs checked.
 """
 import importlib.util
+import io
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -251,3 +258,368 @@ def test_longer_wrapper_name_is_not_a_shorter_one(uwa):
     assert uwa.invokes("echo 'null' | Bash: wm-set.sh loop_state", "wm-set.sh")
     assert uwa.invokes("echo '{}' | Bash: aspirations-add-goal.sh asp-001",
                        "aspirations-add-goal.sh")
+
+
+# --- `--new-since`: naming the sites that joined the unverified set -----------
+#
+# The ratchet records a count, so a regression used to arrive as "+N" beside a
+# remedy that printed an arbitrary 20 of the unverified sites. These tests build a
+# throwaway git repo holding the audit's two input shapes and check that the sites
+# which moved are NAMED, that nothing is named when nothing moved, and that a tree
+# the audit could not rebuild is refused rather than read as "no change".
+
+WRITER = "#!/usr/bin/env bash\nrt_call POST /store\n"   # a write wrapper by the audit's own rule
+READER = "#!/usr/bin/env bash\nrt_call GET /store\n"
+_PROSE = "\n".join("Plain prose line %d." % i for i in range(8))   # no exit-code evidence
+_CHECK = "IF that call exits non-zero, stop here."                 # matches the non-zero pattern
+SKILL = ".claude/skills/demo/SKILL.md"
+
+
+def _site(name):
+    return "Bash: bash core/scripts/wm-set.sh " + name
+
+
+def _skill(*sites):
+    """A SKILL.md with one block per site: the site (it may span lines, e.g. a call plus a
+    check line), then prose that carries no exit-code evidence."""
+    return "# Demo skill\n\n" + "".join("%s\n%s\n\n" % (s, _PROSE) for s in sites)
+
+
+def _line_of(body, needle):
+    return [i for i, ln in enumerate(body.splitlines(), 1) if ln == needle]
+
+
+def _git(repo, *args, env=None):
+    proc = subprocess.run(["git", "-C", str(repo), "-c", "core.autocrlf=false", *args],
+                          capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def _write(repo, rel, body):
+    f = repo / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(body, encoding="utf-8")
+
+
+def _commit(repo, msg, date=None):
+    _git(repo, "add", "-A")
+    env = dict(os.environ)
+    if date:
+        env.update(GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+    _git(repo, "commit", "-q", "--no-verify", "-m", msg, env=env)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def delta_repo(tmp_path, uwa, monkeypatch):
+    """An empty git checkout the audit is pointed at (its working tree is the 'after')."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "config", "user.email", "t@example.invalid")
+    _git(root, "config", "user.name", "t")
+    _git(root, "config", "commit.gpgsign", "false")
+    monkeypatch.setattr(uwa, "PROJECT_ROOT", root)
+    monkeypatch.setattr(uwa, "SCRIPTS_DIR", root / "core" / "scripts")
+    return root
+
+
+def _seed(repo, *sites):
+    _write(repo, "core/scripts/wm-set.sh", WRITER)
+    _write(repo, "core/scripts/wm-read.sh", READER)
+    _write(repo, SKILL, _skill(*sites))
+
+
+def _net(rep):
+    """joined minus left must equal the change in `unverified`, whatever moved."""
+    return (sum(r["count"] for r in rep["joined"]) - sum(r["count"] for r in rep["left"]))
+
+
+def _rec(text, line, verified, evidence=None, f="a/SKILL.md", wrapper="wm-set.sh"):
+    return {"file": f, "wrapper": wrapper, "text": text, "line": line,
+            "verified": verified, "evidence": evidence}
+
+
+def test_delta_a_new_site_is_named_with_its_line(uwa, delta_repo):
+    """The synthetic +1 the ratchet's remedy has to be able to answer."""
+    _seed(delta_repo, _site("slot_a"), _site("slot_b"))
+    first = _commit(delta_repo, "base")
+    body = _skill(_site("slot_a"), _site("slot_b"), _site("slot_c"))
+    _write(delta_repo, SKILL, body)
+    rep = uwa.delta_report(uwa.collect_at(first), uwa.collect())
+    assert rep["before"]["unverified"] == 2 and rep["after"]["unverified"] == 3
+    assert [(r["file"], r["text"], r["lines"], r["absent"], r["verified_other"])
+            for r in rep["joined"]] == [
+        (SKILL, _site("slot_c"), _line_of(body, _site("slot_c")), 1, 0)]
+    assert rep["left"] == []
+    assert _net(rep) == 1
+
+
+def test_delta_cli_reports_the_new_site_as_text_and_json(uwa, delta_repo, monkeypatch, capsys):
+    _seed(delta_repo, _site("slot_a"))
+    first = _commit(delta_repo, "base")
+    body = _skill(_site("slot_a"), _site("slot_b"))
+    _write(delta_repo, SKILL, body)
+
+    monkeypatch.setattr(sys, "argv", ["uwa", "--new-since", first])
+    assert uwa.main() == 0
+    out = capsys.readouterr().out
+    assert "JOINED the unverified set (1)" in out
+    assert "%s:%d" % (SKILL, _line_of(body, _site("slot_b"))[0]) in out
+    assert "new site" in out and "LEFT the unverified set (0)" in out
+    assert "line numbers are in the AFTER tree" in out
+
+    monkeypatch.setattr(sys, "argv", ["uwa", "--new-since", first, "--json"])
+    assert uwa.main() == 0
+    rep = json.loads(capsys.readouterr().out)
+    assert [r["text"] for r in rep["joined"]] == [_site("slot_b")]
+    assert rep["baseline"] is None and rep["left"] == []
+
+
+def test_delta_a_line_shift_or_line_ending_is_not_a_change(uwa, delta_repo):
+    """Records are keyed by (file, wrapper, text): inserting lines above a site, or
+    rewriting the file with CRLF endings, moves every line number and changes nothing."""
+    _seed(delta_repo, _site("slot_a"), _site("slot_b"))
+    first = _commit(delta_repo, "base")
+    shifted = "Added line 1.\nAdded line 2.\nAdded line 3.\n" + _skill(_site("slot_a"), _site("slot_b"))
+    (delta_repo / SKILL).write_bytes(shifted.replace("\n", "\r\n").encode("utf-8"))
+    rep = uwa.delta_report(uwa.collect_at(first), uwa.collect())
+    assert rep["joined"] == [] and rep["left"] == []
+    assert rep["before"]["unverified"] == rep["after"]["unverified"] == 2
+
+
+def test_delta_a_site_that_loses_its_check_is_named_as_credit_lost(uwa, delta_repo, capsys):
+    """The real regression class: no call line changed, a neighbouring line was edited
+    and the site stopped being credited. The row says what it was credited by."""
+    _seed(delta_repo, _site("slot_a") + "\n" + _CHECK, _site("slot_b"))
+    first = _commit(delta_repo, "base")
+    _write(delta_repo, SKILL, _skill(_site("slot_a"), _site("slot_b")))
+    rep = uwa.delta_report(uwa.collect_at(first), uwa.collect())
+    assert rep["before"]["unverified"] == 1 and rep["after"]["unverified"] == 2
+    [row] = rep["joined"]
+    assert row["text"] == _site("slot_a")
+    assert (row["absent"], row["verified_other"]) == (0, 1)
+    assert row["other_evidence"] and row["other_evidence"][0].startswith("rc:")
+    assert _net(rep) == 1
+    assert "credit lost (was rc:" in uwa.render_delta(dict(rep, before_label="b", after_label="a", baseline=None))
+
+
+def test_delta_a_callee_that_became_a_write_wrapper_names_its_callers(uwa, delta_repo):
+    """Reclassification: the call sites were always there and not one skill line changed.
+    A diff of changed call-site lines finds nothing; a diff of the audit's own records
+    names the callers and the wrapper that joined the population."""
+    _write(delta_repo, "core/scripts/relay-set.sh", "#!/usr/bin/env bash\necho hello\n")
+    _write(delta_repo, "core/scripts/wm-set.sh", WRITER)
+    _write(delta_repo, "core/scripts/wm-read.sh", READER)
+    skill = _skill("Bash: bash core/scripts/relay-set.sh one", "Bash: bash core/scripts/relay-set.sh two",
+                   _site("slot_a"))
+    _write(delta_repo, SKILL, skill)
+    first = _commit(delta_repo, "base")
+    _write(delta_repo, "core/scripts/relay-set.sh", "#!/usr/bin/env bash\nrt_call POST /store\n")
+    second = _commit(delta_repo, "relay-set.sh gains a mutating call")
+    assert _git(delta_repo, "diff", "--name-only", first, second) == "core/scripts/relay-set.sh"
+    rep = uwa.delta_report(uwa.collect_at(first), uwa.collect_at(second))
+    assert rep["wrappers_joined"] == ["relay-set.sh"] and rep["wrappers_dropped"] == []
+    assert sorted(r["text"] for r in rep["joined"]) == [
+        "Bash: bash core/scripts/relay-set.sh one", "Bash: bash core/scripts/relay-set.sh two"]
+    assert _net(rep) == 2
+    assert "wrapper newly a write wrapper" in uwa.render_delta(
+        dict(rep, before_label="b", after_label="a", baseline=None))
+    # The mirror: the wrapper loses the call and its callers leave the unverified set.
+    back = uwa.delta_report(uwa.collect_at(second), uwa.collect_at(first))
+    assert back["wrappers_dropped"] == ["relay-set.sh"] and back["wrappers_joined"] == []
+    assert back["joined"] == [] and sorted(r["text"] for r in back["left"]) == sorted(
+        r["text"] for r in rep["joined"])
+
+
+def test_delta_departures_are_reported_and_the_two_lists_reconcile(uwa, delta_repo):
+    _seed(delta_repo, _site("slot_a"), _site("slot_b"), _site("slot_c"))
+    first = _commit(delta_repo, "base")
+    _write(delta_repo, SKILL, _skill(_site("slot_a") + "\n" + _CHECK, _site("slot_b")))
+    rep = uwa.delta_report(uwa.collect_at(first), uwa.collect())
+    by_text = {r["text"]: r for r in rep["left"]}
+    assert (by_text[_site("slot_a")]["absent"], by_text[_site("slot_a")]["verified_other"]) == (0, 1)
+    assert (by_text[_site("slot_c")]["absent"], by_text[_site("slot_c")]["verified_other"]) == (1, 0)
+    assert rep["joined"] == []
+    assert _net(rep) == rep["after"]["unverified"] - rep["before"]["unverified"] == -2
+    text = uwa.render_delta(dict(rep, before_label="b", after_label="a", baseline=None))
+    assert "LEFT the unverified set (2) -- line numbers are in the BEFORE tree" in text
+
+
+def test_delta_identical_lines_are_counted_not_collapsed(uwa):
+    """Twins have the same key. A set-based diff would report 0 when a third appears."""
+    before = [_rec("call", 10, False), _rec("call", 20, False)]
+    after = [_rec("call", 10, False), _rec("call", 20, False), _rec("call", 30, False)]
+    [row] = uwa._moves(before, after)
+    assert (row["count"], row["identical"], row["lines"]) == (1, 3, [30])
+    assert uwa._moves(after, before) == []
+
+
+def test_delta_twins_are_matched_by_order_so_the_flipped_one_is_named(uwa):
+    before = [_rec("call", 10, True, "rc:x"), _rec("call", 20, False), _rec("call", 30, False)]
+    after = [_rec("call", 11, False), _rec("call", 21, False), _rec("call", 31, False)]
+    [row] = uwa._moves(before, after)
+    assert row["lines"] == [11] and row["count"] == 1
+    assert (row["absent"], row["verified_other"], row["other_evidence"]) == (0, 1, ["rc:x"])
+
+
+def test_delta_twins_fall_back_to_naming_all_when_order_matching_disagrees(uwa):
+    """If matching by order does not reproduce the count, name every unverified twin:
+    wide is acceptable, a wrong line is not."""
+    before = [_rec("call", 10, False), _rec("call", 20, False), _rec("call", 30, True, "rc:x")]
+    after = [_rec("call", 11, True, "rc:x"), _rec("call", 21, False), _rec("call", 31, False),
+             _rec("call", 41, False)]
+    [row] = uwa._moves(before, after)
+    # Matching by order would name 31 and 41 (two lines for a count of 1), which is not
+    # the count, so every unverified twin is named instead.
+    assert row["count"] == 1 and row["lines"] == [21, 31, 41]
+    text = uwa.render_delta({
+        "before": dict(unverified=2, verified=1, call_sites=3, write_wrappers=1, skill_files=1),
+        "after": dict(unverified=3, verified=1, call_sites=4, write_wrappers=1, skill_files=1),
+        "joined": [row], "left": [], "wrappers_joined": [], "wrappers_dropped": [],
+        "before_label": "b", "after_label": "a", "baseline": None})
+    assert "(1 of these 3 unverified identical lines)" in text
+
+
+@pytest.mark.parametrize("before,after", [
+    ([_rec("a", 1, False)], [_rec("a", 1, False), _rec("b", 2, False)]),
+    ([_rec("a", 1, True, "rc:x"), _rec("b", 2, False)], [_rec("a", 1, False), _rec("b", 2, True, "rc:x")]),
+    ([_rec("a", 1, False), _rec("a", 2, True, "rc:x")], [_rec("a", 1, True, "rc:x"), _rec("a", 2, False), _rec("a", 3, False)]),
+    ([_rec("a", 1, False), _rec("b", 2, False)], []),
+])
+def test_delta_joined_minus_left_equals_the_change_in_unverified(uwa, before, after):
+    joined, left = uwa._moves(before, after), uwa._moves(after, before)
+    unv = lambda rs: sum(1 for r in rs if not r["verified"])
+    assert sum(r["count"] for r in joined) - sum(r["count"] for r in left) == unv(after) - unv(before)
+
+
+def test_delta_an_unknown_revision_fails_visibly(uwa, delta_repo, capsys):
+    _seed(delta_repo, _site("slot_a"))
+    _commit(delta_repo, "base")
+    assert uwa.delta_main("no-such-revision", None, False) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "does not name a commit" in captured.err
+
+
+def test_delta_a_tree_that_could_not_be_rebuilt_is_refused_not_read_as_no_change(uwa, delta_repo, capsys):
+    """An empty `before` makes every site look new; an empty one on the other side makes
+    every site look fixed. Both are a blind run, so neither may print a delta."""
+    _write(delta_repo, "README", "nothing the audit reads\n")
+    bare = _commit(delta_repo, "bare")
+    _write(delta_repo, "core/scripts/wm-read.sh", READER)      # a reader only: no write wrapper
+    _write(delta_repo, SKILL, _skill(_site("slot_a")))
+    readers_only = _commit(delta_repo, "readers only")
+    _seed(delta_repo, _site("slot_a"))
+    full = _commit(delta_repo, "full")
+
+    assert uwa.delta_main(bare, None, False) == 2
+    err = capsys.readouterr()
+    assert err.out == "" and "git archive failed" in err.err
+
+    assert uwa.delta_main(readers_only, None, False) == 2
+    err = capsys.readouterr()
+    assert err.out == "" and "the before tree read an empty population" in err.err
+
+    assert uwa.delta_main(full, readers_only, False) == 2
+    err = capsys.readouterr()
+    assert err.out == "" and "the after tree read an empty population" in err.err
+
+
+def test_delta_archive_members_cannot_land_outside_the_scratch_dir(uwa, tmp_path, monkeypatch):
+    """The tar comes from our own history, but the filter is what the docstring promises."""
+    probe = Path(tempfile.gettempdir()) / "unchecked-write-escape-probe.sh"
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, body in (("../unchecked-write-escape-probe.sh", b"rt_call POST /x\n"),
+                           ("core/scripts/wm-set.sh", WRITER.encode()),
+                           (SKILL, _skill(_site("slot_a")).encode())):
+            info = tarfile.TarInfo(name)
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    monkeypatch.setattr(uwa, "_git", lambda *a: buf.getvalue())
+    try:
+        records, write_names, _read, skill_files = uwa.collect_at("anything")
+        assert not probe.exists()
+        assert write_names == {"wm-set.sh"} and skill_files == 1 and len(records) == 1
+    finally:
+        if probe.exists():
+            probe.unlink()
+
+
+def test_delta_a_rebuilt_tree_classifies_like_the_checkout_it_came_from(uwa, delta_repo):
+    """The invariant the whole mode rests on: the corpus is the only variable. Nested files
+    that neither the live walk nor the archive filter selects are present to prove both
+    leave them out."""
+    _seed(delta_repo, _site("slot_a"), _site("slot_b") + "\n" + _CHECK)
+    _write(delta_repo, "core/scripts/tests/nested-set.sh", WRITER)
+    _write(delta_repo, ".claude/skills/demo/extra/SKILL.md", _skill(_site("slot_z")))
+    head = _commit(delta_repo, "base")
+    live, rebuilt = uwa.collect(), uwa.collect_at(head)
+    assert live[0] == rebuilt[0] and live[1] == rebuilt[1] and live[3] == rebuilt[3]
+    assert len(live[0]) == 2 and live[3] == 1
+
+
+def test_delta_baseline_reading_is_the_newest_row_at_the_baseline(uwa, tmp_path):
+    yaml = pytest.importorskip("yaml")
+    def history(*rows):
+        p = tmp_path / "audit-baselines.yaml"
+        p.write_text(yaml.safe_dump({"unchecked_writes": {"baseline": 444, "history": [
+            {"recorded_at": t, "drift_total": n, "verdict": "x"} for t, n in rows]}}), encoding="utf-8")
+        return p
+
+    # Not in chronological order, and the last row is a higher reading: newest AT the baseline.
+    p = history(("2026-01-03T00:00:00", 444), ("2026-01-01T00:00:00", 444),
+                ("2026-01-04T00:00:00", 446), ("2026-01-02T00:00:00", 446))
+    assert uwa.baseline_reading(p) == (444, "2026-01-03T00:00:00")
+
+    gone = history(("2026-01-04T00:00:00", 446), ("2026-01-05T00:00:00", 446))
+    with pytest.raises(RuntimeError, match="left the window"):
+        uwa.baseline_reading(gone)
+
+    (tmp_path / "empty.yaml").write_text("other_metric: {baseline: 3}\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="no unchecked_writes baseline"):
+        uwa.baseline_reading(tmp_path / "empty.yaml")
+
+
+def test_delta_baseline_mode_resolves_the_commit_at_or_before_the_reading(uwa, delta_repo, monkeypatch):
+    _seed(delta_repo, _site("slot_a"))
+    c1 = _commit(delta_repo, "c1", "2026-01-01T10:00:00+0000")
+    _write(delta_repo, "NOTES", "two\n")
+    c2 = _commit(delta_repo, "c2", "2026-01-02T10:00:00+0000")
+    _write(delta_repo, "NOTES", "three\n")
+    c3 = _commit(delta_repo, "c3", "2026-01-03T10:00:00+0000")
+    # A zone east of UTC: a stamp handed to git WITHOUT an explicit UTC offset would be read
+    # in local time, 13 hours early, and land on c1 instead of c2.
+    monkeypatch.setenv("TZ", "Pacific/Auckland")
+    monkeypatch.setattr(uwa, "baseline_reading", lambda: (444, "2026-01-02T12:00:00"))
+
+    ref = uwa.resolve_since("baseline", None)
+    assert ref["sha"] == c2 and ref["baseline"] == 444
+    assert uwa.resolve_since("baseline", c1)["sha"] == c1          # the walk starts at --until
+    assert uwa.resolve_since(c3, None) == {"sha": c3, "how": "named", "baseline": None}
+
+    monkeypatch.setattr(uwa, "baseline_reading", lambda: (444, "2025-12-31T00:00:00"))
+    with pytest.raises(RuntimeError, match="no commit at or before"):
+        uwa.resolve_since("baseline", None)
+
+
+def test_delta_report_prints_on_a_stdout_that_cannot_encode_the_skill_text(uwa, delta_repo, monkeypatch):
+    """Skill lines carry arrows and dashes. A console encoding that cannot hold them must
+    not cost the operator the report after the work is done."""
+    _seed(delta_repo, _site("slot_a"))
+    first = _commit(delta_repo, "base")
+    _write(delta_repo, SKILL, _skill(_site("slot_a"), _site("slot_b") + "  # step \u2192 next"))
+    raw = io.BytesIO()
+    stdout = io.TextIOWrapper(raw, encoding="ascii", errors="strict", write_through=True)
+    monkeypatch.setattr(sys, "stdout", stdout)
+    assert uwa.delta_main(first, None, False) == 0
+    assert "\u2192".encode("utf-8") in raw.getvalue()
+
+
+def test_delta_until_without_new_since_is_a_usage_error(uwa, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["uwa", "--until", "HEAD"])
+    with pytest.raises(SystemExit) as exc:
+        uwa.main()
+    assert exc.value.code == 2

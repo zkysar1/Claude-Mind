@@ -25,6 +25,13 @@ if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
     PROJECT_ROOT="$(cygpath -m "$PROJECT_ROOT")"
     CORE_ROOT="$(cygpath -m "$CORE_ROOT")"
     CONFIG_DIR="$(cygpath -m "$CONFIG_DIR")"
+    # _paths.sh exports PYTHONPYCACHEPREFIX from the UNCONVERTED PROJECT_ROOT.
+    # Under MSYS_NO_PATHCONV=1 a native python reads that /c/... value as
+    # C:\c\... (or makes empty cwd-relative c/ dirs) and caches no bytecode
+    # (). Rebuild it from the converted root: no extra cygpath spawn.
+    if [ -n "${PYTHONPYCACHEPREFIX:-}" ]; then
+        export PYTHONPYCACHEPREFIX="$PROJECT_ROOT/core/.pycache"
+    fi
     # AGENT_DIR may be empty (no agent bound); META_DIR and WORLD_DIR are always set
     # _paths.sh exports ALIASES of these values (WORLD_PATH/MIND_WORLD,
     # META_PATH/MIND_META) at source time, i.e. still in MSYS /c/... form.

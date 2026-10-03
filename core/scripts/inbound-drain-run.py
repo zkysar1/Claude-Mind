@@ -154,6 +154,11 @@ def run(apply: bool = False, slot_override: Path | None = None) -> dict:
         "quarantined": sum(int(e.get("quarantined") or 0) for e in envs),
         "skipped_tmp": sum(int(e.get("skipped_tmp") or 0) for e in envs),
         "unconfigured": sum(int(e.get("unconfigured") or 0) for e in envs),
+        "busy": sum(int(e.get("busy") or 0) for e in envs),
+        "unprovisioned": sum(int(e.get("unprovisioned") or 0) for e in envs),
+        "erased": sum(int(e.get("erased") or 0) for e in envs),
+        "erase_pending": sum(int(e.get("erase_pending") or 0) for e in envs),
+        "erase_failed": sum(int(e.get("erase_failed") or 0) for e in envs),
         "failed": [],
         "stranded": [],
     }
@@ -190,6 +195,39 @@ def run(apply: bool = False, slot_override: Path | None = None) -> dict:
     # (value_len=7) and its minted "Assigned by the member" aspiration all along. A finding
     # that names a phantom is worse than silence: it is actionable-looking and unactionable.
     # rb-2515 class ("reported absent may be PRESENT under a different env-var name").
+    # UNPROVISIONED, the same channel again: a verb or knowledge edit left queued because
+    # the drain's process cannot resolve member handles. Name both variables, since
+    # either one missing is enough and the finding is how an operator learns which to set.
+    for e in envs:
+        n = int(e.get("unprovisioned") or 0)
+        if n:
+            res["failed"].append({"file": e.get("environment") or "?",
+                                  "reason": f"{n} member record(s) left queued: this box "
+                                            "cannot resolve member handles "
+                                            "(KNOWLEDGE_HANDLE_SECRET or ENVIRONMENT_ID "
+                                            "unset in the drain's environment)"})
+    # ERASES ( u4): a member forgot something and was told it is erased after 30 days.
+    # An erase that failed did not finish after that window and is tried again (which copy of the
+    # text is left is in the drain's own account, not in a count); one that is pending is due and
+    # nothing this box can do meets it (a guardrail has no erase primitive yet, for one). Both reach the
+    # finding key, or an overdue promise to a member would read as a healthy `drained=0` exactly
+    # as an undrained directive did. The counts alone are what the slot's `|| true; exit 0` leaves
+    # us, and the per-record account is in the drain's own output.
+    for e in envs:
+        n = int(e.get("erase_failed") or 0)
+        if n:
+            res["failed"].append({"file": e.get("environment") or "?",
+                                  "reason": f"{n} erase(s) of a forgotten item did not finish after "
+                                            "the undo window and the next drain tries again: see "
+                                            "erasures in the drain output"})
+        n = int(e.get("erase_pending") or 0)
+        if n:
+            res["failed"].append({"file": e.get("environment") or "?",
+                                  "reason": f"{n} erase(s) of a forgotten item are due and cannot be "
+                                            "completed by this box (for example a guardrail, which has "
+                                            "no erase primitive yet, text the pipeline writer cannot "
+                                            "reach, or a page only a person can judge): see erasures "
+                                            "in the drain output"})
     # STRANDED records (): a record a PRIOR run claimed into processing/
     # and never completed. The drain deliberately leaves it there — re-applying a
     # member's half-applied instruction is an operator judgment, not a sweep's

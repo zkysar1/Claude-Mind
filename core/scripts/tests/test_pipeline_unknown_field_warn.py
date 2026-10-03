@@ -132,6 +132,33 @@ def test_high_frequency_corpus_fields_are_allowlisted():
         assert field in _pipeline_fields.PIPELINE_KNOWN_FIELDS, field
 
 
+def test_the_member_forget_marker_is_allowlisted():
+    """knowledge-edit-apply.py writes it and knowledge_projection reads it ().
+
+    It rides every hypothesis forget, so a key missing from the allowlist would warn on
+    each one, and a warning that fires on every write of a feature is how a useful signal
+    gets silenced wholesale.
+    """
+    from knowledge_projection import FORGOTTEN_FIELD
+
+    assert FORGOTTEN_FIELD in _pipeline_fields.PIPELINE_KNOWN_FIELDS
+    stamped = _rec(**{FORGOTTEN_FIELD: "2026-10-02T00:00:00+00:00"})
+    assert _pipeline_fields.warn_unknown_fields(stamped, source="test") is None
+    # Positive control: the warner still fires on a key that is not listed.
+    assert _pipeline_fields.warn_unknown_fields(_rec(zzz_not_a_field="x"), source="test") == {"zzz_not_a_field"}
+
+
+def test_the_member_undo_stamp_is_allowlisted():
+    """knowledge-edit-apply.py stamps it on every undo and coordination_merge ranks an undo by
+    it (g-335-1726 u7a). Like the forget marker it rides every use of the feature, so a key
+    missing from the allowlist would warn on each one."""
+    from knowledge_projection import RESTORED_FIELD
+
+    assert RESTORED_FIELD in _pipeline_fields.PIPELINE_KNOWN_FIELDS
+    stamped = _rec(**{RESTORED_FIELD: "2026-10-02T00:00:00+00:00"})
+    assert _pipeline_fields.warn_unknown_fields(stamped, source="test") is None
+
+
 def test_both_writers_share_one_allowlist():
     """Parity is structural, not a discipline (guard-2323)."""
     assert pipeline.warn_unknown_fields is pipeline_write.warn_unknown_fields

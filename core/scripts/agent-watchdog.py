@@ -4772,14 +4772,60 @@ class StoreOvercapProbe(Probe):
     re-sweep the whole registry every few minutes to restate a number that moves
     over hours. The interval is well inside any cadence the loop actually meets,
     so it does not become a declared cadence the fleet never reaches (guard-5202).
+
+    THE CONSUMER (g-115-11717). Until then a surfaced store went only to
+    core/logs/watchdog-<agent>.jsonl and one stderr line -- box-local,
+    git-ignored, never synced -- and because the ratchet then keeps that store
+    quiet, that one line WAS the whole alarm: on 2026-09-30 four shared stores
+    sat 1.25-1.32x over cap for 20+ h with no agent told. A SHARED store
+    (`machine_local` not True; an unclassifiable one counts as shared, since a
+    false alarm costs one goal and a missed one costs that incident) now files
+    ONE Investigate goal:
+
+      - fleet-wide key, no agent or box in it (guard-2107): the condition and the
+        goal queue are both fleet-scoped, so a box-scoped key would let every
+        reducer file its own copy. One open goal covers every store that
+        surfaces while it is open, and its description is a snapshot.
+      - filed on `surfaced` ONLY, so the ratchet keeps its once-per-episode
+        meaning: a store carried quietly never re-files. `unfiled` carries a
+        filing that FAILED to the next poll, because the ratchet has already
+        marked the store and will never surface it again (the g-115-2803
+        lesson, as GitDriftProbe's `fired`).
+      - closed when no shared store is over cap, LEVEL-triggered and not gated
+        on `unfiled` or any episode flag (guard-3437).
+      - no board post: the board channel is itself one of the stores this alarm
+        names, and every post re-PUTs the whole object.
+
+    Machine-local stores stay quiet, as before. `ratcheted_quiet` still rides in
+    the payload so the carried debt is visible without being the alarm.
     """
 
     name = "store-overcap"
     INTERVAL_MIN = 60
+    # One key for the whole fleet (guard-2107). Its head must be BOTH sanctioned
+    # (gates/origin_signal.py rewrites any other, which would break exact dedup)
+    # AND exempt from the candidate tier: an `investigate:` head is parked as a
+    # `candidate`, which the selector never offers (aspirations.yaml
+    # candidate_tier; measured 2026-10-02, this probe's first filing under that
+    # head landed `candidate`). `drift_detected:` is the detection lane the tier
+    # exempts, and a store drifting past its cap is exactly that.
+    GOAL_ORIGIN_SIGNAL = "drift_detected:store-overcap-shared-stores"
+    # A test that ticks every probe against the real project root reaches the
+    # filing and closing below: the first version of this consumer filed a real
+    # goal from test_agent_watchdog_worker_role.py (guard-1094). So both refuse
+    # under pytest by default; a test that stubs the boundary turns this off
+    # explicitly, and one that forgets to is refused, not written.
+    REFUSE_WRITES_UNDER_PYTEST = True
+    # Stores named in the goal title before it elides the rest; the description
+    # always names them all.
+    TITLE_STORES = 3
 
     def __init__(self, ctx: WatchdogContext) -> None:
         super().__init__(ctx)
         self.last_polled: Optional[float] = None
+        # Shared stores whose goal filing failed on an earlier poll (see the
+        # class docstring); persisted so a retry survives the process.
+        self.unfiled: list[str] = []
 
     def check(self) -> list[Event]:
         now = time.time()
@@ -4802,10 +4848,41 @@ class StoreOvercapProbe(Probe):
 
         surfaced = list(rep.get("surfaced") or [])
         cleared = list(rep.get("ratchet_cleared") or [])
-        if not surfaced and not cleared:
+        over_now = rep.get("over_now") or {}
+
+        # THE CONSUMER (class docstring). `machine_local is not True` is the
+        # SHARED test, so an unclassifiable store (None) is filed, not assumed
+        # local.
+        shared_over = sorted(p for p, row in over_now.items()
+                             if (row or {}).get("machine_local") is not True)
+        shared_new = [p for p in surfaced if p in shared_over]
+        # A filing that failed on an earlier poll: the ratchet already marked
+        # the store, so `surfaced` will never name it again. Retried only while
+        # the store is still over cap.
+        retry = [p for p in self.unfiled if p in shared_over and p not in shared_new]
+        goal = None
+        if shared_new or retry:
+            goal = self._file_overcap_goal(sorted(shared_new + retry), rep)
+            # Forget the stores only once the goal LANDED or an open one already
+            # covers them; a genuine failure retries next poll.
+            self.unfiled = ([] if goal.get("filed") or goal.get("dedup")
+                            else sorted(shared_new + retry))
+        else:
+            self.unfiled = []
+        # Level-triggered and never gated on `unfiled` or any episode flag
+        # (guard-3437): that state is box-local and ephemeral, and the box that
+        # sees a store clear need not be the one that filed. It needs a real
+        # measurement: `line_bounded` 0 means detect_overcap looked at nothing,
+        # and an empty `over_now` over no population is not "back under cap"
+        # (guard-2273).
+        closed = None
+        if not shared_over and rep.get("line_bounded"):
+            closed = self._close_overcap_goal(rep)
+
+        if (not surfaced and not cleared and not retry
+                and not (closed or {}).get("closed")):
             return []
 
-        over_now = rep.get("over_now") or {}
         payload = {
             "surfaced": surfaced,
             "newly_over": rep.get("newly_over"),
@@ -4819,38 +4896,225 @@ class StoreOvercapProbe(Probe):
             "swept": rep.get("swept"),
             "recorded": rep.get("recorded"),
             "record_error": rep.get("record_error"),
-            "ratios": {p: (over_now.get(p) or {}).get("ratio") for p in surfaced},
+            "ratios": {p: (over_now.get(p) or {}).get("ratio")
+                       for p in sorted(set(surfaced) | set(retry))},
             # Both caveats the detector attaches travel with the alarm: a
             # non-machine-local ratio is one box's reading of a shared object,
             # and a refused store is one no sweep can bring down.
             "caveat": rep.get("caveat"),
             "unbounded_by_refusal": rep.get("unbounded_by_refusal"),
+            # The delivery half, so the log answers "did anyone get told".
+            "shared_surfaced": shared_new,
+            "retried": retry,
+            "unfiled": list(self.unfiled),
+            "goal": goal,
+            "closed": closed,
         }
-        if surfaced:
+        if surfaced or retry:
             detail = ", ".join(
-                "%s(%.2fx)" % (p, (over_now.get(p) or {}).get("ratio") or 0.0)
-                for p in surfaced)
+                "%s(%.2fx)%s" % (p, (over_now.get(p) or {}).get("ratio") or 0.0,
+                                 " [retry]" if p in retry else "")
+                for p in sorted(set(surfaced) | set(retry)))
+            if goal is None:
+                delivery = "machine-local only, no goal filed"
+            elif goal.get("filed"):
+                delivery = "goal %s filed" % (goal.get("goal_id") or "(id unreadable)")
+            elif goal.get("dedup"):
+                delivery = "an open goal already covers it"
+            else:
+                delivery = "goal NOT filed (%s), retrying next poll" % goal.get("error")
             return [Event(
                 probe=self.name, event="store_overcap", severity="critical",
                 payload=payload,
                 summary=("store-overcap: %s at/past %sx cap on consecutive runs "
                          "and new-or-regressed against the ratchet (%d known "
-                         "over-cap store(s) carried quietly)"
+                         "over-cap store(s) carried quietly); %s"
                          % (detail, rep.get("threshold"),
-                            len(rep.get("ratcheted_quiet") or []))))]
+                            len(rep.get("ratcheted_quiet") or []), delivery)))]
+        what = ("%s back under cap — ratchet mark dropped, so a recurrence will "
+                "surface again" % ", ".join(cleared)
+                if cleared else "no shared store is over cap")
+        close_note = (closed or {}).get("detail")
         return [Event(
             probe=self.name, event="store_overcap_cleared", severity="info",
             payload=payload,
-            summary=("store-overcap cleared: %s back under cap — ratchet mark "
-                     "dropped, so a recurrence will surface again"
-                     % ", ".join(cleared)))]
+            summary="store-overcap cleared: %s%s" % (
+                what, " (%s)" % close_note if close_note else ""))]
+
+    def _file_overcap_goal(self, stores: list, rep: dict) -> dict:
+        """File one deduped Investigate goal. Fail-open ({filed: False, error})."""
+        origin_signal = self.GOAL_ORIGIN_SIGNAL
+        if self.REFUSE_WRITES_UNDER_PYTEST and os.environ.get("PYTEST_CURRENT_TEST"):
+            return {"filed": False, "goal_id": None,
+                    "error": "refused: running under pytest (guard-1094)"}
+        try:
+            from _paths import WORLD_DIR
+            import importlib
+            pf = importlib.import_module("pointer_freshness")
+            if pf.open_goal_exists(origin_signal, WORLD_DIR, self.ctx.agent_dir):
+                return {"filed": False, "dedup": True, "goal_id": None,
+                        "error": "open goal exists (dedup)"}
+            over_now = rep.get("over_now") or {}
+            row_texts = []
+            for p in stores:
+                row = over_now.get(p) or {}
+                # An unreadable classifier is filed as shared (check() says why),
+                # so the goal must not state it as a fact.
+                unread = (", machine-local classification UNREADABLE (%s), treated "
+                          "as shared" % (row.get("machine_local_error") or "no reason given")
+                          if row.get("machine_local") is None else "")
+                row_texts.append(
+                    "%s %.2fx (%s lines against a bound of %s, mode %s, dry-run sweep "
+                    "action %s, owner goal %s%s)"
+                    % (p, row.get("ratio") or 0.0, row.get("total"), row.get("bound"),
+                       row.get("mode"), row.get("action"),
+                       row.get("owner_goal") or "none declared", unread))
+            rows = "; ".join(row_texts)
+            shown = ", ".join(
+                "%s %.2fx" % (p, (over_now.get(p) or {}).get("ratio") or 0.0)
+                for p in stores[:self.TITLE_STORES])
+            if len(stores) > self.TITLE_STORES:
+                shown += ", +%d more" % (len(stores) - self.TITLE_STORES)
+            refused = [p for p in stores if p in (rep.get("unbounded_by_refusal") or [])]
+            refusal = ""
+            if refused:
+                refusal = ("Refused by the sweep's recovery-layer gate: %s. %s "
+                           % (", ".join(refused),
+                              rep.get("unbounded_by_refusal_note") or ""))
+            body = {
+                # Observed facts only: the cause is inferred, so it lives in the
+                # description under its own label, not in the title.
+                "title": ("Investigate: shared store(s) over cap on consecutive "
+                          "watchdog runs — " + shown),
+                "priority": "HIGH",
+                "participants": ["agent"],
+                "description": (
+                    f"agent-watchdog StoreOvercapProbe on {self.ctx.agent_name}'s box "
+                    f"found {len(stores)} SHARED line-bounded store(s) at/past "
+                    f"{rep.get('threshold')}x their cap on two consecutive recorded "
+                    f"runs, new or worse against its ratchet. Observed: {rows}. "
+                    f"Plausible mechanism (inferred, not verified): the store-hygiene "
+                    f"sweep (g-115-1651) is overdue, or cannot act on the store -- the "
+                    f"dry-run action above says which when it has one. {refusal}"
+                    f"This goal is the consumer the alarm lacked: before g-115-11717 a "
+                    f"store_overcap event reached only a box-local log "
+                    f"(core/logs/watchdog-<agent>.jsonl) that no agent reads. "
+                    f"Each ratio is ONE box's reading of a shared object, and a "
+                    f"read-through copy can mis-state it: re-measure with "
+                    f"`bash core/scripts/jsonl-hygiene.sh detect-overcap --no-record` "
+                    f"(read-only) before acting. This goal is a SNAPSHOT: the probe "
+                    f"files at most one while one is open, names only the stores that "
+                    f"surfaced when it was filed, and retires it once no shared store "
+                    f"is over cap. Machine-local stores are carried quietly and not "
+                    f"named here. Auto-filed by StoreOvercapProbe (g-115-11717)."
+                ),
+                "category": "framework-infrastructure",
+                "origin_signal": origin_signal,
+                # No intended_agent: the remedy is fleet-wide, so any Body may take it.
+            }
+            from _runtime_bash import BASH as _bash
+            _override_reason = (
+                "StoreOvercapProbe owns exact fleet-wide dedup via "
+                "open_goal_exists(origin_signal) plus a close path; the "
+                "prose-overlap dup gate would refuse this goal against the "
+                "store-hygiene goals that share its vocabulary, and an unattended "
+                "filer has no reader to surface that refusal (guard-1173, "
+                "g-115-11717).")
+            proc = subprocess.run(
+                [_bash, "core/scripts/aspirations-add-goal.sh", ESCALATION_ASP,
+                 "--source", ESCALATION_SOURCE,
+                 "--override-duplication", _override_reason],
+                input=json.dumps(body, ensure_ascii=True),
+                capture_output=True, text=True,
+                cwd=str(self.ctx.project_root_path), timeout=60,
+            )
+            if proc.returncode != 0:
+                return {"filed": False, "goal_id": None,
+                        "error": (proc.stderr or proc.stdout or "non-zero exit").strip()[:200]}
+            try:
+                goal_id = json.loads(proc.stdout).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                goal_id = None
+            return {"filed": True, "goal_id": goal_id, "error": None}
+        except Exception as e:  # noqa: BLE001 — filing must not kill the event
+            return {"filed": False, "goal_id": None, "error": f"{type(e).__name__}: {e}"}
+
+    def _close_overcap_goal(self, rep: dict) -> dict:
+        """Retire the goal this probe filed once no shared store is over cap.
+
+        GitDriftProbe._close_drift_goal's three narrowing guards, for the same
+        reasons (guard-3437): origin_signal EQUALITY, so only goals this probe
+        family filed can match; pending-and-unclaimed, so work someone has
+        started is never yanked out from under them (guard-1007); and `skipped`,
+        never `completed`, because no investigation happened. The outcome_note
+        goes in BEFORE the status, so a partial failure leaves an open goal
+        carrying a TRUE sentence rather than a closed one with no explanation.
+        """
+        origin_signal = self.GOAL_ORIGIN_SIGNAL
+        if self.REFUSE_WRITES_UNDER_PYTEST and os.environ.get("PYTEST_CURRENT_TEST"):
+            return {"attempted": False, "detail": "refused: running under pytest (guard-1094)"}
+        try:
+            from _paths import WORLD_DIR
+            import importlib
+            pf = importlib.import_module("pointer_freshness")
+            open_goals = pf.open_goal_records(origin_signal, WORLD_DIR, self.ctx.agent_dir)
+            if not open_goals:
+                return {"attempted": False, "detail": None}
+            closed, held = [], []
+            from _runtime_bash import BASH as _bash
+            note = ("agent-watchdog StoreOvercapProbe re-measured this box "
+                    "(%s line-bounded stores, threshold %sx) and no shared store is "
+                    "at or past its cap, so the overcap this goal was filed for is "
+                    "gone on this box's reading. No investigation was performed -- "
+                    "the condition resolved. The probe is retiring this goal as "
+                    "`skipped`; if the status still reads open, that write did not "
+                    "land and the goal is safe to close by hand. A fresh "
+                    "`bash core/scripts/jsonl-hygiene.sh detect-overcap --no-record` "
+                    "that still shows a shared store over cap means this box read a "
+                    "stale copy: file a new goal rather than reopening this one "
+                    "(g-115-11717)."
+                    % (rep.get("line_bounded"), rep.get("threshold")))
+            for g in open_goals:
+                gid = g.get("id")
+                if not gid:
+                    continue
+                if g.get("status") != "pending" or g.get("claimed_by"):
+                    held.append(f"{gid}:{g.get('status')}"
+                                f"{'/claimed' if g.get('claimed_by') else ''}")
+                    continue
+                ok = True
+                for field, value in (("outcome_note", note), ("status", "skipped")):
+                    proc = subprocess.run(
+                        [_bash, "core/scripts/aspirations-update-goal.sh", gid,
+                         field, value, "--source", g.get("_source", "world")],
+                        capture_output=True, text=True,
+                        cwd=str(self.ctx.project_root_path), timeout=60,
+                    )
+                    if proc.returncode != 0:
+                        held.append(f"{gid}:close-failed")
+                        ok = False
+                        break
+                if ok:
+                    closed.append(gid)
+            parts = []
+            if closed:
+                parts.append("closed " + ",".join(closed))
+            if held:
+                parts.append("held " + ",".join(held))
+            return {"attempted": True, "closed": closed, "held": held,
+                    "detail": "; ".join(parts) or None}
+        except Exception as e:  # noqa: BLE001 — a close failure must not kill the tick
+            return {"attempted": True, "closed": [], "held": [],
+                    "detail": f"error: {type(e).__name__}: {e}"}
 
     def to_dict(self) -> dict:
-        return {"last_polled": self.last_polled}
+        return {"last_polled": self.last_polled, "unfiled": list(self.unfiled)}
 
     def from_dict(self, state: dict) -> None:
         lp = state.get("last_polled")
         self.last_polled = lp if isinstance(lp, (int, float)) else None
+        uf = state.get("unfiled")
+        self.unfiled = sorted(str(p) for p in uf) if isinstance(uf, list) else []
 
 
 class PeerLivenessProbe(Probe):

@@ -256,7 +256,9 @@ def _bump_tree_yaml_last_updated(key, today):
     # Lock timeout, YAML parse error, file-permission failure — all silently
     # surface to stderr and continue. Never block the user's edit.
     try:
-        locked_modify_yaml(str(tree_yaml), _do)
+        # : a second same-day edit of the node leaves the data as read,
+        # and under own-cloud every rewrite is a new object version of the index.
+        locked_modify_yaml(str(tree_yaml), _do, skip_if_unchanged=True)
         return True
     except Exception as e:
         print(f"tree-front-matter-sync: _tree.yaml update failed: {e}", file=sys.stderr)

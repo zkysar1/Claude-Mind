@@ -139,3 +139,66 @@ def test_constant_still_honored_when_env_unset(tmp_path, monkeypatch):
     assert vp._resolve_vendor_dir() == d
     assert vp.ensure_vendor_path() is True
     assert sys.path[-1] == str(d)
+
+
+# --- stack_absent_reason () ----------------------------------------
+# Unique stand-in module names: the real numpy is already loaded in this
+# process, and find_spec on a loaded module never touches the filesystem.
+
+@pytest.fixture
+def _fake_stack(monkeypatch):
+    monkeypatch.setattr(vp, "_STACK_MODULES", ("_g306574_np",))
+    monkeypatch.setattr(vp, "_ENCODER_BACKENDS", ("_g306574_enc_a", "_g306574_enc_b"))
+
+
+def _install(vendor, *names):
+    for n in names:
+        (vendor / n).mkdir(parents=True)
+        (vendor / n / "__init__.py").write_text("", encoding="utf-8")
+
+
+def test_stack_absent_names_the_missing_module(tmp_path, monkeypatch, _fake_stack):
+    monkeypatch.setenv("MIND_VENDOR_DIR", str(tmp_path / "not-provisioned"))
+    assert vp.stack_absent_reason() == "_g306574_np is not importable"
+
+
+def test_stack_absent_when_only_numpy_is_present(tmp_path, monkeypatch, _fake_stack):
+    d = tmp_path / "py"
+    _install(d, "_g306574_np")
+    monkeypatch.setenv("MIND_VENDOR_DIR", str(d))
+    assert vp.stack_absent_reason().startswith("no encoder backend is importable")
+
+
+def test_stack_present_with_numpy_and_any_one_backend(tmp_path, monkeypatch, _fake_stack):
+    d = tmp_path / "py"
+    _install(d, "_g306574_np", "_g306574_enc_b")   # the SECOND backend alone is enough
+    monkeypatch.setenv("MIND_VENDOR_DIR", str(d))
+    assert vp.stack_absent_reason() is None
+
+
+def test_stack_installed_after_start_counts_as_present(tmp_path, monkeypatch, _fake_stack, _isolate):
+    """ outcome B at its root: a process that started with no vendor dir
+    must see a stack installed later, with no restart. The import-time append
+    runs once; the probe resolves the dir at call time."""
+    d = tmp_path / "py"                           # does not exist yet
+    monkeypatch.setenv("MIND_VENDOR_DIR", str(d))
+    assert vp.stack_absent_reason() is not None
+    assert str(d) not in sys.path
+    _install(d, "_g306574_np", "_g306574_enc_a")
+    assert vp.stack_absent_reason() is None
+    assert sys.path[-1] == str(d)                 # appended, never prepended
+
+
+def test_a_loaded_module_counts_without_a_path_search(monkeypatch, _fake_stack):
+    import types
+    monkeypatch.setenv("MIND_VENDOR_DIR", "/nonexistent-vendor-dir")
+    monkeypatch.setitem(sys.modules, "_g306574_np", types.ModuleType("_g306574_np"))
+    monkeypatch.setitem(sys.modules, "_g306574_enc_a", types.ModuleType("_g306574_enc_a"))
+    assert vp.stack_absent_reason() is None
+
+
+def test_a_blocked_module_is_not_importable(monkeypatch, _fake_stack):
+    """sys.modules[name] = None is the interpreter's own 'import blocked' marker."""
+    monkeypatch.setenv("MIND_VENDOR_DIR", "/nonexistent-vendor-dir")
+    monkeypatch.setitem(sys.modules, "_g306574_np", None)
+    assert vp.stack_absent_reason() == "_g306574_np is not importable"

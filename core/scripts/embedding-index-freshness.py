@@ -11,10 +11,11 @@ A tick that runs wherever a loop runs keeps every box's own index fresh.
 Behavior (all paths fail-open; this must never delay loop continuation):
   1. `embedding_blend_enabled` false (tree.yaml retrieval:) → exit 0 silent.
      The whole check costs one small YAML read while the feature is off.
-  2. No index on disk → exit 0 silent. The INITIAL full build (~11-45 min
-     of CPU embedding) is a deliberate operator/goal action, never spawned
-     from a hook. Only incremental freshness (--update: re-embeds changed
-     docs only, typically seconds) is automated.
+  2. No index on disk → exit 0 silent. This default mode never builds one:
+     only incremental freshness (--update: re-embeds changed docs only,
+     typically seconds) runs from iteration-close and the daemon. The INITIAL
+     full build (minutes to tens of minutes of CPU embedding) belongs to the
+     --session-start mode below.
   3. Index fresh (meta.json mtime >= newest source-store mtime) AND the
      index's model matches tree.yaml `embedding_model_name` → exit 0.
   4. Stale OR model-drifted, debounce clear → record the attempt marker, spawn
@@ -26,7 +27,8 @@ Behavior (all paths fail-open; this must never delay loop continuation):
      retries next window instead of storming, and a running one is never
      doubled.
 
-Trigger sites: iteration-close.sh productivity-check, AND the daemon's
+Trigger sites: iteration-close.sh productivity-check, the SessionStart hook
+(--session-start, below), AND the daemon's
 /v1/retrieve endpoint (rate-limited there). Until 2026-09-29 the loop close was
 the only one, under a flat 6h debounce — so a box in assistant mode, or a loop
 between iterations, never refreshed at all, and a busy one refreshed at most
@@ -55,7 +57,38 @@ This docstring claimed until cdb3288607 that "the updater itself pins the
 index's existing model (g-306-82), so a config model change can never be
 half-applied by this tick." That pinning is exactly what let a drifted index
 survive five weeks: the updater now rebuilds on the CONFIGURED model instead.
+
+SESSION-START MODE (g-306-574). Until this mode, step 2 above was a rule that
+the initial build is never spawned from a hook, and it left a box that never
+runs the loop and never serves a retrieve on the token baseline for good: both
+other triggers return at "no index". Measured by omni on a ZDS box that hosts
+only chat sessions (cc-12; relayed in g-306-574's description, not re-measured
+here): no index and every query token-only since the daemon started on
+2026-09-02, with 16 of 119 known guardrails and reasoning-bank entries found in
+the top 20 by their own words, against 110 of 119 once provisioned.
+`--session-start`, called from
+sessionstart-orchestrator.sh, does what the default mode may not:
+  - blend off → silent. Blend on and THIS interpreter cannot import the encoder
+    stack (_vendor_path.stack_absent_reason) → print ONE line saying so and
+    naming the provisioning recipe (guard-1427), whatever the index state: a
+    box with an index and no numpy serves token-only too.
+  - Stack present, no meta.json → take the attempt claim with O_CREAT|O_EXCL
+    (two sessions starting together must not start two builds), spawn
+    `embedding-index-build.py --build` DETACHED, niced, and print ONE line
+    saying it is building, where the log is, and that retrieval is token-only
+    meanwhile. A claim younger than DEBOUNCE_SECONDS prints one line saying an
+    attempt is recorded and has not landed. A claim older than that is taken
+    over (the build never produced meta.json) by renaming it away, which has
+    one winner like the create.
+  - Index present → silent. Refreshing one stays with the two triggers above.
+The spawn passes no --model: embedding_model_name is the calibration anchor
+(guard-5905). It defaults HF_HUB_OFFLINE and TRANSFORMERS_OFFLINE to 0 for the
+child, because the builder's own offline default cannot fetch the model on a
+box whose cache is empty (guard-1427); a value the operator exported wins. The
+child's output goes to UPDATE_LOG, and a build that is still running when its
+claim expires would be doubled (g-115-11544 tracks serializing builds).
 """
+import argparse
 import json
 import os
 import subprocess
@@ -82,6 +115,8 @@ DEBOUNCE_SECONDS = 6 * 3600  # after an attempt that did NOT land: one per 6h
 SUCCESS_INTERVAL_SECONDS = 10 * 60  # after one that landed: next may spawn in 10 min
 INDEX_DIR = SCRIPT_DIR.parent.parent / "mind_api" / "state" / "retrieval-embedding-index"
 UPDATE_LOG = SCRIPT_DIR.parent / "logs" / "embedding-index-update.log"
+INITIAL_BUILD_NICE = 10  # the first build pegs every core for minutes: yield to the session
+STACK_RECIPE = "pip install --target ~/.ayoai-vendor/py fastembed (guard-1427)"
 
 
 _CFG_CACHE = []
@@ -217,10 +252,154 @@ def _source_mtime():
     return newest
 
 
-def main():
+def _index_dir():
+    return Path(os.environ.get("EMBED_FRESHNESS_INDEX_DIR")
+                or os.environ.get("MIND_EMBEDDING_INDEX_DIR") or INDEX_DIR)
+
+
+def _spawn_detached(args, env=None, low_priority=False):
+    """Start `args` detached (never waited on), its output appended to UPDATE_LOG.
+
+    Raises on a spawn failure; the callers decide how loud that is."""
+    UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(UPDATE_LOG, "ab") as log_f:
+        kwargs = {"stdout": log_f, "stderr": log_f,
+                  "cwd": str(SCRIPT_DIR.parent.parent)}
+        if env is not None:
+            kwargs["env"] = env
+        if os.name == "nt":
+            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: survives the
+            # parent bash exiting (nohup/disown are flaky on Git Bash).
+            kwargs["creationflags"] = 0x00000008 | 0x00000200
+        else:
+            kwargs["start_new_session"] = True
+            if low_priority and hasattr(os, "nice"):
+                kwargs["preexec_fn"] = lambda: os.nice(INITIAL_BUILD_NICE)
+        subprocess.Popen(args, **kwargs)
+
+
+def _claim_initial_build(marker, now):
+    """Take the right to start THE initial build, atomically.
+
+    Returns (True, None) when this call owns the attempt, else (False,
+    attempted) with the claim's mtime (None when it could not be read). The
+    create is the arbiter: O_CREAT|O_EXCL has one winner however many sessions
+    start together. A claim past DEBOUNCE_SECONDS belongs to an attempt that
+    never produced meta.json (that is what "initial" means here), so it is
+    taken over by renaming it away, which also has exactly one winner."""
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(3):  # create; take over a stale claim; create again
+        try:
+            fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(time.strftime("%Y-%m-%dT%H:%M:%S"))
+            return True, None
+        try:
+            attempted = marker.stat().st_mtime
+        except OSError:
+            continue  # the holder vanished between create and stat: create again
+        if now - attempted < DEBOUNCE_SECONDS:
+            return False, attempted
+        stale = "%s.stale-%d" % (marker, os.getpid())
+        try:
+            os.rename(str(marker), stale)
+        except OSError:
+            return False, attempted  # another session took it over first
+        try:
+            os.unlink(stale)
+        except OSError:
+            pass
+    return False, None
+
+
+def _first_build_env():
+    """The child's env for the initial build. The builder and the reader both
+    setdefault HF_HUB_OFFLINE=1, right for the query path and wrong for the one
+    run that must fetch the model into an empty cache (guard-1427). Defaulting
+    the pair to 0 here lets that run work; an exported value wins."""
+    env = dict(os.environ)
+    env.setdefault("HF_HUB_OFFLINE", "0")
+    env.setdefault("TRANSFORMERS_OFFLINE", "0")
+    return env
+
+
+def _stamp(epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(epoch))
+
+
+def session_start(dry_run=False):
+    """The --session-start decision. Returns {"status": ..., "message": ...};
+    message None means say nothing. Every path is fail-open, and "cannot tell"
+    (a probe that raises, a claim that cannot be recorded) is silence, never a
+    build."""
+    if not _blend_enabled():
+        return {"status": "off", "message": None}
+    try:
+        from _vendor_path import stack_absent_reason
+        absent = stack_absent_reason()
+    except Exception:
+        return {"status": "probe-failed", "message": None}
+    if absent:
+        return {"status": "stack-absent", "message": (
+            "[embedding-index] retrieval is TOKEN-ONLY on this box: the semantic blend is on "
+            "fleet-wide but %s in this interpreter. Provision with: %s. The next session "
+            "start then builds the index if there is none." % (absent, STACK_RECIPE))}
+    index_dir = _index_dir()
+    if (index_dir / "meta.json").exists():
+        return {"status": "index-present", "message": None}
+    try:
+        won, attempted = _claim_initial_build(index_dir / ".last-update-attempt",
+                                              time.time())
+    except OSError:
+        return {"status": "claim-failed", "message": None}
+    if not won:
+        when = ("at %s " % _stamp(attempted)) if attempted else ""
+        until = ("; the next attempt is allowed after %s" % _stamp(attempted + DEBOUNCE_SECONDS)
+                 if attempted else "")
+        return {"status": "attempt-recorded", "message": (
+            "[embedding-index] an initial index build was started %sand has not landed (still "
+            "running, or failed): see %s. Retrieval is TOKEN-ONLY until meta.json exists%s."
+            % (when, UPDATE_LOG, until))}
+    building = (
+        "[embedding-index] no index on this box, so retrieval is TOKEN-ONLY until one exists: "
+        "building it now in the background (minutes to tens of minutes), log %s. The first "
+        "build may download the model once; export HF_HUB_OFFLINE=1 to forbid that."
+        % UPDATE_LOG)
+    if dry_run:
+        return {"status": "would-spawn", "message": building}
+    args = [sys.executable, str(SCRIPT_DIR / "embedding-index-build.py"), "--build"]
+    if index_dir != INDEX_DIR:
+        args += ["--out", str(index_dir)]
+    try:
+        _spawn_detached(args, env=_first_build_env(), low_priority=True)
+    except Exception as exc:
+        try:
+            (index_dir / ".last-update-attempt").unlink()  # no process: not an attempt
+        except OSError:
+            pass
+        return {"status": "spawn-failed", "message": (
+            "[embedding-index] no index on this box and the initial build could not be "
+            "started: %s" % str(exc)[:160])}
+    return {"status": "spawned", "message": building}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Per-box retrieval embedding index tick.")
+    ap.add_argument("--session-start", action="store_true",
+                    help="SessionStart hook mode: build the initial index, or say why "
+                         "retrieval is token-only (g-306-574)")
+    ns = ap.parse_args([] if argv is None else argv)
+    if ns.session_start:
+        message = session_start(os.environ.get("EMBED_FRESHNESS_DRYRUN") == "1")["message"]
+        if message:
+            print(message)
+        return 0
+
     dry_run = os.environ.get("EMBED_FRESHNESS_DRYRUN") == "1"
-    index_dir = Path(os.environ.get("EMBED_FRESHNESS_INDEX_DIR")
-                     or os.environ.get("MIND_EMBEDDING_INDEX_DIR") or INDEX_DIR)
+    index_dir = _index_dir()
     meta = index_dir / "meta.json"
 
     if not _blend_enabled():
@@ -264,21 +443,11 @@ def main():
         return 0
 
     try:
-        UPDATE_LOG.parent.mkdir(parents=True, exist_ok=True)
-        log_f = open(UPDATE_LOG, "ab")
-        kwargs = {"stdout": log_f, "stderr": log_f,
-                  "cwd": str(SCRIPT_DIR.parent.parent)}
-        if os.name == "nt":
-            # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: survives the
-            # parent bash exiting (nohup/disown are flaky on Git Bash).
-            kwargs["creationflags"] = 0x00000008 | 0x00000200
-        else:
-            kwargs["start_new_session"] = True
         args = [sys.executable, str(SCRIPT_DIR / "embedding-index-build.py"),
                 "--update"]
         if index_dir != INDEX_DIR:
             args += ["--out", str(index_dir)]
-        subprocess.Popen(args, **kwargs)
+        _spawn_detached(args)
         print(json.dumps({"op": "freshness-tick", "spawned": True,
                           "index_dir": str(index_dir)}))
     except Exception as exc:  # fail-open — never abort the caller's phase
@@ -288,4 +457,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

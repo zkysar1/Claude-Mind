@@ -22,7 +22,8 @@ leave the box (PEARL §10.3). Two filters, then redaction:
    - Guardrails + hypotheses: these stores do NOT carry a reliable ``applies_to``
      (guardrails were 817/820 unset as of 2026-07-15), so they are filtered by
      CATEGORY against the domain allowlist — an ALLOWLIST, never a denylist, so an
-     untagged framework entry fails CLOSED (suppressed) rather than leaking.
+     untagged framework entry fails CLOSED (suppressed) rather than leaking. A
+     guardrail must also be one the resident still follows (:func:`is_active_guardrail`).
 
 2. Redaction — every exposed string passes through :func:`redact`: filesystem paths →
    ``[path]``, known agent names → "the agent", framework ids (rb-N / guard-N / g-N-N /
@@ -338,9 +339,78 @@ def redact(
     return out.strip()
 
 
-#: Absolute paths: POSIX (``/home/…``) and Windows (``C:\…`` / ``C:/…``). Conservative —
-#: only matches rooted paths so ordinary prose ("and/or") is untouched.
+#: Absolute paths: POSIX (``/home/…``) and Windows (``C:\…`` / ``C:/…``). NOT only rooted
+#: paths, whatever an earlier note here said: the ``/`` branch has no left boundary, so
+#: ordinary prose matches too — "and/or" becomes "and[path]" and "9/30/2026" becomes
+#: "9[path]" (measured 2026-09-30, g-335-1726: 897 of 1,162 editable-size wiki bodies on
+#: one box). It over-redacts, which is the safe direction here, and it is left as it is:
+#: narrowing it changes what every bundle publishes and is its own change.
 _ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[\w.\-\\/]{2,}")
+
+
+def is_unredacted(text: str, redactor: Redactor) -> bool:
+    """True when the published view of ``text`` is ``text`` itself.
+
+    Trimmed ends do not count as a change, except leading spaces or tabs, which can
+    indent a first line. Everything else does: a secret, a path, an agent name or a
+    framework id replaced or removed, a high-entropy token dropped, a run of spaces
+    collapsed.
+
+    It answers the member's question before a correction (g-335-1726): "if I replace what
+    I see, is anything I cannot see lost?" A correction replaces the stored text with the
+    member's text, which starts from the view, so it is safe only when the view is all of
+    the stored text. :func:`project` marks those rows ``unredacted``, and the member-edit
+    applier refuses the rest (``view_redacted``).
+    """
+    return redactor(text) == text.strip() and text.lstrip("\r\n") == text.lstrip()
+
+
+#: The field a correction replaces, per item kind, in the order the published row reads
+#: them: a hypothesis with no claim shows its title.
+_ITEM_TEXT_FIELDS: dict[str, tuple[str, ...]] = {
+    "node": ("body",),
+    "hypothesis": ("claim", "title"),
+    "guardrail": ("rule",),
+}
+
+
+def item_text(kind: str, record: Mapping[str, object]) -> str:
+    """The stored text behind an item's published view, or ``""`` for an unknown kind.
+
+    :func:`project` publishes ``redactor(item_text(...))`` as the row's text, and the
+    member-edit applier hashes the same expression to check a correction's base
+    (:func:`view_digest`). One reader for both, so the box can never check a field other
+    than the one the member was shown.
+    """
+    for name in item_text_fields(kind):
+        value = record.get(name)
+        if value:
+            return str(value)
+    return ""
+
+
+def item_text_fields(kind: str) -> tuple[str, ...]:
+    """The stored fields that carry an item's member-visible text, in the order
+    :func:`item_text` reads them, or ``()`` for an unknown kind.
+
+    The member-edit applier retains and blanks exactly these when a member forgets a
+    hypothesis, so what a forget removes is what the member was shown and what an edit
+    replaces: one table, not a second list that could drift from it (guard-3970).
+    """
+    return _ITEM_TEXT_FIELDS.get(kind, ())
+
+
+def view_digest(view: str) -> str:
+    """The ``base`` a correction carries: lowercase hex SHA-256 of the UTF-8 of ``view``.
+
+    ``view`` is the text a member corrected, exactly as the published row carries it. A
+    browser hashes the string it parsed from the bundle, and a browser string is UTF-16:
+    a surrogate pair is one character and a lone surrogate encodes as U+FFFD. The round
+    trip below reads this str the same way, so both ends hash the same bytes, and a lone
+    surrogate cannot make the encode raise.
+    """
+    as_browser = view.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return hashlib.sha256(as_browser.encode("utf-8")).hexdigest()
 
 
 # ── filter predicates ────────────────────────────────────────────────────────
@@ -380,6 +450,41 @@ def is_exposed_by_category(entry: Mapping[str, object], allow: frozenset[str]) -
     """
     tl = top_level_category(str(entry.get("category") or ""))
     return bool(tl) and tl in allow
+
+
+def is_active_guardrail(entry: Mapping[str, object]) -> bool:
+    """A guardrail the resident still follows: ``status`` is exactly ``"active"``.
+
+    The literal test the resident's own readers apply (retrieve.py and guardrail-check.py
+    keep ``status == "active"``), so a member is shown exactly the rules a run can retrieve
+    or fire. A retired rule is hidden, which is how a member's correction replaces the rule
+    it superseded (g-335-1726). So is a record with no status or any other value, which no
+    run reads either: an allowlist, so it fails closed.
+    """
+    return entry.get("status") == "active"
+
+
+#: The field a member's forget stamps on a hypothesis record, holding the UTC instant of the
+#: forget (g-335-1726). A pipeline record is never deleted and its lifecycle only moves
+#: forward, so a forgotten hypothesis stays where it is with its statement blanked, and this
+#: marker is what takes it out of the exposed set.
+FORGOTTEN_FIELD = "forgotten_at"
+
+#: The field a member's undo stamps on a hypothesis record, holding the UTC instant the undo
+#: began (g-335-1726 u7a). It never decides what is shown: :func:`is_forgotten` reads only the
+#: marker above. It exists so the pipeline merge can order an undo against a stale copy of the
+#: forget it reversed. A record whose marker was cleared carries no trace of the forget, so
+#: without this stamp a copy that still holds the forget cannot be told from a newer one.
+RESTORED_FIELD = "restored_at"
+
+
+def is_forgotten(entry: Mapping[str, object]) -> bool:
+    """A hypothesis a member forgot: its ``forgotten_at`` is set.
+
+    ANY truthy value counts, so a marker written in an unexpected shape hides the record
+    rather than showing it.
+    """
+    return bool(entry.get(FORGOTTEN_FIELD))
 
 
 # ── projections (shape-preserving) ───────────────────────────────────────────
@@ -478,6 +583,18 @@ def _goal_id_of(goal: Mapping[str, object]) -> str:
     return str(goal.get("id") or goal.get("goal_id") or "").strip()
 
 
+def handle_inputs_present(secret: str, environment_id: str) -> bool:
+    """Whether a box holding these two values can key ANY handle (g-335-1726).
+
+    The provisioning half of the emptiness guard :func:`goal_handle` and :func:`item_handle`
+    both apply, as one rule: the secret counts as given unstripped, and ``environment_id``
+    counts only when it is not blank. A resolver folds an unprovisioned box into the same
+    miss as an unknown handle, so a caller that must not treat "this box cannot resolve" as
+    "no such item" asks this first.
+    """
+    return bool(str(secret or "")) and bool(str(environment_id or "").strip())
+
+
 def goal_handle(goal_id: str, secret: str, environment_id: str = "") -> str:
     """An opaque, per-environment handle for one goal id — or ``""`` when unavailable.
 
@@ -522,7 +639,7 @@ def goal_handle(goal_id: str, secret: str, environment_id: str = "") -> str:
     env = str(environment_id or "").strip()
     # EVERY component of the message gets an emptiness guard, not just the obvious secret
     # (guard-6312). `env` is hoisted so the guard and the message read the same value.
-    if not gid or not key or not env:
+    if not gid or not handle_inputs_present(key, env):
         return ""
     # NUL-separated so ("env", "g-1-2") and ("envg", "-1-2") cannot collide.
     msg = f"{env}\x00{gid}".encode("utf-8")
@@ -552,7 +669,7 @@ def item_handle(kind: str, item_id: str, secret: str, environment_id: str = "") 
     iid = str(item_id or "").strip()
     key = str(secret or "")
     env = str(environment_id or "").strip()
-    if k not in KNOWLEDGE_ITEM_KINDS or not iid or not key or not env:
+    if k not in KNOWLEDGE_ITEM_KINDS or not iid or not handle_inputs_present(key, env):
         return ""
     if "\x00" in iid or "\x00" in env:
         return ""
@@ -820,12 +937,14 @@ def _exposed_knowledge(
     and the domain allowlist they were cut with. :func:`project` publishes exactly these
     records and :func:`resolve_item_handle` addresses exactly these records, so what a
     member can SEE and what a member can ADDRESS are one set by construction (rb-10157,
-    the same tie :func:`_exposed_goal` makes for goals).
+    the same tie :func:`_exposed_goal` makes for goals). A guardrail is cut by status as
+    well as category, so a superseded rule leaves both sets. A hypothesis is cut by its
+    forgotten marker as well as category, so a forgotten one leaves both.
     """
     nodes = [n for n in tree_nodes if is_domain_tree_node(str(n.get("category") or n.get("file") or ""))]
     allow = domain_categories(nodes)
-    hyps = [h for h in hypotheses if is_exposed_by_category(h, allow)]
-    guards = [g for g in guardrails if is_exposed_by_category(g, allow)]
+    hyps = [h for h in hypotheses if is_exposed_by_category(h, allow) and not is_forgotten(h)]
+    guards = [g for g in guardrails if is_active_guardrail(g) and is_exposed_by_category(g, allow)]
     return nodes, allow, hyps, guards
 
 
@@ -840,6 +959,16 @@ def _with_handle(
     handle = item_handle(kind, item_id, secret, environment_id)
     if handle:
         row["handle"] = handle
+
+
+def _with_unredacted(row: dict[str, object], text: str, redactor: Redactor) -> None:
+    """Add ``unredacted: True`` to an addressable row whose editable ``text`` shows whole.
+
+    Only beside a ``handle``, so an unprovisioned box keeps every row's exact shape. No key
+    at all otherwise: a consumer reads a missing flag as "not safe to correct".
+    """
+    if "handle" in row and is_unredacted(text, redactor):
+        row["unredacted"] = True
 
 
 def project(
@@ -866,7 +995,10 @@ def project(
 
     ``item_handle_secret`` adds an opaque ``handle`` to each exposed wiki node,
     hypothesis and guardrail row (:func:`item_handle`, g-335-1726). Empty by default, so
-    an existing caller keeps its exact shape.
+    an existing caller keeps its exact shape. A node, hypothesis or guardrail row with a
+    handle also carries ``unredacted: True`` when the text a member would correct is
+    published whole (:func:`is_unredacted`). A node whose record says ``body_truncated``
+    never carries it.
     """
     nodes, allow, hyps, guards = _exposed_knowledge(tree_nodes, hypotheses, guardrails)
 
@@ -879,12 +1011,15 @@ def project(
         goals, redactor, handle_secret=goal_handle_secret, environment_id=environment_id
     )
     for n in nodes:
+        # One local for the published text and the flag, so the two can never read
+        # different sources.
+        body = item_text("node", n)
         bundle.tree.append(
             {
                 "key": str(n.get("key") or n.get("id") or ""),
                 "title": redactor(str(n.get("title") or "")),
                 "summary": redactor(str(n.get("summary") or "")),
-                "body": redactor(str(n.get("body") or "")),
+                "body": redactor(body),
                 "parent": str(n.get("parent") or ""),
                 "children": [str(c) for c in (n.get("children") or []) if c],
                 # NOT redacted, like key/parent/children above and unlike the four text
@@ -899,10 +1034,16 @@ def project(
             }
         )
         _with_handle(bundle.tree[-1], "node", _node_key(n), item_handle_secret, environment_id)
+        # A body the reader cut at its cap is not the stored body, so it is never offered
+        # for correction: the member would replace the whole page with an edit of its first
+        # part, which the applier refuses (view_truncated). g-335-1726 finding 7.
+        if not n.get("body_truncated"):
+            _with_unredacted(bundle.tree[-1], body, redactor)
     for h in hyps:
+        statement = item_text("hypothesis", h)
         bundle.hypotheses.append(
             {
-                "statement": redactor(str(h.get("claim") or h.get("title") or "")),
+                "statement": redactor(statement),
                 "horizon": str(h.get("horizon") or ""),
                 "status": str(h.get("stage") or ""),
                 "outcome": redactor(str(h.get("outcome") or "")),
@@ -911,11 +1052,14 @@ def project(
         _with_handle(
             bundle.hypotheses[-1], "hypothesis", _record_id(h), item_handle_secret, environment_id
         )
+        _with_unredacted(bundle.hypotheses[-1], statement, redactor)
     for g in guards:
-        bundle.guardrails.append({"rule": redactor(str(g.get("rule") or ""))})
+        rule = item_text("guardrail", g)
+        bundle.guardrails.append({"rule": redactor(rule)})
         _with_handle(
             bundle.guardrails[-1], "guardrail", _record_id(g), item_handle_secret, environment_id
         )
+        _with_unredacted(bundle.guardrails[-1], rule, redactor)
     for r in reasoning:
         # Reasoning-bank entries carry BOTH a reliable applies_to AND a category. Require
         # both: applies_to ∈ {domain, any} AND a domain-allowlisted category. applies_to
@@ -983,15 +1127,24 @@ __all__ = [
     "domain_categories",
     "is_exposed_reasoning",
     "is_exposed_by_category",
+    "is_active_guardrail",
+    "FORGOTTEN_FIELD",
+    "RESTORED_FIELD",
+    "is_forgotten",
     "ProjectedBundle",
     "project",
     "project_self",
     "project_program",
     "project_goals",
+    "handle_inputs_present",
     "goal_handle",
     "resolve_goal_handle",
     "KNOWLEDGE_ITEM_KINDS",
     "item_handle",
+    "is_unredacted",
+    "item_text",
+    "item_text_fields",
+    "view_digest",
     "resolve_item_handle",
     "SELF_EXPOSED_FM_FIELDS",
     "PROGRAM_EXPOSED_FM_FIELDS",

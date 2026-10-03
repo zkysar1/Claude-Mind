@@ -113,6 +113,7 @@ GOAL_KNOWN_FIELDS = frozenset({
     'dispatch_lane',                     # 0 -- g-353-137 always-run lane opt-in
                                          # ("always-run" or "always-run:<agent>");
                                          # reader: always-run-lane.py
+    'disposition_reason',                # rehome pointer — see 'rehomed_to'
     'estimated_depth',                   # 38
     'estimated_seconds',                 # 34
     'evidence_note',                     # 12
@@ -125,6 +126,9 @@ GOAL_KNOWN_FIELDS = frozenset({
     'findings',                          # 1
     'goal_id',                           # 2791
     'goal_source',                       # 2741
+    'groom_touched_at',                  # 0 -- g-353-65 grooming `keep` stamp
+                                         # (goal-intake-management.md §5);
+                                         # writer + reader: groom.py
     'handoff_created_at',                # 25
     'handoff_from',                      # 40
     'handoff_to',                        # 49
@@ -198,6 +202,17 @@ GOAL_KNOWN_FIELDS = frozenset({
     'recurring',                         # 160
     'recurring_interval_hours',          # 2
     'references',                        # 1
+    # g-353-65: the same-id REHOME shape. Written daemon-direct (not through
+    # update-goal) by aspirations_write.py _rehome_recurring_goals and
+    # rehome_goal (B4 move-on-touch): the target's adopted copy carries
+    # rehomed_from/rehomed_at/rehome_reason, the source pointer carries
+    # rehomed_to/rehomed_at/superseded_by_goal/disposition_reason. Registered
+    # in the change that shipped the second writer, so a census rise from a
+    # first live rehome reads as an extension, not as a bypassed gate.
+    'rehome_reason',                     # rehome adopted copy
+    'rehomed_at',                        # rehome pointer + adopted copy
+    'rehomed_from',                      # rehome adopted copy
+    'rehomed_to',                        # rehome pointer
     'release_negatives',                 # 0  (g-115-8163 — see release() in
                                          #     mind_api/src/endpoints/aspirations_write.py)
     'requires_capability',               # 8
@@ -254,6 +269,7 @@ GOAL_KNOWN_FIELDS = frozenset({
                                          # its writer by allowlisting it, and
                                          # goal-schemas.md 'Writing it' asks
                                          # for exactly this write.
+    'superseded_by_goal',                # rehome pointer — see 'rehomed_to'
     'tags',                              # 360
     'title',                             # 2791
     'type',                              # 52

@@ -173,6 +173,15 @@ _N3_ALLOWED_EXACT = frozenset({
     # stamps sat 6.5h older than the daemon's own start).
     # Non-secret boolean, same class as the cadence knobs above.
     "UTILIZATION_COUNTERS_SPOOLED",
+    # : the tree-index retrieval spool flag, read at CALL TIME by
+    # `_tree_retrieval_spool.spooled_enabled()` in `retrieve.load_tree_nodes`, which
+    # the daemon runs in-request. The flip itself reaches the daemon through the
+    # settings overlay at spawn (`daemon_overlay_settings_env`, : every
+    # committed settings key the spawning shell lacks is filled in). THIS entry is the
+    # `.env.local` channel, kept so a declaration there is honoured like the key
+    # above (guard-3485: a reader missing from this list never receives the value).
+    # Non-secret boolean.
+    "TREE_RETRIEVAL_SPOOLED",
 })
 
 

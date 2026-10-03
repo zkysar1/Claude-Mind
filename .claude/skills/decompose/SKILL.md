@@ -359,6 +359,9 @@ When decomposing a goal, check: does this goal's work naturally produce a testab
 
 If yes, create a companion hypothesis goal alongside the sub-goals:
 1. Create pipeline record: `echo '<record-json>' | bash core/scripts/pipeline-add.sh` (stage defaults to discovered)
+   Add refuses a record missing any of the 9 `id` (YYYY-MM-DD_slug), `title`, `stage`, `horizon`, `type`,
+   `confidence`, `position` (YES/NO or a multi-word claim, never a stage or type name), `formed_date`,
+   `category` (REQUIRED_FIELDS, core/scripts/pipeline.py; guard-851, rb-8127).
 2. Add hypothesis goal to the same aspiration with:
    - `participants: [agent]`
    - `skill: "/review-hypotheses --hypothesis {hypothesis_id}"`

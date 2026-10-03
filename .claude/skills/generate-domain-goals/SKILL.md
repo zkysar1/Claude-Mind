@@ -273,6 +273,11 @@ lens obey the same Candidate Contract (below).
   X; page renders Y; test T passes; metric Z read from store). Criteria
   requiring data that will not exist until after launch are staged
   ("query runs against synthetic data pre-launch; real cohorts post-launch").
+  Name the environment each check runs in, and pick the cheapest one that
+  exercises the code path and that ANY agent can launch. Keep a check that
+  only one operator's environment can observe for behavior specific to that
+  environment, and stage it into a run already planned there (the domain's
+  test-environment ladder, if it has one: `world/conventions/test-environments.md`).
   `ROUTING:` intended agent + one-line rationale, respecting the brief's
   routing pins.
 - **priority**: HIGH only when the work gates a ship date, revenue, or a

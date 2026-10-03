@@ -7,6 +7,10 @@ Pins the two properties that make the lane honest rather than merely present:
     (coordination.md: independence is the agent name, not the session), and closures
     already carrying a verdict, resting recurring goals, non-completed rows and closures
     older than the window never reach the candidate list;
+  * `list` offers the open review requests first (g-375-116): a goal carrying
+    review_requested and no verdict made at or after it (g-375-119), with its executor as
+    the closer, never to that executor, never when it names no executor, never once its
+    goal is moot;
   * `stats` reads the verdict artifacts through the gate's own reader (last entry wins,
     list- and dict-shaped files both live) and applies the written relax rule exactly;
   * relaxing a role keeps a deterministic sample of its closures reviewed, never none
@@ -167,6 +171,208 @@ def test_candidate_rows_carry_what_the_reviewer_hands_to_the_producer():
     assert row["completed_by_role"] == "worker"
     assert row["commit_sha"] == "abc123"
     assert row["asp_id"] == "asp-375"
+    assert row["kind"] == "closure" and row["closer"] == "alpha"
+
+
+# ─── list: review requests () ────────────────────────────────────────
+
+def request(gid: str, **kw) -> dict:
+    """A goal whose closer asked for a review: still open, done by alpha, no verdict."""
+    base = closure(gid, status="pending", completed_by=None, completed_by_role=None,
+                   completed_by_sid=None, completed_at=None, executed_by="alpha",
+                   claimed_by="alpha", review_requested="2026-09-24T18:00:00")
+    base.update(kw)
+    return base
+
+
+def select_req(goals, **kw):
+    args = dict(reviewed=set(), reviewer="bravo")
+    args.update(kw)
+    return crq.select_requests(goals, **args)
+
+
+def test_a_review_request_is_offered_to_another_mind_with_its_closer_never_to_its_own():
+    res = select_req([request("g-8-1")])
+    assert [r["goal_id"] for r in res["rows"]] == ["g-8-1"]
+    row = res["rows"][0]
+    assert row["kind"] == "request" and row["closer"] == "alpha"    # --closer for the producer
+    assert row["status"] == "pending" and row["review_requested"] == "2026-09-24T18:00:00"
+    # for alpha the same request is its own work: partitioned out and counted, never listed
+    own = select_req([request("g-8-1")], reviewer="ALPHA")
+    assert own["rows"] == [] and own["same_mind"] == ["g-8-1"]
+
+
+def test_the_closer_is_who_closed_else_who_executed_else_who_claimed_and_none_is_declined():
+    goals = [
+        request("g-9-1", status="completed", completed_by="echo", executed_by="alpha"),
+        request("g-9-2", executed_by="zeta", claimed_by="alpha"),
+        request("g-9-3", executed_by=None, claimed_by="echo"),
+        request("g-9-4", executed_by=None, claimed_by=None, filed_by_agent="alpha"),
+    ]
+    res = select_req(goals)
+    assert {r["goal_id"]: r["closer"] for r in res["rows"]} == {
+        "g-9-1": "echo", "g-9-2": "zeta", "g-9-3": "echo"}
+    # a record that names no executor cannot show independence: declined and counted
+    assert res["no_closer"] == ["g-9-4"]
+
+
+def test_answered_moot_and_unrequested_goals_are_never_offered_and_a_request_never_ages_out():
+    goals = [
+        request("g-10-1"),                                    # open request: offered
+        request("g-10-2"),                                    # a verdict answers it
+        request("g-10-3", status="skipped"),                  # moot
+        request("g-10-4", status="superseded"),               # moot
+        request("g-10-5", status="expired"),                  # moot
+        request("g-10-6", review_requested=None),             # never requested
+        request("g-10-7", status="completed", completed_by="alpha",
+                completed_at="2026-09-01T00:00:00", review_requested="2026-09-01T00:00:00"),
+    ]
+    res = select_req(goals, reviewed={"g-10-2"})
+    # g-10-7 was closed weeks ago on the promise of a review: it is still owed one
+    assert [r["goal_id"] for r in res["rows"]] == ["g-10-1", "g-10-7"]
+    assert res["skipped"] == {"moot": 3, "reviewed": 1}
+
+
+def test_requests_rank_open_first_then_tier_2_then_HIGH_then_the_oldest_request():
+    goals = [
+        request("g-11-1", status="completed", completed_by="alpha", priority="HIGH",
+                review_requested="2026-09-20T00:00:00"),       # closed: after every open one
+        request("g-11-2", priority="LOW", review_requested="2026-09-24T10:00:00"),
+        request("g-11-3", priority="LOW", review_requested="2026-09-23T10:00:00"),
+        request("g-11-4", priority="HIGH", review_requested="2026-09-24T12:00:00"),
+    ]
+    rows = select_req(goals)["rows"]
+    assert [r["goal_id"] for r in rows] == ["g-11-4", "g-11-3", "g-11-2", "g-11-1"]
+    assert rows[0]["tier"] == 2
+
+
+def _list(monkeypatch, capsys, closures, requests, *argv, answered=frozenset()):
+    monkeypatch.setattr(crq, "load_closures", lambda role: closures)
+    monkeypatch.setattr(crq, "load_requests", lambda: requests)
+    for name in ("reviewed_ids", "answered_ids"):
+        monkeypatch.setattr(crq, name,
+                            lambda goals: {crq.goal_id_of(g) for g in goals} & set(answered))
+    assert crq.main(["list", "--reviewer", "bravo", "--roles", "worker", *argv]) == 0
+    return capsys.readouterr().out
+
+
+def test_list_never_offers_a_request_a_verdict_already_answers(monkeypatch, capsys):
+    asked = ([request("g-16-1"), request("g-16-2")], None)
+    out = json.loads(_list(monkeypatch, capsys, [], asked, "--json", answered={"g-16-1"}))
+    assert [r["goal_id"] for r in out["candidates"]] == ["g-16-2"]
+    assert out["requests"]["skipped"]["reviewed"] == 1
+    # positive control: unanswered, both are offered
+    out = json.loads(_list(monkeypatch, capsys, [], asked, "--json"))
+    assert [r["goal_id"] for r in out["candidates"]] == ["g-16-1", "g-16-2"]
+
+
+def test_list_offers_requests_ahead_of_closures_within_one_cap_and_each_goal_once(
+        monkeypatch, capsys):
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    closures = [closure(f"g-12-{i}", completed_at=now) for i in range(3)]
+    # g-12-0 is a worker closure whose closer also asked for a review: offered once
+    both = dict(closures[0], review_requested="2026-09-24T18:00:00")
+    asked = [request("g-13-1"),
+             request("g-13-2", status="completed", completed_by="alpha",
+                     review_requested="2026-09-24T17:00:00"), both]
+    out = json.loads(_list(monkeypatch, capsys, closures, (asked, None), "--cap", "4", "--json"))
+    got = [(r["goal_id"], r["kind"]) for r in out["candidates"]]
+    assert got == [("g-13-1", "request"), ("g-13-2", "request"), ("g-12-0", "request"),
+                   ("g-12-1", "closure")], got
+    assert out["requests"]["eligible_total"] == 3 and out["requests"]["read_error"] is None
+    # positive control: with no request the same closures fill the cap
+    out = json.loads(_list(monkeypatch, capsys, closures, ([], None), "--cap", "4", "--json"))
+    assert [r["kind"] for r in out["candidates"]] == ["closure"] * 3
+
+
+def test_a_request_row_prints_its_closer_and_a_failed_read_is_never_silent(monkeypatch,
+                                                                             capsys):
+    out = _list(monkeypatch, capsys, [], ([request("g-15-1")], None))
+    assert "g-15-1 [asp-375] REQUEST open tier=1 MEDIUM closer=alpha" in out
+    assert "READ FAILED" not in out
+    out = _list(monkeypatch, capsys, [], ([], "store read failed rc=1 daemon down"))
+    assert "READ FAILED (store read failed rc=1 daemon down)" in out
+
+
+def test_load_requests_reads_every_wanting_status_in_one_query_and_keeps_the_requested(
+        monkeypatch, capsys):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        rows = [request("g-14-1"), closure("g-14-2"), "not a record"]
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(rows), "")
+
+    monkeypatch.setattr(crq.subprocess, "run", fake_run)
+    rows, err = crq.load_requests()
+    assert err is None and [r["id"] for r in rows] == ["g-14-1"]
+    i = seen["cmd"].index("--goal-status")
+    assert seen["cmd"][i + 1].split(",") == list(crq.REQUEST_STATUSES)
+    assert "completed" in crq.REQUEST_STATUSES and "--full" in seen["cmd"]
+    # a failed read is an error the listing prints, never an empty answer
+    monkeypatch.setattr(crq.subprocess, "run",
+                        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "daemon down"))
+    rows, err = crq.load_requests()
+    assert rows == [] and "rc=1" in err and "daemon down" in err
+    assert "requests store read failed" in capsys.readouterr().err
+
+
+def test_a_verdict_answers_only_a_request_made_at_or_before_it():
+    # : any verdict used to answer a request, so a REJECT, then rework, then a
+    # fresh request was never offered again
+    rejected = _verdict("g-17-1", "REJECT", "2026-10-02T10:00:00")
+    assert crq.answers(rejected, "2026-10-02T12:00:00") is False   # the request after rework
+    assert crq.answers(rejected, "2026-10-02T10:00:00") is True    # the same second answers
+    assert crq.answers(rejected, "2026-10-02T09:59:59") is True    # positive control
+    assert crq.answers(None, "2026-10-02T09:59:59") is False       # no verdict answers nothing
+    # a zone is read as UTC, never compared naive to aware (which raises)
+    assert crq.answers(rejected, "2026-10-02T12:00:00+02:00") is True   # 10:00 UTC
+    assert crq.answers(rejected, "2026-10-02T10:00:01Z") is False
+    assert crq.answers(dict(rejected, reviewed_at="2026-10-02T10:00:00.5"),
+                       "2026-10-02T10:00:00") is True
+
+
+def test_an_unreadable_request_stamp_takes_any_verdict_and_an_unreadable_verdict_stamp_none():
+    v = _verdict("g-18-1", "APPROVE", "2026-10-02T10:00:00")
+    # no verdict could ever be shown to follow an unreadable request: any verdict answers
+    # it, or it would be listed forever
+    # (a zone that carries a stamp past year 1..9999 makes the UTC conversion overflow)
+    for asked in ("true", "soon", "", None, "0001-01-01T00:00:00+01:00"):
+        assert crq.answers(v, asked) is True, asked
+    # a verdict that cannot show it followed the request answers nothing: listed once more,
+    # until the reviewer's next verdict, which close-review-verdict.py always stamps
+    for at in ("yesterday", "", None, "9999-12-31T23:59:59-01:00"):
+        assert crq.answers(dict(v, reviewed_at=at), "2026-10-02T09:00:00") is False, at
+    assert crq.answers("APPROVE", "2026-10-02T09:00:00") is False    # an entry, not a record
+
+
+def test_list_offers_a_request_again_when_its_current_verdict_predates_it(
+        tmp_path, monkeypatch, capsys):
+    # Through main and the gate's own reader, over real trails: the REJECT that sent g-19-1
+    # back predates its fresh request, so the request is offered again. A verdict after the
+    # request (g-19-2), or in the same second (g-19-3), answers it; g-19-4 has none.
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    d = tmp_path / "audit-reports" / "close-reviews"
+    asked = "2026-10-02T12:00:00"
+    _write_artifact(d, "g-19-1", [_verdict("g-19-1", "REJECT", "2026-10-02T10:00:00")])
+    _write_artifact(d, "g-19-2", [_verdict("g-19-2", "REJECT", "2026-10-02T10:00:00"),
+                                  _verdict("g-19-2", "APPROVE", "2026-10-02T13:00:00")])
+    _write_artifact(d, "g-19-3", [_verdict("g-19-3", "APPROVE", asked)])
+    requests = [request(f"g-19-{i}", review_requested=asked) for i in range(1, 5)]
+    monkeypatch.setattr(crq, "load_closures", lambda role: [])
+    monkeypatch.setattr(crq, "load_requests", lambda: (requests, None))
+    argv = ["list", "--reviewer", "bravo", "--roles", "worker", "--cap", "5", "--json"]
+    assert crq.main(argv) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [r["goal_id"] for r in out["candidates"]] == ["g-19-1", "g-19-4"]
+    assert out["requests"]["skipped"]["reviewed"] == 2
+    # positive control: the same trails answer a request made before every verdict
+    requests[:] = [request(f"g-19-{i}", review_requested="2026-10-02T09:00:00")
+                   for i in range(1, 5)]
+    assert crq.main(argv) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [r["goal_id"] for r in out["candidates"]] == ["g-19-4"]
+    assert out["requests"]["skipped"]["reviewed"] == 3
 
 
 # ─── stats ────────────────────────────────────────────────────────────────────
@@ -251,9 +457,15 @@ def test_a_verdict_whose_goal_survives_only_in_an_archived_record_counts_under_i
     monkeypatch.setattr(crq, "load_closures", lambda role: [])
     monkeypatch.setattr(crq, "resolve_unattributed",
                         lambda gids, world=None: resolve(gids, world=tmp_world))
+    out_of_live = crq.load_out_of_live
+    monkeypatch.setattr(crq, "load_out_of_live",
+                        lambda roles, world=None: out_of_live(roles, world=tmp_world))
     assert crq.main(["stats", "--json"]) == 0
     cli = json.loads(capsys.readouterr().out)
     assert cli["attributed_via"]["archive"] == 1 and cli["roles"]["worker"]["rejected"] == 1
+    # and the coverage over the same stores: the one worker closure, reviewed ()
+    cov = cli["roles"]["worker"]["coverage"]
+    assert (cov["covered"], cov["population"], cov["lane_start"]) == (1, 1, "2026-09-26T12:17:00")
 
 
 def test_a_verdict_the_producer_wrote_is_attributed_by_the_closer_it_names(tmp_path,
@@ -316,6 +528,128 @@ def test_stats_keep_measuring_a_relaxed_role_and_say_relaxing_means_sampling(tmp
     assert (w["review"], w["sample_rate"], w["reviewed"]) == ("sampled", 0.2, 10)
     crq._print_stats(sampled)
     assert "role=worker review=sampled@0.2:" in capsys.readouterr().out
+
+
+# ─── coverage () ──────────────────────────────────────────────────────
+
+COV_NOW = datetime(2026, 9, 30, 12, 0, 0)   # a 72 h window opens at 09-27T12:00
+
+
+def cover(live=(), archived=(), evicted=(), reviewed=(), lane_start="2026-09-24T12:00:00",
+          **kw):
+    args = dict(live=list(live), archived=list(archived), evicted_ids=set(evicted),
+                reviewed=set(reviewed), verdict_ids=set(reviewed), lane_start=lane_start,
+                now=COV_NOW, since_hours=72.0)
+    args.update(kw)
+    return crq.coverage_report("worker", **args)
+
+
+def test_coverage_counts_the_misses_apart_from_what_predates_the_lane():
+    # `list` puts every closure past its window in skipped.too_old, misses and history
+    # alike, and the archived and evicted ones leave it with no count at all. The lane
+    # began at its first verdict (09-24T12:00), so its reach began 72 h before that.
+    live = [closure("g-1-1", completed_at="2026-09-29T10:00:00"),   # still in the window
+            closure("g-1-2", completed_at="2026-09-25T10:00:00"),   # aged out unreviewed
+            closure("g-1-3", completed_at="2026-09-22T10:00:00"),   # in the first run's reach
+            closure("g-1-4", completed_at="2026-09-20T10:00:00"),   # before the reach
+            closure("g-1-5", completed_at="2026-09-26T10:00:00"),   # reviewed
+            closure("g-1-6", status="pending", recurring=True)]
+    other_role = closure("g-1-7", completed_by_role="reducer", completed_at="2026-09-25T10:00:00")
+    archived = [closure("g-2-1", completed_at="2026-09-28T10:00:00"),
+                closure("g-2-2", completed_at="2026-09-10T10:00:00")]
+    cov = cover(live + [other_role], archived, evicted={"g-3-1", "g-3-2"},
+                reviewed={"g-1-5", "g-3-2"})
+    assert cov["reach_start"] == "2026-09-21T12:00:00"
+    assert cov["unreviewed"] == {"in_window": ["g-1-1"], "aged_out": ["g-1-2", "g-1-3"],
+                                 "archived": ["g-2-1"], "evicted": ["g-3-1"]}
+    assert cov["predates_lane"] == ["g-1-4", "g-2-2"]
+    assert (cov["covered"], cov["population"], cov["coverage"]) == (2, 7, round(2 / 7, 3))
+    # positive control: list's own reading of the same closures is one bucket of four, two
+    # misses, a pre-lane closure and a reviewed one
+    assert select(live, reviewed={"g-1-5"}, now=COV_NOW)["skipped"]["too_old"] == 4
+
+
+def test_with_no_verdict_yet_nothing_predates_and_an_undated_closure_never_does():
+    live = [closure("g-1-4", completed_at="2026-09-20T10:00:00"),
+            closure("g-1-8", completed_at="", completed_date="")]
+    none_yet = cover(live, lane_start=None)
+    assert none_yet["reach_start"] is None and none_yet["predates_lane"] == []
+    assert none_yet["unreviewed"]["aged_out"] == ["g-1-4", "g-1-8"]
+    assert none_yet["coverage"] == 0.0
+    started = cover(live)
+    assert started["predates_lane"] == ["g-1-4"]
+    assert started["unreviewed"]["aged_out"] == ["g-1-8"]      # undated: counted as a miss
+
+
+def test_a_relaxed_role_counts_only_its_sample_as_due():
+    ids = [f"g-6-{i}" for i in range(40)]
+    gone = [f"g-7-{i}" for i in range(40)]
+    live = [closure(g, completed_at="2026-09-25T10:00:00") for g in ids]
+    cov = cover(live, evicted=set(gone), sampled=True, sample_rate=0.2)
+    inside = [g for g in ids if crq.in_sample(g, 0.2)]
+    assert 0 < len(inside) < len(ids) and cov["unreviewed"]["aged_out"] == sorted(inside)
+    assert cov["unreviewed"]["evicted"] == sorted(g for g in gone if crq.in_sample(g, 0.2))
+    full = cover(live, evicted=set(gone))
+    assert len(full["unreviewed"]["aged_out"]) == 40 and len(full["unreviewed"]["evicted"]) == 40
+
+
+def test_the_lane_starts_at_the_roles_own_first_verdict(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    d = tmp_path / "audit-reports" / "close-reviews"
+    _write_artifact(d, "g-9-1", [_verdict("g-9-1", "APPROVE", "2026-09-20T08:00:00")])
+    _write_artifact(d, "g-5-1", [_verdict("g-5-1", "APPROVE", "2026-09-25T09:00:00")])
+    _write_artifact(d, "g-5-2", [_verdict("g-5-2", "REJECT", "2026-09-24T11:00:00")])
+    goals = {"g-9-1": closure("g-9-1", completed_by_role="reducer"),
+             "g-5-1": closure("g-5-1"), "g-5-2": closure("g-5-2")}
+    stats = crq.role_stats(crq.read_all_verdicts(crq.artifacts_dir()), goals, ["worker"])
+    w = stats["roles"]["worker"]
+    assert w["lane_start"] == "2026-09-24T11:00:00"           # not the reducer's 09-20 verdict
+    assert w["reviewed_ids"] == ["g-5-1", "g-5-2"]
+    assert crq.role_stats({}, {}, ["worker"])["roles"]["worker"]["lane_start"] is None
+
+
+def test_load_out_of_live_reads_the_archive_and_both_censuses(tmp_path):
+    world = tmp_path / "world"
+    world.mkdir()
+    _jsonl(world / "aspirations-archive.jsonl", {
+        "id": "asp-73", "status": "completed",
+        "goals": [closure("g-73-1"), closure("g-73-2", completed_by_role="reducer")],
+        "archived_census": {"evicted_by_closer_role": {"worker": ["g-73-8"],
+                                                       "reducer": ["g-73-7"]}}})
+    _jsonl(world / "aspirations.jsonl", {
+        "id": "asp-74", "status": "active", "goals": [closure("g-74-1")],
+        "archived_census": {"evicted_ids": {"completed": ["g-74-5", "g-74-6"]},
+                            "evicted_by_closer_role": {"worker": ["g-74-5"]}}})
+    archived, evicted, err = crq.load_out_of_live(["worker"], world=str(world))
+    assert err is None
+    assert [g["id"] for g in archived] == ["g-73-1"]     # the live goals come from the query
+    assert evicted == {"worker": {"g-73-8", "g-74-5"}}    # g-74-6 was evicted with no role
+
+
+def test_a_failed_archive_read_reads_as_unknown_coverage_never_as_full(monkeypatch, capsys):
+    def unreadable():
+        raise OSError("store unreadable")
+    monkeypatch.setattr(crq, "_resolver", unreadable)
+    archived, evicted, err = crq.load_out_of_live(["worker"], world="/nonexistent-world")
+    assert (archived, evicted) == ([], {}) and "store unreadable" in err
+    assert "coverage not computed" in capsys.readouterr().err
+    stats = crq.role_stats({}, {}, ["worker"])
+    stats["coverage_error"] = err
+    crq._print_stats(stats)
+    out = capsys.readouterr().out
+    assert "coverage=unknown" in out and "coverage NOT computed" in out
+
+
+def test_stats_print_coverage_beside_the_approve_rate_and_name_the_misses(capsys):
+    stats = crq.role_stats({}, {}, ["worker"])
+    stats["roles"]["worker"]["coverage"] = cover(
+        [closure("g-1-2", completed_at="2026-09-25T10:00:00")], evicted={"g-3-1"},
+        reviewed={"g-1-5"})
+    crq._print_stats(stats)
+    out = capsys.readouterr().out
+    assert "approve_rate=0.0 coverage=1/3=0.333 recent=" in out
+    assert "aged_out=1 archived=0 evicted=1; predates the lane=0" in out
+    assert "never reviewed: g-1-2 g-3-1" in out
 
 
 def test_the_roles_come_from_the_gate_config_section():

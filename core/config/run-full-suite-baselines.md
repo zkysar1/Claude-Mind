@@ -1425,3 +1425,48 @@ SIDE-EFFECTS on the REDUCER's own state (this run was launched from the reducer 
    - A compaction LANDED on that anchor. The banner ordered "resume g-001-01" with no STALE/NOTE/AMBIGUOUS line, because the world copy is archived (read-side gap: g-115-11617).
    - `MIND_GOAL_ID=g-001-01` was injected into every reducer Bash call until the anchor was re-set by hand.
    - Snapshot BOTH the WM cadence slots and `loop-state-save.sh read` before launching from a reducer shell.
+
+### 2026-10-01T05:40Z–06:50Z — alpha REDUCER, `hostname` cc-04, `uname -r` 6.8.0-142-generic, STORAGE_BACKEND=local pin, LIVE DAEMON, MAIN REPO, runner-default 4 chunks, 1646 files, HEAD 92177a35f7 held for the whole run (the next HEAD move, a fast-forward, came at 06:51:02, 8 s after `halves.jsonl`), DETACHED as `nohup env MIND_AGENT=alpha MIND_SID=<sid> STORAGE_BACKEND=local bash core/scripts/run-full-suite.sh > <log> 2>&1 < /dev/null &` (log dir `ayoai-suite-run-alpha`), for the g-115-11591 deep-code closure (carrier merge a79e9a191f, fix ff5a531166)
+
+`TOTAL: 26693 passed, 44 failed, 0 errors` / `VERDICT: GENUINE failures -- trustworthy, act on them`.
+- Per chunk (failed / passed): 00 = 6/5982, 01 = 15/6333, 02 = 17/7696, 03 = 6/6682 (spread). Chunk 03 took ~23 min.
+- Invisible half `82/84`. Domain half `116/118`: `pytest-batch` and `test_efs_classify_halt.sh`, both world/ code that this change does not touch.
+- `--triage`: 2 environmental | 16 genuine-owned | 2 genuine-VERIFY (g-115-11761, g-115-9181) | 0 genuine-UNOWNED.
+- DIFFERENTIAL against the 09-30 run above, read from that run's rotated chunk logs in `<logdir>/prev/`: all 34 of its reds are still red, and 10 are new. None traces to the merge:
+  - 1 is `test_goal_selector_world_source_derivation`, plus `test_goal_selector_intended_agent_inverse.py` in the invisible half. Both hardcode `OFFROSTER_AGENT = "delta"`, and delta is back on the live roster since a Body wrote `agent_status.delta` at 04:51:58 (g-115-11761).
+  - 9 are `test_scorer_override_audit` x8 and `test_skill_discovery_companion_scripts::test_same_second_events_dedup_upstream`. `read_fleet_diaries` unions live worker-Body carrier rows whatever `base` is, since 34e9161d5f (g-306-575).
+  - `test_aspirations_update_goal_source_value.sh` (invisible half) was already red on 09-30 and is now red SOLO (g-115-11764).
+- SIDE-EFFECTS repeated exactly as recorded above. The cadence slots were advanced at 05:54:57 / 05:55:05 (chunk 01). The anchor was set to `g-001-01` at 06:33:26 (chunk 03). BOTH were restored after the run: the cadence values from the compaction checkpoint's `all_slots` (written 05:05:56, before launch), and the anchor from a `loop-state-save.sh read` snapshot taken before chunk 03.
+
+### 2026-10-01T04:03Z–05:17Z — alpha WORKER BODY (reducer live on cc-04, not here), `hostname` cc-07, `uname -r` 6.8.0-142-generic, STORAGE_BACKEND=local pin, LIVE DAEMON, MAIN REPO, runner-default 4 chunks, 1646 files, HEAD 6fa9c9f88b held for the whole run, launched IN-TURN (harness-tracked background task, waited on in-turn, never detached) as `env -u BODY_WM_PATH -u BODY_ROLE MIND_AGENT=alpha MIND_SID=<sid> STORAGE_BACKEND=local bash core/scripts/run-full-suite.sh > /tmp/suite-alpha-11554.log 2>&1 < /dev/null` (log dir `ayoai-suite-run-alpha`), for the g-115-11554 closure. The change under test (`_paths.py` missing-root refusal) was UNCOMMITTED during the run and committed after it as 2aa2d6229d.
+
+`TOTAL: 26692 passed, 45 failed, 0 errors` / `VERDICT: GENUINE failures -- trustworthy, act on them`, `SUITE-RC=1`.
+- Per chunk (failed / passed): 00 = 8/5980, 01 = 14/6340, 02 = 16/7691, 03 = 7/6681. Wall clock ~74 min.
+- Invisible half `82/84 files passed` (reds: `test_goal_selector_intended_agent_inverse.py`, `test_aspirations_update_goal_source_value.sh`). Domain half `117/118 unit(s) passed, 1 skipped` (red: `test_efs_classify_remote_body.sh`).
+- New since 09-29 in chunk 02: `test_owncloud_integration` x6 (S3 HeadObject 403, owned by g-115-10069) and `test_scorer_override_audit` x8.
+
+`--triage`: **2 environmental | 14 genuine-owned | 2 genuine-VERIFY | 1 genuine-UNOWNED**. Environmental: `test_goal_field_append` (52/52 solo) and `test_learning_routing_world_scope` (3/3 solo). VERIFY: `test_iteration_close_quality_flag_carry` (g-115-9181 names its three live param ids) and `test_scorer_override_audit` (g-115-7459 names the file only; the 8 reds read the LIVE agents root, `{'alpha': 50, 'bravo': 4}` against `{'bravo': 4}`). UNOWNED: `test_skill_discovery_companion_scripts::test_same_second_events_dedup_upstream`.
+
+ATTRIBUTING AN UNCOMMITTED CHANGE. The triage's `recent commits (7d)` cannot see a change that is not committed, so attribution was a one-variable A/B. The 17 genuine red files ran in one pytest batch with the modified `_paths.py` (42 failed / 350 passed), then again with HEAD's `_paths.py` swapped in on disk under an EXIT-trap restore (42 / 350). The failing node-id sets were IDENTICAL, and the restore was hash-verified. The invisible and domain reds: `intended_agent_inverse` and `efs_classify_remote_body` fail identically in both arms; `source_value` is flaky in both (modified 1 of 3 runs failed, HEAD 3 of 3). A pytest plugin cannot run this control for `_paths.py`, because subprocess tests import the file from disk.
+
+SIDE-EFFECTS on this Body, the 09-29 / 09-30 signatures again:
+1. Body WM `last_fresh_eyes_review` / `last_fresh_eyes_tree_review` were stamped at 04:15:33 / 04:15:41 (chunk 01) to 16203, despite `env -u BODY_WM_PATH`. Restored with wm-set.sh to the pre-run values, read from this session's 03:48 `compact-checkpoint.yaml` (09-27T21:26:56 / 15801 and 09-27T08:35:17 / 15742).
+2. team-state `shared_cadences.last_fresh_eyes_tree_review` was restamped at 04:56:37 / 15809 / alpha. No local copy holds its prior value: `world/.history` keeps no team-state versions, and the only on-disk backup (`team-state.yaml.rb671-test-backup.79624`) dates from 2026-08-05. Store-side object versions were not probed.
+3. `sessions/<sid>/iteration-checkpoint.json` was anchored to `g-001-01` at 04:57:46 (chunk 03), and the Bash hook then injected `MIND_GOAL_ID=g-001-01` into every call. Re-anchored with `loop-state-save.sh init --goal-id g-115-11554 --source world`, the writer the claim itself uses.
+
+### 2026-10-01T09:07Z–10:18Z — alpha REDUCER, `hostname` cc-04, `uname -r` 6.8.0-142-generic, STORAGE_BACKEND=local pin, LIVE DAEMON, MAIN REPO, runner-default 4 chunks, 1648 files, HEAD 1c10594b4e held for the whole run, DETACHED as `nohup env MIND_AGENT=alpha MIND_SID=<sid> STORAGE_BACKEND=local bash core/scripts/run-full-suite.sh > <log> 2>&1 < /dev/null &` (log dir `ayoai-suite-run-alpha`, `.run-lock.json` taken), for the g-306-284 occ277 consume of worker refs 9c5cc235 (merge 50f207152b, which carries the 2aa2d6229d `_paths.py` missing-root refusal) and dec9c5e6 (merge 64cd8b63a3), pushed in sync merge 1c10594b4e
+
+`TOTAL: 26736 passed, 45 failed, 0 errors` / `VERDICT: GENUINE failures -- trustworthy, act on them`, `SUITE-RC=1`.
+- Per chunk (failed / passed): 00 = 7/5981, 01 = 15/6341, 02 = 17/7698, 03 = 6/6716. Wall clock ~71 min.
+- Invisible half `82/84`. Domain half `117/118`: `pytest-batch` only, the same 15 `test_usage_liveness_*` reds as the 05:40Z run. `test_efs_classify_halt.sh` was green this time.
+- `--triage`: 2 environmental | 16 genuine-owned | 3 genuine-VERIFY | 0 genuine-UNOWNED. Each VERIFY file is named by an open goal: `test_goal_selector_world_source_derivation` (g-115-11761), `test_iteration_close_quality_flag_carry` (g-115-9181), `test_completed_not_committed_scoped_probe` (g-115-6350).
+- DIFFERENTIAL against the 05:40Z run (`<logdir>/prev/`): 44 of 45 reds identical, none gone, 1 new. The new one is `test_completed_not_committed_scoped_probe::test_goal_scoping_narrows_the_population_to_one`, and it is LIVE-STATE coupled, not the merge. Its helper takes the first completed goal of the agent queue's asp-001: there were 3 at 6aa55c6c21 and 0 live after archival. With none, it falls back to a world goal, of which the sweep scans 0.
+- SCOPED-TIER CONTRAST. Same change, `run-scoped-suite.sh --since 03dde50b88`, 243 files (14.75%) in ONE process: 40 reds, 36 of them test-order pollution that this chunked run did not show.
+  - Polluter: `test_fileops_snapshot_blacklist_and_gzip.py`. Its `with_sandbox` re-imports `_paths` under sandbox roots, then deletes the sandboxes without restoring `sys.modules`.
+  - Reproduced: polluter first gives 6 failed; the reverse order gives 35 passed. Identical on `git archive` exports of the pre-merge and post-merge trees.
+  - The 05:40Z chunking kept the polluter (chunk 01, position 66) away from every victim; a scoped run's single process is the shape that exposes it (g-115-10434).
+- SIDE-EFFECTS:
+  1. WM `last_fresh_eyes_review` / `last_fresh_eyes_tree_review` stamped at 09:20:19 / 09:20:27 (chunk 01).
+  2. The anchor was set to `g-001-01` at 09:58:08 (chunk 03).
+  3. team-state `shared_cadences.last_fresh_eyes_tree_review` restamped at 09:20:27 / 15821 / alpha.
+  Items 1 and 2 were restored from a pre-launch snapshot (13 WM slots plus `loop-state-save.sh read`) and read back equal. Item 3 was NOT restored: the snapshot did not cover team-state, so its prior value is unknown. Add `team-state-read.sh --field shared_cadences.last_fresh_eyes_tree_review` to the pre-launch snapshot.

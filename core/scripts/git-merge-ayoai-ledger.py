@@ -48,7 +48,10 @@ Dispatch by basename:
                            so a lossy-safe rollup self-heals on next experience-add)
   everything else       -> coordination_merge.merge_handler_for() registry
                            (changelog.jsonl, aspirations.jsonl, and any other
-                           registered store share the S3-path handler)
+                           registered store share the S3-path handler), then,
+                           path-scoped, a base-aware delete filter
+                           (_drop_one_sided_deletes) for the agent ledgers and,
+                           rotation-gated, for the world and meta changelog
   STILL unregistered    -> _validated_text_merge (see below), else exit 1
 
 UNREGISTERED BASENAMES ARE THE COMMON CASE, NOT THE EDGE (g-115-4253). The
@@ -305,11 +308,12 @@ def _is_agent_ledger_delete_aware(pathname: str) -> bool:
     ``coordination_merge.merge_aspirations``: the world queue represents a removal
     OUT of band -- archival writes the record into the archive store, and the
     daemon archive_sweep -> _reconcile_resurrected repairs from it on the
-    reducer's cadence. Scoping to ``agents/`` keeps every world merge
-    byte-identical.
+    reducer's cadence. Scoping to ``agents/`` keeps every world QUEUE merge
+    byte-identical. The world and meta changelog are delete-aware through their
+    own, rotation-gated predicate (``_is_rotated_changelog``), never this one.
 
     The agent-local queue has no such remedy WIRED. Measured 2026-09-06 (alpha
-    worker Body, cc-10), three signals: ``agent-aspirations-archive.sh`` -- the
+    worker Body, cc-10, g-115-9132), three signals: ``agent-aspirations-archive.sh`` -- the
     wrapper that forces ``--source agent`` -- has ZERO invoking callers anywhere
     outside itself, only a convention table row whose cadence column is ``--``
     and one agent's experience note; a repo-wide grep for any caller passing
@@ -326,8 +330,46 @@ def _is_agent_ledger_delete_aware(pathname: str) -> bool:
     )
 
 
+def _is_rotated_changelog(pathname: str) -> bool:
+    """True for the world and meta changelog, whose removals count only when they
+    have a ROTATION's shape (``_drop_one_sided_deletes(rotation_only=True)``).
+
+    Exactly ``.mind-data/world/changelog.jsonl`` and
+    ``.mind-data/meta/changelog.jsonl``, both routed here by the
+    ``.mind-data/{world,meta}/**/*.jsonl`` lines of .gitattributes. Their
+    writer-side delete path is store-hygiene.yaml's rotation: the world log keeps
+    its newest 20000 lines and archives the rest first, and the meta log caps at
+    its newest 10000. The registry handler is a line union with no %O, so a merge
+    with a peer still holding the pre-rotation copy put every rotated line back,
+    and nothing repairs that out of band, because the rotation archive stays
+    untracked by design (guard-2085). Measured on a downstream deployment that
+    tracks its world in git (msg-20260929-075602-omni-3403): 380,253 of 493,178
+    live rows predated the last rotation, and the file grew 2.4-2.8 MiB a day
+    toward the push size limit. The world goal queue stays out: see
+    ``_is_agent_ledger_delete_aware`` for why its removals are repaired out of band.
+
+    WHY NOT THE AGENT RULE. It honours any one-sided removal of an untouched
+    record, so it cannot tell a rotation from a truncation, and a failed integrate
+    has committed a one-row stub of this very file (g-115-11674). The agent rule
+    reads that stub as the deletion of the whole history and keeps it. A rotation
+    has a shape a truncation lacks: it removes a FRONT SLICE of the base and keeps
+    everything after the cut, starting at a base record, in a window no smaller
+    than any rotation leaves. ``coordination_merge._front_evicted_lines`` tests
+    exactly that shape for the board channels (g-358-81, g-358-119); here it runs
+    against %O. Every other shape keeps the union, so a misread costs today's
+    resurrection, never a loss."""
+    parts = pathname.replace("\\", "/").split("/")
+    return (
+        len(parts) >= 3
+        and parts[-3] == ".mind-data"
+        and parts[-2] in ("world", "meta")
+        and parts[-1] == "changelog.jsonl"
+    )
+
+
 def _drop_one_sided_deletes(merged: bytes, ours: bytes, theirs: bytes,
-                            base: bytes, key_fields=("id",)) -> bytes:
+                            base: bytes, key_fields=("id",),
+                            rotation_only=False) -> bytes:
     """Filter a two-way handler's OUTPUT so a one-sided removal is not undone.
 
     The registry handlers this composes with are unions with no %O: they keep
@@ -373,7 +415,13 @@ def _drop_one_sided_deletes(merged: bytes, ours: bytes, theirs: bytes,
     byte-identity and commutativity properties the handlers guarantee are not
     disturbed. Commutative itself: the drop set is a function of (base, ours,
     theirs) computed symmetrically in ours/theirs, and the output order is the
-    handler's."""
+    handler's.
+
+    ROTATION_ONLY (g-115-11474) narrows the drop set to what a ROTATION removed:
+    base records inside a front slice that ``cm._front_evicted_lines`` accepts
+    for the side no longer holding them. Records are compared in canonical form,
+    so a writer's key order or escaping cannot hide a cut. A removal of any other
+    shape (a stub, a lost tail, a short copy) drops nothing."""
     def _key(item):
         if isinstance(item, dict):
             for kf in key_fields:
@@ -388,10 +436,12 @@ def _drop_one_sided_deletes(merged: bytes, ours: bytes, theirs: bytes,
     if not base_recs:
         return merged
     try:
-        ours_k = {_key(r): r for r in _parse_jsonl(ours)}
-        theirs_k = {_key(r): r for r in _parse_jsonl(theirs)}
+        ours_recs = _parse_jsonl(ours)
+        theirs_recs = _parse_jsonl(theirs)
     except (ValueError, UnicodeDecodeError):
         return merged
+    ours_k = {_key(r): r for r in ours_recs}
+    theirs_k = {_key(r): r for r in theirs_recs}
     base_k = {_key(r): r for r in base_recs}
 
     drop = set()
@@ -402,6 +452,13 @@ def _drop_one_sided_deletes(merged: bytes, ours: bytes, theirs: bytes,
         survivor = ours_k[k] if o_has else theirs_k[k]
         if cm._canon(survivor) == cm._canon(brec):
             drop.add(k)                    # untouched on one side, removed on the other
+    if rotation_only and drop:
+        base_lines = [cm._canon(r) for r in base_recs]
+        rotated_out = set()
+        for side in (ours_recs, theirs_recs):
+            rotated_out |= cm._front_evicted_lines(
+                base_lines, [cm._canon(r) for r in side])
+        drop &= {_key(json.loads(line)) for line in rotated_out}
     if not drop:
         return merged
 
@@ -553,11 +610,15 @@ def merge_bytes(pathname: str, ours: bytes, theirs: bytes,
         # they cannot tell "the peer never had this record" from "the peer
         # DELETED it" -- the guard-1068 resurrection class, still live on the
         # two ledger-routed AGENT stores that reach this fall-through rather
-        # than the base-aware branch above (g-115-9132). Compose rather than
-        # replace: the handler keeps its field-level merge, this restores the
-        # delete.
+        # than the base-aware branch above (g-115-9132), and on the world and
+        # meta changelog, where only a rotation counts (g-115-11474). Compose
+        # rather than replace: the handler keeps its field-level merge, this
+        # restores the delete.
         if _is_agent_ledger_delete_aware(pathname):
             merged = _drop_one_sided_deletes(merged, ours, theirs, base)
+        elif _is_rotated_changelog(pathname):
+            merged = _drop_one_sided_deletes(merged, ours, theirs, base,
+                                             rotation_only=True)
         return merged
     merged = _validated_text_merge(pathname, base, ours, theirs)
     if merged is not None:

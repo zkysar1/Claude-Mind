@@ -58,7 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # tests/test_goal_eviction_invariance.py. Adding a third copy here would fork
 # the vocabulary; note in particular that `retired` is NOT terminal in the
 # SSOT, and this module must not invent it as one.
-from _goal_census import TERMINAL_STATUSES, census_by_status
+from _goal_census import CENSUS_ID_SET_KEYS, TERMINAL_STATUSES, census_by_status
 
 # The Read tool's hard refusal threshold, in bytes. A file at or above this
 # cannot be read by the LLM at all -- which is the failure this module exists
@@ -157,9 +157,11 @@ def project_shell(asp):
     """
     shell = {k: v for k, v in asp.items() if k != 'goals'}
     census = shell.get('archived_census')
-    if not isinstance(census, dict) or 'evicted_ids' not in census:
+    # The closer-role id set () is unbounded the same way, and no summary
+    # reader needs it, so it is dropped with the status ids.
+    if not isinstance(census, dict) or not any(k in census for k in CENSUS_ID_SET_KEYS):
         return shell
-    projected = {k: v for k, v in census.items() if k != 'evicted_ids'}
+    projected = {k: v for k, v in census.items() if k not in CENSUS_ID_SET_KEYS}
     counts = census_by_status(asp)
     if counts:
         projected['by_status'] = {s: counts[s] for s in sorted(counts)}

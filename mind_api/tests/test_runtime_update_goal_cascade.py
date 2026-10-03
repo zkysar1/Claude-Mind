@@ -328,9 +328,11 @@ def test_dotted_field_does_not_mutate_goal(running_daemon):
 # ---------------------------------------------------------------------------
 
 def test_recurring_false_drops_interval_hours_and_last_achieved(running_daemon):
-    """recurring=false must pop the recurring-shape fields at the data
+    """recurring=false must clear the recurring-shape fields at the data
     primitive so goal-selector's `hours_since(lastAchievedAt) < interval_hours`
-    doesn't keep the dead goal alive between archive sweeps."""
+    doesn't keep the dead goal alive between archive sweeps. Cleared to None,
+    never popped (g-115-11591): a popped key came back from any pre-retirement
+    peer copy at the next merge."""
     project_root, port = running_daemon
     g = _seed_goal(port, recurring=True, interval_hours=24,
                    lastAchievedAt="2026-05-12T08:00:00")
@@ -338,8 +340,8 @@ def test_recurring_false_drops_interval_hours_and_last_achieved(running_daemon):
     assert code == 200, body
     persisted = _read_goal(project_root, g["id"])
     assert persisted["recurring"] is False
-    assert "interval_hours" not in persisted
-    assert "lastAchievedAt" not in persisted
+    for key in ("interval_hours", "lastAchievedAt"):
+        assert key in persisted and persisted[key] is None, key
 
 
 def test_recurring_true_preserves_interval_hours(running_daemon):

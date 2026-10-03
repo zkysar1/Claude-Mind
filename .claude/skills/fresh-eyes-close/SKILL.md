@@ -14,6 +14,7 @@ companion_scripts:
   - core/scripts/close-review-gate.py
   - core/scripts/q4-provenance-sample.sh
   - core/scripts/provenance-check.sh
+  - core/scripts/commit-reachability.py
   - core/scripts/liveness-check.sh
 conventions: [coordination, board, reasoning-guardrails, goal-schemas, aspirations]
 minimum_mode: assistant
@@ -92,7 +93,7 @@ fresh-context reviewer per the independence order above rather than proceeding.
 
 ## The four mandatory checks
 
-### 1. Requirements traceability — judgment, plus a MECHANISED citations-MATCH probe
+### 1. Requirements traceability — judgment, plus MECHANISED citations-MATCH and delivery probes
 Every entry in `verification.outcomes` maps to concrete produced evidence.
 **Quote the evidence.** An outcome you cannot quote evidence for is unmet, not
 "probably fine", and a partially-met bar may not be narrated away (`guard-7517`).
@@ -120,6 +121,50 @@ check cannot see, and the producer vetoes an APPROVE on it mechanically. Read
 `clusters_total` beside `sampled_count`: a clean verdict over 2 of 40 clusters is
 a thin one, and the reviewer says so.
 
+**Delivery is part of traceability** (g-375-107). Evidence that never reached the
+target branch does not meet an outcome, and a closed goal is not a landed one
+(`guard-4638`). Probe every commit the closure names, plus every commit the goal
+id finds:
+
+```bash
+# Delivery probe. Fetch first: the probe mirrors worker refs but never refreshes the
+# target, and a stale origin/main reads landed work as stranded (guard-5797).
+git -C <repo> fetch --prune origin '+refs/heads/*:refs/remotes/origin/*' \
+  '+refs/workers/*:refs/remotes/_reach_workers/*'
+# The goal's own commits. The digit guard stops g-375-10 matching g-375-100, and
+# refs/stash is left out because a churn stash quotes the HEAD commit's subject.
+git -C <repo> log --exclude=refs/stash --all --format=%H -E --grep='<goal-id>([^0-9]|$)'
+# Each sha. Read `verdict`, never the exit code: exit 0 only says the probe ran.
+py -3 core/scripts/commit-reachability.py --repo <repo> --target-ref origin/main --sha <sha>
+# A non-LANDED sha: a leading `-` means a patch-equivalent commit is on the target.
+git -C <repo> cherry origin/main <sha> <sha>^
+```
+
+- Every commit the closure names is probed. Leave out a commit the search finds
+  only when its message shows it is another goal's work that cites this id, as
+  a precedent or a measurement source, and name it in the `--check`
+  (`guard-3541`: read the citation context first).
+- `LANDED` passes.
+- Any other verdict is not yet a miss (`guard-3541`): a worker-ref carry lands the
+  same change under a new sha. The `cherry` line printing `- <sha>` shows it on
+  the target by content. Failing that, look for the commit's added lines in
+  `git show origin/main:<path>` for each path it touches, since a carry may merge
+  or adjust hunks. Present by content passes, and the `--check` says how.
+- A commit on the target by neither test is STRANDED. Record a `--finding` naming
+  the sha, the verdict, the containing ref and the probe's `landing_path`, and
+  never write a plain APPROVE:
+  - **APPROVE_WITH_NOTES** when something will still carry it: a worker carrier
+    ref awaiting the reducer, a pushed branch or open PR, or a local commit on the
+    closer's HEAD (`git merge-base --is-ancestor <sha> HEAD`) that the close's
+    own push phase sends. A close-time review runs before that phase, so the
+    close's own commit can be local-only for a few minutes (`guard-3541`).
+  - **REJECT** when nothing will: `ABSENT`, or `STRANDED_LOCAL_ONLY` on a branch
+    no push phase sends. The goal then has a step of its own left undone.
+- `INCONCLUSIVE` is not a pass. Re-run it, and if it persists record "delivery
+  unverified" as a finding.
+- A product-repo goal runs the same lines in its own clone, with its sanctioned
+  branch in place of `origin/main`.
+
 ### 2. Source fidelity — MECHANISED, and the one that catches the founding class
 Diff **every** enumerated entity in the description/source against the artifact,
 verbatim. Do not eyeball this and do not count. Run:
@@ -136,10 +181,13 @@ With no `--approve` or `--reject` it reports the diff and writes nothing
 source, absent from the artifact), `invented` (in the artifact, not in the
 source), `counts_match`, and `substitution_signature`.
 
-**`counts_match: true` beside a non-empty `missing` is the founding incident
-exactly**: coach g-012-02 shipped 16 of 16 entities with 6 identities silently
+**`counts_match: true` beside a non-empty `missing` is how the founding incident
+looked**: coach g-012-02 shipped 16 of 16 entities with 6 identities silently
 substituted, and the count-based criterion went green. Read the diff, never the
-count.
+count. Equal totals alone are not a substitution, though: a source's cited ids
+often number the same as an outcome note's new evidence ids, so
+`substitution_signature` fires only when every KIND (goal, guard, rb, hex ...)
+holds as many ids missing as invented (g-375-58).
 
 **There are TWO mechanical checks and they are complements** (g-357-44).
 `source-fidelity` is the id-set difference — deliberately narrow, id-shaped
@@ -199,7 +247,7 @@ py -3 core/scripts/close-review-verdict.py \
 py -3 core/scripts/close-review-verdict.py \
   --goal <goal-id> --reviewer <your-name> --closer <closing-agent> \
   --source-file <source> --artifact-file <artifact> \
-  --approve --check "traceability: <what you verified>" \
+  --approve --check "traceability: <what you verified, with each commit's delivery verdict>" \
   --check "criteria-adequacy: <the wrong artifact you constructed>" --write
 
 # APPROVE_WITH_NOTES — the close is sound AND you have non-blocking observations
@@ -299,6 +347,8 @@ skip this skill entirely and pay nothing.
 
 ```bash
 STORAGE_BACKEND=local py -3 -m pytest core/scripts/tests/test_close_review_verdict_producer.py -q
+# The delivery probe block in check 1, run line by line on a fixture origin:
+py -3 -m pytest core/scripts/tests/test_fresh_eyes_close_delivery.py -q
 ```
 
 ## Chaining

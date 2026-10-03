@@ -1608,6 +1608,22 @@ if [[ $SESSION_SCOPE -eq 1 ]]; then
   done < <(git -C "$REPO" diff --cached --name-only || true)
 fi
 
+# --- Append-only stub guard () ------------------------------------
+# An append-only store whose working copy LOST rows HEAD holds (the stub a failed
+# integrate leaves) is repaired before staging, or left out of this commit when
+# it cannot be: committing the stub records the deletion.
+if [[ ${#staged_files[@]} -gt 0 ]]; then
+  _sg_drop="$($PYLAUNCH "$(dirname "${BASH_SOURCE[0]}")/append-only-stub-guard.py" --repo "$REPO" "${staged_files[@]}")" || _sg_drop=""
+  if [[ -n "$_sg_drop" ]]; then
+    _sg_kept=()
+    for _p in "${staged_files[@]}"; do
+      grep -qxF -- "$_p" <<< "$_sg_drop" || _sg_kept+=("$_p")
+    done
+    echo "[$SCRIPT_NAME] WARN: left out of this commit by the append-only stub guard: ${_sg_drop//$'\n'/ }" >&2
+    staged_files=("${_sg_kept[@]+"${_sg_kept[@]}"}")
+  fi
+fi
+
 # --- Stage + commit ----------------------------------------------------------
 if [[ ${#staged_files[@]} -gt 0 ]]; then
   add_output=$(git -C "$REPO" add -A -- "${staged_files[@]}" 2>&1) || {

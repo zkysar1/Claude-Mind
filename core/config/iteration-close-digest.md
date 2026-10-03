@@ -116,7 +116,7 @@ flags are never read.
    `score = 0.50·coverage + 0.30·specificity + 0.20·actionability`.
    Otherwise: `score = 0.40·coverage + 0.35·specificity + 0.25·actionability`.
 
-   If `score < 0.45`: demote to curator_overflow (WM slot) via `wm-set.sh`. DO NOT write to tree.
+   If `score < 0.45`: demote via `py -3 core/scripts/overflow-queue-append.py` (APPENDS to `agents/<agent>/session/overflow-queue.yaml`, the store consolidation's Overflow Queue Management reads). DO NOT write to tree.
    If `score >= 0.45`: write Verified Values + Key Insights to the node via Edit. The T21 PostToolUse hook auto-bumps `last_updated` on the node — no explicit `tree-update.sh --set` call required (guard-531; see encoding-protocol-digest.md §6).
 
 4. **Decision rules (Step 8e)** — bash-enforced via

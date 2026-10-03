@@ -467,6 +467,51 @@ def test_archive_sweep_fold_collapses_duplicate_archive_rows(tmp_path):
     assert arch[0]["replay_metadata"]["replay_count"] == 1
 
 
+def test_archive_sweep_idle_path_returns_full_key_set(tmp_path):
+    # Fresh-eyes 2026-09-27 (): the early return (nothing
+    # archived, pruned or stamped) used to omit folded_count and
+    # archive_missing_count, so a caller branching on those keys saw a
+    # different response shape depending on whether the sweep did anything.
+    rid = "2026-07-01_sweep-idle"
+    young = _rec(rid, "archived", outcome="CONFIRMED",
+                 archived_date=date.today().isoformat())
+    world = _seed_world(tmp_path, [young], archive=[dict(young)])
+    resp = pipeline_write.archive_sweep(FakeCtx(world))
+    assert resp.status == 200
+    body = json.loads(resp.body)
+    assert body["archived_count"] == 0
+    assert body["pruned_count"] == 0
+    assert body["folded_count"] == 0, \
+        "the idle path must carry the same key set as the normal return"
+    assert body["archive_missing_count"] == 0
+
+
+def test_archive_sweep_fold_then_flip_same_id_appends_once(tmp_path):
+    # Fresh-eyes 2026-09-28 (): archive_ids is read at the top of
+    # the live-locked block, BEFORE the fold. The fold APPENDS a pruned id
+    # that had no archive copy (archive_missing_count), so the pre-fold set
+    # is stale for exactly that id. If the append-once loop still checks the
+    # pre-fold set, an id that is BOTH pruned (no copy -> the fold appends
+    # it) AND flipped to archived in the same sweep lands TWO archive rows —
+    # the duplicate group (guard-2449) the loop's own comment says cannot
+    # form. Fails on the pre-update code.
+    rid = "2026-07-01_sweep-fold-and-flip"
+    aged = _rec(rid, "archived", outcome="CORRECTED",
+                archived_date=_old(pipeline_write.PRUNE_GRACE_DAYS + 3))
+    flipping = _rec(rid, "resolved", outcome="UNRESOLVABLE",
+                    outcome_date=_old(pipeline_write.ARCHIVE_AGE_DAYS + 2))
+    world = _seed_world(tmp_path, [aged, flipping])
+    body = json.loads(pipeline_write.archive_sweep(FakeCtx(world)).body)
+    assert body["pruned_count"] == 1
+    assert body["archived_count"] == 1
+    assert body["archive_missing_count"] == 1, \
+        "the aged tombstone had no archive copy; the fold must append it"
+    arch = _read_jsonl(world / "pipeline-archive.jsonl")
+    assert [r["id"] for r in arch] == [rid], \
+        "one archive row per id: the fold's append must be visible to the " \
+        "append-once loop in the same sweep"
+
+
 # ---------------------------------------------------------------------------
 # merge semantics (the root cause + the fix's design property)
 # ---------------------------------------------------------------------------

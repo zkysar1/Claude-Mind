@@ -211,13 +211,12 @@ Bash: bash core/scripts/heartbeat-tick.sh
 # component the reducer uses, in its pull-only mode — never a hand-rolled
 # git sequence (no-transcription contract, guard-2676 / g-306-212).
 #
-# WHY IT EXISTS: before this phase a WORKER never pulled at all (iteration-push.sh
-# ran only from reducer paths this loop skips), so no framework fix shipped
-# during a worker's life ever reached it.
+# WHY IT EXISTS: without it a WORKER never pulls, so no framework fix reaches it.
 # Rationale (WHY, measured): core/config/rationale/worker-cycle-preamble.md
 #
-# TOP of the cycle, before any claim. Merges still land mid-unit (carrier
-# push, cron tick): measured low-harm, accepted (g-375-94).
+# TOP of the cycle, before any claim. Between units, while no claim is held, the
+# cron tick runs this same integrate (g-375-96). Merges still land mid-unit
+# (carrier push, cron fast-forward): measured low-harm, accepted (g-375-94).
 #
 # --no-push is deliberate and is the whole difference from the reducer's call:
 # "fetch + integrate, then STOP before the push decision". A worker pulls so it
@@ -331,9 +330,8 @@ Bash: bash core/scripts/trigger-firings-flush.sh
 # discarded and the goals are held from the rest of the fleet.
 Bash: py -3 core/scripts/worker_reducer_liveness.py
 # rc 0 = CONTINUE to SELECT — even when this Body is PARKED. The poll does NOT
-#   resume it; a CLAIM does (Phase 2), so `parked_at` keeps measuring the whole
-#   wait (guard-4184: the cap is a patience cap, and `resume` clears the stamp).
-#   Since g-306-503: a restart seen while parked returns rc 0 on the spot (fp adopted).
+#   resume it; a CLAIM does (Phase 2; guard-4184). Since g-306-503: a restart
+#   seen while parked returns rc 0 on the spot (fp adopted).
 # rc 1 = PARK, which is a WIND-DOWN AND NOT A CLOSE (g-306-291).
 # The JSON on stdout carries {verdict, reason, rc, consecutive_errors} — quote
 # `reason` in the stop message so the wind-down cause is legible.
@@ -352,9 +350,7 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 #           --channel coordination --type finding --tags reducer-stall,body-parked
 #   Bash: python3 core/scripts/stop-reason-record.py --path worker-body-parked \
 #           --reason "<the poll's reason field>" --agent "$MIND_AGENT"
-#     NOT optional bookkeeping: it is what keeps the fleet sweeper reading
-#     EXPECTED_IDLE instead of emailing the user that this box is DEAD. The path
-#     is in the recorder's NO_NOTIFY_PATHS, enforced inside record().
+#     NOT optional: without it the fleet sweeper emails the user this box is DEAD.
 #   Bash: py -3 core/scripts/recovery_yank.py check --agent "$MIND_AGENT"
 #     rc=0 = RECOVERY-YANK: recovery-gate.sh demoted the reducer, no user did
 #     (g-357-51 part 3). ESCALATE ONCE per yank (escalated_before=false): post
@@ -365,6 +361,9 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 #     to a `participants: [agent, user]` goal via aspirations-add-goal.sh. Never
 #     block on notification failure.) Then `--mark-escalated`. rc=1 (user-stop)
 #     / rc=2 (none): park quietly.
+#   Phase 0.5's FIRST park only (`parked`; never Phase 1's): Bash, run_in_background,
+#     nothing appended (guard-1150), so the reducer's return wakes this Body (g-375-103):
+#     py -3 core/scripts/body-manifest.py rejoin-wait --sid "$MIND_SID" --agent "$MIND_AGENT"
 #   Tool (not Bash): ScheduleWakeup(prompt="Parked worker Body: re-enter
 #     /worker-loop at Phase -0 (manifest: parked = RESUMABLE), re-run the
 #     Phase 0.5 poll; SELECT on rc 0 (a claim resumes); rc 1 re-parks.",
@@ -374,17 +373,15 @@ Bash: py -3 core/scripts/worker_reducer_liveness.py
 # stages, only a real close does). Say PARKED, not "winding down". Fail-open: a
 # failed post must never block the park.
 #
-# ON RE-ENTRY (the wakeup fires): Phase -0 owns it — park-due, then this poll.
+# ON RE-ENTRY (the wakeup fires, or the waiter exits): Phase -0 owns it — park-due
+# (due once the waiter saw the claim live again), then this poll.
 #
 # THE PARK IS CAPPED at body-manifest.PARK_MAX_HOURS (60h), whichever trigger
 # parked it: when `py -3 core/scripts/body-manifest.py park-expired --sid ...
 # --agent ...` exits 0, stop re-parking and take the GENUINE close in Phase 1
 # (a REAL stop that DOES email — from a closed Body `/start` is user-only).
-# Expiry FAILS TOWARD STAYING PARKED (unreadable `parked_at` = not-expired).
 # NEVER-PROMOTE: no rc yields "become the reducer"; every ambiguous signal
-# resolves toward wind-down. A single transient poll failure does NOT wind
-# down — transients accumulate to `error_threshold` (3); any LIVE poll resets.
-# Takeover detection: machine_id + claim token fingerprint (g-306-224).
+# resolves toward wind-down (transients, takeovers: worker-park.md).
 
 # Phase 1 — SELECT (reducer's scorer, g-375-06; one-call walk, g-375-53)
 Bash: py -3 core/scripts/worker_execute.py select-walk --top 10
@@ -405,24 +402,11 @@ partner's in_flight OR in_flight_bodies — a WORKER is in the LATTER ONLY (g-30
 # census. The refusal list lives in LIFECYCLE_DISPOSITIONS, never here.
 #   eligible -> a real judgment was made. Proceed to CLAIM.
 #   undetermined -> THE BRIDGE DECLINED TO JUDGE (skill-less goal, or a skill
-#     the table does not map). NOT a pass: the call is YOURS (g-115-6523).
+#     the table does not map). NOT a pass: the call is YOURS (g-115-6523), and
+#     you make it UNDER THE CLAIM at Phase 2.9: claim now, read nothing first.
 # To hear one row's reason, re-ask it. ALL FLAGS BEFORE THE SKILL ARG (argparse
 # REMAINDER swallows a trailing flag); omit a flag whose field is unset:
 Bash: py -3 core/scripts/worker_execute.py goal-eligible --role <executable_by_role> --source <source> --agent <agent> <skill, verbatim>
-#
-# A GREEN ANSWER IS NOT A PROOF. On `undetermined` — and whenever a named skill
-# looks like loop-phase encoding over YOUR OWN unmerged experience — read the
-# goal's
-# verification outcomes and description BEFORE claiming, with THIS command
-# (never a hand parser over the store file — the guard refuses it):
-Bash: bash core/scripts/aspirations-query.sh --goal-field id <goal-id> --full
-# Work that ENCODES to tree/reasoning-bank/guardrails, RESOLVES a hypothesis,
-# drains a capture lane, consumes worker refs, pushes main, or writes the
-# agent-wide working-memory.yaml is REDUCER-ONLY: release it, take the next
-# candidate. SKILL_LIFECYCLE_STAGE is the remedy for a NAMED skill only — a
-# skill-less goal has no key to add. The line: loop-phase encoding (forbidden)
-# vs goal-directed artifact creation from content supplied in the goal
-# (`/tree` is pinned for that reason).
 IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   NOT a close (g-353-73). Exhaustion is TRANSIENT on a multi-Body fleet
   (measured: core/config/rationale/worker-park.md). A worker with no work is
@@ -437,7 +421,7 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
     Bash: touch "agents/$MIND_AGENT/sessions/$MIND_SID/body-closing"
   rc=1 (not parked, or parked under the cap) -> run THE PARK SEQUENCE of Phase
   0.5, its park call as `park --supply-gap` plus `--decline <goal-id>=<why>`
-  for each row of your latest view you did not claim. EXIT 5 = REFUSED, nothing
+  for each row of your latest view, released ones too. EXIT 5 = REFUSED, nothing
   parked: stderr names every open row — claim one, or decline it with a reason.
   Reason "SELECT returned no eligible goal; parked awaiting supply" plus the
   census line park prints, board tags `supply-gap,body-parked` (first park
@@ -497,6 +481,17 @@ READ EVERY narrative field, WHOLE: `outcome_note`, `outcome_notes` (plural,
   a head read drops (guard-2043). An empty outcome_note is NOT an untouched goal
   — prior work hides in progress_note (g-364-54). Treat it as a measurement to
   VERIFY, not repeat; if it landed, close or release per Phase 4a.
+THEN JUDGE THE ROLE from this record, no second read (g-375-110; WHY:
+  worker-role-gate.md). On `undetermined`, or a named skill that looks like
+  loop-phase encoding over YOUR OWN unmerged experience: work that ENCODES to
+  tree/reasoning-bank/guardrails, RESOLVES a hypothesis, drains a capture
+  lane, consumes worker refs, pushes main, or writes the agent-wide
+  working-memory.yaml is REDUCER-ONLY. Release it unstarted, check it reads
+  pending, and claim the NEXT row of the same walk:
+  Bash: aspirations-release.sh <goal-id> --source <source> --reason "<why>" --reason-kind role
+  SKILL_LIFECYCLE_STAGE is the remedy for a NAMED skill only. The line:
+  loop-phase encoding (forbidden) vs goal-directed artifact creation from
+  content supplied in the goal (`/tree` is pinned for that reason).
 # Rationale: core/config/rationale/worker-claim-outcome-note-read.md
 # Phase 2.95 — UNIT CLAIM (g-306-322). The machine-checkable half of 2.9: a goal whose
 # own text says one unit per pass is NON-TERMINAL, so each Body claims it, does
@@ -862,10 +857,10 @@ not late, it is gone.
 
 Three obligations on any goal a worker files:
 
-1. **Mark it.** Put `filed by <agent> worker Body on <hostname>` in the
-   description with the case letter (A or C) and why. A worker-filed goal the
-   reducer disagrees with is recoverable by skipping it — but only if the reducer
-   can SEE that a worker filed it.
+1. **Mark it.** Put the case letter (A or C) and why in the description. Never
+   type your host or sid in a note or filing; scripts add them (g-375-111). A
+   worker-filed goal is recoverable by skipping it, but only if the reducer can
+   SEE that a worker filed it.
 2. **Dedup first** (guard-1204): run a search that does NOT key only on your own
    phrasing. Three of this ruling's four instances were rediscoveries.
 3. **Never file case B by relabelling it C.** The test is not "could I have found

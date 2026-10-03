@@ -38,6 +38,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -226,6 +227,23 @@ def park_backoff_seconds(park_count: int) -> int:
         base, cap = PARK_BACKOFF_BASE_SECONDS, PARK_BACKOFF_MAX_SECONDS
     n = max(int(park_count or 0), 1)
     return int(min(base * (2 ** (n - 1)), cap))
+
+# PARK REJOIN (). A parked Body learned its reducer was back only at its
+# next full re-poll, and the orbit above puts that up to 4h away: 576 of 1839
+# parked Body-minutes in the 7 days to 2026-09-30 came after the reducer's claim
+# was live again. `rejoin-wait`, run in the background from a reducer-gone first
+# park, reads the claim every REJOIN_POLL_SECONDS and writes REJOIN_SIGNAL_FILENAME
+# once the claim is live again; park_due answers DUE on it, so the turn its exit
+# opens re-polls at once. Why a waiter, and why only that park:
+# core/config/rationale/worker-park.md "A parked Body rejoins when its reducer returns".
+REJOIN_SIGNAL_FILENAME = "park-rejoin.json"
+REJOIN_POLL_SECONDS = 120
+# One claim read takes ~0.1s. The bound only keeps a hung read from silencing the
+# waiter for the rest of the park.
+REJOIN_PROBE_TIMEOUT_SECONDS = 60
+# The clause runner-claim.sh prints on its LIVE line: "heartbeat {age}s old". The
+# age is negative when the reducer's clock runs ahead of this box's.
+_HEARTBEAT_AGE_RE = re.compile(r"heartbeat (-?\d+)s old")
 
 # THE PARTITION, NAMED ONCE (). Before `parked` existed every non-active
 # state was terminal, so `!= "active"` and "is closed" were the same predicate and
@@ -871,9 +889,15 @@ def park_due(sid: str, agent: str, project_root: Path | None = None) -> tuple[bo
     field-format problem hold a Body in a cheap-wake orbit that never polls,
     which is a park with no exit. An extra poll costs one preamble; a missed
     one costs the fleet a worker. `seconds_remaining` is 0 when due.
+
+    DUE EARLY on the rejoin waiter's signal (g-375-103): once the reducer's claim
+    is live again, waiting out the orbit only idles a worker the reducer can use.
     """
     data = read_manifest(sid, agent, project_root)
     if data.get("body_state") != "parked":
+        return True, 0
+    _, session_dir, _ = _agent_paths(agent, sid, project_root)
+    if _rejoin_signalled(session_dir, data):
         return True, 0
     stamp = (data.get("park_next_poll_at") or "").strip()
     if not stamp:
@@ -903,6 +927,155 @@ def open_repoll(sid: str, agent: str, project_root: Path | None = None) -> bool:
     _, session_dir, _ = _agent_paths(agent, sid, project_root)
     _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
     return True
+
+
+def _rejoin_signalled(session_dir: Path, data: dict) -> bool:
+    """True iff this Body's rejoin waiter fired after its latest park.
+
+    The signal counts only while it is NEWER than last_parked_at (parked_at on a
+    manifest older than that field), so it retires itself with no delete: the
+    re-park after a re-poll stamps last_parked_at past it, and a park after a
+    resume starts later than it. FAILS TOWARD THE SCHEDULE: a missing, unreadable
+    or older signal is False, and park_due answers from park_next_poll_at.
+    """
+    try:
+        signal = json.loads((session_dir / REJOIN_SIGNAL_FILENAME)
+                            .read_text(encoding="utf-8"))
+        at = datetime.datetime.strptime(str(signal.get("at") or ""),
+                                        "%Y-%m-%dT%H:%M:%S")
+        parked = datetime.datetime.strptime(
+            str(data.get("last_parked_at") or data.get("parked_at") or ""),
+            "%Y-%m-%dT%H:%M:%S")
+    except (OSError, ValueError, TypeError, AttributeError):
+        # AttributeError: a signal that parses as JSON but is not an object.
+        return False
+    return at > parked
+
+
+def _parse_heartbeat_age(output: str):
+    """Seconds since the reducer's last heartbeat, read off the LIVE line only.
+
+    Line-scoped like worker_reducer_liveness._parse_token_fp, so an age printed
+    anywhere else in the capture cannot stand in for this claim's. None when the
+    LIVE line or its heartbeat clause is missing.
+    """
+    import worker_reducer_liveness as wrl
+    text = output or ""
+    i = text.find(wrl.LIVE_MARKER)
+    if i < 0:
+        return None
+    m = _HEARTBEAT_AGE_RE.search(text[i:].split("\n", 1)[0])
+    return int(m.group(1)) if m else None
+
+
+def rejoin_verdict(rc, output: str, state: dict, park_stamp: str,
+                   now: datetime.datetime | None = None) -> tuple:
+    """(fire, reason, machine) for one claim read by a parked Body's waiter.
+
+    Fires only on what the Body's own Phase 0.5 poll would act on, plus proof
+    that the claim moved after the park:
+      - a genuine LIVE read: rc 0 AND a machine parsed from the LIVE line;
+      - worker_reducer_liveness.decide() answers CONTINUE for a PARKED Body on
+        the poll's own state, read here and never written. A takeover onto
+        another box is WIND_DOWN there, so the waiter keeps waiting and cannot
+        drive a re-park loop;
+      - the claim's heartbeat (now minus its age) is later than park_stamp. A
+        claim whose last beat predates the park is what the poll that parked
+        this Body already judged.
+    Anything missing or unreadable is (False, ...): the waiter keeps waiting
+    and the park orbit stays the fallback.
+    """
+    import worker_reducer_liveness as wrl
+    machine = wrl._parse_machine(output or "")
+    if rc != 0 or not machine:
+        return False, f"claim not live (rc={rc})", None
+    if not isinstance(state, dict):
+        state = {}
+    try:
+        errors = int(state.get("consecutive_errors") or 0)
+    except (TypeError, ValueError):
+        errors = 0
+    verdict = wrl.decide(rc, machine, state.get("expected_machine"), errors,
+                         observed_token_fp=wrl._parse_token_fp(output),
+                         expected_token_fp=state.get("expected_token_fp"),
+                         body_state="parked")
+    if verdict["verdict"] != wrl.VERDICT_CONTINUE:
+        return False, verdict["reason"], machine
+    age = _parse_heartbeat_age(output)
+    if age is None:
+        return False, f"claim LIVE on {machine!r} but its heartbeat age is unreadable", machine
+    try:
+        parked = datetime.datetime.strptime(str(park_stamp or ""), "%Y-%m-%dT%H:%M:%S")
+    except (ValueError, TypeError):
+        return False, f"park stamp unreadable ({park_stamp!r})", machine
+    beat = (now or datetime.datetime.now()) - datetime.timedelta(seconds=age)
+    if beat <= parked:
+        return False, (f"claim LIVE on {machine!r} but its last heartbeat "
+                       f"({beat:%Y-%m-%dT%H:%M:%S}) is not later than the park "
+                       f"({park_stamp})"), machine
+    return True, (f"claim LIVE on {machine!r}, heartbeat {age}s old, renewed "
+                  f"after the park ({park_stamp})"), machine
+
+
+def _claim_status(agent: str) -> tuple:
+    """(rc, output) of one `runner-claim.sh status --agent`: the argv
+    worker_reducer_liveness.poll() runs. rc None = the read itself failed (spawn
+    error or timeout), which rejoin_verdict reads as not live."""
+    import subprocess
+    from _runtime_bash import bash_cmd  # guard-580/581: never a bare "bash" argv[0]
+    try:
+        proc = subprocess.run(
+            bash_cmd(str(SCRIPT_DIR / "runner-claim.sh"), "status", "--agent", agent),
+            capture_output=True, text=True, timeout=REJOIN_PROBE_TIMEOUT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, f"claim read failed: {e}"
+    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+def rejoin_wait(sid: str, agent: str, project_root: Path | None = None,
+                interval: float = REJOIN_POLL_SECONDS, probe=None, sleep=None,
+                max_hours: float = PARK_MAX_HOURS) -> tuple:
+    """Wait out a reducer-gone park; signal a rejoin once the claim is live again.
+
+    Returns (action, detail). 'rejoin' = REJOIN_SIGNAL_FILENAME was written, so
+    the next park-due answers DUE. Every other action writes nothing and ends
+    the wait, so the waiter never outlives the park it serves:
+      'stop'    - sessions/<SID>/stop-requested exists: a user stop stays stopped
+      'gone'    - the Body is not on this park: not parked, or parked_at changed
+      'expired' - the park passed its cap; the Body's own wakeup closes it
+    Reads the manifest and the Phase 0.5 poll's state file; writes only the
+    signal. `probe` and `sleep` are test seams.
+    """
+    import time
+    import worker_reducer_liveness as wrl
+    adir, session_dir, _ = _agent_paths(agent, sid, project_root)
+    probe = probe or (lambda: _claim_status(agent))
+    sleep = sleep or time.sleep
+    launch = read_manifest(sid, agent, project_root)
+    parked_at = launch.get("parked_at")
+    if launch.get("body_state") != "parked" or not parked_at:
+        return "gone", f"this Body is not parked (body_state {launch.get('body_state')!r})"
+    while True:
+        sleep(interval)
+        if (session_dir / "stop-requested").exists():
+            return "stop", "a user stop is armed for this Body (stop-requested)"
+        data = read_manifest(sid, agent, project_root)
+        if data.get("body_state") != "parked":
+            return "gone", f"this Body is no longer parked (body_state {data.get('body_state')!r})"
+        if data.get("parked_at") != parked_at:
+            return "gone", (f"a new park began at {data.get('parked_at')}; this "
+                            f"waiter served the park from {parked_at}")
+        if park_expired(sid, agent, project_root, max_hours):
+            return "expired", f"the park from {parked_at} passed its {max_hours:g}h cap"
+        rc, output = probe()
+        fire, reason, machine = rejoin_verdict(
+            rc, output, wrl._read_state(wrl._state_path(adir, sid)),
+            data.get("last_parked_at") or parked_at)
+        if fire:
+            _write_atomic(session_dir / REJOIN_SIGNAL_FILENAME, json.dumps({
+                "at": _now_iso_local(), "parked_at": parked_at,
+                "machine": machine, "reason": reason}) + "\n")
+            return "rejoin", reason
 
 
 def _stage_and_push(session_dir: Path, state_dir: Path, data: dict) -> bool:
@@ -1469,7 +1642,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("write", "read", "set-state", "is-reducer",
                  "close-body-on-genuine", "close-body-late", "push-staged",
-                 "park", "resume", "park-expired", "park-due"):
+                 "park", "resume", "park-expired", "park-due", "rejoin-wait"):
         sp = sub.add_parser(name)
         sp.add_argument("--sid", required=True)
         sp.add_argument("--agent", required=True)
@@ -1585,6 +1758,21 @@ def main(argv=None):
             print("due" if due else "not-due")
             print(remaining)
             return 0 if due else 1
+        elif args.cmd == "rejoin-wait":
+            # : run in the BACKGROUND from THE PARK SEQUENCE, on a
+            # reducer-gone first park only. Its exit opens the Body's next turn,
+            # so it prints facts and never a request: text naming a skill in
+            # request shape trips a harness's skill-coverage backstop
+            # (rb-12040). EXIT 0 = the rejoin signal was written, so park-due
+            # now answers due; 1 = stood down with no signal (a user stop, the
+            # Body left this park, or the park cap passed). Errors 2/3 as below.
+            print(f"rejoin-wait: reading the reducer claim every "
+                  f"{REJOIN_POLL_SECONDS}s while this park lasts", flush=True)
+            action, detail = rejoin_wait(args.sid, args.agent)
+            if action == "rejoin":
+                detail += f"; wrote {REJOIN_SIGNAL_FILENAME}, so park-due now answers due"
+            print(f"{action}: {detail}")
+            return 0 if action == "rejoin" else 1
         elif args.cmd == "push-staged":
             # --sid IS the unitKey here. Used by cleanup-stale-bindings.sh's
             # crash-preserve path, which stages in bash and cannot reach the

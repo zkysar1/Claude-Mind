@@ -81,6 +81,7 @@ if _ORIG_MIND_AGENT is not None:
     os.environ["MIND_AGENT"] = _ORIG_MIND_AGENT
 
 import _embedding_retrieval as er  # noqa: E402
+import _vendor_path as vp  # noqa: E402
 
 CONFIGURED = "all-MiniLM-L6-v2"
 DRIFTED = "BAAI/bge-small-en-v1.5"
@@ -117,6 +118,10 @@ def _isolate(tmp_path, monkeypatch):
     er.clear_caches()
     _retrieve._MODEL_DRIFT_WARNED = False
     _retrieve._BLEND_STATS.clear()
+    # embedding_channel_status() also probes whether THIS process can import the
+    # encoder stack (). These tests are about drift, so pin it to
+    # "present" rather than let the verdict depend on what the box has installed.
+    monkeypatch.setattr(vp, "stack_absent_reason", lambda: None)
     yield tmp_path / "index"
     _retrieve._RETRIEVAL_CFG_CACHE = saved
     _retrieve._MODEL_DRIFT_WARNED = False

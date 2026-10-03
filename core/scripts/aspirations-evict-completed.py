@@ -120,7 +120,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import WORLD_DIR, AGENT_DIR  # noqa: E402
 from _goal_census import (  # noqa: E402
-    ABANDONED_STATUSES, TERMINAL_STATUSES, CENSUS_KEY, effective_counts,
+    ABANDONED_STATUSES, TERMINAL_STATUSES, CENSUS_KEY, CLOSER_ROLE_KEY, effective_counts,
     census_completed, census_by_status, census_evicted_ids, all_evicted_ids,
 )
 
@@ -348,18 +348,33 @@ def _bump_census(asp: dict, status: str, goal_id) -> None:
     resurrected goal a NO-OP (set add), killing the double-count lane of
     g-115-2401. `by_status` is the FROZEN legacy baseline: new evictions never
     touch it; only census repairs shrink it."""
+    _census_add(asp, "evicted_ids", status, goal_id)
+
+
+def _bump_closer_role(asp: dict, goal: dict) -> None:
+    """Keep the closer role of an evicted completed goal in
+    archived_census.evicted_by_closer_role[role] (g-375-38), the one field of the
+    record the post-hoc close-review lane still needs after eviction. A set-add like
+    _bump_census, so it merges by union and re-evicting is a no-op."""
+    role = str(goal.get("completed_by_role") or "").strip().lower()
+    if role and goal.get("status") == "completed":
+        _census_add(asp, CLOSER_ROLE_KEY, role, goal.get("id"))
+
+
+def _census_add(asp: dict, key: str, bucket_name: str, goal_id) -> None:
+    """Set-add goal_id to archived_census[key][bucket_name], kept sorted."""
     census = asp.setdefault(CENSUS_KEY, {})
     if not isinstance(census, dict):
         census = {}
         asp[CENSUS_KEY] = census
-    ids = census.setdefault("evicted_ids", {})
+    ids = census.setdefault(key, {})
     if not isinstance(ids, dict):
         ids = {}
-        census["evicted_ids"] = ids
-    bucket = ids.setdefault(status, [])
+        census[key] = ids
+    bucket = ids.setdefault(bucket_name, [])
     if not isinstance(bucket, list):
         bucket = []
-        ids[status] = bucket
+        ids[bucket_name] = bucket
     gid = str(goal_id)
     if gid not in bucket:
         bucket.append(gid)
@@ -572,6 +587,7 @@ def _make_evictor(cutoff):
             for g in goals:
                 if _eligible(g, cutoff):
                     _bump_census(asp, g.get("status"), g.get("id"))
+                    _bump_closer_role(asp, g)
                 else:
                     kept.append(g)
             asp["goals"] = kept

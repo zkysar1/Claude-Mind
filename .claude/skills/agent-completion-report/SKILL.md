@@ -55,25 +55,21 @@ All data comes from framework scripts — no direct JSONL reads.
    → Extract goals_completed, goals_attempted, key_events
 
 2. Aspirations completed since last report
-   Bash: bash core/scripts/aspirations-read.sh --archive
-   → Filter where completed_at >= since date
-   → Count and list titles
-   # ⚠ THIS IS A WINDOW COUNT AND ONLY A WINDOW COUNT. When `since` is null (the
-   # "Lifetime" branch at step 0) the filter goes vacuous and this degrades into a
-   # RECORD ENUMERATION over archive ∪ live — which no longer reaches the lifetime
-   # population. The 2026-08-14T12:56 metric-neutral eviction moved 5,003 terminal
-   # goal records out of the live world queue into each aspiration's
-   # `archived_census`, and the evictor DELIBERATELY does not re-append them to the
-   # archive store (its docstring says why), so they survive only in .history blobs.
-   # Measured cc-08 2026-08-15 (g-001-04): enumeration over archive(370 asps) +
-   # live(30 world, 1 agent) = 2,679 completed, against 7,084 done of 9,854 from the
-   # census-folded `--summary` at step 3 — a 4,405-goal gap, all of it invisible here.
-   # RULE: take LIFETIME totals from step 3's `--summary`, which folds the census;
-   # keep this enumeration for the WINDOW count, where it stays exact. Window safety
-   # was verified separately: of the 4,972 goals present in the 08-14T12:53 .history
-   # blob but absent from BOTH live and archive, ZERO have completed_at >=
-   # 2026-08-13T20:25:22. Lifetime figures are NOT comparable across the 2026-08-14
-   # boundary by either method — say that, rather than reporting a drop.
+   Bash: bash core/scripts/aspirations-read.sh --archive    # again with --source agent
+   Bash: bash core/scripts/aspirations-read.sh --summary    # live rows, any status (= step 3); again with --source agent
+   → UNION with the live rows the archive has not received (it lags): each `[COMPLETED]` line of that
+     `--summary`, read via `--id <asp-id>` — `--active` is status=active ONLY.
+     Four stores (rb-9964); the archive row wins a duplicate id (rb-8064). Keep rows whose `status` is completed
+   → Place by `completed_at` at the stamp's own granularity (guard-3690): it is date-only on most rows,
+     so a string `>= since` drops every since-day close. Date after the since-day = in; before = out;
+     full timestamp = compare to `since`; date-only ON the since-day = BOUNDARY (place it by
+     `intent_satisfaction.claimed_at` when present, else list it apart); no `completed_at` = UNPLACEABLE
+     (count it). A date-only `since` compares dates exactly: no BOUNDARY
+   → Count and list titles; NEVER drop a BOUNDARY or UNPLACEABLE row silently
+   # ⚠ A WINDOW COUNT ONLY: take LIFETIME totals from step 3's `--summary` (it folds the evicted-goal
+   # census); lifetime figures are NOT comparable across the 2026-08-14 eviction — say that, never
+   # report a drop.
+   # Rationale (WHY window-only, live ∪ archive, date granularity): core/config/rationale/completion-report-aspiration-window.md
 
 3. Active aspirations progress
    Bash: bash core/scripts/aspirations-read.sh --summary
@@ -609,6 +605,7 @@ Since: {since_timestamp} ({hours}h {min}m ago)
 
 ## Completed ({N} goals across {M} aspirations)
   Aspirations completed: {list titles, or "none"}
+  {Step 2 BOUNDARY rows, when any: "Closed on the since-day, time unrecorded: {titles}"; UNPLACEABLE, when >0: "{n} completed rows carry no completed_at"}
 
   {For each aspiration that had goals completed, grouped:}
   **{asp_id}: {asp_title}** ({count} goals)

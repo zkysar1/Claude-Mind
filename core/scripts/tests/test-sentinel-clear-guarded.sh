@@ -225,6 +225,32 @@ else
 fi
 rm -rf "$NOREG"
 
+# A LARGE read-back must not wedge the emptiness check (, guard-7491, guard-5002).
+# The old test `-z "${VERIFY_OUT//[[:space:]]/}"` is superlinear in the captured size: a 453 KB
+# `experience-read.sh --goal <heavy recurring goal>` read-back spun ~5 min at 98% CPU with no
+# child process. The cost is UTF-8-locale-specific and needs a non-ASCII byte to bite (measured
+# on this box: 310 KB pure-ASCII 7.4 s, the same with one arrow per line >60 s, the C locale
+# 0.3 s either way), so the read-back carries an arrow and the run pins LC_ALL=C.UTF-8; the
+# linear check takes milliseconds, so the 20 s bound only trips on a regression. awk (not
+# `yes | head`) because the script runs under pipefail and a short-reading consumer turns
+# SIGPIPE into rc=141.
+: > "$CLEAR_LOG"
+big_t0=$SECONDS
+big_out="$(LC_ALL=C.UTF-8 timeout 20 bash "$TMP/sentinel-clear-guarded.sh" --slot force_experience_archival \
+            --verify "awk 'BEGIN{for(i=0;i<10000;i++) print \"exp-big-record → a b c d e f g h\"}'" \
+            --expect 'exp-big-record' -- true 2>&1)"
+big_rc=$?
+big_secs=$((SECONDS - big_t0))
+if [[ "$big_rc" == "0" && -s "$CLEAR_LOG" && $big_secs -lt 15 ]]; then
+    printf '  PASS  %-52s rc=0 clear=yes %ss\n' "300 KB read-back -> linear emptiness check" "$big_secs"
+    PASS=$((PASS+1))
+else
+    printf '  FAIL  %-52s rc=%s (want 0; 124 = timed out) clear=%s %ss\n' \
+        "300 KB read-back -> linear emptiness check" "$big_rc" "$([[ -s "$CLEAR_LOG" ]] && echo yes || echo no)" "$big_secs"
+    printf '        output: %s\n' "${big_out:0:200}"
+    FAIL=$((FAIL+1))
+fi
+
 echo
 echo "TOTAL: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]] || exit 1

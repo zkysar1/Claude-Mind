@@ -123,15 +123,20 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _body_stamp import stamp_line  # noqa: E402  (a worker Body's note is signed, )
 from _runtime_bash import bash_cmd  # noqa: E402  (guard-580/581: never bare "bash")
+from aspirations import VALID_GOAL_STATUSES  # noqa: E402  (the owner of the status set)
 
 SCRIPTS = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPTS.parent.parent
 
-# Every status a live goal can hold. The read below filters by id, but
+# Every status a goal can hold. The read below filters by id, but
 # aspirations-query.sh REQUIRES a status filter, so this enumerates all of them
-# rather than guessing the goal's current one.
-ALL_STATUSES = "pending,in-progress,completed,blocked,skipped,expired,decomposed"
+# rather than guessing the goal's current one. It is derived from the owner, not
+# copied: a hand-kept copy here lacked `candidate` and `superseded`, so an append
+# to a newly filed goal failed as an empty read of the agent queue (measured
+# 2026-10-02 on ; rb-6371).
+ALL_STATUSES = ",".join(sorted(VALID_GOAL_STATUSES))
 
 # Keys the DEFAULT six-key projection cannot produce. Seeing at least one of
 # these is the proof that --full actually returned the stored record. This is
@@ -156,7 +161,23 @@ RC_CONCURRENT_MODIFICATION = 9
 
 
 def _run(argv, **kw):
-    return subprocess.run(argv, capture_output=True, text=True, cwd=str(PROJECT_ROOT), **kw)
+    """subprocess.run for the store wrappers; the reply comes back as text.
+
+    A value sent on stdin (input=) goes as UTF-8 BYTES (g-115-11615): text-mode
+    stdin on Windows rewrites every '\\n' as '\\r\\n', so a multi-line value was
+    stored with CRs that were never in it. The reply is decoded the way text
+    mode decodes it (universal newlines), so callers see what they saw before.
+    """
+    value = kw.pop("input", None)
+    if value is None:
+        return subprocess.run(argv, capture_output=True, text=True, cwd=str(PROJECT_ROOT), **kw)
+    res = subprocess.run(argv, capture_output=True, input=value.encode("utf-8"),
+                         cwd=str(PROJECT_ROOT), **kw)
+
+    def _text(raw: bytes) -> str:
+        return raw.decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
+
+    return subprocess.CompletedProcess(res.args, res.returncode, _text(res.stdout), _text(res.stderr))
 
 
 def _parse_json_tail(raw: str):
@@ -631,6 +652,15 @@ def main(argv=None) -> int:
     text = args.text.strip("\n")
     if not text:
         _die(RC_VALUE_SHAPE, "refusing to append empty text")
+    # A worker Body's NOTE block is signed here, never by the Body (): the
+    # line names its sid and this box from its own environment. It ends the block,
+    # above the sentinel, so it rotates with the text it signs. Only the two note
+    # fields: a description is read as scope, where the line's sid would count as
+    # a named entity (why: _body_stamp.py). Any other field, and anyone else's
+    # text, is stored exactly as passed.
+    signed = stamp_line() if args.field in ("progress_note", "outcome_note") else None
+    if signed:
+        text = f"{text}\n{signed}"
 
     row = read_goal(args.goal_id, args.source)
     pre = row.get(args.field)

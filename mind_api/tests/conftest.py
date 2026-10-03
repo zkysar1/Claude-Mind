@@ -52,6 +52,9 @@ os.environ["STORAGE_BACKEND"] = "local"
 # honours it on every lane (2026-08-18), and the byte-compat tests here read the
 # legacy filename. Pin OFF; core/scripts/tests/conftest.py does the same.
 os.environ.pop("GATE_FIRINGS_SEGMENTED", None)
+# And the tree-index retrieval spool flag (): the daemon's retrieve lane
+# branches on it. Pin OFF; core/scripts/tests/conftest.py does the same.
+os.environ.pop("TREE_RETRIEVAL_SPOOLED", None)
 
 
 # Suppress the daemon stale-code check for the whole pytest session
@@ -122,7 +125,23 @@ os.environ["RT_STALENESS_WARNED"] = "1"
 # sanctioned seam for redirecting wm.py in tests; popping it here leaves that
 # seam free for a test that wants it, rather than pre-empting it with the host
 # box's live path.
-for _leaky in ("MIND_WORLD", "MIND_META", "BODY_WM_PATH"):
+#
+#  extends the same pop to the forked-Body identity vars. MIND_SID
+# is the load-bearing one: loop-state-save.py::_checkpoint_path resolves
+# body_state_path(MIND_AGENT, "iteration-checkpoint.json"), which is
+# Body-keyed at agents/<agent>/sessions/<MIND_SID>/... whenever MIND_SID is
+# set AND a forked working-memory.yaml exists for it -- and falls back to the
+# LIVE agent-wide checkpoint when no fork exists. A wrapper test's
+# os.environ.copy() (test_wrapper_aspirations_retire_release_claim.py::_run)
+# therefore handed the real aspirations-claim.sh the LIVE session sid, and its
+# _post_claim_effects anchor wrote the live repo's iteration checkpoint on
+# every successful claim. Popping MIND_SID here (before the _BOOTSTRAP_ENV
+# snapshot below, which must read _UNSET) removes the ambient value entirely;
+# BODY_ROLE and MIND_CHECKPOINT_PATH ride the same pop -- no test reads the
+# ambient value of either, and the MIND_CHECKPOINT_PATH seam is meant to be
+# set explicitly per harness, never inherited.
+for _leaky in ("MIND_WORLD", "MIND_META", "BODY_WM_PATH", "MIND_SID",
+               "BODY_ROLE", "MIND_CHECKPOINT_PATH"):
     os.environ.pop(_leaky, None)
 
 
@@ -155,11 +174,16 @@ for _leaky in ("MIND_WORLD", "MIND_META", "BODY_WM_PATH"):
 # Adding it would reduce safety in the exact tree where a production leak was
 # observed, which is the wrong direction and outside this goal.
 _UNSET = object()
-# MIND_SID rides along (): wrapper harnesses forward it to
-# subprocess wrappers, and the claim endpoint's missing_claim_sid gate makes
-# its presence behavior-changing — a test that pops it from os.environ (or a
-# launch context where the inject hook never ran) otherwise leaks that state
-# into every later test in the process.
+# MIND_SID is NOT captured here (, supersedes the 
+# capture-and-restore): it is a forked-Body session identity, not a test input.
+# The module-level pop above removed the ambient value, so capturing it would
+# read _UNSET and restore nothing — but the restore channel itself was the
+# hazard: it re-injected the live session sid (captured on a launch context
+# where the inject hook had run) before every test, re-opening the
+# live-checkpoint anchor window for the wrapper harnesses. The per-test
+# _scrub_body_identity_env fixture below holds the scrub instead, one-way.
+# Wrapper harnesses that need a sid pass one explicitly (setdefault / env=),
+# which is the production shape anyway.
 _BOOTSTRAP_ENV = {
     key: os.environ.get(key, _UNSET)
     # BODY_WM_PATH is captured AFTER the pop loop above, so it reads _UNSET and
@@ -167,10 +191,38 @@ _BOOTSTRAP_ENV = {
     # already has. The module-level pop alone is not enough: it fires once at
     # collection, so any test that sets the var (legitimately, per guard-862)
     # would leak the redirect into every test collected after it.
+    # MIND_SID is deliberately ABSENT (): the 
+    # capture-and-restore was the re-injection channel -- it handed the live
+    # session sid back to every test, so the wrapper harnesses'
+    # os.environ.copy() carried it into the real claim wrapper and the live
+    # checkpoint anchor fired. The one-way _scrub_body_identity_env fixture
+    # below replaces it.
     for key in ("STORAGE_BACKEND", "MIND_WORLD", "MIND_META",
-                "MIND_AGENT", "MIND_SID", "RT_STALENESS_WARNED",
+                "MIND_AGENT", "RT_STALENESS_WARNED",
                 "BODY_WM_PATH")
 }
+
+
+@pytest.fixture(autouse=True)
+def _scrub_body_identity_env():
+    """Hold the forked-Body identity scrub one-way for every test ().
+
+    The module-level pop above runs once at collection; this fixture re-pops
+    MIND_SID / BODY_WM_PATH / BODY_ROLE / MIND_CHECKPOINT_PATH before each
+    test, so neither a prior test's mutation nor an import-time set in a later
+    module can re-open the ambient window. One-way (no restore), for the same
+    reason as _scrub_daemon_client_env above: these are per-session identity
+    values a test process must never hold, not inputs tests are entitled to
+    see. Wrapper harnesses that need a sid or a checkpoint redirect pass one
+    explicitly (env.setdefault / env= / monkeypatch.setenv), which runs after
+    this fixture and stands. Duplicated in core/scripts/tests/conftest.py —
+    the two test packages load independently and neither imports the other's
+    conftest.
+    """
+    for _var in ("MIND_SID", "BODY_WM_PATH", "BODY_ROLE",
+                 "MIND_CHECKPOINT_PATH"):
+        os.environ.pop(_var, None)
+    yield
 
 
 @pytest.fixture(autouse=True)

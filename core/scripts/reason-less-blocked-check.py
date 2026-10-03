@@ -27,13 +27,25 @@ files ONE deduplicated Investigate (origin_signal
 for reconciliation: reconstruct the real blocker into blocked_by/blocker_ref, OR
 unblock to pending if the premise is gone (the g-115-2591 reconcile protocol).
 
-DEDUP IS BY THE SAME READ (fail-closed by construction, guard-487). The open
-audit Investigate is detected IN THE SAME active read that finds the blocked
-goals — no separate query that could error into a blind double-file. Because
-that read is guard-383 fatal on error, a read failure aborts BEFORE any filing
-(cannot file blindly), and at most one open audit exists at a time (a missed
-filing re-detects next iteration; a cross-box duplicate does not self-heal, so
-skip-on-uncertainty is correct — guard-487).
+DEDUP IS PER MEMBER, on the SAME READ (fail-closed by construction, guard-487;
+tightened g-115-11720). The open audit Investigate(s) are detected IN THE
+SAME active read that finds the blocked goals — no separate query that could
+error into a blind double-file. Because that read is guard-383 fatal on
+error, a read failure aborts BEFORE any filing (cannot file blindly), and a
+cross-box duplicate does not self-heal, so skip-on-uncertainty is correct
+(guard-487).
+
+AN OPEN AUDIT COVERS A FLAGGED GOAL IFF IT NAMES IT (the shared
+naming-surface rule, audit_open_coverage, used by both precheck filing
+lanes). The old dedup skipped a fresh filing while ANY open class-keyed
+audit existed — even one that named none of the goals currently flagged, the
+same fold that latched the defer-drift lane (g-115-5132, 55 days, 0 re-gates).
+Now: a flagged id any open audit names (title or description) is NOT
+re-filed — that audit owns its members; a flagged id no open audit names is
+UNCOVERED and gets a fresh filing naming exactly the uncovered ids (at most
+ONE new audit per run). An unreadable (empty title AND description) audit is
+treated as covering — a cross-box duplicate never self-heals, so
+skip-on-uncertainty stays correct.
 
 WHY NO AGE FILTER (unlike the defer sweeps): a reason-less-blocked goal is a
 STRUCTURAL violation, not a time-based one — a blocked goal must always carry a
@@ -51,6 +63,12 @@ JSON output:
     ],
     "open_audit_exists": bool,          # an investigate:reason-less-blocked-audit
     "open_audit_goal_id": str | None,   #   already pending/in-progress
+                                       #   (ANY open audit — report surface;
+                                       #   the filing predicate is the
+                                       #   per-member rule below)
+    "uncovered_ids": [...],             # : flagged ids NO open audit
+                                        #   names in its title/description — the
+                                        #   filing predicate (non-empty -> file)
     "investigate_filed": str | None,    # goal_id filed this run (--apply only)
     "actions_taken": "dry-run" | "apply",
     "now": iso,
@@ -79,6 +97,10 @@ PROJECT_ROOT = CORE_ROOT.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
+
+# : the per-member open-audit coverage rule, shared with the
+# defer-drift lane (same naming-surface semantics, one implementation).
+from audit_open_coverage import uncovered_ids  # noqa: E402
 
 # : never hardcode the escalation aspiration —  is the UPSTREAM
 # deployment's queue and does not exist elsewhere, so a literal files nothing.
@@ -153,7 +175,14 @@ def _find_open_audit(all_goals):
     Scans the SAME goal list produced by _read_goals — no separate query. An
     audit is 'open' when its origin_signal == AUDIT_ORIGIN_SIGNAL and its
     status is pending/in-progress. Resolved/skipped/completed audits do NOT
-    block re-filing (the violation may have recurred with new goals).
+    count (the violation may have recurred with new goals).
+
+    g-115-11720: this is now the REPORTING surface only ("some open audit
+    exists", for the JSON + human output). The FILING predicate is the
+    per-member rule (audit_open_coverage.uncovered_ids): an open audit
+    suppresses a fresh filing for a flagged id only if it NAMES that id.
+    The old behavior — any open audit suppresses every filing — was the
+    same class-keyed latch as the defer-drift lane (g-115-5132).
     """
     for g in all_goals:
         if (g.get("origin_signal") == AUDIT_ORIGIN_SIGNAL
@@ -205,14 +234,14 @@ def _file_investigate(aspiration_id, entries):
 
     On a goal_duplication_blocked refusal, retries ONCE with a justified,
     audited X-Mind-Override-Duplication. _file_investigate is reached ONLY
-    when the caller's _find_open_audit found NO open reconcile audit, so the
-    gate's block is against COMPLETED prior recurring audits — a structural
-    false positive for this inherently-recurring audit (each fresh straggler
-    needs its own audit once the prior one closed). Without the retry the
-    reason-less safety mechanism can never escalate a straggler once >=1
-    reconcile audit has completed. Mirrors ohs-husk-cluster-check.py
-    file_goal() (g-335-96) + the automated-filer-gate-interaction tree node.
-    (g-115-3067)"""
+    when the per-member dedup (g-115-11720) found UNCOVERED flagged ids — no
+    open audit names them — so the gate's block is against COMPLETED prior
+    recurring audits — a structural false positive for this
+    inherently-recurring audit (each fresh straggler needs its own audit
+    once the prior one closed). Without the retry the reason-less safety
+    mechanism can never escalate a straggler once >=1 reconcile audit has
+    completed. Mirrors ohs-husk-cluster-check.py file_goal() (g-335-96) +
+    the automated-filer-gate-interaction tree node. (g-115-3067)"""
     record = _build_investigate(entries)
     try:
         result = _rt.aspirations_add_goal(aspiration_id, record, source=ESCALATION_SOURCE)
@@ -244,9 +273,11 @@ def main(argv=None):
                      "Detective by default; --apply files ONE deduplicated "
                      "reconcile Investigate. Reference: g-115-2595."))
     ap.add_argument("--apply", action="store_true",
-                    help=("File a deduplicated reconcile Investigate when "
-                          "reason-less-blocked goals are found and no open audit "
-                          "already exists. Default: dry-run (report only)."))
+                    help=("File ONE reconcile Investigate naming the "
+                          "reason-less-blocked goals NO open audit already "
+                          "names (per-member dedup, g-115-11720). Default: "
+                          "dry-run (report only — uncovered_ids is in the "
+                          "JSON either way)."))
     ap.add_argument("--investigate-aspiration", default=ESCALATION_ASP,
                     help=("Aspiration ID the audit Investigate is filed under. "
                           f"Default {ESCALATION_ASP} (framework hygiene), resolved "
@@ -275,19 +306,30 @@ def main(argv=None):
 
     open_audit_goal_id = _find_open_audit(all_goals)
 
+    # : the FILING predicate is PER MEMBER — a flagged id is
+    # re-filed only if NO open audit names it in its title/description (the
+    # shared naming-surface rule; the old any-open-audit suppression was the
+    # class-keyed latch). The SAME active read is the audit surface
+    # (guard-487). Computed for dry-run too — it IS the report.
+    uncovered = sorted(
+        set(uncovered_ids(all_goals, AUDIT_ORIGIN_SIGNAL,
+                          [e["goal_id"] for e in reason_less])))
+
     result = {
         "scanned": len(all_goals),
         "reason_less_count": len(reason_less),
         "reason_less": reason_less,
         "open_audit_exists": open_audit_goal_id is not None,
         "open_audit_goal_id": open_audit_goal_id,
+        "uncovered_ids": uncovered,
         "investigate_filed": None,
         "actions_taken": "apply" if args.apply else "dry-run",
         "now": now.isoformat(timespec="seconds"),
     }
 
-    if args.apply and reason_less and open_audit_goal_id is None:
-        filed = _file_investigate(args.investigate_aspiration, reason_less)
+    if args.apply and uncovered:
+        entries = [e for e in reason_less if e.get("goal_id") in set(uncovered)]
+        filed = _file_investigate(args.investigate_aspiration, entries)
         if str(filed).startswith("<add-goal-failed"):
             # Surface the failure loudly; the sweep re-detects next iteration
             # (guard-487 fail-closed: a missed filing re-detects, so it is safe

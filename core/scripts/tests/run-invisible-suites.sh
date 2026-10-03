@@ -87,6 +87,22 @@ PER_FILE_TIMEOUT="${PER_FILE_TIMEOUT:-300}"
 
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: no python3 on PATH — _paths.sh shim not active" >&2; exit 2; }
 
+# : strip the forked-Body identity vars before any file dispatch.
+# A main()-style file launched with bare `python3 "$f"` (and a shell file with
+# bare `bash "$f"`) inherits this shell's env — so a worker-Body shell carries
+# its LIVE MIND_SID / BODY_WM_PATH / BODY_ROLE into every dispatched suite.
+# MIND_SID is the load-bearing one: a suite that runs the real
+# aspirations-claim.sh reaches _post_claim_effects -> loop-state-save.sh init,
+# whose _checkpoint_path() resolves body_state_path(MIND_AGENT, ...) —
+# Body-keyed at agents/<agent>/sessions/<MIND_SID>/ when a forked
+# working-memory.yaml exists, else the LIVE agent-wide checkpoint either way.
+# The pytest half gets the same scrub from each tree's conftest (core/scripts
+# and mind_api); this runner is the delegation path (run-scoped-suite.py) that
+# loads NO conftest, so it must scrub its own launch env. MIND_CHECKPOINT_PATH
+# (the  test seam, loop-state-save.py) is scrubbed with the same
+# shape: a suite sets it explicitly per harness, never inherits it.
+unset MIND_SID BODY_WM_PATH BODY_ROLE MIND_CHECKPOINT_PATH
+
 # ---- Bound-agent resolution () -----------------------------------
 # The production scripts these suites invoke resolve their agent via
 # MIND_AGENT, which normally arrives through the PreToolUse bash-agent-inject

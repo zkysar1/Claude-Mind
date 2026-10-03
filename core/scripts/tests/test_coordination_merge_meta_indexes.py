@@ -861,6 +861,31 @@ def test_audit_baselines_history_is_unioned():
     assert len(_load(cm.merge_audit_baselines(a, b))["m"]["history"]) == 2
 
 
+def test_audit_baselines_history_collapses_identical_rows_and_verdict_follows_the_later_side():
+    shared = {"recorded_at": "2026-07-30T00:00:00", "drift_total": 3}
+    a = _y({"m": _bl(3, "2026-07-31T00:00:00", "stable", history=[
+        shared, {"recorded_at": "2026-07-31T00:00:00", "drift_total": 3}])})
+    b = _y({"m": _bl(5, "2026-08-01T00:00:00", "regressed", history=[
+        shared, {"recorded_at": "2026-08-01T00:00:00", "drift_total": 5}])})
+    got = _load(cm.merge_audit_baselines(a, b))["m"]
+    assert len(got["history"]) == 3, "the shared row must collapse, the two others stay"
+    assert (got["baseline"], got["last_verdict"]) == (3, "regressed")
+
+
+def test_audit_baselines_a_key_beyond_the_merged_four_is_taken_whole_from_one_side():
+    """Pins the table in `audit-baselines.md` (Merge across boxes). Only baseline, history,
+    last_recorded and last_verdict have a rule; any other key rides WHOLE with the side whose
+    canonical JSON sorts higher, which with differing baselines is the HIGHER baseline's side.
+    A member list stored beside the baseline would therefore describe a different reading
+    than the MIN baseline next to it. If a per-key rule is ever added, change that section too."""
+    a = _y({"m": _bl(444, "2026-10-03T04:49:36", members=["a1", "a2"])})
+    b = _y({"m": _bl(446, "2026-10-03T05:53:14", "regressed", members=["b1", "b2", "b3"])})
+    for out in (cm.merge_audit_baselines(a, b), cm.merge_audit_baselines(b, a)):
+        got = _load(out)["m"]
+        assert got["baseline"] == 444
+        assert got["members"] == ["b1", "b2", "b3"], "extra key must come from the higher-baseline side"
+
+
 def test_audit_baselines_is_commutative():
     a = _y({"m1": _bl(186, "2026-07-30T23:23:08", unit="x"),
             "m2": _bl(0, "2026-07-30T23:23:01")})

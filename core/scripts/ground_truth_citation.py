@@ -100,11 +100,93 @@ _GOAL_ID = re.compile(r"\bg-\d{3}-\d+\b")  # seq is open-ended: guard-1161
 # No overlap with _GOAL_ID: `\bg-\d{3}` cannot match inside "guard-2024".
 _RULE_ID = re.compile(r"\b(?:guard|rb)-\d{2,6}\b")
 # A tree-node key is a slash-joined slug ("system/daemon-only-architecture"),
-# optionally the full store path. Anchored on the slug shape so ordinary prose
-# containing a slash ("and/or") cannot satisfy a citation requirement.
+# optionally the full store path; a FILE citation is a slash-joined path ending
+# in a known extension ("core/scripts/wm-read.sh", the shape the OLD grammar
+# truncated at the first non-conforming segment --  / the file-path
+# variant appended 2026-09-29).
+#
+# WHY THIS GRAMMAR (, the bare-fraction defect and its lineage).
+# The old segment class [a-z0-9]+ admitted every shape in the goal's measured
+# instance list: "48/57", "1155/1155", "389/391" (ratios), "pip/sol",
+# "collided/perceived", "owner/name", "records/files" (prose word-pairs),
+# "191/h" (a rate unit), "dev/null" (shell syntax). Two candidate remedies
+# were MEASURED and rejected against that list before this one was chosen:
+#   * "require an alphabetic character per segment" (the goal's FIX line):
+#     falsified by the counter-evidence appended 2026-09-06 -- adopt/drop,
+#     posts/h, world/board, claim/complete ALL carry a letter in every segment.
+#   * anchoring on the world/knowledge/tree/ root alone: would drop the 3,585
+#     path-qualified-but-unresolved tokens the guard-6054 note measured, and
+#     none of the prose word-pairs carry that root either.
+# The surviving discriminator is structural, not lexical: a genuine node key
+# in this store is kebab-case (the naming rule), so the run must contain a
+# kebab segment; a genuine FILE citation is anchored by its extension. Census
+# over the live tree (2026-10-03): every multi-segment node key of the 3,264
+# live keys contains a kebab segment (0 of 3,260 without), and the corpus
+# census below shows the dropped set is the phantom class while every pinned
+# test token and every live key still matches.
+#
+# THREE ALTERNATIVES (ordered; the file form first so the extension binds the
+# WHOLE run -- "core/scripts/wm-read.sh" must not split into a truncated key
+# plus a dangling "sh"):
+#   ALT1  a >=2-segment file-path run terminated by a KNOWN file extension.
+#         Segments may carry uppercase and underscore (BudgetMeterVerticle.java,
+#         q4_provenance_sample.py); the run must contain a letter, which an
+#         all-digit run never can.
+#   ALT2  a >=2-segment lowercase run (kebab segments only -- the node-key
+#         shape) containing at least one kebab segment. Lookahead, so the
+#         whole run is still consumed as one token.
+#   _RATIO_RUN below remains the per-token guard for all-digit runs: with this
+#         grammar they stop matching at all (the letter lookahead + kebab
+#         qualifier both reject them), and the guard is kept so a future
+#         widening of the grammar cannot silently resurrect the ratio class.
+#
+# ANSWERING THE  COMMENT (L120-129 below) with measurements rather
+# than a regex swap: that comment rejected "require a hyphen or a known root"
+# as guard-1901 alarm suppression because it would drop genuine
+# unhyphenated node keys. Census over the full goal-corpus exports (10,938
+# fields / 24.5M chars, 2026-10-03): the old extractor yielded 7,155 distinct
+# node-key tokens (23,188 total); this grammar yields 3,970 (11,503) and GAINS
+# 1,562 distinct extension-terminated citations (5,310 total) the old grammar
+# truncated or missed. The 4,747 distinct dropped tokens (16,776 total) are the
+# phantom class: at retrieved=False (the worst case for suppression) 13,466
+# previously-reported cluster spans are still flagged and 1,885 are not -- and
+# by construction every one of those 1,885 carried ONLY node-key tokens (no
+# url: a url would still be extracted and still flagged), so each returns to
+# the pre-existing corpus-wide `if not checkable: continue` policy rather than
+# to a hidden pass -- the same shape as the 18 ratio notes the _RATIO_RUN note
+# measured, where the lost alarm was never real.
+#
+# THE ONE PINNED TOKEN THIS DROPS, documented rather than left for a future
+# reader to find: "runs/32023260302" (all-digit segments, no kebab) no longer
+# matches. The proof is the _RATIO_RUN proof's, stronger: no file path,
+# tree-node key or URL in this store consists only of digits and slashes
+# (the naming rule is kebab-case; the live-tree census above has zero
+# all-digit multi-segment keys), so the excluded set contains no genuine
+# citation. test_CONTROL_digit_bearing_paths_are_not_mistaken_for_ratios was
+# updated to pin a letter-bearing all-numeric-SEGMENT token instead
+# ("runs/32023260302-a") and asserts the pure-digit form is dropped.
+#
+# KNOWN RESIDUAL (measured, out of this goal's outcome scope): a box label
+# "alpha/cc-08" still matches ALT2 -- it is grammatically identical to a
+# genuine key ("system/daemon-only-architecture": bare first segment + kebab
+# second), and no token-level discriminator separates the two without a
+# root-whitelist, which is exactly the widening the  note rejected.
+# Recorded in the goal's progress note so the residual is not re-discovered.
+# _FILE_EXT is deliberately short: it names the extension classes the store
+# actually holds, not every conceivable file type -- a longer list would start
+# matching prose like "see the yaml|json spec" while buying nothing measured.
+_FILE_EXT = (r"md|sh|py|pyi|java|mjs|js|ts|tsx|sql|yaml|yml|toml|json|jsonl|"
+             r"txt|conf|ini|service|timer")
 _NODE_KEY = re.compile(
-    r"\b(?:world/knowledge/tree/)?[a-z0-9]+(?:-[a-z0-9]+)*"
-    r"(?:/[a-z0-9]+(?:-[a-z0-9]+)*)+(?:\.md)?\b")
+    r"\b(?:"
+    # ALT1: file-path run + known extension (letter required somewhere)
+    r"(?=[A-Za-z0-9]+[^/]*[A-Za-z])(?:[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*/)+"
+    r"[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*\.(?:" + _FILE_EXT + r")"
+    r"|"
+    # ALT2: lowercase kebab-slug run with >=1 kebab segment (letter + kebab)
+    r"(?=[a-z0-9/-]*[A-Za-z])(?=[a-z0-9/-]*-)"
+    r"(?:[a-z0-9]+(?:-[a-z0-9]+)*/)+[a-z0-9]+(?:-[a-z0-9]+)*"
+    r")\b")
 
 # A slash-joined run of BARE NUMBERS is a ratio, not a citation -- "6/6 suites
 # passed", "124/125", "20/40/80", "0/0/0". _NODE_KEY's segment class is

@@ -149,7 +149,7 @@ def _normalize_phase(phase: str, schema: dict | None = None) -> str:
     return aliases.get(phase, phase)
 
 
-def _normalize_condition(condition: str) -> str:
+def _normalize_condition(condition: str, schema: dict | None = None) -> str:
     """Strip a trailing explanation from a claimed condition.
 
     The journal line is `OBLIGATION ABBREVIATED: <phase> — <condition>`, and an agent
@@ -173,6 +173,16 @@ def _normalize_condition(condition: str) -> str:
     genuinely different condition still fails. Keep this body identical to its twin in
     `abbreviated-obligation-audit.py`; `test_obligation_audit_phase_vocabulary.py` pins
     the two together (tree node `two-parsers-one-invariant`).
+
+    THIRD CLASS, the claim's own WORDING (g-115-11622, measured 2026-10-02). The head left
+    after the cut is looked up in the schema's `condition_aliases:` (compared lower-cased,
+    whitespace collapsed) and replaced by the canonical token it names. A TRUE condition
+    written as `zone tight` or `outcome_class routine` never reached the runtime check,
+    because `condition not in allowed` is exact membership: in one corpus snapshot (the 233
+    claim lines the auditor's own parser accepts, 5 agents) 12 claims scored "schema
+    disallows this condition" on wording alone, and the two the goal was filed over were
+    among them. The map only RENAMES; the runtime check still decides, and a head that is
+    not listed passes through unchanged and still fails.
     """
     cond = (condition or "").strip()
     cut = len(cond)
@@ -180,7 +190,13 @@ def _normalize_condition(condition: str) -> str:
         i = cond.find(sep)
         if i != -1:
             cut = min(cut, i)
-    return cond[:cut].strip()
+    head = cond[:cut].strip()
+    aliases = (schema or {}).get("condition_aliases") or {}
+    wanted = " ".join(head.lower().split())
+    for claimed, token in aliases.items():
+        if " ".join(str(claimed).lower().split()) == wanted:
+            return str(token).strip()
+    return head
 
 
 def _validate_claim(phase: str, condition: str, budget_zone: str,
@@ -201,7 +217,7 @@ def _validate_claim(phase: str, condition: str, budget_zone: str,
     """
     obligations = (schema or {}).get("obligations") or {}
     phase = _normalize_phase(phase, schema)
-    condition = _normalize_condition(condition)
+    condition = _normalize_condition(condition, schema)
     spec = obligations.get(phase)
     if not spec:
         return False, "unknown obligation phase"
@@ -344,7 +360,8 @@ def _file_investigate_goal(session_false_claims: int, audit_log_path: Path,
                 f"obligation-schema.yaml's `obligations:` keys, so no condition was ever "
                 f"evaluated — the fix is vocabulary (either the claim or the schema), not "
                 f"discipline. 'schema disallows this condition' means the phase is governed "
-                f"but the condition text did not match an `abbreviated_allowed_when` token. "
+                f"but the condition text matched neither an `abbreviated_allowed_when` "
+                f"token nor a `condition_aliases` wording. "
                 f"Only a reason naming the runtime state ('runtime zone=...', 'claim says "
                 f"routine but checkpoint says ...') is an obligation abbreviated on a "
                 f"condition that did not hold.\n\n"

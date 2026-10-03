@@ -289,5 +289,7 @@ def test_pipeline_is_read_once_per_process(monkeypatch):
 
 def test_interval_hours_mirrors_goal_selector():
     for goal in ({"interval_hours": 60}, {"interval_hours": 1.995},
-                 {"remind_days": 2}, {"interval_hours": 6.75, "remind_days": 9}, {}):
+                 {"remind_days": 2}, {"interval_hours": 6.75, "remind_days": 9}, {},
+                 # A cleared interval_hours reads as absent ().
+                 {"interval_hours": None}, {"interval_hours": None, "remind_days": 2}):
         assert cadence_signals._interval_hours(goal) == float(gs.get_interval_hours(goal))

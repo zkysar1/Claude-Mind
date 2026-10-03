@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1019,8 +1020,10 @@ def test_selfheal_retry_conflict_reports_conflict_shape_not_dirty_defer(tmp_path
     )
     assert r.returncode == 0, r.stderr              # fail-soft, never blocks
     err = r.stderr
-    # the self-heal did engage and did clear the cross-agent churn
-    assert "clearing 0 tracked + 1 untracked cross-agent file(s)" in err, err
+    # : the merge is computed off the tree, so the content conflict
+    # surfaces BEFORE the dirty-tree check and the churn is never touched.
+    # Either order must report the conflict shape, which is what this pins.
+    assert (a / "agents" / "otheragent" / "note.txt").read_text(encoding="utf-8") == "A churn\n"
     # ...and the residual failure is reported as a CONFLICT, not a dirty defer
     assert "conflict-abort" in err, err
     assert "dirty-defer" not in err, err
@@ -2607,6 +2610,291 @@ def test_ff_only_dirty_tree_with_nothing_to_integrate_never_asks_the_probe(tmp_p
     _must(b, "push", "-q", "origin", "main")
     r2 = _ff(a, "--strict", env_extra=probe)
     assert "claim probe: " + _NONE in (r2.stdout + r2.stderr), r2.stderr
+
+
+# --------------------------------------------------------------------------- #
+# --ff-only on a box where no loop runs: fast-forward around agents/* churn ()
+# --------------------------------------------------------------------------- #
+# The measured cc-14 shape: own-cloud keeps a tracked store file modified, no loop runs
+# to commit it, and every tick logged. These tests pin what makes the new path safe
+# unattended: it commits nothing, discards nothing, never pushes, and puts the cache's
+# bytes back exactly. Each log-only case is paired with a run on the SAME tree that does
+# land (guard-4166).
+_NOLOOP = ("noloop - no loop runs here: 5 agent(s) configured, none RUNNING; "
+           "1 session(s), none a worker Body")
+_STORE = "agents/alpha/aspirations.jsonl"
+_CACHE_BYTES = b"base\nfrom-the-cache\n"
+
+
+def _noloop(tmp_path: Path) -> dict:
+    return _claim_probe(tmp_path, "noloop", _NOLOOP)
+
+
+def _churn_tree(tmp_path: Path, *, upstream_touches_store: bool):
+    """A one commit behind origin, with a tracked store file the cache has modified."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_STORE: "base\n"})
+    if upstream_touches_store:
+        _commit_file(b, _STORE, "base\nfrom-b\n", "B: commits its copy of the store")
+    else:
+        _commit_file(b, "up.txt", "up\n", "B: up")
+    _must(b, "push", "-q", "origin", "main")
+    (a / _STORE).write_bytes(_CACHE_BYTES)
+    return origin, a, b
+
+
+def _kept(repo: Path) -> list:
+    return sorted((repo / ".git").glob("iteration-push-tick-churn-*"))
+
+
+def _porcelain(repo: Path) -> str:
+    return _git(repo, "status", "--porcelain", "--untracked-files=no").stdout
+
+
+def test_ff_only_noloop_fast_forwards_past_churn_the_range_does_not_touch(tmp_path):
+    origin, a, b = _churn_tree(tmp_path, upstream_touches_store=False)
+    before, origin_before = _tip(a), _origin_tip(origin)
+    unknown = "unknown - 5 agents have a local-paths.conf here"
+    r = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "unknown", unknown))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert f"— log only, the merge is the loop's (claim probe: {unknown})" in out, out
+    assert _tip(a) == before, out
+    # The same tree once the probe answers that no loop runs here.
+    r2 = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out2 = r2.stdout + r2.stderr
+    assert r2.returncode == 0, out2
+    assert ("no loop runs here, and the incoming range touches none of the 1 modified "
+            "agents/* file(s), left in place (g-375-108)") in out2, out2
+    assert _tip(a) == origin_before and (a / "up.txt").exists(), out2
+    assert _must(a, "rev-list", "--merges", "--count", "HEAD") == "0", "not a fast-forward"
+    assert (a / _STORE).read_bytes() == _CACHE_BYTES
+    assert _porcelain(a) == f" M {_STORE}\n"
+    assert _kept(a) == [] and _must(a, "stash", "list") == ""
+    assert _origin_tip(origin) == origin_before, "the tick pushed"
+
+
+def test_ff_only_noloop_puts_back_the_bytes_of_churn_the_range_touches(tmp_path):
+    origin, a, b = _churn_tree(tmp_path, upstream_touches_store=True)
+    origin_before = _origin_tip(origin)
+    # CONTROL: git alone refuses this fast-forward, so the set-aside is what lands it.
+    _must(a, "fetch", "-q", "origin")
+    assert _git(a, "merge", "--ff-only", "-q", "origin/main").returncode != 0
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("no loop runs here, so the 1 modified agents/* file(s) the range touches were "
+            "set aside and put back byte for byte (g-375-108)") in out, out
+    assert _tip(a) == origin_before, out
+    assert _must(a, "rev-list", "--merges", "--count", "HEAD") == "0", "not a fast-forward"
+    assert (a / _STORE).read_bytes() == _CACHE_BYTES
+    assert _porcelain(a) == f" M {_STORE}\n"
+    assert _kept(a) == [] and _must(a, "stash", "list") == ""
+    assert _origin_tip(origin) == origin_before, "the tick pushed"
+
+
+def test_ff_only_noloop_cache_bytes_equal_to_upstream_leave_a_clean_tree(tmp_path):
+    """Measured on cc-14 2026-10-02 04:45Z: a peer committed the bytes this box's cache
+    held, so the tree came back clean after the fast-forward."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_STORE: "base\n"})
+    _commit_file(b, _STORE, _CACHE_BYTES.decode(), "B: commits the bytes A's cache holds")
+    _must(b, "push", "-q", "origin", "main")
+    (a / _STORE).write_bytes(_CACHE_BYTES)
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "set aside and put back byte for byte (g-375-108)" in out, out
+    assert _tip(a) == _origin_tip(origin) and _porcelain(a) == "", out
+    assert (a / _STORE).read_bytes() == _CACHE_BYTES
+
+
+def test_ff_only_noloop_brings_back_a_file_the_range_deleted_with_its_directory(tmp_path):
+    """The range deletes the only tracked file under a directory, so git removes the
+    directory too. The cache's bytes still come back, now untracked, and no copy is kept
+    for a person to look at."""
+    rel = "agents/alpha/sub/only.jsonl"
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {rel: "base\n"})
+    _must(b, "rm", "-q", "--", rel)
+    _must(b, "commit", "-q", "-m", "B: drops the store")
+    _must(b, "push", "-q", "origin", "main")
+    (a / rel).write_bytes(_CACHE_BYTES)
+    # CONTROL: git alone refuses this fast-forward, so the set-aside is what lands it.
+    _must(a, "fetch", "-q", "origin")
+    assert _git(a, "merge", "--ff-only", "-q", "origin/main").returncode != 0
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "set aside and put back byte for byte (g-375-108)" in out, out
+    assert _tip(a) == _origin_tip(origin), out
+    assert (a / rel).read_bytes() == _CACHE_BYTES
+    assert _must(a, "ls-files", "--", rel) == "" and _porcelain(a) == ""
+    assert _kept(a) == []
+
+
+def _stage_store(a: Path) -> None:
+    _must(a, "add", "--", _STORE)
+
+
+def _unstage_store(a: Path) -> None:
+    _must(a, "reset", "-q", "--", _STORE)
+
+
+def _edit_outside(a: Path) -> None:
+    (a / "base.txt").write_text("a session's edit\n", encoding="utf-8", newline="\n")
+
+
+def _undo_outside(a: Path) -> None:
+    _must(a, "checkout", "-q", "--", "base.txt")
+
+
+def _delete_store(a: Path) -> None:
+    (a / _STORE).unlink()
+
+
+def _undelete_store(a: Path) -> None:
+    (a / _STORE).write_bytes(_CACHE_BYTES)
+
+
+@pytest.mark.parametrize("shape, why, undo", [
+    (_stage_store, "something is staged, which is a session's work in progress", _unstage_store),
+    (_edit_outside, "base.txt is not a modified agents/* file, so it is a session's work",
+     _undo_outside),
+    (_delete_store, f"{_STORE} is not a modified agents/* file, so it is a session's work",
+     _undelete_store),
+], ids=["staged", "outside-agents", "deleted"])
+def test_ff_only_noloop_leaves_every_other_dirty_shape_alone(tmp_path, shape, why, undo):
+    origin, a, b = _churn_tree(tmp_path, upstream_touches_store=True)
+    shape(a)
+    before, porcelain = _tip(a), _porcelain(a)
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert f"— log only: {why} (claim probe: {_NOLOOP})" in out, out
+    assert _tip(a) == before and _porcelain(a) == porcelain, out
+    assert _kept(a) == [], out
+    # CONTROL: the same tree with only the store churn left does land.
+    undo(a)
+    r2 = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    assert "set aside and put back byte for byte (g-375-108)" in (r2.stdout + r2.stderr), r2.stderr
+    assert (a / _STORE).read_bytes() == _CACHE_BYTES
+
+
+def test_ff_only_noloop_leaves_local_commits_to_the_session(tmp_path):
+    origin, a = _non_ff_tree(tmp_path)
+    before, origin_before = _tip(a), _origin_tip(origin)
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("ff-only tick: NOT a fast-forward (ahead 1, behind 1) — log only: no loop runs "
+            "here, and 1 local commit(s) are a session's own to merge (claim probe: "
+            + _NOLOOP + ")") in out, out
+    assert _tip(a) == before and _origin_tip(origin) == origin_before, out
+    # CONTROL: the same tree does integrate when a worker Body's loop owns the merge.
+    r2 = _ff(a, "--strict", env_extra=_claim_probe(tmp_path, "none", _NONE))
+    assert "running the loop's --no-push integrate (g-375-96)" in (r2.stdout + r2.stderr), r2.stderr
+    assert _tip(a) != before, r2.stderr
+
+
+def test_ff_only_noloop_waits_for_a_person_while_earlier_copies_are_kept(tmp_path):
+    origin, a, b = _churn_tree(tmp_path, upstream_touches_store=True)
+    kept = a / ".git" / "iteration-push-tick-churn-20261002T000000Z"
+    kept.mkdir()
+    before = _tip(a)
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert f"{kept} holds copies an earlier tick could not put back, so a person looks" in out, out
+    assert _tip(a) == before and (a / _STORE).read_bytes() == _CACHE_BYTES, out
+    # CONTROL: once a person has dealt with it, the same tick lands.
+    kept.rmdir()
+    r2 = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    assert "set aside and put back byte for byte (g-375-108)" in (r2.stdout + r2.stderr), r2.stderr
+
+
+def test_ff_only_noloop_refused_fast_forward_puts_the_bytes_back(tmp_path):
+    origin, a, b = _churn_tree(tmp_path, upstream_touches_store=True)
+    _commit_file(b, "incoming.txt", "theirs\n", "B: adds incoming.txt")
+    _must(b, "push", "-q", "origin", "main")
+    (a / "incoming.txt").write_text("mine, untracked\n", encoding="utf-8", newline="\n")
+    before = _tip(a)
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert "ff-only tick: merge --ff-only refused rc=" in out, out
+    assert "the 1 agents/* file(s) set aside were put back byte for byte — log only" in out, out
+    assert _tip(a) == before, out
+    assert (a / _STORE).read_bytes() == _CACHE_BYTES
+    assert (a / "incoming.txt").read_text(encoding="utf-8") == "mine, untracked\n"
+    assert _kept(a) == [], out
+
+
+def test_ff_only_noloop_keeps_the_copies_when_a_file_cannot_come_back(tmp_path):
+    """Origin turns the store file into a directory, so its copy cannot go back. The
+    fast-forward has landed by then; the copy and its INDEX stay for a person, and
+    nothing is dropped inside the new directory. (The guard that then holds every later
+    churn tick is pinned by the waits_for_a_person test above.)"""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_STORE: "base\n"})
+    _must(b, "rm", "-q", "--", _STORE)
+    _commit_file(b, _STORE + "/part.jsonl", "x\n", "B: the store becomes a directory")
+    _must(b, "push", "-q", "origin", "main")
+    (a / _STORE).write_bytes(_CACHE_BYTES)
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert ("the 1 copied agents/* file(s) did NOT all come back intact (checkout rc=0, "
+            "merge rc=0)") in out, out
+    assert _tip(a) == _origin_tip(origin), out
+    assert sorted(p.name for p in (a / _STORE).iterdir()) == ["part.jsonl"], "a copy was dropped inside"
+    kept = _kept(a)
+    assert len(kept) == 1, out
+    assert (kept[0] / "0").read_bytes() == _CACHE_BYTES
+    assert (kept[0] / "INDEX").read_text(encoding="utf-8").rstrip("\n").split("\t")[2] == _STORE
+
+
+def test_ff_only_noloop_checks_every_copy_it_puts_back(tmp_path):
+    """The raw-hash check after the copy-back is what reports a copy that went bad while
+    it was set aside. A post-merge hook runs between the set-aside and the copy-back, so
+    it stands in for anything that corrupts the copy there."""
+    origin, a, b = _churn_tree(tmp_path, upstream_touches_store=True)
+    hook = a / ".git" / "hooks" / "post-merge"
+    hook.write_text("#!/bin/sh\nfor d in \"$(git rev-parse --git-dir)\"/iteration-push-tick-churn-*; "
+                    "do printf 'corrupted\\n' > \"$d/0\"; done\n", encoding="utf-8", newline="\n")
+    hook.chmod(0o755)
+    r = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 1, out
+    assert ("the 1 copied agents/* file(s) did NOT all come back intact (checkout rc=0, "
+            "merge rc=0)") in out, out
+    assert "put back byte for byte" not in out, out
+    kept = _kept(a)
+    assert len(kept) == 1 and (kept[0] / "INDEX").exists(), out
+    # CONTROL: without the hook the same shape reports a clean put-back.
+    hook.unlink()
+    for d in kept:
+        shutil.rmtree(d)
+    (a / _STORE).write_bytes(_CACHE_BYTES)
+    _commit_file(b, "up2.txt", "2\n", "B: up2")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(b, _STORE, "base\nfrom-b-again\n", "B: commits its store again")
+    _must(b, "push", "-q", "origin", "main")
+    r2 = _ff(a, "--strict", env_extra=_noloop(tmp_path))
+    assert "set aside and put back byte for byte (g-375-108)" in (r2.stdout + r2.stderr), r2.stderr
+    assert (a / _STORE).read_bytes() == _CACHE_BYTES
+
+
+def test_ff_only_noloop_dry_run_changes_nothing(tmp_path):
+    origin, a, b = _churn_tree(tmp_path, upstream_touches_store=True)
+    _must(a, "fetch", "-q", "origin")   # --dry-run does not fetch
+    before = _tip(a)
+    r = _ff(a, "--dry-run", env_extra=_noloop(tmp_path))
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert ("ff-only tick (dry-run): no loop runs here; would fast-forward 1 commit(s) "
+            "around 1 modified agents/* file(s), 1 of them in the incoming range") in out, out
+    assert _tip(a) == before and (a / _STORE).read_bytes() == _CACHE_BYTES and _kept(a) == []
 
 
 # --------------------------------------------------------------------------- #

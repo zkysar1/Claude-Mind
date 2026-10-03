@@ -1007,6 +1007,20 @@ def load_tree_nodes(categories, depth, read_only=False):
         if keys_to_write:
             locked_modify_yaml(TREE_PATH, _bump_counters)
 
+        # : fold the spool into the index, at most once per
+        # DRAIN_INTERVAL_SECONDS per box. Called whether or not the flag is on
+        # NOW: a box that switched it off must still land what it spooled, and an
+        # empty spool is two stats. This is the drain every box reaches (the
+        # write_tree door is not -- see the spool module docstring), and it is
+        # self-gating and never raises: a drain that cannot run leaves the deltas
+        # in the spool, where `pending_deltas` keeps them visible.
+        try:
+            import _tree_retrieval_spool as _trs
+            _trs.flush_into_index(TREE_PATH)
+        except Exception as _exc:  # noqa: BLE001 - retrieval must never block
+            print("[retrieve] tree retrieval-spool drain skipped: {}".format(
+                _exc), file=sys.stderr)
+
     return results, retrieval_channels_used
 
 # ---------------------------------------------------------------------------
@@ -2692,6 +2706,16 @@ _DEFAULT_RETRIEVAL_CFG = {
     # (limit - N) slots are ranked. 0 disables (byte-identical to pre-).
     # Only active on the real-embedding path; the TF-IDF fallback is untouched.
     "cosine_reserved_slots": 3,
+    # Exact-key slot reservation (). The strongest lexical channel
+    # had no guaranteed slot: a utility_weight penalty (times_noise) or a
+    # higher real cosine on a semantic neighbour could push an exact-key match
+    # below the MMR cutoff, so a node queried by its own key missed the page
+    # — worst between a write and the next index build, when the unindexed
+    # floor is the node's only edge. Reserves the top-N exact_key-channel
+    # nodes (natural position, not promoted). Channel-based, so BOTH the
+    # TF-IDF and the real-embedding paths are protected. 0 disables
+    # (byte-identical to pre-). Mirrors tree.yaml.
+    "exact_key_reserved_slots": 2,
     # Embedding-cosine bonus weight on the real-embedding path (2026-09-03).
     # Derivation + the measured sweep: _score_weight_limit. Mirrors tree.yaml.
     "embedding_cosine_bonus_weight": 12.0,
@@ -2868,18 +2892,38 @@ def embedding_channel_status():
     loaded here (a degraded sentence-transformers box pays ~28s per load,
     g-115-3577). Deep capability probing stays in embedding-index-build.py
     --stats (channel=alive|DEAD).
+
+    The verdict describes the SERVING PROCESS, not just the box (g-306-574).
+    Flags on plus an index file on disk read 'alive' while a daemon that started
+    before the encoder stack was installed served every query token-only, and
+    only a restart changed that (measured on a chat-only box, 2026-09-30). Two
+    more probes close it, neither of which loads the model: an import-spec check
+    of what THIS process can import right now, and the last scoring outcome this
+    process recorded (_embedding_retrieval.last_degradation). The daemon
+    evaluates the status after the request's own scoring calls, so the second
+    probe reads that request's outcome.
     """
     cfg = _load_retrieval_config()
     if not (cfg.get("embedding_blend_enabled")
             or cfg.get("embedding_tree_channel_enabled")):
         return "off"
     try:
-        from _embedding_retrieval import index_available
+        from _embedding_retrieval import index_available, last_degradation
+        import _vendor_path
         if not index_available():
             return ("DEAD: flags ON but no per-box index -- token-only on "
                     "this box (build: embedding-index-build.py --build)")
     except Exception as exc:  # same structural degradation contract as the blend
         return "DEAD: _embedding_retrieval unavailable (%s)" % exc
+    # BEFORE the drift read: that read loads the index (numpy) inside a
+    # swallow-all, so for a process that cannot import numpy it answers "no
+    # drift" and the verdict falls through to alive.
+    missing = _vendor_path.stack_absent_reason()
+    if missing:
+        return ("DEAD: index present but this process cannot import the encoder "
+                "stack (%s) -- token-only until it can (provision: py -3 -m pip "
+                "install --target ~/.ayoai-vendor/py fastembed; no restart "
+                "needed)" % missing)
     drift = _embedding_model_drift()
     if drift:
         # Not "alive": the lanes are deliberately FROZEN (see
@@ -2889,6 +2933,13 @@ def embedding_channel_status():
                 "lanes FROZEN to the token baseline (cosine floors are "
                 "calibrated on the configured model); self-heal: "
                 "embedding-index-build.py --update" % drift)
+    last = last_degradation()
+    # An empty query is a no-op, not a degraded box (cosine_scores records it
+    # but does not warn on it), so it is not evidence either way.
+    if last and last.get("reason") != "empty-query":
+        return ("DEAD: the last scoring attempt in this process degraded to "
+                "token-overlap (%s: %s)" % (last.get("reason"),
+                                            last.get("detail") or "no detail"))
     return "alive"
 
 def _utility_weight(node, cfg=None):
@@ -3277,22 +3328,48 @@ def _score_weight_limit(matched, channels, limit,
             scored = rescored
 
     if all_nodes and len(scored) > limit:
+        # EXACT-KEY SLOT RESERVATION (). exact_key is the
+        # strongest LEXICAL channel (CHANNEL_SCORES 4.0) — the query IS the
+        # node's key — yet it had no guaranteed slot: its base lead over a
+        # semantic neighbour is a fraction of a point (measured 2026-09-29:
+        # eff 8.04 vs 8.2 for a word-adjacent neighbour), so a utility_weight
+        # penalty from times_noise or a high real cosine on the neighbour
+        # flips the sort, and _mmr_rerank then drops the key as redundant.
+        # The window is widest between a node's write and the next index
+        # build (the unindexed-floor imputation gives the key its only edge),
+        # which is exactly when the operator is querying for what they just
+        # wrote ( outcome 3). Same shape as the cosine reservation
+        # below: reserved nodes are GUARANTEED a slot but NOT promoted — they
+        # land in their natural effective-score position. Channel-based, so
+        # it protects both the TF-IDF and the real-embedding paths.
+        reserved = []
+        n_exact = int(cfg.get("exact_key_reserved_slots", 0) or 0)
+        if n_exact > 0 and limit > 1:
+            exact = [e for e in scored if e[3] == "exact_key"]
+            exact.sort(key=lambda e: -e[2])
+            # Never reserve every slot — MMR must keep meaningful authority.
+            reserved = exact[:min(n_exact, limit - 1)]
         # Cosine slot reservation (). Pull the top-N floor-clearing
         # nodes by SEMANTIC cosine out of the pool, fill the remaining slots
         # with the unchanged MMR pass, then re-sort the union by effective
         # score. Reserved nodes are GUARANTEED a slot but are NOT promoted —
         # they land in their natural effective-score position, so this fixes
         # exclusion without distorting the returned ORDER.
-        reserved = []
         n_reserve = int(cfg.get("cosine_reserved_slots", 0) or 0)
         if use_emb and n_reserve > 0 and limit > 1:
             floor = float(cfg.get("embedding_tree_min_cosine",
                                   cfg.get("embedding_min_cosine", 0.35)))
+            exact_keys = {e[0] for e in reserved}
             eligible = [e for e in scored
-                        if float(emb_scores.get(e[0], 0.0)) >= floor]
+                        if e[0] not in exact_keys
+                        and float(emb_scores.get(e[0], 0.0)) >= floor]
             eligible.sort(key=lambda e: -float(emb_scores.get(e[0], 0.0)))
-            # Never reserve every slot — MMR must keep meaningful authority.
-            reserved = eligible[:min(n_reserve, limit - 1)]
+            # Exact-key reservations hold the strongest lexical claim to a
+            # slot; cosine fills only the slots still unclaimed, and the
+            # combined total never takes every slot.
+            room = limit - 1 - len(reserved)
+            if room > 0:
+                reserved += eligible[:min(n_reserve, room)]
         if reserved:
             reserved_keys = {e[0] for e in reserved}
             rest = [e for e in scored if e[0] not in reserved_keys]

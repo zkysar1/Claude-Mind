@@ -17,6 +17,19 @@ This module is the tree-shaped equivalent — option (b) of the goal's design
 note: a local spool drained by the next STRUCTURAL tree write, which already
 pays the whole-object PUT, so the flush costs nothing extra.
 
+THE DRAIN HAS TWO DOORS, AND ONLY ONE IS REACHABLE ON EVERY BOX (g-358-231).
+`tree.py::write_tree` drains (see `take_for_flush` below), but its only live
+callers are `tree-accuracy-sync.py` and `tree_archive.py` -- reducer-side
+maintenance. Every op in tree.py writes through `locked_modify_yaml`, and the
+daemon's structural writer (`mind_api/src/world/tree_write.py`) dumps with the
+same parameters on its own; none of them drains. A box that only retrieves (every
+worker box) would therefore have spooled forever: counters absent from the
+shared index, and every retrieval re-reading an ever-longer file.
+`flush_into_index` is the door every box reaches: one `locked_modify_yaml` per
+`DRAIN_INTERVAL_SECONDS`, called from the retrieval that produced the deltas. It
+bounds the lag an index reader sees to that interval and the PUT cost to one per
+box per interval.
+
 WHY NOT REUSE `_utilization_store`. Its API is RECORD-shaped: `record_increment(
 kind, rec_id, counter, ...)` addresses a JSONL row by `id` and its counters live
 under a `utilization` sub-map, read back through `utilization_of(rec, counters)`.
@@ -60,11 +73,31 @@ precedent).
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 SPOOL_BASENAME = "tree-retrieval.spool.jsonl"
 FLUSHING_BASENAME = "tree-retrieval.spool.flushing.jsonl"
 STAMP_BASENAME = "tree-retrieval.spool.last-flush"
+FLUSH_LOCK_BASENAME = "tree-retrieval.spool.flush.lock"
+
+# Every basename this lane creates beside the index that the `*.lock` glob does
+# not already cover. They sit in the world tree dir, which own-cloud SYNCS, so
+# each must be in owncloud_sync._EXCLUDE_NAMES (machine-local: never pushed, never
+# pulled -- guard-3018). Measured 2026-10-02 (, fresh process, with
+# machine-local and shared controls): before those entries all three classified
+# SHARED, so flipping the flag would have had every box push its spool and pull
+# every other box's, and each box would then drain every other box's deltas into
+# the index. test_tree_retrieval_spool.py asserts each name is excluded.
+SYNC_EXCLUDED_NAMES = (SPOOL_BASENAME, FLUSHING_BASENAME, STAMP_BASENAME)
+
+# The longest a box lets spooled deltas wait before `flush_into_index` folds them
+# into the shared index: the bound on how stale an index reader can be and, at one
+# whole-object PUT per box per interval, on the PUT cost. The readers that decide
+# anything (the archival clock, the retire gate) work in days, so six hours is
+# invisible to them; one hour would put the lane's PUT floor back near the
+# per-retrieval cost it replaces.
+DRAIN_INTERVAL_SECONDS = 6 * 3600
 
 # Same opt-in shape as UTILIZATION_COUNTERS_SPOOLED: default OFF, so landing
 # this module changes nothing until the flag is flipped deliberately.
@@ -294,3 +327,106 @@ def commit_flush(tree_path, stamp_ts=None):
     except Exception as exc:                      # noqa: BLE001
         print("[tree-retrieval-spool] commit failed: %s" % exc, file=sys.stderr)
         return False
+
+
+def _has_work(tree_path):
+    """(residue, live_nonempty) from two stats; reads no file content."""
+    flushing = flushing_path(tree_path)
+    live = spool_path(tree_path)
+    residue = flushing is not None and flushing.exists()
+    try:
+        live_nonempty = live is not None and live.stat().st_size > 0
+    except OSError:
+        live_nonempty = False
+    return residue, live_nonempty
+
+
+def _interval_elapsed(tree_path, interval, now):
+    """True when this box's last drain is at least `interval` old.
+
+    The clock is the stamp file's mtime: every `commit_flush` rewrites it, so a
+    drain by `write_tree` resets it too. No stamp means this box has never
+    drained, and a stamp dated in the future is a clock fault; both drain rather
+    than wait, because a spurious drain costs one PUT and a wedged one costs
+    counters that never land.
+    """
+    stamp = stamp_path(tree_path)
+    try:
+        age = now - stamp.stat().st_mtime
+    except (OSError, AttributeError):
+        return True
+    return age >= interval or age < 0
+
+
+def flush_into_index(tree_path, interval=DRAIN_INTERVAL_SECONDS, now=None,
+                     force=False):
+    """Fold the spool into the index with ONE `locked_modify_yaml`. Never raises.
+
+    Self-gating, so a caller invokes it unconditionally: an absent or empty spool
+    is two stats. A non-empty spool waits `interval` since this box's last drain,
+    except crash residue (`.flushing`), which is un-landed work and always drains.
+    Returns {"status": s} with s one of empty / deferred / busy / flushed / error.
+
+    The decision is made twice, the second time under the flush lock, because two
+    retrievals can both see the interval elapsed and the loser must not drain
+    again behind the winner. `take_for_flush` runs INSIDE the modifier, so it holds
+    the same tree lock `write_tree` holds when it takes; `commit_flush` runs after
+    the write has landed. In the sliver between the lock release and the commit a
+    `write_tree` could take the same residue and double-count it: advisory
+    counters double-count rather than lose, the same trade `commit_flush` makes.
+    A write that raises leaves the batch in `.flushing`, readable through
+    `pending_deltas` and re-drained by the next call.
+    """
+    now = time.time() if now is None else now
+    try:
+        residue, live_nonempty = _has_work(tree_path)
+        if not residue and not live_nonempty:
+            return {"status": "empty"}
+        if not (force or residue or _interval_elapsed(tree_path, interval, now)):
+            return {"status": "deferred"}
+        lock_path = _sibling(tree_path, FLUSH_LOCK_BASENAME)
+    except Exception as exc:                      # noqa: BLE001 - never block a caller
+        return {"status": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
+
+    from storage_backend import LocalBackend
+    lock = LocalBackend()
+    try:
+        lock.acquire_lock(lock_path, timeout=1, stale_seconds=120)
+    except Exception:                             # noqa: BLE001 - someone else is draining
+        return {"status": "busy"}
+    try:
+        residue, live_nonempty = _has_work(tree_path)
+        if not residue and not live_nonempty:
+            return {"status": "empty"}
+        if not (force or residue or _interval_elapsed(tree_path, interval, now)):
+            return {"status": "deferred"}
+
+        from _fileops import locked_modify_yaml
+        taken = {}
+
+        def _fold(data):
+            # Safe to re-run: locked_modify_yaml re-runs the modifier on an
+            # own-cloud If-Match conflict, and `.flushing` persists until
+            # `commit_flush`, so a second take re-reads the same batch (plus
+            # anything spooled since) and folds it into the fresh read.
+            taken["deltas"] = take_for_flush(tree_path)
+            taken["applied"] = apply_pending(data, taken["deltas"])
+            return data
+
+        locked_modify_yaml(tree_path, _fold, skip_if_unchanged=True)
+        stamp_ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now))
+        if not commit_flush(tree_path, stamp_ts):
+            return {"status": "error",
+                    "error": "commit failed; the batch stays in .flushing"}
+        return {"status": "flushed", "keys": len(taken.get("deltas") or {}),
+                "applied": taken.get("applied", 0)}
+    except Exception as exc:                      # noqa: BLE001 - fail-open, batch retained
+        print("[tree-retrieval-spool] drain failed (%s: %s); the batch stays in "
+              "the spool for the next drain" % (type(exc).__name__, exc),
+              file=sys.stderr)
+        return {"status": "error", "error": "%s: %s" % (type(exc).__name__, exc)}
+    finally:
+        try:
+            lock.release_lock(lock_path)
+        except Exception:                         # noqa: BLE001
+            pass
