@@ -119,41 +119,34 @@ Bash: bash core/scripts/credential-defer-recheck.sh --apply
 
 Rationale (WHY defer-drift detective): `core/config/rationale/precheck-gates.md` (2026-06-12 asp-304 incident)
 
+SELF-CONTAINED --apply (rb-428 family — g-115-11720, NOT the old LLM-compose
+pattern): the SCRIPT files the re-gate Investigate itself; the LLM only
+surfaces the WARN (an LLM WARN is the drift class g-115-2595 scripted away).
+Dedup is PER MEMBER (audit_open_coverage): an open class-keyed audit covers a
+drifted id IFF it NAMES that id in title or description; an id no open audit
+names is UNCOVERED and gets a fresh filing — at most ONE per run, naming
+exactly the uncovered ids. An unreadable audit (empty title AND description)
+counts as covering (skip-on-uncertainty). The old any-open-audit suppression
+was the 55-day latch behind g-115-5132; full rationale:
+defer-drift-check.py docstring.
+
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check defer-drift-check)
-Bash: bash core/scripts/defer-drift-check.sh --output json
-Parse drift_count + drifted[].
+Bash: bash core/scripts/defer-drift-check.sh --apply --output json
+Parse drift_count + drifted[] + uncovered_ids + investigate_filed.
 IF drift_count == 0:
     continue silently to Phase 0.5b.11   # the clean, common case
 ELSE:
     Output: "▸ ⚠ DEFER-DRIFT: {drift_count} goal(s) with a PAST deferred_until + structured-defer marker (deferred_readiness pollution risk)"
     FOR EACH d in drifted[:5]:
         Output: "    {d.goal_id} ({d.source}): deferred_until={d.deferred_until} {d.hours_past}h past | {d.defer_prefix} | pc={d.precondition_status}"
-    # File ONE deduplicated Investigate so the drift gets re-gated by judgment.
-    # Dedup: skip if an open Investigate with origin_signal
-    # "investigate:defer-drift-audit" already exists (a single open re-gate pass
-    # covers all current drift — mirrors the rb-428 sweep family's idempotency
-    # posture). Uses --goal-field origin_signal (EXACT match on the stable dedup
-    # key), NOT --title-contains: the title is prose while the machine key lives
-    # in origin_signal, so a title-substring search would be VACUOUS and fail
-    # open into a duplicate (g-115-2196 — the exact bug class this call site had
-    # with the old nonexistent --status/--contains flags).
-    # The key MUST carry the "investigate:" prefix: origin-signal-gate
-    # ALLOWED_PREFIXES has no bare "defer-drift-audit" form, so an unprefixed
-    # key gets Layer-D auto-derive REWRITTEN to investigate:<title-slug> at
-    # filing time and the exact-match dedup here goes vacuous — the sweep then
-    # re-files a duplicate every iteration the drift persists (observed
-    # 2026-07-17, g-115-2475; second instance of the g-115-2196 vacuous-dedup
-    # class, this time on the VALUE not the flag).
-    Bash: existing=$(bash core/scripts/aspirations-query.sh --goal-status pending,in-progress --goal-field origin_signal "investigate:defer-drift-audit")
-    IF existing is empty:
-        Compose an Investigate listing each drifted goal + its precondition_status
-        (prose -> re-gate deferred_until to the correct future date from the
-        defer_reason; ready -> the gate is merely stale, clear the defer;
-        still_unmet -> re-gate). File via aspirations-add-goal.sh into asp-115
-        (participants: [agent], category framework-architecture, priority MEDIUM,
-        origin_signal "investigate:defer-drift-audit").
+    IF investigate_filed:
+        Output: "    → filed re-gate Investigate {investigate_filed} (uncovered={len(uncovered_ids)}) — re-gate each by judgment: pc=prose -> re-gate deferred_until to the correct future date from the defer_reason; pc=ready -> clear the defer; pc=still_unmet -> re-gate (route lane-owned goals to their owner, do NOT appropriate)"
+    ELIF uncovered_ids is empty:
+        Output: "    → all drifted goals already named by an open re-gate audit (per-member dedup — no duplicate filed)"
+    # No LLM filing here — the --apply flag already filed-or-deduped bash-side
+    # (drift-proof, the whole point of g-115-2595). Continue to Phase 0.5b.11.
 ```
 
 
@@ -170,21 +163,25 @@ a blocker. So when a peer-dependency blocker completes, nothing auto-unblocks th
 dependent — it strands invisibly (canonical: g-115-2198-b / g-115-2200 stranded
 ~2 days until felt-sense RAW-read the queue; surfaced by g-115-2591).
 
-SELF-CONTAINED --apply (rb-428 family — NOT the defer-drift detective pattern of
-0.5b.10). The SCRIPT files ONE deduplicated reconcile Investigate itself (dedup
-by the SAME active read that finds the blocked goals — guard-487 fail-closed,
-guard-383 fatal-on-read-error so it can never file blindly) when reason-less
-goals exist and no open audit does. The LLM's ONLY job here is to surface the
-WARN — do NOT compose or file the Investigate (the `--apply` flag already did,
-bash-side). This is deliberate: the exact failure g-115-2595 fixes is
-LLM-discretionary steps drifting (guard-616/rb-616), so the filing must be
-bash-enforced, not left to LLM memory.
+SELF-CONTAINED --apply (rb-428 family; sibling of 0.5b.10 — both moved to
+script-owned filing in g-115-11720). The SCRIPT files ONE deduplicated reconcile
+Investigate itself (dedup by the SAME active read that finds the blocked goals
+— guard-487 fail-closed, guard-383 fatal-on-read-error so it can never file
+blindly) when reason-less goals exist and at least one is UNCOVERED. Dedup is
+PER MEMBER (audit_open_coverage — the shared naming-surface rule): an open
+audit suppresses a filing for a flagged id only if it NAMES that id in its
+title or description; the old any-open-audit suppression was the same
+class-keyed latch the defer-drift lane had (g-115-5132). The LLM's ONLY job
+here is to surface the WARN — do NOT compose or file the Investigate (the
+`--apply` flag already did, bash-side). This is deliberate: the exact failure
+g-115-2595 fixes is LLM-discretionary steps drifting (guard-616/rb-616), so the
+filing must be bash-enforced, not left to LLM memory.
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check reason-less-blocked-check)
 Bash: bash core/scripts/reason-less-blocked-check.sh --apply --output json
-Parse reason_less_count + reason_less[] + investigate_filed + open_audit_goal_id.
+Parse reason_less_count + reason_less[] + uncovered_ids + investigate_filed + open_audit_goal_id.
 IF reason_less_count == 0:
     continue silently to Phase 0.5b.12   # the clean, common case
 ELSE:
@@ -192,9 +189,9 @@ ELSE:
     FOR EACH e in reason_less[:5]:
         Output: "    {e.goal_id} ({e.source}) [{e.aspiration_id}] intended={e.intended_agent}: {e.title}"
     IF investigate_filed:
-        Output: "    → filed reconcile Investigate {investigate_filed} (asp-115) — reconstruct each real blocker into blocked_by/blocker_ref, OR unblock to pending if the premise is gone (route lane-owned goals to their owner, do NOT appropriate)"
-    ELIF open_audit_goal_id:
-        Output: "    → open reconcile Investigate {open_audit_goal_id} already covers these (dedup — no duplicate filed)"
+        Output: "    → filed reconcile Investigate {investigate_filed} (uncovered={len(uncovered_ids)}) — reconstruct each real blocker into blocked_by/blocker_ref, OR unblock to pending if the premise is gone (route lane-owned goals to their owner, do NOT appropriate)"
+    ELIF uncovered_ids is empty:
+        Output: "    → all flagged goals already named by an open reconcile audit {open_audit_goal_id} (per-member dedup — no duplicate filed)"
     # No LLM filing here — the --apply flag already filed-or-deduped bash-side
     # (drift-proof, the whole point of g-115-2595). Continue to Phase 0.5b.12.
 ```
@@ -1052,3 +1049,80 @@ unchanged; only the CHECK moved into the battery. Distinct from Phase 8.8
 (non-recurring close path evolution check) — the battery is the precheck-side net
 that survives recurring-heavy sessions.
 
+
+## Phase 0.5k
+
+The 0.5k lanes (0.5k.1–0.5k.21 in the SKILL.md tier table) are the deferrable
+audit + ratchet sweeps. Each table row is the whole phase: invocation, cost
+note, and (where it exists) a parse-shape warning. This section is the
+**shared body** for the ratchets' re-fire disposal (g-115-11721); the other
+lanes have no prose body and none is created here.
+
+### 0.5k re-fire disposal: owned finding, open unclaimed owner (g-115-11721)
+
+**WHY THIS EXISTS.** Measured 2026-09-30 (omni, cc-03) and re-measured
+2026-10-02 (alpha, cc-04): when a 0.5k detector re-fired on a finding whose
+owner goal was already open, every agent's precheck composed a new reading
+paragraph into the owner's `progress_note` — g-115-10165 (goal-field census
+ratchet) accumulated 35 appends / 27,242 chars from five agents in ~2 weeks
+and was never claimed; g-115-8734 16 appends; g-115-5132 9. Each reading is a
+re-measure plus a composed paragraph, repeated by every agent, and every later
+reader of the goal pays for the pile (goal-field-append.py already rotates a
+note past 32,768 bytes — g-115-5920 was rotated 09-23). Detection was fast;
+action did not follow, because NOTHING converted the repeats into work: no
+goal-selector criterion counts appends, and the ratchets had no stated
+disposal for the "REGRESSED and an owner is open" state.
+
+**THE DISPOSAL.** When a 0.5k detector (the ratchets 0.5k.12 / .14 / .20 /
+.21, or any 0.5k lane) reports a finding whose owner goal is **open and
+unclaimed**:
+
+1. Re-derive the number yourself (the reading's own value is the re-measure —
+   a stale detector number must never be propagated forward).
+2. If the re-measure is the same as (or adds nothing new to) what the owner's
+   `progress_note` already records: append **ONE short line**, never a
+   paragraph, via the sanctioned append path (its idempotency sentinel caps
+   it at one line per agent per day):
+
+   ```
+   Bash: goal-field-append.sh --source <src> <owner-goal-id> progress_note recheck-<agent>-<YYYYMMDD> "[recheck:<agent> <YYYY-MM-DD>] <lane> re-fired: <one clause>"
+   ```
+
+3. The `[recheck:<agent> <YYYY-MM-DD>]` marker line is the **selection
+   signal**: `recheck_marker.lift_for` (SSOT, `core/scripts/recheck_marker.py`)
+   reads the owner's `progress_note` at selection time, and once ≥2 DISTINCT
+   agents carry a marker within 7 days while the owner stays unclaimed, the
+   goal-selector **owned-redetection floor** hoists the owner to the top
+   selection slot (yielding to the drain-lane and strategic-focus hoists;
+   outranked by the reducer-only floor) and emits a stderr banner recorded on
+   the verdict sidecar. The repeat-detection IS the escalation — the claim
+   path is then ordinary. Config: `owned_redetection` in
+   `core/config/aspirations.yaml` (min_agents=2, window_days=7 — the goal's
+   own verification threshold).
+
+**WHY A MARKER LINE AND NOT A PARAGRAPH.** The line is ~60 bytes; the note's
+rotation cap then bounds the pile. The store is append-only under own-cloud
+commutative merge — deletion cannot be encoded, so "update one counter line"
+means append one SHORT line; the predicate reads the LATEST date per agent,
+which makes older lines inert without the deletion the store cannot express.
+A paragraph re-measures the same census number and re-derives the same strays
+list — the information content is the date and the delta, which the clause
+carries.
+
+**"SOMETHING NEW" MEANS** one of: the re-measured number moved (census count
+changed, a new stray name appeared, a new stalled goal crossed a threshold);
+a new cause or bypass door was identified; or the owner goal's claim/status
+state changed. When any of those hold, append the line anyway but make the
+clause say WHAT is new — the clause is the bounded delta, and a later reader
+of the owner must not have to diff two paragraphs to find it.
+
+**WHAT IS NOT COVERED.** A finding with NO open owner goal is a normal filing
+decision (file the goal) — this disposal only governs the owned + open +
+unclaimed state. A CLAIMED owner is out of scope by construction: the floor's
+predicate requires the owner unclaimed, and a claimed goal's precheck appends
+continue as today (the claimer reads its own note). The four ratchet scripts
+stay READ-ONLY reporters: no ratchet writes a marker line itself, because the
+re-measure in step 1 is the agent's job (a script re-measure without the
+agent's comparison to what the note already records could append a "new"
+delta that is not new — the whole point of the one-line clause is the agent's
+judgment, bounded to a line).

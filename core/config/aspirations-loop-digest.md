@@ -141,6 +141,9 @@ re-introduces the clobber class g-115-1561 fixed.
                   # quiescent sleep (back-compat preserved). (g-303-28)
               IF goal is None:
                   Bash: execution-diary.sh phase-end phase-2-select
+                  # §4 idle ladder (B3 g-353-66): generation is the LAST rung.
+                  Bash: precheck-eval.sh pipeline-depth --apply → IF candidate_tier=="on" AND groomable_count>0:
+                      LOOP_CONTINUE if promoted, else ONE grooming bite (g-353-65) then LOOP_CONTINUE
                   /create-aspiration from-self --plan; fallback /research-topic + /reflect
                   # Dry-idle terminal (g-115-2084-c): if generation produced nothing
                   # executable, do NOT hot re-enter — the synchronous Skill re-entry

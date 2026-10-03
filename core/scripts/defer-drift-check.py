@@ -25,16 +25,38 @@ undetected again. See the reasoning-bank entry "deferred_until drift from
 defer_reason prose makes goal-selector deferred_readiness boost data-immature
 goals to top" + the asp-304 Maintain goal for the lineage.
 
-DETECTIVE, NOT CORRECTIVE. The guard CANNOT auto-fix the gate: the correct
-future date lives in the defer_reason PROSE, which it cannot parse reliably
-ENOUGH to pick the exact re-gate date (parsing "~2026-07-11" out of free text
-is brittle, and clearing the defer would wrongly surface a genuinely not-ready
-goal). So it SURFACES drift for re-gate-by-judgment — exactly the fix a
-human/agent applies in ~30s once the drift is known. Detection is the hard
-part; the report is the deliverable. (It DOES extract prose dates for one
-coarser purpose — telling an on-schedule expiry apart from genuine drift, see
-on_schedule_expiry below — but that is a same-day proximity check, not the
-exact-date parse it declines to trust for correction.)
+DETECTIVE + SELF-CONTAINED FILING (g-115-11720). The guard CANNOT
+auto-CORRECT the gate: the correct future date lives in the defer_reason
+PROSE, which it cannot parse reliably ENOUGH to pick the exact re-gate date
+(parsing "~2026-07-11" out of free text is brittle, and clearing the defer
+would wrongly surface a genuinely not-ready goal). So it SURFACES drift for
+re-gate-by-judgment — exactly the fix a human/agent applies in ~30s once the
+drift is known. The FILING moved into this script (g-115-11720): --apply
+files ONE deduplicated re-gate Investigate (origin_signal
+"investigate:defer-drift-audit") listing the drifted goals — the action the
+precheck digest's Phase 0.5b.10 used to leave to LLM prose. An LLM WARN is
+the exact drift class g-115-2595 scripted away in the sibling lane, so the
+filing is bash-enforced, not left to LLM memory (rb-428 self-contained-apply
+family, like reason-less-blocked-check.py). (It DOES extract prose dates for
+one coarser purpose — telling an on-schedule expiry apart from genuine
+drift, see on_schedule_expiry below — but that is a same-day proximity
+check, not the exact-date parse it declines to trust for correction.)
+
+DEDUP IS PER MEMBER, on the SAME read (guard-487 fail-closed by
+construction). An open audit (origin_signal == "investigate:defer-drift-audit",
+status pending/in-progress) covers a drifted id IFF it NAMES that id in its
+title or description (audit_open_coverage.uncovered_ids — the shared
+naming-surface rule both precheck filing lanes use). The old dedup skipped a
+fresh filing while ANY open class-keyed audit existed — even one that named
+none of the goals currently drifted. That fold was the 55-day latch behind
+g-115-5132 (opened 2026-08-06, title still naming a goal absent from every
+metrics run since; 9 drift reports from 3 agents folded into it, 0 re-gates
+run, members flagged up to 518 h). Now: an id any open audit names is NOT
+re-filed (that audit owns its members); an id no open audit names is
+UNCOVERED and gets a fresh filing — at most ONE new audit per run, naming
+exactly the uncovered ids. An unreadable (empty-title-and-description)
+audit is treated as covering: a cross-box duplicate never self-heals, so
+skip-on-uncertainty stays correct (guard-487).
 
 ON-SCHEDULE EXPIRY (g-115-1541). A defer whose deferred_until was deliberately
 set TO its own prose maturity date (e.g. defer_reason "...completes ~2026-06-18"
@@ -59,10 +81,12 @@ merely stale, a clear candidate — from "still_unmet" — genuine drift to
 re-gate; prose-only defers are reported "prose" since the condition is
 unverifiable here).
 
-Reporting tool — NEVER mutates goal state (no --apply). Exit always 0 except
-guard-383 fatal on a source read error (a silent empty-aggregate would hide
-drift behind a "0 drifted" lie — same fatal-source-read contract as
-precondition-defer-recheck.py / parent-supersession-sweep.py).
+Reporting tool — NEVER mutates existing goal state. --apply ADDS at most one
+audit Investigate goal (the filing is a new record, never an edit of the
+drifted goals). Exit always 0 except guard-383 fatal on a source read error
+(a silent empty-aggregate would hide drift behind a "0 drifted" lie — same
+fatal-source-read contract as precondition-defer-recheck.py /
+parent-supersession-sweep.py).
 
 JSON output:
   {
@@ -77,6 +101,13 @@ JSON output:
     "on_schedule_expiry": [            # own prose maturity date — NOT drift, so
       {..., "classification": "on_schedule_expiry", "prose_date": "YYYY-MM-DD"}
     ],                                 # the precheck files no drift Investigate
+    "uncovered_ids": [...],            # : drifted ids NO open audit
+                                       # names in its title/description — the
+                                       # filing predicate (non-empty -> file)
+    "open_audit_goal_ids": [...],      #   the open class-keyed audits (pending /
+    "open_audit_exists": bool,         #   in-progress), for the human report
+    "investigate_filed": str | None,   #   goal_id filed this run (--apply only)
+    "actions_taken": "dry-run" | "apply",
     "now": iso,
   }
 
@@ -108,8 +139,36 @@ import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # Canonical path + fileop primitives (same SSOT as the writing siblings
 # precondition-defer-recheck.py / defer-recheck.py — rb-468 family).
-from _paths import WORLD_DIR  # noqa: E402
+from _paths import AGENT_DIR, WORLD_DIR  # noqa: E402
 from _fileops import locked_append_jsonl  # noqa: E402
+
+# : never hardcode the escalation aspiration —  is the UPSTREAM
+# deployment's queue and does not exist elsewhere, so a literal files nothing.
+# (Same resolver block as the sibling self-contained filer,
+# reason-less-blocked-check.py.)
+try:
+    from _escalation_target import resolve as _resolve_asp, source_flag as _asp_source
+    ESCALATION_ASP, _ESCALATION_ASP_VIA = _resolve_asp(CORE_ROOT, WORLD_DIR, AGENT_DIR)
+    ESCALATION_SOURCE = _asp_source(ESCALATION_ASP, WORLD_DIR, AGENT_DIR)
+except Exception:
+    ESCALATION_ASP, _ESCALATION_ASP_VIA, ESCALATION_SOURCE = (
+        "asp-115", "fallback:import-failed", "world")
+
+# : the open-audit dedup moved from the precheck digest's LLM
+# prose into this script (the rb-428 self-contained-apply family — an LLM
+# WARN is the exact drift class  scripted away in the sibling
+# lane), and it became PER MEMBER: an open audit covers a drifted id only
+# if it NAMES it. The fold (any open class-keyed audit suppresses every
+# fresh filing) was the 55-day latch behind .
+from audit_open_coverage import open_audits, uncovered_ids  # noqa: E402
+
+# The stable filing key. MUST keep the "investigate:" prefix: the
+# origin-signal-gate ALLOWED_PREFIXES has no bare "defer-drift-audit" form,
+# so an unprefixed key gets Layer-D auto-derive REWRITTEN to
+# investigate:<title-slug> at filing time and the exact-match dedup goes
+# vacuous (, second instance 2026-07-17  — the value,
+# not the flag).
+AUDIT_ORIGIN_SIGNAL = "investigate:defer-drift-audit"
 
 # The three STRUCTURED_DEFER_PREFIXES (single source of truth:
 # core/scripts/gates/defer_classifier.py). Imported when available so a future
@@ -364,13 +423,109 @@ def _append_metric(path, record):
               file=sys.stderr)
 
 
+def _build_investigate(entries):
+    """Build the re-gate audit Investigate naming EXACTLY the uncovered
+    drifted goals (the ids no open audit covers — the per-member dedup,
+    g-115-11720). Every affected goal id lands in the title AND the
+    description (the naming-surface audit_open_coverage reads back next
+    run), so the per-id coverage rule can see this audit's own members."""
+    lines = []
+    for e in entries:
+        lines.append(
+            f"  - {e['goal_id']} [{e['aspiration_id']}] "
+            f"({e['source']}): deferred_until={e['deferred_until']} "
+            f"{e['hours_past']}h past | {e['defer_prefix']} | "
+            f"pc={e['precondition_status']} | {e['title']}")
+    listing = "\n".join(lines)
+    ids = " ".join(e["goal_id"] for e in entries)
+    # NOTE: no goal ids as PROSE in this text — the title+description IS the
+    # naming surface the per-member dedup reads back (audit_open_coverage),
+    # so an incidental id mention would accidentally "cover" that id on the
+    # next run. This description therefore cites the lane, never a goal.
+    description = (
+        f"{len(entries)} goal(s) have a PAST deferred_until while a "
+        f"structured-defer marker persists (deferred_readiness selector "
+        f"pollution; detection: defer-drift-check.py, aspirations-precheck "
+        f"Phase 0.5b.10). This audit names exactly the drifted goal(s) no "
+        f"OLDER open re-gate audit covers (per-member dedup, g-115-11720): "
+        f"do NOT fold a later drift onto this audit unless it names that "
+        f"goal — an audit that names none of the current set is stale and "
+        f"must not suppress a fresh filing.\n\n"
+        f"Drifted goals (most-overdue first):\n{listing}\n\n"
+        f"RE-GATE each by judgment (the ~30s fix the detective cannot make: "
+        f"the exact future date lives in the defer_reason prose): "
+        f"pc=prose -> re-gate deferred_until to the correct future date from "
+        f"the defer_reason; pc=ready -> the gate is merely stale, clear the "
+        f"defer; pc=still_unmet -> re-gate. Route lane-owned goals to their "
+        f"owning agent's vertical rather than appropriating them."
+    )
+    return {
+        "title": (f"Investigate: re-gate {len(entries)} drifted defer(s) "
+                  f"{ids}"),
+        "description": description,
+        "priority": "MEDIUM",
+        "participants": ["agent"],
+        "category": "framework-architecture",
+        "tags": ["defer-drift", "deferred-readiness", "learning-health"],
+        "origin_signal": AUDIT_ORIGIN_SIGNAL,
+    }
+
+
+def _file_investigate(aspiration_id, entries):
+    """File the re-gate audit Investigate via the daemon. Returns goal_id or
+    an <add-goal-failed:...> marker (never raises — the caller surfaces it).
+
+    On a goal_duplication_blocked refusal, retries ONCE with a justified,
+    audited X-Mind-Override-Duplication (the same structural-rationale
+    retry as the sibling self-contained filer,
+    reason-less-blocked-check._file_investigate, g-115-3067): _file_investigate
+    is reached ONLY when the per-member dedup found UNCOVERED ids, so any
+    dup-gate match is against COMPLETED prior recurring audits — each fresh
+    straggler legitimately needs its own audit once the prior one closed.
+    """
+    record = _build_investigate(entries)
+    try:
+        result = _rt.aspirations_add_goal(
+            aspiration_id, record, source=ESCALATION_SOURCE)
+    except _rt.RtError as e:
+        body = (e.body or str(e)).strip()
+        if "goal_duplication_blocked" not in body:
+            return f"<add-goal-failed:{body or 'no detail'}>"
+        try:
+            result = _rt.aspirations_add_goal(
+                aspiration_id, record, source=ESCALATION_SOURCE,
+                overrides={"Duplication": (
+                    "defer-drift sweep: per-member dedup confirmed the "
+                    "filed ids are UNCOVERED by every open audit; dup-gate "
+                    "match is COMPLETED prior recurring audits (structural "
+                    "FP). g-115-11720")})
+        except _rt.RtError as e2:
+            return f"<add-goal-failed:{(e2.body or str(e2)).strip() or 'no detail'}>"
+    if isinstance(result, dict):
+        return result.get("goal_id") or result.get("id") or "<unknown-id>"
+    return "<unknown-id>"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=("Flag goals whose deferred_until is PAST while a "
                      "structured-defer marker persists (deferred_readiness "
-                     "pollution). Detective only — never mutates. Sibling: "
-                     "precondition-defer-recheck.py."),
+                     "pollution). Detective by default; --apply files ONE "
+                     "per-member-deduplicated re-gate Investigate. Sibling: "
+                     "precondition-defer-recheck.py (detection), "
+                     "reason-less-blocked-check.py (apply family)."),
     )
+    ap.add_argument("--apply", action="store_true",
+                    help=("File a re-gate Investigate naming the drifted "
+                          "goals NO open audit already names (per-member "
+                          "dedup, g-115-11720). Default: dry-run (report "
+                          "only — the uncovered ids are in the JSON either "
+                          "way)."))
+    ap.add_argument("--investigate-aspiration", default=ESCALATION_ASP,
+                    help=("Aspiration ID the audit Investigate is filed "
+                          "under. Default %(default)s (framework hygiene), "
+                          "resolved per deployment. Must exist in the "
+                          "resolved queue."))
     ap.add_argument("--output", choices=["json", "human"], default="json")
     ap.add_argument("--min-hours-past", type=float, default=0.0,
                     help=("Only flag goals whose deferred_until is at least "
@@ -413,6 +568,17 @@ def main():
     drifted.sort(key=lambda d: d["hours_past"], reverse=True)
     on_schedule.sort(key=lambda d: d["hours_past"], reverse=True)
 
+    # : the dedup is PER MEMBER. An open class-keyed audit covers a
+    # drifted id only if it NAMES it (audit_open_coverage) — the old
+    # any-open-audit suppression was the 55-day latch (). The SAME
+    # active read that found the drift is the audit surface (guard-487).
+    drifted_ids = [d["goal_id"] for d in drifted if d.get("goal_id")]
+    uncovered = sorted(
+        set(uncovered_ids(all_goals, AUDIT_ORIGIN_SIGNAL, drifted_ids)))
+    open_audit_goal_ids = sorted(
+        a.get("id") for a in open_audits(all_goals, AUDIT_ORIGIN_SIGNAL)
+        if a.get("id"))
+
     result = {
         "scanned": scanned,
         "drift_count": len(drifted),
@@ -423,8 +589,29 @@ def main():
         # for selection / clearing on the normal path.
         "on_schedule_expiry_count": len(on_schedule),
         "on_schedule_expiry": on_schedule,
+        #  apply path (computed for dry-run too — it IS the report):
+        "uncovered_ids": uncovered,
+        "open_audit_goal_ids": open_audit_goal_ids,
+        "open_audit_exists": bool(open_audit_goal_ids),
+        "investigate_filed": None,
+        "actions_taken": "apply" if args.apply else "dry-run",
         "now": now.isoformat(timespec="seconds"),
     }
+
+    if args.apply and uncovered:
+        entries = [d for d in drifted if d.get("goal_id") in set(uncovered)]
+        filed = _file_investigate(args.investigate_aspiration, entries)
+        if str(filed).startswith("<add-goal-failed"):
+            # Surface the failure loudly; the sweep re-detects next run
+            # (guard-487 fail-open: a missed filing re-detects, so it is safe
+            # to leave unfiled — never file a possible duplicate on
+            # uncertainty).
+            print(f"[defer-drift-check] Investigate filing failed: {filed}",
+                  file=sys.stderr)
+            result["investigate_filed"] = None
+            result["investigate_error"] = filed
+        else:
+            result["investigate_filed"] = filed
 
     # Accumulate the observation BEFORE emitting, so a broken stdout consumer
     # cannot cost the ledger a datapoint. Naive-UTC stamp per the fleet clock
@@ -453,6 +640,12 @@ def main():
     if args.output == "human":
         print(f"scanned={scanned} drift_count={len(drifted)} "
               f"on_schedule_expiry={len(on_schedule)}")
+        if drifted:
+            print(f"  uncovered={len(uncovered)} "
+                  f"(no open audit names these) | open_audits="
+                  f"{','.join(open_audit_goal_ids) or 'none'} | "
+                  f"investigate_filed={result['investigate_filed'] or '-'} "
+                  f"({result['actions_taken']})")
         for d in drifted:
             print(f"  [drift] {d['goal_id']} ({d['source']}): deferred_until="
                   f"{d['deferred_until']} {d['hours_past']}h past | "

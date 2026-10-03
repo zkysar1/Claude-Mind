@@ -83,4 +83,47 @@ def ensure_vendor_path():
         return False
 
 
+# What the retrieval path needs IN PROCESS: numpy for the cosine matmul and one
+# encoder backend (_embedding_model.load_encoder prefers fastembed, falls back
+# to sentence-transformers).
+_STACK_MODULES = ("numpy",)
+_ENCODER_BACKENDS = ("fastembed", "sentence_transformers")
+
+
+def _importable(name):
+    """True when `name` is already loaded or can be located on sys.path.
+    find_spec locates a module and imports nothing."""
+    if sys.modules.get(name) is not None:
+        return True
+    try:
+        from importlib.util import find_spec
+        return find_spec(name) is not None
+    except (ImportError, ValueError, AttributeError):
+        # ValueError: a sys.modules entry whose __spec__ is None.
+        return False
+
+
+def stack_absent_reason():
+    """None when THIS process can import the encoder stack, else one line saying
+    what is missing.
+
+    Resolves the vendor dir first, at call time, so a stack installed after the
+    process started counts as present — the property `cosine_scores` relies on
+    (g-306-574: a daemon that started before ~/.ayoai-vendor/py existed kept
+    serving the token baseline while its channel status read 'alive', until a
+    restart). Nothing is imported or loaded, so it is safe on the per-request
+    status path. It answers "are the files importable", not "does the binary
+    load": a present-but-broken stack shows up through
+    _embedding_retrieval.last_degradation() after the first scoring attempt.
+    """
+    ensure_vendor_path()
+    for name in _STACK_MODULES:
+        if not _importable(name):
+            return "%s is not importable" % name
+    if not any(_importable(m) for m in _ENCODER_BACKENDS):
+        return ("no encoder backend is importable (%s)"
+                % " or ".join(m.replace("_", "-") for m in _ENCODER_BACKENDS))
+    return None
+
+
 ensure_vendor_path()

@@ -72,7 +72,7 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field --value-stdin --override-narrative-replace --outcome-note --outcome-note-file --expect-sha256"
+_ACCEPTED_FLAGS="--source --force-defer --override-agent-match --override-uncommitted --cross-lane --override-missing-artifact --override-residual --override-shrink --blocker-ref --force-unstructured-defer --override-blocker-gate --allow-new-field --value-stdin --override-narrative-replace --outcome-note --outcome-note-file --ledger-evidence --ledger-verdict --expect-sha256"
 
 # --- Parse args -----------------------------------------------------------
 SOURCE_VAL="world"
@@ -89,6 +89,8 @@ CROSS_LANE=""
 VALUE_STDIN=""
 OUTCOME_NOTE=""
 OUTCOME_NOTE_FILE=""
+LEDGER_EVIDENCE=""
+LEDGER_VERDICT=""
 EXPECT_SHA256=""
 declare -a PASSTHROUGH=()
 declare -a PASSTHROUGH_SOURCE=()
@@ -165,6 +167,23 @@ while [[ $# -gt 0 ]]; do
             # guard-5634 CreateProcess ~32k / guard-1187 MAX_ARG_STRLEN).
             OUTCOME_NOTE_FILE="${2-}"
             shift $(( $# >= 2 ? 2 : 1 ));;
+        --ledger-evidence|--ledger-verdict)
+            # : the writer's half of the §5 candidate ledger row, riding
+            # a status write the way --outcome-note does (body keys, not headers).
+            # This arm only TRANSPORTS: the daemon validates both values with
+            # gates.candidate_transition.caller_channel, so the policy exists
+            # once. --ledger-evidence takes a JSON object (today only
+            # {"promoted_by":"<kebab-name>"}); --ledger-verdict names the §5
+            # verdict when the status default is not the writer's (rb-route
+            # lands as `skipped`, whose default is close-moot). An empty value
+            # is refused, as --expect-sha256 does: it would send no stamp at
+            # all while the caller believes it stamped.
+            if [ -z "${2-}" ]; then
+                echo "Error: $1 needs a value; an empty one would skip the ledger stamp silently." >&2
+                exit 2
+            fi
+            if [ "$1" = "--ledger-evidence" ]; then LEDGER_EVIDENCE="$2"; else LEDGER_VERDICT="$2"; fi
+            shift 2;;
         --expect-sha256)
             # : compare-and-swap precondition. The daemon refuses the
             # write (409 field_precondition_failed, nothing written) unless the
@@ -379,6 +398,10 @@ if [ -n "$OUTCOME_NOTE" ] && [ "$FIELD" != "status" ]; then
     echo "Error: --outcome-note/--outcome-note-file ride only a status write (g-358-36). For a standalone note use: aspirations-update-goal.sh <id> outcome_note <text>." >&2
     exit 1
 fi
+if { [ -n "$LEDGER_EVIDENCE" ] || [ -n "$LEDGER_VERDICT" ]; } && [ "$FIELD" != "status" ]; then
+    echo "Error: --ledger-evidence/--ledger-verdict ride only a status write (g-353-166)." >&2
+    exit 1
+fi
 
 # Encode value as JSON, mirroring aspirations.py parse_value. Single py -3
 # call (~30-50ms on Windows) vs full aspirations.py module load (~400-500ms).
@@ -390,7 +413,7 @@ fi
 # The program still arrives via `-c` (argv), which is what keeps stdin free for the
 # data: `python3 -` or a heredoc-fed program would consume stdin ITSELF and silently
 # discard the piped value (guard-4740 / guard-4728).
-ENCODED_VALUE=$(printf '%s' "$VALUE" | MIND_COMPANION_NOTE="$OUTCOME_NOTE" $(rt_python_launcher) -c '
+ENCODED_VALUE=$(printf '%s' "$VALUE" | MIND_COMPANION_NOTE="$OUTCOME_NOTE" MIND_COMPANION_LEDGER_EVIDENCE="$LEDGER_EVIDENCE" MIND_COMPANION_LEDGER_VERDICT="$LEDGER_VERDICT" $(rt_python_launcher) -c '
 import json, sys
 v = sys.stdin.read()
 if v == "true":
@@ -418,10 +441,24 @@ else:
 # the daemon unwraps {"value": ..., "outcome_note": ...} and lands both
 # fields in one locked RMW. Empty env var (flag not passed) leaves the body
 # byte-identical to the historical shape.
+# : the §5 ledger companions ride the same body under ledger_evidence /
+# ledger_verdict. Non-JSON evidence is sent as the raw string so the daemon
+# refuses it with caller_channel own message instead of this encoder guessing.
 import os
 _n = os.environ.get("MIND_COMPANION_NOTE", "")
-if _n:
-    r = {"value": r, "outcome_note": _n}
+_le = os.environ.get("MIND_COMPANION_LEDGER_EVIDENCE", "")
+_lv = os.environ.get("MIND_COMPANION_LEDGER_VERDICT", "")
+if _n or _le or _lv:
+    r = {"value": r}
+    if _n:
+        r["outcome_note"] = _n
+    if _le:
+        try:
+            r["ledger_evidence"] = json.loads(_le)
+        except json.JSONDecodeError:
+            r["ledger_evidence"] = _le
+    if _lv:
+        r["ledger_verdict"] = _lv
 sys.stdout.write(json.dumps(r))
 ')
 

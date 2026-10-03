@@ -160,3 +160,52 @@ def test_guard_does_not_disturb_guard_580_or_581(tmp_path):
 def test_non_string_arguments_are_stringified_before_checking():
     argv = bash_cmd("x.sh", 7, 1.5)
     assert argv[-2:] == ["7", "1.5"]
+
+
+# A fourth class is LENGTH (, measured on ZDS 2026-09-28): MSYS globs
+# any word holding whitespace, one of ? * [ " ' ( ) { }, or a leading ~, and the
+# glob cuts it to 8,186 CHARACTERS with argc unchanged and rc=0. A plain word with
+# none of those arrived whole at 12,000; the same value on stdin arrived whole.
+CUT = 8186
+
+
+@pytest.mark.parametrize("value", [
+    "word " * 2000,
+    "a" * CUT + " b",
+    "~" + "a" * CUT,
+    "a" * CUT + "*",
+    "(" + "a" * CUT,
+])
+def test_predicate_flags_a_value_msys_would_cut(value):
+    assert len(value) > CUT
+    assert _win_arg_corrupts(value)
+
+
+@pytest.mark.parametrize("value", [
+    "a" * 12000,
+    ("a " * CUT)[:CUT],
+])
+def test_predicate_leaves_a_long_value_msys_delivers_whole(value):
+    assert not _win_arg_corrupts(value)
+
+
+def test_long_spaced_value_is_refused_on_win32_and_points_at_stdin(monkeypatch):
+    # The refusal runs only on win32 and dev is POSIX, so drive the branch
+    # through sys.platform rather than skipping it everywhere it is read.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("MIND_BASH_ALLOW_UNSAFE_ARGS", raising=False)
+    with pytest.raises(ValueError) as exc:
+        bash_cmd("x.sh", "rb-1773", "content", "word " * 2000)
+    msg = str(exc.value)
+    assert "argument 3" in msg
+    assert "8,186" in msg and "TRUNCATE" in msg
+    assert "input=payload" in msg and "g-115-11615" in msg
+    assert "COLLAPSE" not in msg and "quote/brace" not in msg
+
+
+def test_value_at_the_cut_still_builds_on_win32(monkeypatch):
+    # Positive control (guard-4166): no refusal for a value MSYS delivers whole.
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.delenv("MIND_BASH_ALLOW_UNSAFE_ARGS", raising=False)
+    at_cut = ("a " * CUT)[:CUT]
+    assert bash_cmd("x.sh", at_cut, "a" * 12000)[-2:] == [at_cut, "a" * 12000]

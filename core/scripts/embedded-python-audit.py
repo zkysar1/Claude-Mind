@@ -223,13 +223,37 @@ def find_blocks(path, text):
             j = i + 1
             while j < n and (len(lines[j - 1]) - len(lines[j - 1].rstrip("\\"))) % 2 == 1:
                 j += 1
+            # NESTED SHAPE (): the opener sits inside a double-quoted
+            # string handed to another program (`remote_exec "python3 - <<'PYEOF'`
+            # ... `PYEOF")`). At the local shell level there is no heredoc, so there
+            # is no bare tag line and the closer is the tag followed by the closing
+            # quote; `bash -n` parses it clean, so "never closes" would be a false
+            # verdict. Whichever closer comes FIRST ends the block, so a bare tag
+            # still wins for a real local heredoc (a `"$(python3 - <<'PY'` opener)
+            # and a later block's bare tag is never swallowed. An opener with
+            # neither closer stays UNTERMINATED, so the lane can still fail. The
+            # nested body is NOT compiled: it is double-quote text that the local
+            # shell rewrites (`\"`, `$VAR`) before the remote side sees it, and
+            # main() reports how many blocks were left uncompiled so the skip is
+            # never silent.
+            # `dq`: the opener line ends inside a DOUBLE-quoted string. Built on the
+            # shared quote-state scanner (guard-2222), not a second one: appending a
+            # `"` closes a double quote that was open, opens one that was not, and
+            # leaves a single quote open, so the pair of calls separates the three.
+            head = line[:hm.start()]
+            dq = ends_inside_quote(head) and not ends_inside_quote(head + '"')
+            nested = False
             while j < n and lines[j].strip() != tag:
+                if dq and lines[j].strip().startswith(tag + '"'):
+                    nested = True
+                    break
                 body_lines.append(lines[j])
                 j += 1
             out.append(dict(
                 kind="heredoc_" + ("quoted" if hm.group(1) else "unquoted"),
                 line=i + 1, body="\n".join(body_lines),
-                quarantined=quarantined, unterminated=(j >= n)))
+                quarantined=quarantined, unterminated=(j >= n),
+                nested_unchecked=nested))
             i = j + 1
             continue
 
@@ -444,7 +468,7 @@ def main():
     # the output saying so. A checker that reports what it RAN but never what it
     # declined to look for hands the reader a false all-clear (guard-1760).
     roots, world_state = iter_roots(args.root)
-    findings, total, quarantined = [], 0, 0
+    findings, total, quarantined, nested = [], 0, 0, 0
     for root in roots:
         for f in sorted(root.rglob("*.sh")):
             try:
@@ -456,6 +480,9 @@ def main():
                 if b["quarantined"]:
                     quarantined += 1
                     continue
+                if b.get("nested_unchecked"):
+                    nested += 1
+                    continue
                 reason = check_block(b)
                 if reason:
                     findings.append(dict(file=str(f), line=b["line"],
@@ -464,6 +491,7 @@ def main():
     roots_str = [str(r) for r in roots]
     if args.json or args.list:
         print(json.dumps(dict(total_blocks=total, quarantined=quarantined,
+                              nested_not_compiled=nested,
                               roots_scanned=roots_str, world_root_state=world_state,
                               findings=findings), indent=2))
     else:
@@ -480,6 +508,10 @@ def main():
             print("[embedded-python-audit] SCOPE: world root %s -- this run did "
                   "NOT cover world/scripts, so 'clean' below is only as wide as "
                   "the root(s) listed above" % world_state)
+        if nested:
+            print("[embedded-python-audit] NOTE: %d block(s) sit inside a "
+                  "double-quoted string handed to another program and were NOT "
+                  "compiled (they are counted in the total above)" % nested)
         for x in findings:
             print("  FAIL %s:%s [%s] %s" % (x["file"], x["line"], x["kind"], x["reason"]))
         if not findings:

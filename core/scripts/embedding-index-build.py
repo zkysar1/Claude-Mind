@@ -411,7 +411,9 @@ def cmd_stats(out):
         print(json.dumps({"op": "stats", "exists": False, "out": str(out),
                           "channel": "DEAD",
                           "channel_reason": "index absent on this box -- "
-                          "initial build is a deliberate action: "
+                          "the next session start builds one when the encoder "
+                          "stack is importable (embedding-index-freshness.py "
+                          "--session-start, g-306-574), or run: "
                           "embedding-index-build.py --build"}))
         return
     meta = json.loads(meta_path.read_text(encoding="utf-8"))

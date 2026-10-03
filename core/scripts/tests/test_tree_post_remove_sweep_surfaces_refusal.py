@@ -58,6 +58,14 @@ def test_sweep_prints_the_repair_refusal_through_the_real_subprocess(
     spec = importlib.util.spec_from_file_location("tree_g358146", scripts / "tree.py")
     tree = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(tree)
+    # : the sweep now passes an EXPLICIT env naming THIS module's
+    # own WORLD_DIR (the fix that stops a re-pointed caller's ambient world
+    # from being nulled by the repair child). Under in-process import that
+    # WORLD_DIR resolved through the real cached _paths — not the tmp
+    # MIND_WORLD above — so pin it to the fixture world to keep the isolation
+    # the docstring describes. The contract under test (the child follows the
+    # tree module's world, whatever it is) is exactly what the pin exercises.
+    monkeypatch.setattr(tree, "WORLD_DIR", world)
     tree._post_remove_sweep_dangling(["no-such-node-g358146"])
 
     err = capsys.readouterr().err

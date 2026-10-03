@@ -237,6 +237,23 @@ BODY="$(cat)"
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
+# A WORKER BODY'S FILING IS SIGNED HERE, never by the Body (): the
+# description gains a last line saying a worker filed it on this box, read from
+# its own environment (why the writer signs, and why a filing carries no sid:
+# _body_stamp.py). worker-loop's "Mark it" rule leans on it, so the reducer can
+# SEE that a worker filed the goal without trusting a host the model recalled. A
+# body the helper cannot sign passes through unchanged; a helper failure files
+# the goal unsigned, aloud.
+if [ "${BODY_ROLE:-}" = "worker" ] && [ -n "$BODY" ]; then
+    # shellcheck disable=SC2046
+    if _signed_body="$(printf '%s' "$BODY" | $(rt_python_launcher) "$CORE_ROOT/scripts/_body_stamp.py" description)" \
+            && [ -n "$_signed_body" ]; then
+        BODY="$_signed_body"
+    else
+        echo "Warning: could not sign this worker filing (_body_stamp.py failed); filing it unsigned." >&2
+    fi
+fi
+
 QUERY="asp_id=${ASP_ID}&source=${SOURCE_VAL}"
 
 declare -a HEADER_ARGS=()

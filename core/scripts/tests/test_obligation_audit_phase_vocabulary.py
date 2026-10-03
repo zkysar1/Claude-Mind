@@ -264,3 +264,133 @@ def test_a_phase_key_with_an_EMPTY_spec_is_unknown_in_BOTH_auditors(oa, aoa):
                  "phase_aliases": {"state-update": "state"}}
     assert oa._validate_claim("state-update", "context_budget.zone == tight", "tight", "deep", populated) == (True, None)
     assert aoa._validate_claim("state-update", "context_budget.zone == tight", populated, "deep", "tight") == (True, None)
+
+
+# --- The claim's own WORDING () ----------------------------------------------
+# `Investigate: false-abbreviation-claims` was filed over two claims whose condition was
+# TRUE: state-update and learning-gate at runtime zone tight, each written as
+# `zone tight (...)`. `condition not in allowed` was exact membership and only the
+# canonical token is listed, so both scored "schema disallows this condition" and the
+# runtime check never ran. The rename lives in the schema (`condition_aliases:`, read by
+# both auditors); these tests pin it against the REAL schema and keep the runtime in charge.
+
+# Verbatim from agents/zeta/journal/2026/09/2026-09-30.md, the claims behind the goal.
+FILED_OVER = [
+    ("state-update", "zone tight (Skill body not loaded; mechanical close via recurring-close.sh; "
+                     "tree Verified Values + summary STATUS already written in-turn)"),
+    ("learning-gate", "zone tight (mechanical phase via recurring-close.sh; no meta-signal; "
+                      "goals_completed not a multiple of 5)"),
+]
+
+
+def _allowed_tokens(schema):
+    return {t for spec in (schema.get("obligations") or {}).values()
+            for t in (spec.get("abbreviated_allowed_when") or [])}
+
+
+def test_condition_aliases_are_declared_and_every_target_is_a_token_the_schema_allows(schema):
+    """An alias that names a token no phase allows would map a claim onto nothing."""
+    aliases = schema.get("condition_aliases")
+    assert isinstance(aliases, dict) and aliases, "condition_aliases missing from the schema"
+    allowed = _allowed_tokens(schema)
+    for wording, token in aliases.items():
+        assert token in allowed, f"alias {wording!r} -> {token!r}, which no phase allows"
+        assert wording == " ".join(str(wording).lower().split()), (
+            f"alias key {wording!r} must be lower-cased with single spaces: lookups compare in that form"
+        )
+
+
+@pytest.mark.parametrize("phase,condition", FILED_OVER)
+def test_the_claims_the_goal_was_filed_over_validate_when_the_zone_was_tight(oa, aoa, schema, phase, condition):
+    """The positive control, and the reason the goal existed: both conditions were TRUE."""
+    assert oa._validate_claim(phase, condition, "tight", "deep", schema) == (True, None)
+    assert aoa._validate_claim(phase, condition, schema, "deep", "tight") == (True, None)
+
+
+@pytest.mark.parametrize("phase,condition", FILED_OVER)
+@pytest.mark.parametrize("zone", ["normal", "fresh"])
+def test_a_wording_alias_does_not_launder_a_claim_the_runtime_contradicts(oa, aoa, schema, phase, condition, zone):
+    """The map renames; the runtime check still decides (no rubber stamp)."""
+    expected = (False, f"observed zone={zone} but claim says tight")
+    assert oa._validate_claim(phase, condition, zone, "deep", schema) == expected
+    assert aoa._validate_claim(phase, condition, schema, "deep", zone) == expected
+
+
+@pytest.mark.parametrize("phase", ["verify", "spark"])
+def test_a_routine_wording_alias_does_not_launder_a_deep_checkpoint(oa, aoa, schema, phase):
+    """The routine half of the no-laundering control; the zone half is the test above.
+
+    7 of the 12 claims the map turned valid in the corpus snapshot were the routine
+    wording in `spark`, the largest alias population, and the zone test could not reach it.
+    """
+    wordings = [w for w, token in schema["condition_aliases"].items() if token == "outcome_class == routine"]
+    # The list is built from the schema, so retargeting or deleting an alias would silently shrink it
+    # and the loop would pass over what remained (measured: a sabotage that retargeted one key left
+    # this test green). Pin the two wordings the corpus measured; later additions are covered too.
+    assert {"outcome_class routine", "outcome_class=routine"} <= set(wordings), wordings
+    contradicted = (False, "claim says routine but checkpoint says deep")
+    for wording in wordings:
+        assert oa._validate_claim(phase, wording, "tight", "deep", schema) == contradicted, wording
+        assert aoa._validate_claim(phase, wording, schema, "deep", "tight") == contradicted, wording
+        # POSITIVE CONTROL: the same wording is honoured when the checkpoint IS routine.
+        assert oa._validate_claim(phase, wording, "tight", "routine", schema) == (True, None), wording
+        assert aoa._validate_claim(phase, wording, schema, "routine", "tight") == (True, None), wording
+
+
+def test_every_alias_reaches_the_canonical_token_in_both_auditors_through_any_punctuation(oa, aoa, schema):
+    """Case, spacing, a parenthetical and a following sentence all leave the head intact."""
+    for wording, token in schema["condition_aliases"].items():
+        variants = [
+            wording,
+            wording.upper(),
+            "  " + wording.replace(" ", "   ") + "  ",
+            wording + " (the explanation goes here)",
+            wording + ". A following sentence explains.",
+        ]
+        for variant in variants:
+            assert oa._normalize_condition(variant, schema) == token, f"OA {variant!r}"
+            assert aoa._normalize_condition(variant, schema) == token, f"AOA {variant!r}"
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "zone tightness",              # a longer word, not the alias
+        "the zone was tight",          # a different sentence
+        "tight zone",                  # a wording the corpus never used, so it is NOT listed
+        "outcome_class routine-ish",
+        "I was in a hurry (zone tight)",
+    ],
+)
+def test_an_unlisted_wording_passes_through_unchanged_and_still_fails(oa, aoa, schema, condition):
+    """Normalizers stay total onto the vocabulary (rb-1915): unknown text surfaces, never matches."""
+    head = oa._normalize_condition(condition)  # the schema-free behaviour: the cut only
+    assert oa._normalize_condition(condition, schema) == head
+    assert aoa._normalize_condition(condition, schema) == head
+    assert oa._validate("state-update", condition, "tight", "routine", schema) is False
+    assert aoa._validate_claim("state-update", condition, schema, "routine", "tight")[0] is False
+
+
+def test_an_alias_does_not_widen_what_a_phase_allows(oa, aoa, schema):
+    """The alias lands on a canonical token; each phase's own allow-list still gates it."""
+    # state and learn allow only the zone token, spark only the routine token.
+    cases = [
+        ("state-update", "outcome_class routine", "tight", "routine"),
+        ("learning-gate", "outcome_class=routine", "tight", "routine"),
+        ("spark", "zone tight", "tight", "deep"),
+    ]
+    for phase, condition, zone, outcome in cases:
+        refused = (False, "schema disallows this condition")
+        assert oa._validate_claim(phase, condition, zone, outcome, schema) == refused
+        assert aoa._validate_claim(phase, condition, schema, outcome, zone) == refused
+    # POSITIVE CONTROL: the same wordings are honoured where the phase DOES allow its token.
+    assert oa._validate_claim("spark", "outcome_class routine", "tight", "routine", schema) == (True, None)
+    assert oa._validate_claim("verify", "zone tight", "tight", "deep", schema) == (True, None)
+
+
+def test_the_normalizer_without_a_readable_schema_is_the_old_normalizer(oa, aoa):
+    """An unreadable schema disables the rename, never the cut, and never raises."""
+    for mod in (oa, aoa):
+        assert mod._normalize_condition("zone tight (x)") == "zone tight"
+        assert mod._normalize_condition("zone tight (x)", {}) == "zone tight"
+        assert mod._normalize_condition("zone tight (x)", None) == "zone tight"

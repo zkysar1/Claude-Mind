@@ -167,7 +167,9 @@ class TestDaemonResolverMindData(_EnvIsolatedTest):
         (agent / "local-paths.conf").write_text("", encoding="utf-8")
 
     def test_daemon_resolves_mind_data_bare_default(self):
-        (self._tmproot / ".mind-data").mkdir()
+        # The roots must exist: the daemon refuses a missing one ().
+        (self._tmproot / ".mind-data" / "world").mkdir(parents=True)
+        (self._tmproot / ".mind-data" / "meta").mkdir()
         resolver = self._Resolver(self._tmproot)
         paths = resolver.resolve("testagent")
         self.assertTrue(_norm(paths.world).endswith(".mind-data/world"))
@@ -180,6 +182,9 @@ class TestDaemonResolverMindData(_EnvIsolatedTest):
             "WORLD_PATH=" + str(self._tmproot / "dcustom" / "world") + "\n",
             encoding="utf-8",
         )
+        # The roots must exist: the daemon refuses a missing one ().
+        (self._tmproot / "dcustom" / "world").mkdir(parents=True)
+        (md / "meta").mkdir()
         resolver = self._Resolver(self._tmproot)
         paths = resolver.resolve("testagent")
         self.assertTrue(_norm(paths.world).endswith("dcustom/world"))

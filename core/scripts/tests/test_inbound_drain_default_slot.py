@@ -152,12 +152,38 @@ class DestinationFence(unittest.TestCase):
             self.assertEqual(disp, engine.FAILED)
             self.assertIn("destination fence", detail)
 
+    def test_knowledge_edit_is_FAILED_and_never_applied_when_the_fence_refuses(self):
+        """An edit lands in THIS box's world, as a directive lands in its queue, so a
+        misconfigured box must not apply another environment's edits either."""
+        loaded = []
+        orig_loader = engine._load_knowledge_applier
+        engine._load_knowledge_applier = lambda: loaded.append(1)
+        try:
+            with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+                engine._own_world_root = lambda: Path(a).resolve()
+                disp, detail = engine._apply_knowledge(
+                    {"kind": "knowledge", "handle": "0123456789abcdef", "op": "edit",
+                     "text": "Widgets are green.", "base": "ab" * 32},
+                    spool_root=Path(b))
+        finally:
+            engine._load_knowledge_applier = orig_loader
+        self.assertEqual(disp, engine.FAILED)
+        self.assertIn("destination fence", detail)
+        self.assertEqual(loaded, [], "the applier must not even be loaded")
+
 
 class VerbVocabularyIsDerived(unittest.TestCase):
     def test_known_verbs_come_from_the_registry_not_a_restatement(self):
         from planned_verbs import PLANNED_VERBS
         self.assertEqual(engine.KNOWN_VERBS, tuple(sorted(PLANNED_VERBS)))
         self.assertTrue(engine.KNOWN_VERBS, "registry read must be non-empty here")
+
+    def test_known_knowledge_ops_come_from_the_registry_not_a_restatement(self):
+        from knowledge_edits import KNOWLEDGE_OPS
+        self.assertEqual(engine.KNOWN_KNOWLEDGE_OPS, tuple(KNOWLEDGE_OPS))
+        self.assertTrue(engine.KNOWN_KNOWLEDGE_OPS, "registry read must be non-empty here")
+        self.assertTrue(set(engine.RETENTION_OPS) <= set(engine.KNOWN_KNOWLEDGE_OPS),
+                        "a retention op the registry does not know would never be handed its directory")
 
 
 class CoreDefaultSlotDeclines(unittest.TestCase):

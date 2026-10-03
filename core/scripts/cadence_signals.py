@@ -114,7 +114,8 @@ def _interval_hours(goal) -> float:
     (interval_hours -> remind_days * 24 -> 24); it cannot be imported, because
     goal-selector imports this module. Parity is pinned in
     tests/test_cadence_signal_gate.py."""
-    if "interval_hours" in goal:
+    # A cleared interval_hours (None) reads as absent ().
+    if goal.get("interval_hours") is not None:
         return float(goal["interval_hours"])
     if "remind_days" in goal:
         return float(goal["remind_days"]) * 24

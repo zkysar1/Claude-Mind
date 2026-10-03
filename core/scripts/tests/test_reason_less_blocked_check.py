@@ -198,7 +198,14 @@ def test_main_apply_files_one_when_no_open_audit(monkeypatch, capsys):
     assert calls[0]["record"]["origin_signal"] == mod.AUDIT_ORIGIN_SIGNAL
 
 
-def test_main_apply_skips_when_open_audit_exists(monkeypatch, capsys):
+def test_main_apply_unreadable_audit_surface_fail_closed(monkeypatch, capsys):
+    """: an open audit whose title AND description are both empty
+    has an UNREADABLE naming surface -> treated as covering (suppress the
+    filing). A cross-box duplicate never self-heals, so skip-on-uncertainty
+    stays correct (guard-487). (The pre-g-115-11720 name for this case was
+    'skips when an open audit exists' — the old any-open-audit suppression
+    was the class-keyed latch this goal removes; only the unreadable
+    surface keeps skipping.)"""
     goals = [
         _blocked(id="g-350-04"),
         {"id": "g-115-audit", "status": "pending",
@@ -211,8 +218,9 @@ def test_main_apply_skips_when_open_audit_exists(monkeypatch, capsys):
     assert rc == 0
     assert res["reason_less_count"] == 1
     assert res["open_audit_exists"] is True
+    assert res["uncovered_ids"] == []  # unreadable surface covers
     assert res["investigate_filed"] is None
-    assert calls == []  # dedup: no second audit filed
+    assert calls == []  # no second audit filed
 
 
 def test_main_apply_files_nothing_when_clean(monkeypatch, capsys):
@@ -295,3 +303,123 @@ def test_main_apply_no_retry_on_non_duplication_error(monkeypatch, capsys):
     # Only ONE attempt — no override retry on a non-duplication error.
     assert len(calls) == 1
     assert calls[0]["overrides"] is None
+
+
+# ── Per-member dedup () ──────────────────────────────────────────
+#
+# The old any-open-audit suppression was the same class-keyed latch as the
+# defer-drift lane ( / ). New rule (audit_open_coverage,
+# shared with the defer-drift lane): an open audit covers a flagged id IFF it
+# NAMES that id (title/description, word-boundaried). Uncovered ids get ONE
+# fresh filing per run.
+
+def _named_audit(goal_id, named_ids, status="pending"):
+    """An open reconcile audit whose naming surface lists exactly named_ids."""
+    listing = "\n".join(f"  - {i}" for i in named_ids)
+    return {
+        "id": goal_id,
+        "status": status,
+        "origin_signal": mod.AUDIT_ORIGIN_SIGNAL,
+        "title": (f"Investigate: reconcile {len(named_ids)} reason-less-blocked "
+                  f"goal(s) {' '.join(named_ids)}"),
+        "description": f"Reason-less-blocked goals:\n{listing}\n",
+    }
+
+
+def test_main_apply_outcome2_audit_names_A_new_blocked_B(monkeypatch, capsys):
+    """THE outcome-2 scenario: an open reconcile audit names goal A; a NEW
+    reason-less-blocked goal B appears. B is uncovered and gets filed; A is
+    not re-filed, and the filed record names B and not A."""
+    goals = [
+        _blocked(id="g-350-04"),  # A — covered by the open audit
+        _blocked(id="g-350-10"),  # B — new, uncovered
+        _named_audit("g-115-audit", ["g-350-04"]),
+    ]
+    _patch_reads(monkeypatch, goals)
+    calls = []
+    _patch_add_goal(monkeypatch, calls)
+    rc, res = _run_main(monkeypatch, ["--apply"], capsys)
+    assert rc == 0
+    assert res["reason_less_count"] == 2
+    assert res["uncovered_ids"] == ["g-350-10"]
+    assert res["open_audit_exists"] is True
+    assert res["investigate_filed"] == "g-115-audit-new"
+    assert len(calls) == 1  # exactly ONE new audit
+    rec = calls[0]["record"]
+    assert "g-350-10" in rec["description"]
+    # A (covered by the older audit) is NOT re-named in the fresh filing:
+    assert "g-350-04" not in rec["description"]
+    assert "g-350-04" not in rec["title"]
+
+
+def test_main_apply_stale_audit_names_none_does_not_suppress(monkeypatch, capsys):
+    """An open audit naming NONE of the current flagged ids is stale — it
+    must NOT suppress a fresh filing (the class-keyed latch, g-115-3068)."""
+    goals = [
+        _blocked(id="g-350-04"),
+        _named_audit("g-115-audit", ["g-999-999"]),
+    ]
+    _patch_reads(monkeypatch, goals)
+    calls = []
+    _patch_add_goal(monkeypatch, calls)
+    rc, res = _run_main(monkeypatch, ["--apply"], capsys)
+    assert rc == 0
+    assert res["reason_less_count"] == 1
+    assert res["uncovered_ids"] == ["g-350-04"]
+    assert res["investigate_filed"] == "g-115-audit-new"
+    assert len(calls) == 1
+    assert "g-350-04" in calls[0]["record"]["description"]
+
+
+def test_main_apply_all_covered_files_nothing(monkeypatch, capsys):
+    """Every flagged id named by an open audit -> no filing (the idempotent
+    skip the old dedup existed for is preserved)."""
+    goals = [
+        _blocked(id="g-350-04"),
+        _blocked(id="g-350-10"),
+        _named_audit("g-115-audit", ["g-350-04", "g-350-10"]),
+    ]
+    _patch_reads(monkeypatch, goals)
+    calls = []
+    _patch_add_goal(monkeypatch, calls)
+    rc, res = _run_main(monkeypatch, ["--apply"], capsys)
+    assert rc == 0
+    assert res["reason_less_count"] == 2
+    assert res["uncovered_ids"] == []
+    assert res["investigate_filed"] is None
+    assert calls == []
+
+
+def test_main_apply_dry_run_reports_uncovered_but_files_nothing(monkeypatch, capsys):
+    """The uncovered report is computed for dry-run too (it IS the report);
+    only --apply files."""
+    goals = [
+        _blocked(id="g-350-04"),
+        _named_audit("g-115-audit", ["g-999-999"]),  # stale
+    ]
+    _patch_reads(monkeypatch, goals)
+    calls = []
+    _patch_add_goal(monkeypatch, calls)
+    rc, res = _run_main(monkeypatch, [], capsys)  # no --apply
+    assert rc == 0
+    assert res["actions_taken"] == "dry-run"
+    assert res["uncovered_ids"] == ["g-350-04"]
+    assert res["investigate_filed"] is None
+    assert calls == []
+
+
+def test_main_apply_terminal_audit_does_not_cover(monkeypatch, capsys):
+    """A COMPLETED audit's naming surface is not live coverage — the
+    violation may have recurred with (the same) goals; file again."""
+    goals = [
+        _blocked(id="g-350-04"),
+        _named_audit("g-115-audit", ["g-350-04"], status="completed"),
+    ]
+    _patch_reads(monkeypatch, goals)
+    calls = []
+    _patch_add_goal(monkeypatch, calls)
+    rc, res = _run_main(monkeypatch, ["--apply"], capsys)
+    assert rc == 0
+    assert res["uncovered_ids"] == ["g-350-04"]
+    assert res["investigate_filed"] == "g-115-audit-new"
+    assert len(calls) == 1

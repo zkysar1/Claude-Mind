@@ -23,7 +23,10 @@ Design contract exercised here:
     happened, from the in-flight windows in _bash_inflight.py (g-115-11374);
   - resolves the agent from the payload session_id binding when MIND_AGENT is
     absent (the production PostToolUse[Bash] case);
-  - fails open on empty stdin.
+  - fails open on empty stdin;
+  - does not walk the git-ignored trees under core/ and .claude/ (core/logs/ and
+    the others in _edit_record_skip.py), records a real change made beside them,
+    and keeps a real file changed twice as two rows (g-115-11716).
 """
 
 from __future__ import annotations
@@ -35,6 +38,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+import pytest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
@@ -88,7 +93,7 @@ def _setup_repo(tmp: Path, agents=("alpha", "zeta")) -> Path:
     core_scripts = repo / "core" / "scripts"
     core_scripts.mkdir(parents=True)
     (repo / ".claude").mkdir()
-    for fname in ("bash-edit-record.sh", "_paths.sh", "_bash_inflight.py"):
+    for fname in ("bash-edit-record.sh", "_paths.sh", "_bash_inflight.py", "_edit_record_skip.py"):
         dst = core_scripts / fname
         dst.write_bytes((CORE_SCRIPTS / fname).read_bytes())
         dst.chmod(0o755)
@@ -425,3 +430,215 @@ def test_agent_private_path_not_recorded():
         log = _log(repo, "alpha")
         assert not log.exists() or "scratch.py" not in log.read_text(), \
             "agent-private path was wrongly recorded"
+
+
+# --- Git-ignored trees are not walked () -------------------------
+# Measured 2026-10-02 (alpha, cc-07, 6.8.0-142-generic): 153,872 of 158,268 rows
+# under the scan roots were paths git ignores (core/logs/ 72.6%, core/.pycache/
+# 23.0%), and each Bash call stat'ed 40,659 files, 36,607 of them under
+# core/.pycache. One file per ignored class, so a class dropped from the skip
+# list fails by name.
+
+IGNORED_TREE_FILES = [
+    "core/logs/hook-fires/full-suite-imperative-gate",
+    "core/logs/bash-inject-resolved/aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa",
+    "core/logs/owncloud-sweep-stats.jsonl",
+    "core/.pycache/opt/ayoai-mind/core/scripts/_history_store.cpython-312.pyc",
+    "core/scripts/tests/_tmp_case_test/tmpab12cd/repo/agents/zeta/self.md",
+    ".claude/.history/snapshots/skills/s/SKILL.md/2026-10-02T00-00-00_alpha.yaml",
+    ".claude/worktrees/wt1/core/scripts/copy.py",
+]
+
+
+def _recorded_files(repo: Path) -> list:
+    """Files the recorder logged, minus the memo _paths.sh writes the first time
+    the harness sources it (not a change under test)."""
+    return sorted({r["file"] for r in _records(repo, "alpha")} - {"core/scripts/.platform-memo.sh"})
+
+
+def _age_setup_files(repo: Path, mtime: int):
+    """Back-date what _setup_repo copied in, so only the files a test makes count
+    as changes."""
+    for p in (repo / "core").rglob("*"):
+        if p.is_file():
+            os.utime(p, (mtime, mtime))
+
+
+def test_hook_touches_of_git_ignored_trees_add_no_row_beside_a_real_change():
+    """A Bash call whose only effect on the tree is a hook touching core/logs/ files
+    records nothing; a real change made in the same window is recorded. The real
+    file is the positive control: it shows the recorder ran and walked the same
+    tree the ignored files sit in, so the empty result for them is a skip and not
+    a recorder that never fired (guard-2421)."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        base = int(time.time())
+        _age_setup_files(repo, base - 3600)
+        _seed_cursor(repo, "alpha", base - 60)
+        for rel in IGNORED_TREE_FILES:
+            _make_file(repo, rel, base - 5)
+        _make_file(repo, "core/scripts/real-tool.py", base - 5)
+
+        r = _run(repo, '{"session_id":""}', MIND_AGENT="alpha")
+        assert r.returncode == 0, f"crashed: {r.stderr!r}"
+
+        assert _recorded_files(repo) == ["core/scripts/real-tool.py"], _records(repo, "alpha")
+
+
+def test_a_bash_call_that_only_touches_ignored_files_leaves_the_log_alone():
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        base = int(time.time())
+        _age_setup_files(repo, base - 3600)
+        _seed_cursor(repo, "alpha", base - 60)
+        for rel in IGNORED_TREE_FILES:
+            _make_file(repo, rel, base - 5)
+
+        r = _run(repo, '{"session_id":""}', MIND_AGENT="alpha")
+        assert r.returncode == 0, f"crashed: {r.stderr!r}"
+
+        assert _recorded_files(repo) == [], _records(repo, "alpha")
+
+
+def test_paths_git_tracks_are_still_recorded_beside_look_alike_ignored_names():
+    """The skip is anchored: a directory that merely shares a name with an ignored
+    tree (logs, history, _tmp_ elsewhere, pycache without the dot) is a path git
+    tracks, and dropping its edits would be the over-inclusion this log exists to
+    prevent."""
+    look_alikes = [
+        "core/config/logs/notes.md",
+        "core/scripts/logs.py",
+        "core/scripts/tests/tmp_case/test_x.py",
+        "core/scripts/other/_tmp_case/x.py",
+        ".claude/skills/history/SKILL.md",
+        "core/pycache/notes.md",
+    ]
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        base = int(time.time())
+        _age_setup_files(repo, base - 3600)
+        _seed_cursor(repo, "alpha", base - 60)
+        for rel in look_alikes:
+            _make_file(repo, rel, base - 5)
+
+        r = _run(repo, '{"session_id":""}', MIND_AGENT="alpha")
+        assert r.returncode == 0, f"crashed: {r.stderr!r}"
+
+        assert _recorded_files(repo) == sorted(look_alikes), _records(repo, "alpha")
+
+
+def test_a_real_file_changed_twice_by_bash_is_recorded_twice():
+    """ stays: rows dedup on (file, mtime), so a second change to the
+    same real file is a second row. The skip list must not turn the dedup back
+    into per-file."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        base = int(time.time())
+        _seed_cursor(repo, "alpha", base - 60)
+        path = _make_file(repo, "core/scripts/twice.py", base - 30)
+        _make_file(repo, "core/logs/hook-fires/some-gate", base - 30)
+
+        assert _run(repo, '{"session_id":""}', MIND_AGENT="alpha").returncode == 0
+        mine = lambda: [(r["file"], r["mtime"]) for r in _records(repo, "alpha")
+                        if r["file"] in ("core/scripts/twice.py", "core/logs/hook-fires/some-gate")]
+        assert mine() == [("core/scripts/twice.py", base - 30)], _records(repo, "alpha")
+
+        _seed_cursor(repo, "alpha", base - 20)
+        os.utime(path, (base - 5, base - 5))
+        os.utime(repo / "core/logs/hook-fires/some-gate", (base - 5, base - 5))
+        assert _run(repo, '{"session_id":""}', MIND_AGENT="alpha").returncode == 0
+
+        assert mine() == [
+            ("core/scripts/twice.py", base - 30),
+            ("core/scripts/twice.py", base - 5),
+        ], _records(repo, "alpha")
+
+
+def test_without_the_skip_module_the_walk_still_records_real_changes():
+    """Fail-open: if _edit_record_skip.py is missing or broken the recorder falls
+    back to the names it skipped before the list existed. Extra rows are noise;
+    a dropped real edit is not."""
+    PROJECT_TMP.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=PROJECT_TMP) as td:
+        repo = _setup_repo(Path(td))
+        (repo / "core" / "scripts" / "_edit_record_skip.py").unlink()
+        base = int(time.time())
+        _age_setup_files(repo, base - 3600)
+        _seed_cursor(repo, "alpha", base - 60)
+        _make_file(repo, "core/scripts/real-tool.py", base - 5)
+        _make_file(repo, "core/scripts/__pycache__/real-tool.pyc", base - 5)
+
+        r = _run(repo, '{"session_id":""}', MIND_AGENT="alpha")
+        assert r.returncode == 0, f"crashed: {r.stderr!r}"
+
+        files = _recorded_files(repo)
+        assert "core/scripts/real-tool.py" in files, files
+        assert "core/scripts/__pycache__/real-tool.pyc" not in files, files
+
+
+# --- The skip list against .gitignore and against the tracked tree ----------
+
+REPO_ROOT = CORE_SCRIPTS.parent.parent
+
+
+def _skip_module():
+    import _edit_record_skip
+    return _edit_record_skip
+
+
+def _gitignore_dir_rules() -> set:
+    gitignore = REPO_ROOT / ".gitignore"
+    if not gitignore.is_file():
+        pytest.skip(f"no .gitignore at {gitignore}")
+    lines = [l.strip() for l in gitignore.read_text(encoding="utf-8").splitlines()]
+    return {l[:-1] for l in lines if l.endswith("/") and not l.startswith(("#", "!"))}
+
+
+def test_every_gitignore_directory_rule_under_a_scan_root_is_walked_around():
+    """Drift: a directory rule added to .gitignore under core/ or .claude/ whose
+    files hooks rewrite brings the junk rows back. This fails until the rule is
+    added to SKIP_GLOBS/SKIP_DIRS in _edit_record_skip.py."""
+    skip = _skip_module()
+    rules = _gitignore_dir_rules()
+    under_roots = sorted(r for r in rules if r.startswith(tuple(f"{root}/" for root in skip.SCAN_ROOTS)))
+    assert under_roots, "no anchored directory rule found under core/ or .claude/: the probe cannot fire"
+    uncovered = []
+    for rule in under_roots:
+        parent, _, name = rule.rpartition("/")
+        if not skip.skip_dir(parent, name.replace("*", "x")):
+            uncovered.append(rule)
+    assert not uncovered, (
+        f".gitignore directory rule(s) {uncovered} sit under a scan root but the recorder still walks them: "
+        "add them to _edit_record_skip.py"
+    )
+
+
+def test_nothing_is_skipped_that_gitignore_does_not_ignore():
+    skip = _skip_module()
+    rules = _gitignore_dir_rules()
+    unbacked = [g for g in skip.SKIP_GLOBS if g not in rules]
+    unbacked += [n for n in sorted(skip.SKIP_DIRS - {".git"}) if n not in rules and f"**/{n}" not in rules]
+    assert not unbacked, f"skipped but not a .gitignore directory rule: {unbacked}"
+
+
+def test_no_git_tracked_file_lies_under_a_skipped_directory():
+    """The safety property itself, on the real checkout: skipping a tree git
+    tracks would drop real edits from the log."""
+    skip = _skip_module()
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", "core", ".claude"],
+            capture_output=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        pytest.skip(f"git unavailable: {e}")
+    if out.returncode != 0:
+        pytest.skip(f"not a git checkout: rc={out.returncode}")
+    tracked = [p for p in out.stdout.decode("utf-8").split("\0") if p]
+    assert len(tracked) > 100, f"git ls-files returned {len(tracked)} paths: the probe cannot fire"
+    masked = [p for p in tracked if skip.is_skipped_path(p)]
+    assert masked == [], f"tracked files under a skipped directory: {masked[:10]}"

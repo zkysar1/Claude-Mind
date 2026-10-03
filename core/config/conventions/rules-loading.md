@@ -292,6 +292,29 @@ something is unpinned or the paths get shorter. Printing workspace-relative path
 index line would free 3,500 more chars (the path share falls from 4,790 to 1,290). That
 is a Zak-Code change and is not decided here.
 
+The planted aspire rule (`act-through-your-body`, bootstrap step 3.69, g-377-77) is that next
+rule. Re-measured 2026-10-02 with `render_index()` (Zak-Code d7e9a10, the build the vessel
+runs) over the 37 fleet rules, the findings rule and both pins (safety, no-money), at exact
+workspace path lengths. The harness reproduces the values above (32,041 / +647 at 136 and
+32,391 / +297 at 146 with the safety pin alone), so it is validated:
+
+| resident workspace path | slack before | slack after | fleet index lines pushed out |
+|---|---|---|---|
+| 99 chars | +1,683 | +1,383 | none |
+| 120 | +948 | +627 | none |
+| 136 | +388 | +51 | none |
+| 137 | +353 | +15 | none |
+| 138 | +318 | +258 | `user-interaction` |
+| 146 | +38 | −22 | `user-interaction` |
+| 155 | +19 (one line already dropped) | +23 | `stop-hook-compliance`, the second |
+
+The rule's line costs 300 chars at a 99-char path and 337 at 136 (g-377-77). It fits through a 137-char
+path; from 138 chars up it pushes the alphabetically last fleet rule's index line out, as the
+paragraph above predicted for the next rule. The path counts (124 of 138 workspaces at 99,
+4 at 146) are from the 2026-09-30 measurement, not re-measured. The Environment-Server test
+`test_aspire_rule_planted` holds a ceiling on the rule's name plus description (160 chars), so
+growing either forces this measurement to be redone.
+
 ## Cross-references
 
 - `.claude/rules/gradle-tests-pattern.md` — the first scoped rule

@@ -154,13 +154,15 @@ class CodecError(ValueError):
     object). Raised loudly so a garbage body never reaches a store parser."""
 
 
-def flag_envs(env: Optional[dict] = None) -> frozenset:
+def flag_envs(env: Optional[dict] = None, flag_env: str = FLAG_ENV) -> frozenset:
     """The environment-ids the writer flag names (lower-cased), or the
     singleton {"*"} for every env. A legacy boolean spelling ("1", "true",
     "yes", "on") names no env and yields the EMPTY set — the fail-safe
-    reading of a flip that forgot to say which deployment it is for."""
+    reading of a flip that forgot to say which deployment it is for.
+    `flag_env` names another writer flag read the same way (the composite
+    layout's, g-358-202); the default is the gzip flag."""
     e = os.environ if env is None else env
-    raw = (e.get(FLAG_ENV, "") or "").replace(",", " ").split()
+    raw = (e.get(flag_env, "") or "").replace(",", " ").split()
     ids = {t.strip().lower() for t in raw if t.strip()}
     ids -= _LEGACY_TRUTHY
     if FLAG_ALL_ENVS in ids:
@@ -168,14 +170,14 @@ def flag_envs(env: Optional[dict] = None) -> frozenset:
     return frozenset(ids)
 
 
-def flag_enabled(env: Optional[dict] = None) -> bool:
+def flag_enabled(env: Optional[dict] = None, flag_env: str = FLAG_ENV) -> bool:
     """Is the writer flag set to something that can encode ANY env?"""
-    return bool(flag_envs(env))
+    return bool(flag_envs(env, flag_env))
 
 
-def env_enabled(env_id: Optional[str], env: Optional[dict] = None) -> bool:
+def env_enabled(env_id: Optional[str], env: Optional[dict] = None, flag_env: str = FLAG_ENV) -> bool:
     """Is THIS deployment's env_id named by the writer flag (or is it `*`)?"""
-    ids = flag_envs(env)
+    ids = flag_envs(env, flag_env)
     if not ids:
         return False
     if FLAG_ALL_ENVS in ids:

@@ -292,3 +292,65 @@ def test_daemon_allocator_skips_evicted_seqs():
            "archived_census": {"evicted_ids": {"completed": ["g-115-07"]}}}
     assert aw._allocate_goal_id(asp) == "g-115-08"
     assert aw._allocate_goal_id({"id": "asp-115", "goals": [{"id": "g-115-03"}]}) == "g-115-04"
+
+
+# ------------------------------------------------- closer-role census ()
+#
+# Eviction drops a goal's whole record, completed_by_role with it, so a closure the
+# post-hoc close-review lane never reached left no trace it could count. The role
+# now survives as an id set beside evicted_ids, merged by union like it.
+
+def test_bump_closer_role_keeps_completed_closers_by_role():
+    asp = {"id": "asp-021", "goals": []}
+    _evict._bump_closer_role(asp, _goal("g-021-02", "completed", completed_by_role="Worker"))
+    _evict._bump_closer_role(asp, _goal("g-021-01", "completed", completed_by_role="worker"))
+    _evict._bump_closer_role(asp, _goal("g-021-02", "completed", completed_by_role="worker"))
+    _evict._bump_closer_role(asp, _goal("g-021-03", "skipped", completed_by_role="worker"))
+    _evict._bump_closer_role(asp, _goal("g-021-04", "completed"))
+    # Sorted and deduped, lower-cased; a skipped goal is no closure, and a goal
+    # closed with no role stamped has nothing to keep.
+    assert census.census_closer_role_ids(asp) == {"worker": ["g-021-01", "g-021-02"]}
+    assert "evicted_ids" not in asp["archived_census"]   # the status census is _bump_census's
+
+
+def test_evictor_keeps_the_role_and_every_metric():
+    worker = _goal("g-022-01", "completed", completed_at=OLD, completed_by_role="worker")
+    unstamped = _goal("g-022-02", "completed", completed_at=OLD)
+    live = _goal("g-022-03", "pending")
+    asp = {"id": "asp-022", "title": "t", "goals": [worker, unstamped, live]}
+    # The evictor raises before returning if any completion metric moved.
+    out = _evict._make_evictor(CUTOFF)([asp])[0]
+    assert [g["id"] for g in out["goals"]] == ["g-022-03"]
+    assert out["archived_census"]["evicted_ids"] == {"completed": ["g-022-01", "g-022-02"]}
+    assert census.census_closer_role_ids(out) == {"worker": ["g-022-01"]}
+    assert census.census_by_status(out) == {"completed": 2}   # the role set adds no count
+
+
+def test_merge_unions_the_closer_role_set():
+    a = {"evicted_ids": {"completed": ["g-1-01"]},
+         "evicted_by_closer_role": {"worker": ["g-1-01"]}}
+    b = {"evicted_ids": {"completed": ["g-1-02", "g-1-03"]},
+         "evicted_by_closer_role": {"worker": ["g-1-02"], "reducer": ["g-1-03"]}}
+    m1, m2 = cm._merge_archived_census(a, b), cm._merge_archived_census(b, a)
+    assert m1 == m2
+    # A canonical-max pick would keep one side's dict whole; the union keeps both.
+    assert m1["evicted_by_closer_role"] == {"reducer": ["g-1-03"],
+                                            "worker": ["g-1-01", "g-1-02"]}
+    assert cm._merge_archived_census(m1, a) == m1
+    one = cm._merge_archived_census(
+        {"evicted_by_closer_role": {"worker": ["g-1-05", "g-1-04", "g-1-04"]}}, None)
+    assert one == cm._merge_archived_census(
+        None, {"evicted_by_closer_role": {"worker": ["g-1-05", "g-1-04", "g-1-04"]}})
+    assert one["evicted_by_closer_role"] == {"worker": ["g-1-04", "g-1-05"]}
+
+
+def test_closer_role_set_survives_a_full_record_merge_from_either_side():
+    a = {"id": "asp-023", "title": "x", "goals": [], "last_selected": "2026-06-01T00:00:00",
+         "archived_census": {"evicted_ids": {"completed": ["g-023-01"]},
+                             "evicted_by_closer_role": {"worker": ["g-023-01"]}}}
+    b = {"id": "asp-023", "title": "x", "goals": [], "last_selected": "2026-06-09T00:00:00",
+         "archived_census": {"evicted_ids": {"completed": ["g-023-02"]},
+                             "evicted_by_closer_role": {"worker": ["g-023-02"]}}}
+    m1, m2 = cm.merge_aspirations(_blob(a), _blob(b)), cm.merge_aspirations(_blob(b), _blob(a))
+    assert m1 == m2
+    assert census.census_closer_role_ids(_one(m1)) == {"worker": ["g-023-01", "g-023-02"]}

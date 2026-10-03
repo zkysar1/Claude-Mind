@@ -268,3 +268,47 @@ that never asked the gate has no census, so it cannot declare "no work". The
 reducer-gone park (Phase 0.5) and the loop-exhaustion fence pass no flag and
 are unchanged. The declines are the record a later `requires_capability` pass
 can mine for locus-bound goals.
+
+## Why the role read runs UNDER the claim (g-375-110)
+
+Phase 1 used to have a worker read an `undetermined` row's record with
+`aspirations-query.sh --full` BEFORE claiming it, and Phase 2.9 then read the
+same record again from the claim response. `undetermined` is the common
+verdict: 919 of 938 live candidates name no skill (above), so the bridge
+declines on most rows. Measured 2026-10-02 on the zc worker Bodies, after the
+cc-04 reducer lapse, from transcripts (tool, script and flag names and goal ids
+only) and the Body traces:
+
+- One model call took 33 to 735 s, so every read before the claim cost minutes.
+- Select-walk to claim took 22.4 min on zc-02 and 12.0 min on zc-08; zc-04 had
+  no claim after 46 min. Over 31 episodes the median was 10 tool calls from
+  select-walk to claim (g-375-110 note g110-baseline-1002).
+- Convergence: g-115-8602 drew three alpha workers in 35 min. zc-06 read it at
+  00:43:49, another worker session closed it at 01:09:27, and zc-08 claimed it
+  at 01:12:47 off its 01:00:45 walk. A row nobody has claimed is visible to
+  every walk, so each sibling's read bought nothing.
+- Double reading: zc-08 ran `--full` on g-115-8602 before its claim (01:03:36)
+  and again after it (01:14:21).
+
+The read before the claim existed so that no worker EXECUTES a reducer-only
+goal (g-115-5664, above). That needs the read before the first ACTION, which is
+where guard-2803 places it, not before the claim, and Phase 2.9 runs before any
+execution. So the claim moved first: a worker claims the first eligible or
+undetermined row straight after select-walk and judges the role from the claim
+response, which IS the full record. A misfit is released unstarted with
+`--reason-kind role`, so its `release_negatives` entry is typed and countable
+(g-115-8163), and the next Body to claim the goal reads why the last one let go.
+
+What claim-first costs: a misfit row is held for one record read, and siblings
+walk past it meanwhile. The old order charged that same read to every sibling,
+in parallel, on rows any of them could take. After the release the Body claims
+the NEXT row of the same walk rather than walking again: neither the scorer nor
+select-walk reads `release_negatives`, so a new walk would rank the released
+row first and hand it straight back. A Body that meets the row on a later
+cycle claims it again and reads the `role` entry, which names why the last
+Body let go, in the claim response at Phase 2.9. A released row also stays in
+the walk's census, and `supply_gap_refusals` asks a decline for every census
+row, so the supply-gap park text names released rows among those to decline. Reducer-STAMPED rows are not
+affected: the selector never shows them to a worker, and the claim-boundary
+recheck above (g-306-449) still warns on one stamped after it was scored; its
+message now names the same `--reason-kind role` release.

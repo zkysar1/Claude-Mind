@@ -170,7 +170,10 @@ LANES = (
         "script": "precheck-eval.sh",
         # Subcommand REQUIRED -- a bare call exits 2 (tier table, ).
         "extra_args": ("run-all",),
-        "apply_flag": False,
+        # --apply arms pipeline-depth's §4 starvation fail-safe promote (B3,
+        # ) -- run-all's only side effect, a no-op while
+        # candidate_tier is OFF.
+        "apply_flag": True,
         "finds": {"counts": (), "lists": ("flags",), "false": ()},
     },
     {

@@ -560,10 +560,10 @@ def test_help_exits_0_and_is_not_refused(wrapper):
 
 
 # Wrappers that accept at least one real flag, so `<flag> --help` is a valid
-# invocation. pipeline-update-field takes three positionals and NO flags, so
-# `--source world --help` correctly refuses at --source before reaching --help —
-# excluding it here is a scope statement, not a waiver.
+# invocation. pipeline-update-field refuses --source, so it is probed with the
+# value flag it accepts since .
 HELP_AFTER_FLAG = [
+    ("pipeline-update-field.sh", ["--value-stdin", "--help"]),
     ("aspirations-update-goal.sh", ["--source", "world", "--help"]),
     ("aspirations-update.sh", ["--source", "world", "--help"]),
     ("aspirations-add-goal.sh", ["--source", "world", "--help"]),

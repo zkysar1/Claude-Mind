@@ -36,16 +36,34 @@ guard-1465 vacuous-check failure this goal was filed to prevent. Thresholds belo
 sit just above each store's measured p99 instead: rare enough to stay advisory,
 low enough to actually fire.
 
-WHAT IT CANNOT DO. g-115-3223 outcome 4 asked that the guard-1486-vs-guard-1485
-case reproduce a warning. It cannot, at ANY lexical threshold. Measured: those two
-score jaccard 0.112, and guard-1485 ranks **20th** among guard-1486's neighbours —
-BELOW the store's median nearest-neighbour similarity (0.155). Nineteen unrelated
-guardrails are lexically closer than the true duplicate. They share a root cause
-(NUL bytes in pytest logs defeating grep) expressed in almost disjoint vocabulary.
-Catching that pair needs SEMANTIC similarity (embeddings), not token overlap, and
-is tracked separately. This module detects near-VERBATIM restatement — the
-rb-4038-vs-rb-615 class the goal also names — and says so rather than implying the
-broader capability.
+SEMANTIC TIER (g-306-574 unit C, 2026-10-02)
+--------------------------------------------
+A second, strictly advisory tier runs alongside the lexical one: it queries the
+per-box retrieval embedding index (_embedding_retrieval.cosine_scores, the same
+query path retrieval uses), partitions the rows to this store by the BUILDER's
+own per-row doc-type (the index meta.json is the SSOT — never re-derived), and
+prints the top 3 matches with scores when the TOP match crosses the store's
+calibrated cosine threshold.
+
+Advisory-only and fail-open like the lexical tier: missing index, unavailable
+model, bad meta, any runtime error -> lexical-only, exit 0, never blocks. The
+candidate is embedded on the SAME supplementary_text_parts surface the builder
+embedded the rows (a score on a different surface is not a measurement), and the
+thresholds (_dupe_semantic_thresholds.py) are model-specific — a rebuilt index
+with a different model voids them (guard-1511: re-sweep, record the margins).
+
+WHAT IT CANNOT DO — MEASURED, BOTH TIERS. The guard-1486-vs-guard-1485 reworded
+case scores jaccard 0.112 (rank 20 of 220 lexical neighbours — no lexical
+threshold catches it) AND cosine 0.6227 on all-MiniLM-L6-v2 (ranks 28th/13th of
+7,086 guardrails — BELOW the unrelated-record nearest-neighbour floor's median
+0.6788, p99 0.8832). No threshold on this model separates that reworded twin
+from the noise floor, so the guardrails tier is flagged THIN-MARGIN and its twin
+recall is UNVALIDATED; reasoning-bank and pattern-signatures have no surviving
+live twin to validate against (p99 rarity bound only). The class that DOES fire
+is the near-verbatim one (the goal's own cc-12 copies: cosine 0.694/0.659 at
+rank 1–2) — and the reworded case remains in the recurring near-dup
+consolidation review's hands. The module says this in the warning text rather
+than implying the broader capability.
 
 TITLE, NOT TITLE+CONTENT, for reasoning-bank: measured 0.529 title-only vs 0.368
 title+content on the rb-3927/rb-4038 known-duplicate pair. Long content dilutes
@@ -177,6 +195,133 @@ def format_warning(store: str, label: str, nearest_id: str, similarity: float,
     )
 
 
+# ── Semantic tier (g-306-574 unit C) ─────────────────────────────────────────
+# STRICTLY ADVISORY and fail-open, exactly like the lexical tier: it can add a
+# second advisory line, and nothing in it can change the return code, refuse an
+# add, or even suppress the lexical line. The model in _dupe_semantic_thresholds
+# is the calibration source of truth — a rebuilt index under a DIFFERENT model
+# voids the thresholds (guard-1511), so rather than silently scoring with
+# numbers that no longer mean anything, the tier stays off and records WHY.
+SEMANTIC_TOP_K = 3
+
+
+def _semantic_text(record: dict) -> str:
+    """The candidate's EMBEDDING surface: retrieve.supplementary_text_parts —
+    the SAME surface embedding-index-build.match_text embedded the index rows
+    on. A hand-maintained second field list here would be the g-306-45
+    anti-pattern (two halves of a join written twice), so the builder's shared
+    helper is the source, not a copy. Deliberately NOT signal_text(): that is
+    the lexical tier's surface, and a cosine measured on one surface against
+    rows written on another is not a measurement."""
+    try:
+        import retrieve as _r
+        return " ".join(_r.supplementary_text_parts(record)).strip()
+    except Exception:
+        return ""
+
+
+# Which builder doc-type in the index's meta.json belongs to which store.
+# Mirrors embedding-index-build.load_corpus (guardrail / rb / signature rows
+# are written by it); the query side reads the per-row `type` FROM the index
+# (the SSOT) and uses this map only to pick out this store's rows.
+STORE_DOC_TYPE = {
+    "guardrails": "guardrail",
+    "reasoning-bank": "rb",
+    "pattern-signatures": "signature",
+}
+
+
+def semantic_scores(record: dict, store: str, cand_id: str = ""):
+    """Pure half of the semantic tier: this store's same-store rows scored
+    against the candidate's embedding surface, ranked descending, own id
+    excluded.
+
+    Always returns the 2-tuple (payload, meta): ((matches, threshold,
+    model), None) where matches is a ranked list of (doc_id, cosine) — or
+    (None, reason) on ANY of: unknown store, no calibrated threshold, no
+    semantic text, index absent or unreadable, index built under a model
+    other than the calibrated one (guard-1511: the numbers would be
+    meaningless, so the tier stays off and says WHY), empty same-store
+    partition, or encoder/index runtime error. ONE shape, both halves — the
+    success path's 3-tuple used to make `out, meta = ...` raise, and this
+    file swallows that into `error:ValueError` (a reason that names nothing).
+    Pure in the retrieval-module surface it is tested against: the tests
+    monkeypatch `_embedding_retrieval.cosine_scores / doc_types / index_model`,
+    so no model loads and no real index is touched."""
+    import _dupe_semantic_thresholds as _dst
+    thr = _dst.SEMANTIC_THRESHOLDS.get(store)
+    doc_type = STORE_DOC_TYPE.get(store)
+    if thr is None or doc_type is None:
+        return None, "no-calibrated-threshold"
+    query = _semantic_text(record)
+    if not query:
+        return None, "no-semantic-text"
+    import _embedding_retrieval as _er
+    model = _er.index_model()
+    if model is None:
+        # Absent vs present-but-unreadable are different operator actions:
+        # build the index, versus fix a torn/partial meta.json write.
+        return None, ("index-meta-unreadable" if _er.index_available()
+                      else "index-absent")
+    if model != _dst.CALIBRATED_MODEL:
+        return None, f"model-mismatch:{model}"
+    scores = _er.cosine_scores(query)
+    if not scores:
+        reason = (_er.last_degradation() or {}).get("reason") or "degraded"
+        return None, reason
+    types = _er.doc_types()
+    if not types:
+        return None, "doc-types-unreadable"
+    matches = sorted(((sid, sc) for sid, sc in scores.items()
+                      if types.get(sid) == doc_type and sid != cand_id),
+                     key=lambda p: p[1], reverse=True)
+    if not matches:
+        return None, "no-same-store-rows"
+    return (matches, thr, model), None
+
+
+def format_semantic_lines(matches, threshold: float, model: str, label: str,
+                          top_k: int = SEMANTIC_TOP_K) -> str:
+    """The advisory block for a firing semantic tier (top match already crossed
+    `threshold`). Pure formatting — no I/O, no retrieval."""
+    lines = ["[store-dupe-warn] SEMANTIC (advisory, not blocking): top "
+             f"{min(top_k, len(matches))} existing {label} entries by "
+             f"embedding cosine against this {label}"]
+    for sid, sc in matches[:top_k]:
+        lines.append(f"[store-dupe-warn]   {sc:.3f}  {sid}")
+    lines.append(f"[store-dupe-warn]   (top cosine >= {threshold} on the {model} "
+                 "index; the add was NOT blocked; near-verbatim twins score "
+                 "highest — a duplicate reworded in different words may still "
+                 "sit in the unrelated-record floor; calibration: "
+                 "_dupe_semantic_thresholds.py)")
+    return "\n".join(lines)
+
+
+def semantic_check(record: dict, store: str, cfg: dict,
+                   top_k: int = SEMANTIC_TOP_K):
+    """The ADVISORY semantic tier, one call. Always returns the 4-tuple
+    (lines, top_id, top_cosine, reason): exactly one of the two halves is
+    populated — (lines, top_id, top_cosine, None) when the top match crossed
+    the store's calibrated cosine threshold, else (None, None, None, reason),
+    where reason is the semantic_scores verdict so the telemetry lane can say
+    WHY the tier served nothing on a given add. NEVER raises — the lexical
+    tier's fail-open contract applies to this one too, and nothing in here
+    may change the return code or suppress the lexical line."""
+    try:
+        out, meta = semantic_scores(record, store, str(record.get("id") or ""))
+        if out is None:
+            return None, None, None, meta
+        matches, thr, model = out
+        top_id, top_score = matches[0]
+        if top_score < thr:
+            return None, None, None, "below-threshold"
+        return (format_semantic_lines(matches, thr, model,
+                                      cfg.get("label", store), top_k),
+                top_id, round(top_score, 4), None)
+    except Exception as exc:
+        return None, None, None, f"error:{type(exc).__name__}"
+
+
 def check(record: dict, store: str, corpus: Optional[List[Tuple[str, str]]] = None,
           world_dir: Optional[Path] = None,
           detail: Optional[dict] = None) -> Optional[str]:
@@ -199,6 +344,37 @@ def check(record: dict, store: str, corpus: Optional[List[Tuple[str, str]]] = No
             detail.clear()
             detail["decision"] = decision
             detail.update(kw)
+
+    def _finish(lex, semantic):
+        # The single exit for every REACHED verdict. `lex` is (warning,
+        # mark_kwargs) or (None, noop_kwargs); `semantic` is the
+        # semantic_check 4-tuple. The decision follows what the USER SAW: a
+        # line on stderr from EITHER tier is `pass` — "trigger matched, fired
+        # but did not block" is the taxonomy's definition of an advisory, and
+        # the semantic tier is a trigger of this same gate. Recording a
+        # line-emitting call as `noop` would be the g-115-3093 misdescription
+        # class (the record says "no trigger matched" while a warning sits in
+        # the caller's stderr). Silence from both tiers is `noop`; nothing in
+        # `semantic` can block, and the extra fields keep the two tiers
+        # separable for the retirement evaluator (semantic_fired /
+        # semantic_top1 / semantic_reason).
+        lex_warning, mark_kw = lex
+        sem_lines, sem_top_id, sem_cos, sem_reason = semantic
+        mark_kw = dict(mark_kw)
+        mark_kw.pop("decision", None)   # the decision is RE-DERIVED below
+        if sem_lines is not None:
+            mark_kw["semantic_fired"] = True
+            mark_kw["semantic_top1"] = sem_top_id
+            mark_kw["semantic_top1_cosine"] = sem_cos
+        else:
+            mark_kw["semantic_reason"] = sem_reason
+        decision = "pass" if (lex_warning is not None or sem_lines is not None) else "noop"
+        _mark(decision, **mark_kw)
+        if lex_warning is None:
+            return sem_lines
+        if sem_lines is None:
+            return lex_warning
+        return lex_warning + "\n" + sem_lines
 
     cfg = STORES.get(store)
     if cfg is None:
@@ -226,28 +402,38 @@ def check(record: dict, store: str, corpus: Optional[List[Tuple[str, str]]] = No
     cand_id = str(record.get("id") or "")
     if cand_id:
         corpus = [(i, t) for i, t in corpus if i != cand_id]
+    # The semantic tier runs for EVERY reached verdict (warn or not): it is a
+    # separate advisory signal with its own calibrated bar, and a lexical miss
+    # is exactly the case it was filed for. It is lazy-imported, fail-open, and
+    # cannot flip the decision or the exit code — only add lines and a field.
+    semantic = semantic_check(record, store, cfg)
     near_id, sim, near_text = mdl_gate.nearest(candidate, corpus)
     if near_id is None:
-        _mark("noop", reason="no comparable neighbour", corpus_size=len(corpus))
-        return None
+        return _finish((None, {"decision": "noop",
+                               "reason": "no comparable neighbour",
+                               "corpus_size": len(corpus)}), semantic)
     if sim < cfg["threshold"]:
         # The scan RAN and cleared the candidate. Recorded as `noop` (no trigger
         # matched) rather than `pass`, so `count(decision != "noop")` — the
         # retirement evaluator's fired-count — equals the number of times this
         # actually WARNED. Calling every silent add a `pass` would make the
         # helper look permanently useful and un-retirable.
-        _mark("noop", corpus_size=len(corpus), nearest_id=near_id,
-              similarity=round(sim, 4), threshold=cfg["threshold"])
-        return None
+        return _finish((None, {"decision": "noop",
+                               "corpus_size": len(corpus), "nearest_id": near_id,
+                               "similarity": round(sim, 4),
+                               "threshold": cfg["threshold"]}), semantic)
     # Warned. `pass` in the _gate_log taxonomy is "trigger matched, fired but did
     # NOT block the caller" — exactly an advisory. NOT `block`: this helper never
     # stops an add and never recommends stopping one, so a `block` record would
     # overstate it. (Contrast goal-pickup-coordination-check, where race_risk IS
     # a yield recommendation and `block` is the honest label. Same mechanism, two
     # different verdicts — an inherited mapping would misreport.)
-    _mark("pass", corpus_size=len(corpus), nearest_id=near_id,
-          similarity=round(sim, 4), threshold=cfg["threshold"])
-    return format_warning(store, cfg["label"], near_id, sim, cfg["threshold"], near_text)
+    return _finish((format_warning(store, cfg["label"], near_id, sim,
+                                   cfg["threshold"], near_text),
+                    {"decision": "pass",
+                     "corpus_size": len(corpus), "nearest_id": near_id,
+                     "similarity": round(sim, 4),
+                     "threshold": cfg["threshold"]}), semantic)
 
 
 def refuse_check(record: dict, store: str,

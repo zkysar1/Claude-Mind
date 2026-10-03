@@ -222,6 +222,15 @@ opposite actions based on the `applied` counter.
 Fail-open: if the source-goal lookup fails for a rule, default to
 node.last_updated as the age proxy. Never retire a rule whose age cannot
 be determined at all (treat unknown age as fresh).
+
+# REACHABILITY GATE — runs BEFORE the retire loop above; fail CLOSED (rb-6174,
+# guard-841). An absent suffix reads as applied == 0, so the predicate is only
+# meaningful where the counter is actually written. Measure the share of rule
+# lines that carry an `applied:` suffix. Below 5%, the counter is not wired:
+# report the census, retire NOTHING, and leave the lane as a detector.
+# Measured 2026-10-02 (g-001-01): 6 of 2,960 rule lines (0.20%) carried the
+# suffix, in 1 node, all stamped on one date, so `applied == 0` matched 1,199
+# lines (309 nodes) by default rather than by disuse.
 ```
 
 ### Step 2.6: Tree Node Utility Curation

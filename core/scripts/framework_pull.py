@@ -481,6 +481,89 @@ def read_halves(out_dir):
     return rows
 
 
+# ----------------------------------------- C4 baseline differential (opt-in)
+#
+# Strict C4 asks "is the suite green?". A deployment whose own suite is red
+# BEFORE the adoption, for reasons it owns, can never answer yes, so every
+# adoption rolls back. --c4-baseline asks the question C4 exists for instead --
+# "did THIS adoption add a red?" -- by running the same suite on the pre-adopt
+# commit, on the same box, and comparing failing node ids. Strict stays the
+# default. Normative text: pull-promotion.md, "C4 baseline differential";
+# measurement and reasoning: core/config/rationale/c4-baseline-differential.md.
+
+_RED_LINE = re.compile(r"^(?:FAILED|ERROR) (\S.*?)(?: - .*)?$")
+_NODE_ID = re.compile(r"^[\w./\\-]+\.py(?:::|$)")
+
+
+def failing_node_ids(text: str) -> set:
+    """Full pytest node ids named by FAILED/ERROR short-summary lines.
+
+    FULL ids, [param] included: run-full-suite.py's own failing_tests() drops
+    the class and the parametrize id so a person can cite the function, and a
+    differential built on that would let a NEW failing parameter of an
+    already-red test hide behind it. A line counts only when its id STARTS with
+    a .py path (then "::" or the end), so a free-text ERROR line from the runner
+    cannot enter the set. An id is cut at the first " - ", as the runner's own
+    parser does; a [param] containing " - " is cut the same way in both runs.
+    """
+    out = set()
+    for line in (text or "").splitlines():
+        m = _RED_LINE.match(line.rstrip())
+        if m and _NODE_ID.match(m.group(1)):
+            out.add(m.group(1).strip())
+    return out
+
+
+def failing_node_ids_from_dir(out_dir) -> set:
+    """Union of failing_node_ids over <out_dir>/chunk-*.log.
+
+    The chunk logs, NOT the runner's stdout: on a GENUINE verdict the runner
+    prints failing FILES with counts and never the node ids, so a parse of the
+    captured stdout finds nothing and would read as "no reds". The runner
+    rotates the previous run's chunk logs aside before it starts and this glob
+    is not recursive, so one run's ids cannot leak into the next run's set.
+    Absent or unreadable -> the empty set, which verify_with_baseline treats as
+    unprovable, never as clean.
+    """
+    ids = set()
+    if not out_dir:
+        return ids
+    try:
+        for f in sorted(Path(out_dir).glob("chunk-*.log")):
+            ids |= failing_node_ids(f.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return set()
+    return ids
+
+
+def _verdict_trustworthy(verdict) -> bool:
+    """The run concluded and its numbers mean something: CLEAN or GENUINE.
+
+    INVALID (contended, tree-moved, hung, could not spawn) and a missing
+    verdict mean the failing set is not evidence about the tree (guard-1760).
+    """
+    return bool(verdict) and "INVALID" not in verdict \
+        and ("CLEAN" in verdict or "GENUINE" in verdict)
+
+
+def _framework_halves_clean(halves) -> bool:
+    """True when halves.jsonl was read and no framework-owned half is red.
+
+    The rule suite_is_green applies when it excuses a red rc, minus its "a
+    deployment half must explain the rc" clause (here the chunked half's own
+    pre-existing reds explain it). A half with no row reads as not red, as it
+    does in suite_is_green. Absent or unreadable halves are unprovable.
+    """
+    if not halves:
+        return False
+    by_half = {h.get("half"): h for h in halves if isinstance(h, dict)}
+    for name in FRAMEWORK_HALVES:
+        row = by_half.get(name)
+        if row is not None and row.get("rc") not in (0, None):
+            return False
+    return True
+
+
 # --------------------------------------------------- C4 in a pinned worktree
 
 # The gitignored runtime state a `git worktree add --detach` checkout does NOT
@@ -568,7 +651,8 @@ def bridge_runtime_state(project_root: Path, wt: Path, agent: str | None) -> lis
 
 
 def verify_in_worktree(project_root: Path, sha: str, log_path: Path,
-                       agent: str | None = None, runner=None, bridger=None):
+                       agent: str | None = None, runner=None, bridger=None,
+                       collect_failures: bool = False):
     """C4 verify, pinned at `sha` in a detached worktree off project_root.
 
     WHY THE LIVE TREE CANNOT BE THE VERIFY TREE: run-full-suite's tree-moved
@@ -587,6 +671,11 @@ def verify_in_worktree(project_root: Path, sha: str, log_path: Path,
     created, which suite_is_green reads as not-green via the INVALID verdict.
     The teardown is in a `finally`, per guard-5842: a leftover worktree is not
     inert -- it is a live source of reds elsewhere in the suite.
+
+    With collect_failures=True, meta["failed"] is the sorted list of FAILED and
+    ERROR node ids read from the runner's chunk logs (the stdout log does not
+    carry them; see failing_node_ids_from_dir). Off by default: strict C4 never
+    reads it.
     """
     import shutil as _sh
     import tempfile as _tf
@@ -611,10 +700,75 @@ def verify_in_worktree(project_root: Path, sha: str, log_path: Path,
         out_dir = suite_out_dir(wt)
         meta["out_dir"] = str(out_dir) if out_dir else None
         meta["halves"] = read_halves(out_dir)
+        if collect_failures:
+            meta["failed"] = sorted(failing_node_ids_from_dir(out_dir))
         return rc, verdict, meta
     finally:
         git(project_root, "worktree", "remove", "--force", str(wt), timeout=300)
         _sh.rmtree(wt, ignore_errors=True)
+
+
+def verify_with_baseline(project_root: Path, adopt_sha: str, pre_sha: str,
+                         log_path: Path, agent: str | None = None, verifier=None):
+    """C4 in its opt-in baseline form: green iff the adoption added no red test.
+
+    Strict first. Only when the strict verdict is red does it spend a SECOND
+    suite run, on `pre_sha` (this box's tree before the adoption). Green then
+    means all three hold: the adopt-commit run concluded with real failures
+    (GENUINE), every failing node id on it also failed on the pre-adopt tree,
+    and no framework-owned half is red. Everything else is red, with the reason
+    in meta["baseline_refused"] -- including each case where the evidence
+    cannot prove "no new reds" (an INVALID run, a GENUINE verdict beside an
+    empty failing set, unreadable halves). The cheap refusals run BEFORE the
+    second suite run is paid for.
+
+    Returns (green, verdict, meta): the 3-tuple adopt()'s pinned default verify
+    already returns.
+    """
+    verifier = verifier or verify_in_worktree
+    rc, verdict, meta = verifier(project_root, adopt_sha, log_path,
+                                 agent=agent, collect_failures=True)
+    meta = dict(meta or {})
+    post_failed = set(meta.pop("failed", None) or [])
+    if suite_is_green(rc, verdict, meta.get("halves")):
+        meta["c4_mode"] = "strict"
+        return True, verdict, meta
+    meta["c4_mode"] = "baseline-differential"
+
+    def refuse(why):
+        meta["baseline_refused"] = why
+        return False, verdict, meta
+
+    if not _verdict_trustworthy(verdict):
+        return refuse("the adopt-commit run did not conclude (INVALID or no "
+                      "verdict); its failures are not evidence")
+    if "CLEAN" in verdict:
+        return refuse("the chunked half is clean, so the red is in another half; "
+                      "no baseline excuses a framework-owned half")
+    if not post_failed:
+        return refuse("GENUINE verdict but no FAILED/ERROR node id was read from "
+                      "the chunk logs; cannot prove the reds are not new")
+    if not _framework_halves_clean(meta.get("halves")):
+        return refuse("a framework-owned half is red, or halves.jsonl is unreadable")
+
+    base_log = log_path.with_name(log_path.stem + "-baseline" + log_path.suffix)
+    b_rc, b_verdict, b_meta = verifier(project_root, pre_sha, base_log,
+                                       agent=agent, collect_failures=True)
+    meta["baseline_verdict"] = b_verdict
+    if not _verdict_trustworthy(b_verdict):
+        return refuse("the pre-adopt baseline run did not conclude; there is "
+                      "nothing to compare against")
+    base_failed = set((b_meta or {}).get("failed") or [])
+    if "GENUINE" in b_verdict and not base_failed:
+        return refuse("baseline GENUINE but no node id was read from its chunk "
+                      "logs; cannot compare")
+    new = sorted(post_failed - base_failed)
+    meta["post_reds"] = len(post_failed)
+    meta["baseline_reds"] = len(base_failed)
+    meta["new_reds"] = new[:50]
+    note = (f"baseline differential: {len(post_failed)} red after adopt, "
+            f"{len(base_failed)} red before, {len(new)} new")
+    return (not new), f"{verdict} -- {note}", meta
 
 
 # ------------------------------------------------------------ orchestration
@@ -902,7 +1056,7 @@ def _default_restart(project_root: Path) -> bool:
 
 def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
           world_dir: Path, verify=None, restart=None, pusher=None,
-          copier=None) -> dict:
+          copier=None, c4_baseline: bool = False) -> dict:
     """Execute the adoption: graft -> copy -> commit -> verify -> adopt/rollback.
 
     Every side-effecting collaborator is injectable so the RED path (verify
@@ -1090,7 +1244,10 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
         log = project_root / "agents" / agent / "temp" \
               / f"framework-pull-verify-{newest}.log"
 
-        def verify(root=project_root, _log=log, _sha=adopt_sha, _agent=agent):
+        def verify(root=project_root, _log=log, _sha=adopt_sha, _agent=agent,
+                   _pre=pre_sha, _baseline=c4_baseline):
+            if _baseline:
+                return verify_with_baseline(root, _sha, _pre, _log, agent=_agent)
             rc, verdict, meta = verify_in_worktree(root, _sha, _log, agent=_agent)
             return (suite_is_green(rc, verdict, meta.get("halves")), verdict, meta)
     outcome = verify()
@@ -1103,7 +1260,9 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
         green, verdict = outcome
         vmeta = {}
     step("verify", green, verdict=verdict, sha=adopt_sha,
-         worktree=vmeta.get("worktree"), halves=vmeta.get("halves"))
+         worktree=vmeta.get("worktree"), halves=vmeta.get("halves"),
+         **{k: vmeta[k] for k in ("c4_mode", "post_reds", "baseline_reds",
+                                  "new_reds", "baseline_refused") if k in vmeta})
 
     if not green:
         result["rollback"] = rollback(project_root, pre_sha, restart=restart,
@@ -1120,6 +1279,11 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
         "source_sha": sha,
         "verified": True,
     }
+    if vmeta.get("c4_mode") == "baseline-differential":
+        # The audit trail must not read like a strict pass (pull-promotion.md,
+        # "C4 baseline differential"): `verified` alone cannot tell them apart.
+        doc["c4_mode"] = "baseline-differential"
+        doc["baseline_reds"] = vmeta.get("baseline_reds")
     world_dir.mkdir(parents=True, exist_ok=True)
     (world_dir / "installed-release.yaml").write_text(render_installed_release(doc),
                                                       encoding="utf-8")
@@ -1224,6 +1388,12 @@ def main(argv=None) -> int:
                     help="dry run: full report, nothing copied (DEFAULT)")
     ap.add_argument("--adopt", action="store_true",
                     help="execute the adoption (requires a clear plan)")
+    ap.add_argument("--c4-baseline", action="store_true",
+                    help="with --adopt: C4 also passes when the post-adopt suite has no "
+                         "failing test that the PRE-adopt tree on this box did not also "
+                         "fail. Runs the suite a second time, on the pre-adopt commit, "
+                         "only when the first run is red. Default off (strict C4). "
+                         "See pull-promotion.md, 'C4 baseline differential'")
     ap.add_argument("--record-installed", metavar="TAG", default=None,
                     help="git-fed shape only (pull-promotion.md addendum h): record TAG "
                          "in world/installed-release.yaml and exit. TAG must resolve in "
@@ -1319,7 +1489,7 @@ def main(argv=None) -> int:
         result = adopt(project_root=project_root,
                        source_repo=source_repo,
                        newest=report["newest_tag"], plan=report,
-                       world_dir=world_dir)
+                       world_dir=world_dir, c4_baseline=args.c4_baseline)
         if args.json:
             print(json.dumps(result, indent=2, default=str))
         else:

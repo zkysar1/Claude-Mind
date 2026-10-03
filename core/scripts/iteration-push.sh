@@ -18,10 +18,16 @@
 #     fetching updates from GitHub and pushing updates to GitHub: without it, the
 #     first push from a second machine wedges this machine's pushes permanently
 #     (non-fast-forward retried forever — the 2026-07-03 6-vs-12 divergence).
-#     Merge safety in the shared multi-agent tree: `git merge` ABORTS if the
+#     Merge safety in the shared multi-agent tree: the integrate REFUSES if the
 #     index has staged entries (it cannot absorb a concurrent partner's staged
 #     files the way a bare `git commit` can — guard-741/guard-836 hazard does
-#     not apply), and refuses rather than overwrites dirty working-tree files.
+#     not apply), and refuses rather than overwrites files that are dirty WHEN
+#     IT LANDS. git checks only at that moment: a plain `git merge` silently
+#     overwrote a write made while its merge drivers ran, so the merge is
+#     computed off the tree first (_ip_merge_upstream, ). The
+#     fast-forward's own checkout is still unguarded, and a path left in
+#     info/exclude (_ip_exclude_locally) is expendable to git, so a merge that
+#     re-tracks it replaces the local copy.
 #     Any merge failure (dirty tree, staged entries, true conflict) is aborted
 #     cleanly (merge --abort if MERGE_HEAD exists) and logged LOUDLY. Dirty-tree
 #     refusals self-heal in-run (agents/<self>/* churn is COMMITTED pathspec-
@@ -158,8 +164,12 @@ Options:
                       FAST-FORWARD. A dirty tree or a non-fast-forward runs the
                       loop's --no-push integrate instead, but ONLY when
                       tick_claim_probe.py answers that this box's worker Body
-                      holds no claim (g-375-96); otherwise it is LOGGED and left
-                      alone, as is a merge in progress. Never pushes (overrides
+                      holds no claim (g-375-96). When it answers that no loop
+                      runs on this box (g-375-108), a tree strictly behind whose
+                      only changes are modified agents/* files fast-forwards and
+                      keeps those files' bytes; it commits and discards nothing.
+                      Every other shape is LOGGED and left alone, as is a merge
+                      in progress. Never pushes (overrides
                       --push-worker-ref). A caller running this from cron must
                       first check that this help text lists the flag: an older
                       copy of this script only WARNS on an unknown arg and would
@@ -533,16 +543,19 @@ fi
 # those two shapes to the loop's own --no-push integrate, and ONLY when
 # tick_claim_probe.py answers that this box's worker Body holds no claim. Between
 # units that is the integrate the loop runs at its next boundary, only sooner.
+# An answer that no loop runs on the box goes to _ip_tick_churn_ff below ().
 # Every other probe answer keeps the log-only line, with the answer appended.
 # --no-optional-locks: a background status must not take index.lock under a live
 # session's git command.
 #
 # _ip_tick_no_claim: 0 only when the probe answers `none`. _IP_TICK_WHY carries the
-# probe's line for the log. MIND_AGENT is exported to the probe's agent when unset,
-# because the self-heal scopes "self" by it and a cron carries none.
+# probe's line for the log, and _IP_TICK_VERDICT its first word. MIND_AGENT is
+# exported to the probe's agent when unset, because the self-heal scopes "self" by it
+# and a cron carries none.
 # ITERATION_PUSH_CLAIM_PROBE (tests only) names a script to run in the probe's place.
 _IP_TICK_HANDOFF=0
 _IP_TICK_WHY=""
+_IP_TICK_VERDICT=""
 _ip_tick_no_claim() {
   local _out _verdict _agent _evidence
   if [ -n "${ITERATION_PUSH_CLAIM_PROBE:-}" ]; then
@@ -555,11 +568,152 @@ _ip_tick_no_claim() {
   # read splits on whitespace, so a bare "none" leaves _agent EMPTY; a prefix strip
   # would have handed back "none" itself as the agent name.
   read -r _verdict _agent _evidence <<<"$_out"
+  _IP_TICK_VERDICT="$_verdict"
   [ "$_verdict" = none ] || return 1
   case "$_agent" in ''|-|*[!A-Za-z0-9_-]*) return 1;; esac
   if [ -n "${MIND_AGENT:-}" ] && [ "$MIND_AGENT" != "$_agent" ]; then return 1; fi
   export MIND_AGENT="$_agent"
   return 0
+}
+
+# --- A box where no loop runs fast-forwards around its agents/* churn () ----
+# Measured 2026-10-01 on cc-14 (five agents configured, interactive seats only): 250
+# log-only ticks after its last integrate on 2026-09-24, and 232 commits (9.5 h)
+# behind. Own-cloud keeps tracked agents/* store files modified there, no loop runs to
+# commit them, so every tick met a dirty tree and nothing ever merged.
+# The loop's integrate is the wrong tool on such a box. Its self-heal COMMITS the
+# "self" agent's files, which a box with no loop never pushes, so the box would leave
+# the fast-forward line for good and merge on top at every later tick; it cannot name
+# "self" where several agents live; and it CLEARS other agents' files. This path
+# commits and discards nothing, so the box stays a plain follower of origin:
+#   - it runs only when nothing is ahead, nothing is staged, and every dirty tracked
+#     path is a modified file under agents/. Local commits and edits anywhere else
+#     are a session's own to merge, so they stay log only;
+#   - a modified file the incoming range does not touch stays in place, because
+#     git's own fast-forward never writes it;
+#   - a modified file the range does touch is copied byte for byte into a dir under
+#     .git, checked out to HEAD, and copied back after the fast-forward, each copy
+#     checked by its raw hash both ways. The cache decides from raw content whether it
+#     may refresh a file, and a file git rewrote stays frozen at git's copy (rb-3399,
+#     its 2026-09-25 addendum), so the bytes the cache wrote are the ones to keep.
+#     Not git stash: it stores a file through the attribute filters, so a round trip
+#     can change its bytes (probed 2026-10-02: under eol=crlf an LF file came back
+#     CRLF), and refs/stash is the stack the people on the box use. A cache write
+#     between the copy aside and the copy-back is overwritten, the same race
+#     every git merge on an own-cloud box runs (rb-3399);
+#   - if a copy does not come back intact, the dir stays with an INDEX of what it
+#     holds, and while such a dir exists every later tick only logs, so a person looks.
+#     On a box with no loop nothing alarms on that yet ().
+# Always exits (soft_exit). Callers reach it only on a probe answer of `noloop`.
+_ip_tick_churn_ff() {
+  local _rec _p _bad="" _rc _out _from _ffrc _corc _i _h _ok=1 _keep
+  local _stf="$GITDIR/iteration-push-tick-status.z"
+  local -a _dirty=() _touched=() _before=()
+  if [ "$_FF_AHEAD" -gt 0 ]; then
+    log "ff-only tick: $_FF_WHY — log only: no loop runs here, and ${_FF_AHEAD} local commit(s) are a session's own to merge (claim probe: $_IP_TICK_WHY)"
+    soft_exit 0
+  fi
+  git -C "$REPO" --no-optional-locks diff --cached --quiet; _rc=$?
+  if [ "$_rc" -eq 1 ]; then
+    log "ff-only tick: $_FF_WHY — log only: something is staged, which is a session's work in progress (claim probe: $_IP_TICK_WHY)"
+    soft_exit 0
+  elif [ "$_rc" -ne 0 ]; then
+    log "ff-only tick: git diff --cached failed rc=${_rc} — log only"; soft_exit 1
+  fi
+  # -z keeps any path byte-exact. Nothing is staged, so no record is a rename's second path.
+  if ! git -C "$REPO" --no-optional-locks status --porcelain=v1 -z --untracked-files=no >"$_stf"; then
+    rm -f "$_stf"; log "ff-only tick: git status -z failed — log only"; soft_exit 1
+  fi
+  while IFS= read -r -d '' _rec; do
+    _p="${_rec:3}"
+    if [ "${_rec:0:2}" = " M" ]; then
+      case "$_p" in agents/*) _dirty+=("$_p"); continue;; esac
+    fi
+    _bad="$_p"; break
+  done <"$_stf"
+  rm -f "$_stf"
+  if [ -n "$_bad" ]; then
+    log "ff-only tick: $_FF_WHY — log only: $_bad is not a modified agents/* file, so it is a session's work (claim probe: $_IP_TICK_WHY)"
+    soft_exit 0
+  fi
+  if [ "${#_dirty[@]}" -eq 0 ]; then
+    log "ff-only tick: the tree changed under the tick — log only, the next tick decides"; soft_exit 0
+  fi
+  # Copies an earlier tick could not put back stay until a person looks at them.
+  for _keep in "$GITDIR"/iteration-push-tick-churn-*; do
+    [ -e "$_keep" ] || continue
+    log "ff-only tick: $_FF_WHY — log only: ${_keep} holds copies an earlier tick could not put back, so a person looks"
+    soft_exit 1
+  done
+  for _p in "${_dirty[@]}"; do
+    git -C "$REPO" --no-optional-locks diff --quiet HEAD "$UPSTREAM" -- "$_p"; _rc=$?
+    case "$_rc" in
+      0) ;;
+      1) _touched+=("$_p");;
+      *) log "ff-only tick: cannot compare $_p between HEAD and $UPSTREAM rc=${_rc} — log only"; soft_exit 1;;
+    esac
+  done
+  if [ "$DRY_RUN" = 1 ]; then
+    log "ff-only tick (dry-run): no loop runs here; would fast-forward ${_FF_BEHIND} commit(s) around ${#_dirty[@]} modified agents/* file(s), ${#_touched[@]} of them in the incoming range"
+    soft_exit 0
+  fi
+  _from="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  if [ "${#_touched[@]}" -eq 0 ]; then
+    _out="$(git -C "$REPO" merge --ff-only -q "$UPSTREAM" 2>&1)"; _ffrc=$?
+    if [ "$_ffrc" -eq 0 ]; then
+      log "ff-only tick: fast-forwarded ${_FF_BEHIND} commit(s) ${_from}..$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?'); no loop runs here, and the incoming range touches none of the ${#_dirty[@]} modified agents/* file(s), left in place (g-375-108)"
+      soft_exit 0
+    fi
+    log "ff-only tick: merge --ff-only refused rc=${_ffrc} — log only: $(printf '%s' "$_out" | tail -n 1)"
+    soft_exit 1
+  fi
+  # Copy each touched file aside and check the copy by raw hash (--no-filters: the bytes
+  # on disk, not git's normalized view) before anything in the worktree changes.
+  _keep="$GITDIR/iteration-push-tick-churn-$(date -u +%Y%m%dT%H%M%SZ)"
+  if ! mkdir "$_keep"; then log "ff-only tick: cannot create ${_keep} — log only"; soft_exit 1; fi
+  _i=0
+  for _p in "${_touched[@]}"; do
+    _h="$(git -C "$REPO" hash-object --no-filters -- "$_p")" || _h=""
+    if [ -z "$_h" ] || ! cp -p -- "$REPO/$_p" "$_keep/$_i" \
+       || [ "$(git -C "$REPO" hash-object --no-filters -- "$_keep/$_i")" != "$_h" ]; then
+      rm -rf -- "$_keep"   # nothing in the worktree has changed yet
+      log "ff-only tick: cannot copy $_p aside intact — log only"; soft_exit 1
+    fi
+    printf '%s\t%s\t%s\n' "$_i" "$_h" "$_p" >>"$_keep/INDEX"
+    _before+=("$_h"); _i=$((_i + 1))
+  done
+  _ffrc=""
+  _out="$(git -C "$REPO" checkout -q -- "${_touched[@]}" 2>&1)"; _corc=$?
+  if [ "$_corc" -eq 0 ]; then
+    _out="$(git -C "$REPO" merge --ff-only -q "$UPSTREAM" 2>&1)"; _ffrc=$?
+  fi
+  # Every copy goes back whatever happened above, and each is checked by its raw hash.
+  # A path the range turned into a directory takes no copy: cp would drop it inside. A
+  # directory the range emptied is made again, so a file it deleted comes back untracked.
+  _i=0
+  for _p in "${_touched[@]}"; do
+    if [ -d "$REPO/$_p" ] || ! mkdir -p -- "$(dirname -- "$REPO/$_p")" \
+       || ! cp -p -- "$_keep/$_i" "$REPO/$_p" \
+       || [ "$(git -C "$REPO" hash-object --no-filters -- "$_p")" != "${_before[$_i]}" ]; then
+      _ok=0
+    fi
+    _i=$((_i + 1))
+  done
+  if [ "$_ok" != 1 ]; then
+    log "ff-only tick: the ${#_touched[@]} copied agents/* file(s) did NOT all come back intact (checkout rc=${_corc}, merge rc=${_ffrc:-not run}); ${_keep} keeps them with an INDEX, and every tick logs only until a person looks"
+    soft_exit 1
+  fi
+  rm -rf -- "$_keep"
+  if [ "$_corc" -ne 0 ]; then
+    log "ff-only tick: checking out ${#_touched[@]} agents/* file(s) was refused rc=${_corc}, and they were put back intact — log only: $(printf '%s' "$_out" | tail -n 1)"
+    soft_exit 1
+  fi
+  if [ "$_ffrc" -eq 0 ]; then
+    log "ff-only tick: fast-forwarded ${_FF_BEHIND} commit(s) ${_from}..$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?'); no loop runs here, so the ${#_touched[@]} modified agents/* file(s) the range touches were set aside and put back byte for byte (g-375-108)"
+    soft_exit 0
+  fi
+  log "ff-only tick: merge --ff-only refused rc=${_ffrc}, and the ${#_touched[@]} agents/* file(s) set aside were put back byte for byte — log only: $(printf '%s' "$_out" | tail -n 1)"
+  soft_exit 1
 }
 if [ "$FF_ONLY" = 1 ]; then
   if [ -e "$GITDIR/MERGE_HEAD" ]; then
@@ -588,6 +742,8 @@ if [ "$FF_ONLY" = 1 ]; then
     if [ "$_FF_BEHIND" -gt 0 ] && _ip_tick_no_claim; then
       log "ff-only tick: $_FF_WHY; claim probe: $_IP_TICK_WHY — running the loop's --no-push integrate (g-375-96)"
       _IP_TICK_HANDOFF=1
+    elif [ "$_IP_TICK_VERDICT" = noloop ]; then
+      _ip_tick_churn_ff
     else
       log "ff-only tick: $_FF_WHY — log only, the merge is the loop's${_IP_TICK_WHY:+ (claim probe: $_IP_TICK_WHY)}"
       soft_exit 0
@@ -709,18 +865,101 @@ _ip_defer_streak_reset() {
 # empty-result line below keeps a silent probe from reading as "no paths".
 _ip_log_conflict_paths() {
   local paths n p drv line=""
-  paths="$(git -C "$REPO" diff --name-only --diff-filter=U 2>/dev/null)"
+  # _ip_merge_upstream reports a merge-tree conflict in IP_CONFLICT_PATHS, with
+  # no MERGE_HEAD to probe; a legacy `git merge` conflict leaves MERGE_HEAD.
+  if [ "${IP_MERGE_CONFLICT:-0}" = 1 ]; then
+    paths="$IP_CONFLICT_PATHS"
+  else
+    paths="$(git -C "$REPO" diff --name-only --diff-filter=U 2>/dev/null)"
+  fi
   if [ -z "$paths" ]; then
     log "conflicted paths: NONE REPORTED — unmerged-path probe came back empty (not the same as 'no conflict'; see guard-1985)"
     return 0
   fi
-  n="$(printf '%s\n' "$paths" | grep -c . || true)"
+  n="$(printf '%s\n' "$paths" | grep -c .)"
   while IFS= read -r p; do
     [ -z "$p" ] && continue
     drv="$(git -C "$REPO" check-attr merge -- "$p" 2>/dev/null | sed 's/.*: merge: //')"
     line="${line}${line:+, }${p} (merge=${drv:-unknown})"
   done < <(printf '%s\n' "$paths" | head -12)
+  # Name the cap, so a reader resolving by hand knows the list is partial ().
+  [ "$n" -gt 12 ] && line="${line}, +$((n - 12)) more not named"
   log "conflicted paths (${n}): ${line}"
+}
+
+# _ip_merge_upstream: integrate $UPSTREAM into HEAD. Sets MERGE_OUT, MERGE_RC,
+# IP_MERGE_CONFLICT and IP_CONFLICT_PATHS (, from ).
+#
+# WHY NOT `git merge`. git checks the working tree for local changes only when
+# the merge STARTS. A write that lands while a merge driver runs (the daemon's
+# heartbeat append, another session, a test) is then overwritten by the
+# checkout, with rc 0 and no message. Measured on git 2.43.0 (cc-07,
+# 2026-10-01) and Git for Windows 2.45.1: a slow driver on one file, an append
+# to another 2 s in, and the append was gone after "Merge made by the 'ort'
+# strategy".
+#
+# So the merge is computed OFF the working tree (`merge-tree --write-tree`
+# runs every driver against blobs) and landed with `merge --ff-only`, which
+# re-checks the tree at that moment and refuses a file written meanwhile.
+# The remaining window is the fast-forward's own checkout, not the drivers.
+# A conflict leaves NO MERGE_HEAD; callers test _ip_merge_conflicted.
+IP_MERGE_CONFLICT=0
+IP_CONFLICT_PATHS=""
+_ip_merge_conflicted() { [ "${IP_MERGE_CONFLICT:-0}" = 1 ] || [ -f "$GITDIR/MERGE_HEAD" ]; }
+_ip_merge_upstream() {
+  local _head _out _rc _tree _commit _staged _usage
+  IP_MERGE_CONFLICT=0
+  IP_CONFLICT_PATHS=""
+  _head="$(git -C "$REPO" rev-parse --verify -q HEAD)"
+  # Capture, then match: `-h` exits 129, which pipefail would carry through a
+  # pipe into grep and read as "unsupported".
+  _usage="$(git -C "$REPO" merge-tree -h 2>&1)"
+  if [ -z "$_head" ] || git -C "$REPO" merge-base --is-ancestor "$_head" "$UPSTREAM" 2>/dev/null \
+     || [[ "$_usage" != *--write-tree* ]]; then
+    # A fast-forward runs no driver. A git without --write-tree (< 2.38) keeps
+    # the old merge, window and all.
+    MERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
+    MERGE_RC=$?
+  else
+    # `git merge` refuses ANY staged entry before a true merge (guard-741);
+    # a fast-forward would carry it along, so refuse here in git's own shape.
+    _staged="$(git -C "$REPO" diff --cached --name-only "$_head" 2>/dev/null)"
+    if [ -n "$_staged" ]; then
+      MERGE_OUT="$(printf 'error: Your local changes to the following files would be overwritten by merge:\n%s\nPlease commit your changes or stash them before you merge.\nAborting' \
+        "$(printf '%s\n' "$_staged" | awk '{print "\t" $0}')")"
+      MERGE_RC=2
+    else
+      _out="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge-tree --write-tree --name-only "$_head" "$UPSTREAM" 2>&1)"
+      _rc=$?
+      _tree="$(printf '%s\n' "$_out" | head -n 1)"
+      if [ "$_rc" -eq 1 ]; then
+        IP_MERGE_CONFLICT=1
+        IP_CONFLICT_PATHS="$(printf '%s\n' "$_out" | sed -n '2,/^$/p' | sed '/^$/d' | LC_ALL=C sort -u)"
+        MERGE_OUT="$_out"
+        MERGE_RC=1
+      elif [ "$_rc" -ne 0 ]; then
+        MERGE_OUT="$_out"
+        MERGE_RC="$_rc"
+      elif ! _commit="$(git -C "$REPO" commit-tree "$_tree" -p "$_head" -p "$UPSTREAM" \
+                          -m "Merge remote-tracking branch '$UPSTREAM'" 2>&1)"; then
+        MERGE_OUT="$_commit"
+        MERGE_RC=1
+      else
+        # HEAD moved since $_head (another session committed): not a fast
+        # forward any more, so this refuses and the caller defers.
+        MERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --ff-only "$_commit" 2>&1)"
+        MERGE_RC=$?
+      fi
+    fi
+  fi
+  if [ "$MERGE_RC" -ne 0 ]; then
+    # git's own words, so the cause can be read from the push log ().
+    local _n _l
+    _n="$(printf '%s\n' "$MERGE_OUT" | grep -c .)"
+    printf '%s\n' "$MERGE_OUT" | sed '/^$/d' | head -n 30 | while IFS= read -r _l; do log "git: | ${_l}"; done
+    [ "$_n" -gt 30 ] && log "git: | (+$((_n - 30)) more line(s) not logged)"
+  fi
+  return 0
 }
 
 _ip_defer_streak_tick() {  # $1 = shape (dirty-defer | conflict-abort), $2 = blocking paths (defer lanes)
@@ -1484,6 +1723,26 @@ _selfheal_cross_agent_churn_remerge() {
     if [ "${#mergeable_shared[@]}" -gt 0 ]; then
       log "self-heal: + ${#mergeable_shared[@]} git-commutative SHARED file(s) outside agents/* committed rather than deferred (g-115-9744)"
     fi
+    # : an append-only store whose working copy LOST rows HEAD holds
+    # (the stub a failed integrate leaves) is repaired before staging, or left
+    # out of this commit when it cannot be: committing the stub records the
+    # deletion, and rows this box never pushed exist nowhere else.
+    local _sg_err _sg_drop _p _l _kept=()
+    _sg_err="$(mktemp)"
+    _sg_drop="$(python3 "$SCRIPT_DIR/append-only-stub-guard.py" --repo "$REPO" "${_heal_stage[@]}" 2>"$_sg_err")"
+    while IFS= read -r _l; do [ -n "$_l" ] && log "self-heal: $_l"; done <"$_sg_err"
+    rm -f "$_sg_err"
+    if [ -n "$_sg_drop" ]; then
+      for _p in "${_heal_stage[@]}"; do
+        grep -qxF -- "$_p" <<<"$_sg_drop" || _kept+=("$_p")
+      done
+      while IFS= read -r _p; do [ -n "$_p" ] && _heal_spec+=(":(exclude)$_p"); done <<<"$_sg_drop"
+      _heal_stage=("${_kept[@]+"${_kept[@]}"}")
+      if [ "${#_heal_stage[@]}" -eq 0 ]; then
+        log "self-heal: nothing left to commit after the append-only stub guard — defer"
+        return 1
+      fi
+    fi
     if ! git -C "$REPO" add -- "${_heal_stage[@]}" 2>/dev/null; then
       log "self-heal: git add of self-namespace churn failed — defer"
       return 1
@@ -1595,8 +1854,7 @@ _selfheal_cross_agent_churn_remerge() {
 
   # Retry the merge ONCE. Reassigns the OUTER MERGE_OUT/MERGE_RC (intentional —
   # the caller's post-helper defer log then reflects the retry outcome).
-  MERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
-  MERGE_RC=$?
+  _ip_merge_upstream
   if [ "$MERGE_RC" -eq 0 ]; then
     return 0
   fi
@@ -1608,7 +1866,7 @@ _selfheal_cross_agent_churn_remerge() {
   # shape that did occur ("NOT ... cross-agent churn (auto-cleared)"). Signal it
   # separately with rc=2 so the caller ticks the right streak shape and prints
   # the conflict guidance the FIRST-merge path already prints for this shape.
-  if [ -f "$GITDIR/MERGE_HEAD" ]; then
+  if _ip_merge_conflicted; then
     _ip_log_conflict_paths
     git -C "$REPO" merge --abort >/dev/null 2>&1 || true
     log "self-heal: churn healed, but the merge retry hit a TRUE content conflict (rc=${MERGE_RC}) — aborted cleanly"
@@ -1804,16 +2062,15 @@ if [ "$BEHIND" -gt 0 ]; then
     # : before the FIRST merge, so both it and the self-heal retry see
     # every path UPSTREAM deleted-and-ignores as deleted on both sides.
     _ip_untrack_upstream_ignored_deletions
-    MERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
-    MERGE_RC=$?
+    _ip_merge_upstream
     if [ "$MERGE_RC" -ne 0 ]; then
       # Conflict state left behind? Abort it — the tree must NEVER be left
       # mid-merge for the loop to trip over.
-      if [ -f "$GITDIR/MERGE_HEAD" ]; then
+      if _ip_merge_conflicted; then
         _ip_log_conflict_paths
         git -C "$REPO" merge --abort >/dev/null 2>&1 || true
         log "MERGE CONFLICT with $UPSTREAM — aborted cleanly, will retry next iteration."
-        log "If this repeats every iteration it is a TRUE cross-machine content conflict (MERGE_HEAD was created — NOT the dirty-tree defer shape): resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
+        log "If this repeats every iteration it is a TRUE cross-machine content conflict (the merge itself conflicted — NOT the dirty-tree defer shape): resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
         _ip_defer_streak_tick "conflict-abort"
         _ip_defer_exit
       fi
@@ -1832,7 +2089,7 @@ if [ "$BEHIND" -gt 0 ]; then
         # guidance and tick the same streak shape, or the alarm sends the reader
         # hunting staged entries and dirty shared files that are not there.
         log "MERGE CONFLICT with $UPSTREAM (surfaced by the churn self-heal retry) — aborted cleanly, will retry next iteration."
-        log "If this repeats every iteration it is a TRUE cross-machine content conflict (MERGE_HEAD was created — NOT the dirty-tree defer shape): resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
+        log "If this repeats every iteration it is a TRUE cross-machine content conflict (the merge itself conflicted — NOT the dirty-tree defer shape): resolve manually (git merge $UPSTREAM) or investigate which store conflicted."
         _ip_defer_streak_tick "conflict-abort"
         _ip_defer_exit
       else
@@ -2026,10 +2283,11 @@ if [ "$NO_FETCH" -eq 0 ] && printf '%s' "$PUSH_OUT" | grep -qiE 'non-fast-forwar
   if [ "$RBEHIND" -gt 0 ]; then
     # : under a throttled fetch this is the FIRST merge to see UPSTREAM.
     _ip_untrack_upstream_ignored_deletions
-    RMERGE_OUT="$(GIT_TERMINAL_PROMPT=0 git -C "$REPO" merge --no-edit "$UPSTREAM" 2>&1)"
-    RMERGE_RC=$?
+    _ip_merge_upstream
+    RMERGE_OUT="$MERGE_OUT"
+    RMERGE_RC="$MERGE_RC"
     if [ "$RMERGE_RC" -ne 0 ]; then
-      if [ -f "$GITDIR/MERGE_HEAD" ]; then
+      if _ip_merge_conflicted; then
         _ip_log_conflict_paths
         git -C "$REPO" merge --abort >/dev/null 2>&1 || true
         log "recovery merge CONFLICT with $UPSTREAM — aborted cleanly, will retry next iteration"

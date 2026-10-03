@@ -433,3 +433,55 @@ def test_retrieve_serves_when_daemon_started_before_world_was_configured(
     assert status == 200, body
     keys = [n["key"] for n in json.loads(body)["tree_nodes"]]
     assert "alpha-test-node" in keys
+
+
+def test_embedding_channel_flips_dead_to_alive_when_the_stack_appears(
+        running_daemon, tmp_path, monkeypatch):
+    """ outcome B, over HTTP: a daemon that started before the encoder
+    stack was installed must not report meta.embedding_channel 'alive' while it
+    cannot score, and must report it alive once the stack appears, with no
+    restart. A real (tiny) index and the real probe; only the encoder is a stub
+    and the stack's modules are unique stand-in names, so the numpy this process
+    already holds stays out of it."""
+    import pytest
+    np = pytest.importorskip("numpy")
+    import _embedding_retrieval as er
+    import _vendor_path as vp
+    import retrieve as _r
+
+    index_dir = tmp_path / "index"
+    index_dir.mkdir()
+    np.save(index_dir / "embeddings.npy", np.asarray([[1, 0, 0, 0], [0, 1, 0, 0]], dtype="float16"))
+    (index_dir / "meta.json").write_text(json.dumps({
+        "model": er.MODEL_NAME, "dim": 4, "count": 2,
+        "docs": [{"id": "guard-1", "type": "guardrail", "hash": "h"},
+                 {"id": "guard-2", "type": "guardrail", "hash": "h"}]}), encoding="utf-8")
+
+    class _Stub:
+        def encode(self, queries, normalize_embeddings=True, show_progress_bar=False):
+            return np.asarray([[1, 0, 0, 0]], dtype="float32")
+
+    cfg = dict(_r._DEFAULT_RETRIEVAL_CFG)
+    cfg.update({"embedding_blend_enabled": True, "embedding_model_name": er.MODEL_NAME})
+    monkeypatch.setattr(_r, "_RETRIEVAL_CFG_CACHE", cfg)
+    monkeypatch.setenv(er._INDEX_DIR_ENV, str(index_dir))
+    monkeypatch.setattr(er, "_get_model", lambda *a, **k: _Stub())
+    monkeypatch.setattr(vp, "_STACK_MODULES", ("_g306574_np",))
+    monkeypatch.setattr(vp, "_ENCODER_BACKENDS", ("_g306574_enc",))
+    monkeypatch.setattr(sys, "path", list(sys.path))   # ensure_vendor_path appends to it
+    vendor = tmp_path / "py"                            # does not exist when the daemon "starts"
+    monkeypatch.setenv("MIND_VENDOR_DIR", str(vendor))
+    er.clear_caches()
+
+    _, port = running_daemon
+    q = {"category": "alpha", "depth": "shallow", "read_only": "1"}
+    before = json.loads(_get(port, "/v1/retrieve", q)[1])["meta"]["embedding_channel"]
+    assert before.startswith("DEAD"), before
+    assert "_g306574_np" in before, before            # names what is missing
+
+    for name in ("_g306574_np", "_g306574_enc"):       # the stack is installed afterwards
+        (vendor / name).mkdir(parents=True)
+        (vendor / name / "__init__.py").write_text("", encoding="utf-8")
+    after = json.loads(_get(port, "/v1/retrieve", q)[1])["meta"]["embedding_channel"]
+    assert after == "alive", after
+    er.clear_caches()

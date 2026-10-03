@@ -137,9 +137,9 @@ def _build_world(root: Path, *, write_bodies: bool = False) -> Path:
     _write_jsonl(
         world / "guardrails.jsonl",
         [
-            {"category": "marine-biology/method", "rule": "Verify every claim against two sources."},
-            {"category": "framework-architecture", "rule": "Never critical() in a handler."},
-            {"rule": "Untagged guardrail — must fail closed."},  # no category
+            {"status": "active", "category": "marine-biology/method", "rule": "Verify every claim against two sources."},
+            {"status": "active", "category": "framework-architecture", "rule": "Never critical() in a handler."},
+            {"status": "active", "rule": "Untagged guardrail — must fail closed."},  # no category
         ],
     )
     _write_jsonl(
@@ -1567,6 +1567,26 @@ def test_resolve_handle_is_none_without_the_secret(tmp_path: Path, monkeypatch) 
     assert M.resolve_handle(world, tmp_path, handle) == "g-369-119"
     monkeypatch.delenv(M._GOAL_HANDLE_SECRET_VAR, raising=False)
     assert M.resolve_handle(world, tmp_path, handle) is None
+
+
+def test_handles_provisioned_turns_false_exactly_where_the_resolver_cannot_resolve(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """: the inbound drain asks this before applying a member's queued write, so
+    it must be False in exactly the cases that make resolve_handle return None for a valid
+    handle — read off the same two variables, under the same rule."""
+    world = _goal_world_with_secret(tmp_path, monkeypatch)
+    from knowledge_projection import goal_handle
+
+    handle = goal_handle("g-369-119", _EXPORT_HANDLE_SECRET, "test-env")
+    assert M.handles_provisioned() is True
+    assert M.resolve_handle(world, tmp_path, handle) == "g-369-119"
+    for var, value in ((M._GOAL_HANDLE_SECRET_VAR, ""), ("ENVIRONMENT_ID", ""),
+                       ("ENVIRONMENT_ID", "  ")):
+        with monkeypatch.context() as m:
+            m.setenv(var, value)
+            assert M.handles_provisioned() is False, (var, value)
+            assert M.resolve_handle(world, tmp_path, handle) is None, (var, value)
 
 
 def test_resolve_handle_cli_prints_the_id_on_rc_zero_and_nothing_on_rc_one(

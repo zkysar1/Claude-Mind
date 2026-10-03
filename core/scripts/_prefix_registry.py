@@ -10,10 +10,11 @@ Schema (per row):
     prefix          : "Apply:", "Unblock:", … — case-sensitive title token
     kind            : "apply", "unblock", … — origin_signal kind label
     semantic_class  : "cognitive_primitive" | "tactical_correction" | "meta_diagnostic"
+                      | "operational_triage"
 
 Three views are exposed:
 
-* ``PRIMITIVE_PREFIXES``  — full case-sensitive tuple of all 6 prefixes;
+* ``PRIMITIVE_PREFIXES``  — full case-sensitive tuple of every registered prefix;
   used by precheck-eval.py for "all primitive goals?" detection.
 * ``SIGNAL_KIND_PRIMITIVES`` — tuple of (lower_prefix, kind) for the 4
   primitives that map to an origin_signal kind; used by
@@ -56,6 +57,13 @@ from typing import Optional, Tuple
 #                           from cargo-cult-detector consolidation and carry
 #                           "drift_detected:..." origin_signals; the gate
 #                           REJECTS "batch:" as a top-level kind.
+#   - operational_triage   → in PRIMITIVE_PREFIXES only.  Alert: titles come
+#                           from an inbox sweep triaging an inbound alert;
+#                           the work is a response (acknowledge, route, fix),
+#                           not learning, so a window of them reads velocity
+#                           0 by construction.  The gate has no "alert:"
+#                           kind, so the row stays out of
+#                           SIGNAL_KIND_PRIMITIVES.
 _REGISTRY: Tuple[Tuple[str, str, str], ...] = (
     ("Apply:",       "apply",       "tactical_correction"),
     ("Unblock:",     "unblock",     "cognitive_primitive"),
@@ -63,6 +71,7 @@ _REGISTRY: Tuple[Tuple[str, str, str], ...] = (
     ("Idea:",        "idea",        "cognitive_primitive"),
     ("Investigate:", "investigate", "cognitive_primitive"),
     ("Batch:",       "batch",       "meta_diagnostic"),
+    ("Alert:",       "alert",       "operational_triage"),
 )
 
 
@@ -85,8 +94,8 @@ def starts_with_any_primitive(title: Optional[str]) -> bool:
     """Return True if ``title`` (case-sensitive) starts with any primitive prefix.
 
     Mirrors the precheck-eval.py invariant: a goal title is considered a
-    cognitive primitive iff it starts with one of the 6 prefixes exactly as
-    spelled in CLAUDE.md.
+    cognitive primitive iff it starts with one of the registered prefixes
+    exactly as spelled in the registry.
     """
     if not title:
         return False

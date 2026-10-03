@@ -6,7 +6,7 @@
 #
 # Hot path:
 #   1. Skinny PROJECT_ROOT resolve (no _paths.sh)
-#   2. Parse positional args: rec_id field value
+#   2. Parse rec_id and field, and the value: positional, --value-file or --value-stdin
 #   3. POST /v1/pipeline/update-field with query params
 #   4. On 200, print the record to stdout
 #
@@ -25,12 +25,16 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="(none — this wrapper takes three positionals only)"
+_ACCEPTED_FLAGS="--value-file <path> | --value-stdin"
 
 # --- Parse args -----------------------------------------------------------
 REC_ID=""
 FIELD=""
 VALUE=""
+# Read by argv_strict_resolve_value below. This parser sets them itself because
+# it does not call argv_strict_parse.
+ARGV_VALUE_FILE=""
+ARGV_VALUE_STDIN=0
 declare -a PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
@@ -39,8 +43,22 @@ while [[ $# -gt 0 ]]; do
             # BEFORE the -*) arm: --help is a `-*` token, and refusing it with
             # exit 2 would be a regression the refusal introduced rather than a
             # defect it fixed (). Help exits 0.
-            argv_strict_help "$(basename "$0")" "<rec-id> <field> <value>" \
+            argv_strict_help "$(basename "$0")" \
+                "<rec-id> <field> (<value> | --value-file <path> | --value-stdin)" \
                 "$_ACCEPTED_FLAGS";;
+        # The value can come from a file or stdin instead of argv ().
+        # On Windows, Git bash cuts an argv word holding whitespace at 8,186
+        # characters with rc=0, so a long narrative value needs one of these.
+        --value-file)
+            if [ $# -lt 2 ]; then
+                printf '%s: --value-file requires a path\n' "$(basename "$0")" >&2
+                exit 2
+            fi
+            ARGV_VALUE_FILE="$2"; shift 2;;
+        --value-file=*)
+            ARGV_VALUE_FILE="${1#--value-file=}"; shift;;
+        --value-stdin)
+            ARGV_VALUE_STDIN=1; shift;;
         -*)
             # REFUSE (). This wrapper is named identically to the four
             # *-update-field siblings that DID adopt the strict parser, so it read
@@ -59,7 +77,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Need all three positionals.
+# One value source only. Two at once exit 2 inside the resolver, before any
+# write. Like the sibling wrappers, it drops trailing newlines from the value.
+VALUE="$(argv_strict_resolve_value "$(basename "$0")" "$VALUE")"
+
+# Need the record id, the field and a value.
 if [ -z "$REC_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
     echo "Error: rec_id, field, and value are all required." >&2
     exit 1

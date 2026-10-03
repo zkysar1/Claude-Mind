@@ -28,7 +28,7 @@ from ..jsonl_cache import cache as _jsonl_cache
 from .. import file_locks, history, changelog
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
-from storage_backend import get_backend  # noqa: E402  # s5b: own-cloud read freshness
+from storage_backend import LocalBackend, get_backend  # noqa: E402  # s5b: own-cloud read freshness
 from ..agent_paths import assert_not_cruft  # noqa: E402
 
 # _stamp_now is imported (rather than re-deriving strftime here) so the
@@ -584,6 +584,16 @@ def merge(ctx) -> "Response":  # type: ignore[name-defined]
         return Response.error(500, "write_failed", str(e))
 
 
+def _backend_is_local() -> bool:
+    """True when this daemon writes straight to local files: one box, so nothing merges its
+    store with another copy. Anything that stops the answer from being read is False, the
+    refusing one."""
+    try:
+        return isinstance(get_backend(), LocalBackend)
+    except Exception:  # noqa: BLE001 - a backend that cannot be built is not a local one
+        return False
+
+
 def set_field(ctx) -> "Response":  # type: ignore[name-defined]
     """POST /v1/store/set-field?store=&id=&field=&value=
 
@@ -620,8 +630,23 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
                               "query parameter 'value' required")
     value = _parse_value(value_str)
 
+    # Erase mode ( u3b): the one write that may change an immutable field. A member's
+    # forget blanks a guardrail's rule with it once the undo window is over. Refused before the
+    # store is read unless the field is erasable here and this backend is a single box's: a rule
+    # edited in place forks the record at a cross-box merge (rb-5511), and only one box has none.
+    erase = (ctx.query.get("erase") or "").strip() == "1"
+    if erase:
+        if field_name not in spec.erasable_fields:
+            return Response.error(
+                400, "not_erasable",
+                f"'{field_name}' has no erase mode on this store.")
+        if not _backend_is_local():
+            return Response.error(
+                409, "erase_not_local",
+                "This field is erased only where no other copy of the store can be merged with it: "
+                "one box on the local backend. This daemon's backend is not that.")
     # Immutable fields (e.g. "created" for rb/guard).
-    if (field_name in spec.immutable_fields
+    elif (field_name in spec.immutable_fields
             or field_name.split(".")[0] in spec.immutable_fields):
         return Response.error(
             400, "immutable_field",
@@ -644,6 +669,11 @@ def set_field(ctx) -> "Response":  # type: ignore[name-defined]
                     404, "not_found", f"{spec.id_field} {key} not found")
             idx, rec = found
             rec = apply_defaults(rec, spec.default_fields)
+            if erase and rec.get("status") != "retired":
+                # Read inside the lock: a record un-retired since the sweep looked is shown again.
+                return Response.error(
+                    409, "erase_not_retired",
+                    f"{spec.id_field} {key} is not retired, so it is not erased.")
             rec[field_name] = value
             # Amendment recency stamp ( / guard-1703, redesigned
             # per-field by ). Cross-box merge resolves content fields

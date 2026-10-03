@@ -213,6 +213,23 @@ worker must never arm; not the `/aspirations` re-entry; and not the agent-wide
 execution diary or reasoning snapshot, which belong to the reducer or another
 session on the box. It does not need `compact-checkpoint.yaml`.
 
+The in-flight goal block checks the anchored goal's live status. A terminal goal
+prints **STALE ANCHOR** (ignore it, select fresh work), except on the reducer when
+the execution diary shows `iteration-close --phase verify` ran for it and the
+productivity-check's `phase_end` did not follow. Then it prints **CLOSE OWED**,
+naming the close phases with no `phase_end` after that verify and sending the
+reader to finish the close before selecting (g-115-5048; guard-7366, guard-4245).
+Verify marks the goal terminal before state-update, learning-gate and the
+productivity-check run, and the checkpoint's `phase` is the selection stamp, so
+the diary is the record of how far the close got (`_close_tail_owed`; a test pins
+its phase names to `iteration-close.sh`). The diary cannot say whether a phase is
+still running, so the banner sends the reader to `proc-match.sh iteration-close` and
+`recurring-close` first: each phase is its own, often backgrounded, process, and
+re-running one that already finished sweeps a partner's uncommitted edit into the
+commit (rb-1906, guard-2638). The probe reads the bound agent's own diary only: a goal
+pulled from a sibling closes under the owner's `MIND_AGENT`, so its phase rows go to
+the owner's diary and the anchor keeps STALE ANCHOR.
+
 ---
 
 ## Execution Diary Integration

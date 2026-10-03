@@ -561,7 +561,7 @@ except Exception:
             | $(rt_python_launcher) "$CORE_ROOT/scripts/worker_execute.py" \
                 claim-role-recheck --claim-file - 2>/dev/null)" || true
         if [ "${_role_verdict:-}" = "reducer-only" ]; then
-            echo "[aspirations-claim] ROLE REFUSAL: ${goal_id} declares executable_by_role='reducer' on the record you were just handed -- a WORKER must not execute it. It was stamped AFTER it was scored (the selector hides reducer rows from a worker, so Phase 1 saw null). RELEASE it and take the next candidate: bash core/scripts/aspirations-release.sh ${goal_id} --source \"\${SOURCE:-world}\". (g-306-449)" >&2
+            echo "[aspirations-claim] ROLE REFUSAL: ${goal_id} declares executable_by_role='reducer' on the record you were just handed -- a WORKER must not execute it. It was stamped AFTER it was scored (the selector hides reducer rows from a worker, so Phase 1 saw null). RELEASE it and take the next candidate: bash core/scripts/aspirations-release.sh ${goal_id} --source \"\${SOURCE:-world}\" --reason \"executable_by_role is reducer\" --reason-kind role. (g-306-449, g-375-110)" >&2
         fi
         unset _role_verdict
     fi

@@ -4,6 +4,8 @@
 # 2026-07-26_unchecked-writes-are-the-norm, ). Read-only: reads
 # core/scripts/*.sh to derive the write-wrapper population and
 # .claude/skills/*/SKILL.md to classify. Writes nothing.
+# `--new-since REV|baseline` names the sites that joined the unverified set since a
+# revision: it also reads git history and meta/audit-baselines.yaml, and still writes nothing.
 # Shared measurement channel with the governed-store writer audit ().
 set -euo pipefail
 source "$(cd "$(dirname "$0")" && pwd)/_paths.sh"

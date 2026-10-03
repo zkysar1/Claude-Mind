@@ -109,7 +109,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0-pre3 | fresh-eyes-code-gate | always-run | same battery → Phase 0-pre3 section |
 | 0 (Recurring Safety Net) | aspirations-recover-recurring | medium | `bash core/scripts/aspirations-recover-recurring.sh --source world` then `--source agent` |
 | 0 (Monitor Stale) | monitor-stale-check | medium | `bash core/scripts/monitor-stale-check.sh --apply` |
-| 0.5.0 | precheck-eval | medium | `bash core/scripts/precheck-eval.sh run-all` (subcommand REQUIRED; bare call exits 2) |
+| 0.5.0 | precheck-eval | medium | `bash core/scripts/precheck-eval.sh run-all --apply` (subcommand REQUIRED; bare call exits 2) |
 | 0.5b.0.5 | blocker-recheck | medium | `bash core/scripts/blocker-recheck.sh --max-age-hours <config.proactive_escalation.blocker_age_hours> --apply` |
 | 0.5b.1b | inbox-alert-age-check | always-run | dispatched by `bash core/scripts/precheck-always-run-battery.sh --apply` (Phase 0-pre.0e) → this file's Phase 0.5b.1b section; standalone fallback `bash core/scripts/inbox-alert-age-check.sh --apply` |
 | 0.5b.1c | user-blocker-escalation-check | always-run | same battery → Phase 0.5b.1c section; standalone fallback `bash core/scripts/user-blocker-escalation-check.sh --apply` |
@@ -177,6 +177,16 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5k.19 | repo-hygiene-sweep | deferrable | `bash core/scripts/repo-hygiene-sweep.sh` HOLD until g-115-8556 lands (guard-5885) |
 | 0.5k.20 | stalled-goal-ratchet | deferrable | `bash core/scripts/stalled-goal-ratchet.sh` (~60s — needs >=120s bound). The only lane bounding TOTAL non-executable time, not one block class. `--dry-run --json` for rows (summary on stderr) |
 | 0.5k.21 | domain-term-ratchet | deferrable | `bash core/scripts/domain-term-ratchet.sh` (.sh REQUIRED; ~90s). Registry-derived peer ids present in core but NOT blocklisted. Scoped to `environments/id` ON PURPOSE — the whole-census figure (~1358) is ~89% conventions-heading prose and must never be ratcheted. A census yielding ZERO registry ids reports `skipped` and leaves the baseline alone (g-115-10049) |
+
+**0.5k recheck disposal (g-115-11721) — a 0.5k detector (the ratchets 0.5k.12 / .14 / .20 / .21 above, or any 0.5k lane) re-fired on a finding whose owner goal is OPEN and UNCLAIMED:** do NOT compose a new reading paragraph. Re-derive the number yourself, then append ONE short line to the owner goal's `progress_note` via `goal-field-append.sh` (its idempotency sentinel caps it at one line per agent per day):
+
+```
+Bash: goal-field-append.sh --source <src> <owner-goal-id> progress_note recheck-<agent>-<YYYYMMDD> "[recheck:<agent> <YYYY-MM-DD>] <lane> re-fired: <one clause — what re-fired, and that nothing new was found, or the new delta>"
+```
+
+The marker line is the selection signal: once ≥2 DISTINCT agents carry a `[recheck:...]` line within 7 days while the owner stays unclaimed, the goal-selector owned-redetection floor hoists the owner goal to the top selection slot and emits a banner — the repeat-detection IS the escalation, and the claim path is ordinary. (The 0.5k lanes carry no `## Phase` headers of their own — the table rows ARE the phase; this pointer is how the full body is reached.)
+
+▸ Body in `core/config/aspirations-precheck-digest.md` (§ Phase 0.5k) — `bash core/scripts/load-precheck-digest.sh`. g-115-11721.
 
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
@@ -587,13 +597,13 @@ IF signal is not null:
     Bash: printf '%s' '<payload-json>' > agents/<agent>/temp/exp-payload.raw
     Bash: bash core/scripts/sentinel-clear-guarded.sh \
             --slot force_experience_archival \
-            --verify "bash core/scripts/experience-read.sh --goal <goal-id>" \
+            --verify "bash core/scripts/experience-read.sh --id <experience_id>" \
             --expect "<experience_id>" \
             -- bash -c 'bash core/scripts/experience-add.sh < agents/<agent>/temp/exp-payload.raw'
     # rc=0 cleared · rc=1 the write failed · rc=2 the write did not land (read-back
     # empty or id mismatch) · rc=3 usage/clear error. On 1 or 2 do NOT narrate
-    # "experience archived" — read the diagnostic, fix the payload, and let the
-    # sentinel re-fire.
+    # "experience archived" — read the diagnostic, fix the payload; the sentinel
+    # re-fires.
     # Continue to Phase 0.
 ```
 
@@ -1039,7 +1049,7 @@ reintroducing a shadow LLM path here.
 
 ```
 Bash: bash core/scripts/execution-diary.sh phase-start phase-0.5.0-scripted
-Bash: bash core/scripts/precheck-eval.sh run-all
+Bash: bash core/scripts/precheck-eval.sh run-all --apply
 Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 # Parse the JSON. `flags[]` entries are prefixed with their subcommand
 # (e.g. `zombies:needs_complete_review`) because run-all merges sub-reports.
@@ -1085,6 +1095,7 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 #                                          aspirations-complete.sh (no evidence gate). Next
 #                                          pass re-detects it as all_terminal if you stop early.
 #   pipeline-depth:thin_pipeline       → invoke /create-aspiration from-self
+#   pipeline-depth:starvation_promoted → do NOT generate (§4 fail-safe already promoted)
 #   hypothesis-health:stalled_pipeline → /review-hypotheses --resolve
 #   accuracy:accuracy_low              → file Investigate goal targeting
 #                                        results.accuracy.worst_strategies

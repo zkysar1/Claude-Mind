@@ -389,7 +389,7 @@ Weight: `meta/goal-selection-strategy.yaml → cross_aspiration_support`
 
 To permanently stop a recurring goal: set `recurring: false` via `aspirations-update-goal.sh <goal-id> recurring false`. The data layer (`cmd_update_goal` in `aspirations.py`) cascading-clears `interval_hours` and `lastAchievedAt` in the same write — preserving `achievedCount` / `currentStreak` / `longestStreak` as historical record. Without the cascade, the orphan timing fields would mislead the goal-selector's "not yet due" filter and require the archive sweep to silently repair.
 
-To complete one cycle of a recurring goal atomically: `bash core/scripts/recurring-close.sh <goal-id> <routine|deep>`. Wraps the 4 iteration-close phases, bumps `lastAchievedAt` via `aspirations-complete-by.sh` (routed inside `iteration-close.sh do_verify` when the goal is recurring), updates `consecutive_routine`, and fires the cargo-cult detector at threshold (`recurring.cargo_cult_threshold`, default 3 in `core/config/aspirations.yaml`).
+To complete one cycle of a recurring goal atomically: `bash core/scripts/recurring-close.sh <goal-id> <routine|deep> --source <world|agent>` (`--source` is REQUIRED: omitting it exits 2 with a usage line). Wraps the 4 iteration-close phases, bumps `lastAchievedAt` via `aspirations-complete-by.sh` (routed inside `iteration-close.sh do_verify` when the goal is recurring), updates `consecutive_routine`, and fires the cargo-cult detector at threshold (`recurring.cargo_cult_threshold`, default 3 in `core/config/aspirations.yaml`).
 
 Phase 0 Recurring Goal Checks resets completed recurring goals to `pending` after `interval_hours` elapses. Phase 7 skips "aspiration fully complete" for aspirations where ALL goals are recurring (perpetual aspirations).
 

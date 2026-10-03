@@ -151,6 +151,10 @@ _EXCLUDE_DIRS = {
     # second layer (a flat legacy file re-created by old code is still
     # machine-local — never push it).
     ".experience-stats",
+    # composite-store segment objects (g-358-202): `<dir>/.composite/<store>/<asp>/<n>.<md5>.jsonl`,
+    # on the remote only. They are backend-private pieces of ONE logical file, never files of their
+    # own, so the pull sweep must not mirror them and the walk must not descend into such a dir.
+    ".composite",
 }
 # Directory-name PREFIXES pruned exactly like _EXCLUDE_DIRS (g-372-44). An
 # exact-basename set cannot see an INVENTED sibling of an excluded dir: renaming
@@ -239,6 +243,18 @@ _EXCLUDE_NAMES = {
     "experience-stats.spool.jsonl",
     "experience-stats.spool.flushing.jsonl",
     "experience-stats.spool.last-flush",
+    # tree-index retrieval counter spool (g-358-231): the same shape and severity
+    # as the utilization and experience lanes above. It sits beside the tree index
+    # in the world tree dir (a SYNCED dir) and is drained back INTO that shared
+    # index by _tree_retrieval_spool.flush_into_index, so a synced copy would have
+    # every box drain every other box's deltas. Measured before these entries: all
+    # three names classified SHARED. Names are
+    # _tree_retrieval_spool.SYNC_EXCLUDED_NAMES; test_tree_retrieval_spool.py
+    # asserts every one is present here. The .flush.lock companion rides the
+    # *.lock glob below.
+    "tree-retrieval.spool.jsonl",
+    "tree-retrieval.spool.flushing.jsonl",
+    "tree-retrieval.spool.last-flush",
     # citation-credit sweep throttle (g-115-7384). FOURTH per-box .last-*
     # stamp to need a literal entry, and the third added after the fact --
     # `.last-sweep` matches no glob above, exactly as the gate-firings comment

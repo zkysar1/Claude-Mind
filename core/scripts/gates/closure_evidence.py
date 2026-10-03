@@ -50,6 +50,11 @@ owns the refusal, the override and the ledger. One module, one path, for every
 agent and every Body: iteration-close.sh do_verify calls it before the status
 write, and both the worker (Phase 4a) and the reducer (Phase 5) close through
 there (guard-5132).
+
+THE ADVISORY (g-375-52) rides the same path and never refuses. A note that
+cites a file under the closer's per-session dir cites evidence no other box can
+open, so scratch_citations() names each such paragraph that lacks the lines the
+claim rests on, or whose note names no host. See its section at the end.
 """
 from __future__ import annotations
 
@@ -381,4 +386,93 @@ def refusal_text(goal_id: str, result: dict, note_source: str) -> str:
                  f"the record's note: put the rows first and keep the note's current text below "
                  f"them (read it: bash core/scripts/aspirations-query.sh --goal-field id {goal_id} "
                  f"--full). For a false refusal, add --override-closure-evidence \"<why>\" (audited).")
+    return "\n".join(lines)
+
+
+# ─── the session-scratch advisory () ──────────────────────────────
+#
+# A per-session dir (agents/<agent>/sessions/<SID>/) never syncs: its dirname is
+# in owncloud_sync._EXCLUDE_DIRS. So a note that cites a suite log, probe output
+# or census file there cites evidence that only the closing box can open. A
+# reviewer on any other box has to re-derive the claim or record it unverified.
+# Measured 2026-09-27: 14 of the first 39 close reviews flagged it, and
+# guard-7485 is the behavioural rule: keep the path as a pointer, inline the
+# lines it rests on, and name the host.
+#
+# This half is ADVISORY. It never refuses, because a closure can be sound and
+# still cite a pointer; the cost of the gap falls on the reviewer, not the close.
+
+# An excerpt is a backticked or quoted span of 12+ characters with a space in
+# it: an output line, or a command. A lone name or a lone path has no space.
+EXCERPT_RE = re.compile(r"`([^`\n]+)`|\"([^\"\n]+)\"|\u201c([^\u201d\n]+)\u201d")
+# A host is named as "hostname <box>", "hostname: <box>" or "host=<box>". The
+# CLI also passes this box's own hostname, which counts anywhere in the note.
+# Not after a dash, so a command's --host=127.0.0.1 flag names no host.
+HOST_RE = re.compile(r"(?<![\w-])hostname\b[ \t]*[:=]?[ \t]*[`\"(]?[A-Za-z0-9][\w.-]*"
+                     r"|(?<![\w-])host[ \t]*[:=][ \t]*[`\"(]?[A-Za-z0-9][\w.-]*", re.IGNORECASE)
+# \r too: a note written on Windows (or a CRLF summary on stdin) has "\r\n\r\n"
+# between paragraphs, and without it the whole note reads as one paragraph.
+PARAGRAPH_RE = re.compile(r"\n[ \t\r]*\n")
+
+
+def session_path_re(sessions_dirname: str) -> "re.Pattern[str]":
+    """A path that runs through <sessions_dirname>/<SID>/ into something below
+    it. The SID must be hex, 8+ characters with dashes allowed, so a product
+    repo's src/sessions/handlers/ does not match. path_tokens() has already
+    dropped placeholders such as <SID>, so a note describing the convention
+    does not match either."""
+    return re.compile(r"(?:^|[\\/])" + re.escape(sessions_dirname)
+                      + r"[\\/][0-9A-Fa-f]{8}[0-9A-Fa-f-]*[\\/][^\\/]")
+
+
+def has_excerpt(text: str) -> bool:
+    for m in EXCERPT_RE.finditer(text):
+        span = next(g for g in m.groups() if g is not None).strip()
+        if len(span) >= 12 and " " in span:
+            return True
+    return False
+
+
+def names_host(note: str, hostname: str = "") -> bool:
+    if HOST_RE.search(note):
+        return True
+    return bool(hostname) and re.search(
+        r"(?<![\w.-])" + re.escape(hostname) + r"(?![\w-])", note, re.IGNORECASE) is not None
+
+
+def scratch_citations(note: str, *, sessions_dirname: str, hostname: str = "") -> List[dict]:
+    """One entry per paragraph (blank-line separated, 1-based) that cites a
+    per-session path and is missing what a reviewer on another box needs:
+    {"paragraph": n, "paths": [...], "missing": ["excerpt", "host"]}. The
+    excerpt must sit in the same paragraph as the path it backs; the host may
+    be named anywhere in the note. [] means nothing to advise."""
+    sess = session_path_re(sessions_dirname)
+    note = note or ""
+    hosted = names_host(note, hostname)
+    out: List[dict] = []
+    for n, para in enumerate(PARAGRAPH_RE.split(note), start=1):
+        paths = [t for t in path_tokens(para) if sess.search(t)]
+        if not paths:
+            continue
+        missing = ([] if has_excerpt(para) else ["excerpt"]) + ([] if hosted else ["host"])
+        if missing:
+            out.append({"paragraph": n, "paths": paths, "missing": missing})
+    return out
+
+
+def advisory_text(goal_id: str, found: List[dict], hostname: str = "") -> str:
+    """Short, like the refusal: where it fired, what is missing, the fix."""
+    lines = [f"closure-evidence-gate: ADVISORY (g-375-52, never refuses). {goal_id}'s note cites "
+             f"session-scratch evidence that no other box can open:"]
+    for f in found[:6]:
+        state = "no lines inline beside it" if "excerpt" in f["missing"] else "lines inline"
+        lines.append(f"  - paragraph {f['paragraph']}: {', '.join(f['paths'][:2])} ({state})")
+    if len(found) > 6:
+        lines.append(f"  - ... and {len(found) - 6} more")
+    if any("host" in f["missing"] for f in found):
+        lines.append("  The note names no host.")
+    lines.append(f"  Keep each path as a pointer. Beside it, quote in backticks the lines the claim "
+                 f"rests on: the VERDICT or TOTAL line with its command, a count with its predicate, "
+                 f"or the decisive probe output. Name the box as \"hostname {hostname or '<box>'}\" "
+                 f"(guard-7485).")
     return "\n".join(lines)

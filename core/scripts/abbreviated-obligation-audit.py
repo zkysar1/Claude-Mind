@@ -142,7 +142,7 @@ def _normalize_phase(phase, schema):
     return aliases.get(phase, phase)
 
 
-def _normalize_condition(condition):
+def _normalize_condition(condition, schema=None):
     """Strip a TRAILING explanation from a claimed condition.
 
     `condition not in allowed` is exact membership, so a claim naming the canonical token
@@ -158,6 +158,16 @@ def _normalize_condition(condition):
     genuinely different condition still fails. Keep this body identical to its twin in
     `obligation-audit.py` — which carries the full measurement —
     `test_obligation_audit_phase_vocabulary.py` pins the two together.
+
+    THIRD CLASS, the claim's own WORDING (g-115-11622, measured 2026-10-02). The head left
+    after the cut is looked up in the schema's `condition_aliases:` (compared lower-cased,
+    whitespace collapsed) and replaced by the canonical token it names. A TRUE condition
+    written as `zone tight` or `outcome_class routine` never reached the runtime check,
+    because `condition not in allowed` is exact membership: in one corpus snapshot (the 233
+    claim lines the auditor's own parser accepts, 5 agents) 12 claims scored "schema
+    disallows this condition" on wording alone, and the two the goal was filed over were
+    among them. The map only RENAMES; the runtime check still decides, and a head that is
+    not listed passes through unchanged and still fails.
     """
     cond = (condition or "").strip()
     cut = len(cond)
@@ -165,14 +175,20 @@ def _normalize_condition(condition):
         i = cond.find(sep)
         if i != -1:
             cut = min(cut, i)
-    return cond[:cut].strip()
+    head = cond[:cut].strip()
+    aliases = (schema or {}).get("condition_aliases") or {}
+    wanted = " ".join(head.lower().split())
+    for claimed, token in aliases.items():
+        if " ".join(str(claimed).lower().split()) == wanted:
+            return str(token).strip()
+    return head
 
 
 def _validate_claim(phase, condition, schema, iter_outcome_class, claim_zone):
     """Returns (valid: bool, failure_reason: str|None)."""
     obligations = (schema or {}).get("obligations") or {}
     phase = _normalize_phase(phase, schema)
-    condition = _normalize_condition(condition)
+    condition = _normalize_condition(condition, schema)
     spec = obligations.get(phase)
     # `not spec`, NOT `is None` — the twin uses the falsy test and a phase key
     # carrying an empty body governs nothing, so the two disagreed on a real

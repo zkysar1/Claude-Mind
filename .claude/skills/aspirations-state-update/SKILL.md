@@ -396,10 +396,14 @@ IF outcome_class == "routine":
         ELSE:
             curator_score = (coverage * 0.40) + (specificity * 0.35) + (actionability * 0.25)
         IF curator_score < pass_threshold (default 0.45):
-            Output: "▸ CURATOR GATE: REJECTED (score {curator_score:.2f} < {pass_threshold}) — demoted to overflow"
-            echo '{"observation": "<insight_text>", "target_node": "<node.key>", "curator_score": <score>, "reason": "below_threshold"}' | wm-set.sh curator_overflow
+            Output: "▸ CURATOR GATE: REJECTED (score {curator_score:.2f} < {pass_threshold}) — demoted to overflow queue"
+            echo '{"observation": "<insight_text>", "target_node": "<node.key>", "curator_score": <score>, "reason": "below_threshold"}' | py -3 core/scripts/overflow-queue-append.py
             SKIP steps d through f for this insight (do NOT write to tree)
-            # Overflow items get second chance during session-end consolidation
+            # The item APPENDS to agents/<agent>/session/overflow-queue.yaml — the store
+            # /aspirations-consolidate's Step 0.1 triage + Overflow Queue Management read,
+            # so it gets its second chance at the next consolidation (g-115-11580: the
+            # former single-slot demotion had no reader, was replaced on a second write,
+            # and was age-evicted after 120 min; append never clobbers).
         ELSE:
             Output: "▸ CURATOR GATE: PASSED (score {curator_score:.2f})"
             # c.6. MDL PARSIMONY ADVISORY (g-115-1468 / earn-the-keep Phase 1c):
@@ -445,7 +449,8 @@ IF outcome_class == "routine":
                     # Reconcile with the curator PASS (curator saw NEW semantic info;
                     # MDL sees lexical overlap):
                     #   - genuine restatement, no new fact -> MERGE into {nearest_id}
-                    #     (Edit the existing node line) or demote to curator_overflow;
+                    #     (Edit the existing node line) or demote via
+                    #     overflow-queue-append.py (same path as the curator gate above);
                     #     do NOT append a near-duplicate line.
                     #   - adds a concrete fact the lexical check missed -> append normally.
                 ELSE:

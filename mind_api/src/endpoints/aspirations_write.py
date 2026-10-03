@@ -106,6 +106,7 @@ from _goal_census import TERMINAL_STATUSES as _TERMINAL_STATUSES  # noqa: E402
 import _aspirations_resurrection as _resurrection  # noqa: E402  # archive-sweep resurrection predicate SSOT (2026-08-16)
 import _decomposed_dependents  # noqa: E402  #  — shared with the CLI's cmd_update_goal
 from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
+from gates.intake_route import apply as _intake_route_apply, load_config as _intake_route_config  # noqa: E402  # 
 from gates.goal_duplication import evaluate as _goal_duplication_eval  # noqa: E402
 from gates.aspiration_supply import (  # noqa: E402
     evaluate as _aspiration_supply_eval,
@@ -1045,12 +1046,25 @@ def _archived_aspiration_hint(base_dir: Path, asp_id: str) -> str:
 
 
 def _find_goal(items: List[Dict[str, Any]], goal_id: str) -> Optional[Tuple[int, int, Dict]]:
-    """Return (asp_idx, goal_idx, asp_dict) or None."""
+    """Return (asp_idx, goal_idx, asp_dict) or None.
+
+    A same-id rehome (rehome_goal, _rehome_recurring_goals) leaves a
+    `superseded` POINTER under the id in the source aspiration, and the store
+    cannot drop it (guard-6913). When both copies exist the first NON-superseded
+    copy wins; first-match would hand every later update / claim / release the
+    pointer whenever the source precedes the target in file order (asp-115 is
+    first). A lone pointer is still returned. Mirrors aspirations.py
+    find_goal_in_aspirations and _sweep_write_guard._find_goal (g-353-65).
+    """
+    pointer = None
     for ai, asp in enumerate(items):
         for gi, goal in enumerate(asp.get("goals", [])):
             if goal.get("id") == goal_id:
-                return (ai, gi, asp)
-    return None
+                if goal.get("status") != "superseded":
+                    return (ai, gi, asp)
+                if pointer is None:
+                    pointer = (ai, gi, asp)
+    return pointer
 
 
 def _recompute_progress(asp: Dict[str, Any]) -> None:
@@ -1935,6 +1949,13 @@ def _run_add_goal_pipeline(ctx, goal: Dict[str, Any], source: str
     # stored signal matches what the gate accepted.
     if sig_result.get("auto_derived") and sig_result.get("origin_signal"):
         goal["origin_signal"] = sig_result["origin_signal"]
+
+    # === Phase C.2: intake routing (; goal-intake-management.md §3) ===
+    # After the origin-signal gate, so a Layer-D auto-derived signal is the one
+    # routed. Only a "candidate" verdict changes the goal, and with
+    # candidate_tier.enabled false (the shipped default) nothing changes at all.
+    _intake_route_apply(goal, config=_intake_route_config(ctx.paths.project_root),
+                        source=source, agent_name=ctx.paths.agent_name)
 
     # === Phase C.5: goal-source default (, applied 2026-05-19) ===
     # The asp-creation pipeline at cmd_add() calls _apply_goal_source_default
@@ -3112,6 +3133,8 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # a bare-string body is untouched, and a dict body for status was
     # previously always an invalid-status refusal, so no caller relied on it.
     companion_note = None
+    companion_ledger_evidence = None
+    companion_ledger_verdict = None
     if field == "status" and isinstance(value, dict) and "value" in value:
         _cn = value.get("outcome_note")
         if _cn is not None and not isinstance(_cn, str):
@@ -3120,6 +3143,11 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 f"outcome_note companion on the status write must be a "
                 f"string, got {type(_cn).__name__} (goal {goal_id})")
         companion_note = _cn
+        # : the writer's half of the §5 candidate ledger row. Shape
+        # is validated by gates.candidate_transition.caller_channel inside the
+        # lock, and only when a row is due. The CLI twin unwraps the same keys.
+        companion_ledger_evidence = value.get("ledger_evidence")
+        companion_ledger_verdict = value.get("ledger_verdict")
         value = value["value"]
 
     # FIELD PRECONDITION (). A caller that composes the new value
@@ -3637,7 +3665,8 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
             _ct_row_due = None
             if field == "status":
                 from gates.candidate_transition import (
-                    evaluate as _ct_eval, append_ledger as _ct_ledger)
+                    evaluate as _ct_eval, append_ledger as _ct_ledger,
+                    caller_channel as _ct_channel)
                 _ct = _ct_eval(goal.get("status"), value)
                 if not _ct["allowed"]:
                     return Response.error(
@@ -3645,11 +3674,21 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                 if _ct["ledger"]:
                     _eff_note = (companion_note if companion_note is not None
                                  else goal.get("outcome_note"))
+                    # : the writer may name its verdict and stamp its
+                    # own evidence (promoted_by); one shared validator, both
+                    # paths.
+                    _cc_verdict, _cc_evidence, _cc_err = _ct_channel(
+                        value, companion_ledger_evidence,
+                        companion_ledger_verdict)
+                    if _cc_err:
+                        return Response.error(
+                            400, "invalid_ledger_channel", _cc_err)
                     _ct_row_due = {
-                        "verdict": _ct["verdict"],
+                        "verdict": _cc_verdict or _ct["verdict"],
                         "new_status": value,
                         "agent": agent or "unknown",
-                        "evidence": {"outcome_note": _eff_note},
+                        "evidence": {"outcome_note": _eff_note,
+                                     **_cc_evidence},
                         "ledger": _ct_ledger,
                     }
 
@@ -4267,20 +4306,29 @@ def update_goal(ctx) -> "Response":  # type: ignore[name-defined]
                     # aspirations.py would be inert while looking correct.
                     # Both sites call the SAME gates.blocker_ref predicate so
                     # they cannot drift apart.
-                    if not _is_live_lease(goal.get("blocker_ref")):
-                        goal.pop("blocker_ref", None)
+                    # Cleared to None, never popped (): a popped key
+                    # comes back from any peer copy that still holds it at the
+                    # next merge (coordination_merge keeps one-sided keys).
+                    if ("blocker_ref" in goal
+                            and not _is_live_lease(goal.get("blocker_ref"))):
+                        goal["blocker_ref"] = None
 
             # 3. recurring=false cascade (PR 7g).
             # Mirror of cmd_update_goal lines 2183-2185. When recurring flips
-            # to falsy, interval_hours and lastAchievedAt MUST drop here so
+            # to falsy, interval_hours and lastAchievedAt MUST be cleared here so
             # goal-selector's `hours_since(lastAchievedAt) < interval_hours`
             # filter doesn't treat the dead goal as "not yet due" until the
             # next archive-sweep safety-net catches it. History fields
             # (achievedCount, currentStreak, longestStreak) are preserved as
             # factual record.
+            # Cleared to None, never popped (): a pop came back from
+            # any pre-retirement peer copy at the next merge and rebuilt the
+            # rb-295 shape. _merge_goal lets this clear beat an older
+            # lastAchievedAt.
             if field == "recurring" and not value:
-                goal.pop("interval_hours", None)
-                goal.pop("lastAchievedAt", None)
+                for key in ("interval_hours", "lastAchievedAt"):
+                    if key in goal:
+                        goal[key] = None
 
             # 4. blocked_by → blocked_since auto-management (PR 7g).
             # Mirror of cmd_update_goal lines 2188-2193. blocked_since is the
@@ -5844,9 +5892,11 @@ def complete_by(ctx):
                 goal.pop("claimed_by_sid", None)  # : see release()
 
                 # Compute elapsed BEFORE updating lastAchievedAt
-                interval = goal.get("interval_hours", 24)
-                if "remind_days" in goal and "interval_hours" not in goal:
-                    interval = goal["remind_days"] * 24
+                # A cleared interval_hours (None, ) reads as absent.
+                interval = goal.get("interval_hours")
+                if interval is None:
+                    interval = (goal["remind_days"] * 24 if "remind_days" in goal
+                                else 24)
                 elapsed = None
                 la_str = goal.get("lastAchievedAt")
                 if la_str:
@@ -8683,6 +8733,115 @@ def rehome_recurring_backfill(ctx) -> "Response":  # type: ignore[name-defined]
     })
 
 
+def rehome_goal(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/aspirations/rehome-goal?source=<world|agent>&goal_id=<id>
+        &to_asp=<asp-id>[&reason=<text>][&dry_run=true]
+
+    Move ONE goal into a live aspiration under its SAME id (g-353-65, B4
+    move-on-touch: world/conventions/goal-intake-management.md §5-6, I6). Same
+    shape _rehome_recurring_goals writes: the target adopts a copy stamped
+    rehomed_from / rehomed_at / rehome_reason, and the copy left behind becomes a
+    `superseded` pointer (rehomed_to, superseded_by_goal = the same id). The
+    pointer IS the tombstone: the live store union-merges with no deletion
+    (guard-1072), so a popped record would be resurrected by any peer. Never
+    renumbers — aspirations-move-goals.py does, and a new id breaks every
+    blocked_by / reply / ledger reference to the goal (guard-1690). Idempotent:
+    a target already holding the id adopts nothing and the source pointer is
+    re-asserted; a goal whose only live copy is already in the target is a
+    no-op (already_rehomed). The pointer is stamped last_modified=now and
+    recurring=false (guard-6913): `superseded` is NOT a merge-terminal status,
+    so a pointer that does not out-date a peer's stale live copy loses LWW and
+    the move comes back as a duplicate.
+    """
+    from ..server import Response
+    source = (ctx.query.get("source") or "world").strip()
+    if source not in ("world", "agent"):
+        return Response.error(400, "invalid_source",
+                              "source must be world or agent")
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+    goal_id = (ctx.query.get("goal_id") or "").strip()
+    to_asp = (ctx.query.get("to_asp") or "").strip()
+    if not goal_id or not to_asp:
+        return Response.error(400, "missing_params", "goal_id and to_asp are required")
+    reason = (ctx.query.get("reason") or "").strip() or "move-on-touch (g-353-65)"
+    dry_run = (ctx.query.get("dry_run") or "").strip().lower() in ("true", "1", "yes")
+    agent = _agent_name(ctx)
+    live_path, base_dir = _resolve_paths(ctx, source)
+    adopted_new = False
+    from_asp = None
+    try:
+        with file_locks.locked(live_path):
+            items = _read_jsonl(live_path)
+            live = [(a, g) for a in items if isinstance(a, dict)
+                    for g in (a.get("goals") or [])
+                    if isinstance(g, dict) and g.get("id") == goal_id
+                    and g.get("status") != "superseded"]
+            if not live:
+                return Response.error(404, "goal_not_found",
+                                      f"{goal_id}: no live copy in the {source} store")
+            outside = [(a, g) for a, g in live if a.get("id") != to_asp]
+            if not outside:
+                # Idempotent ONLY when a pointer proves an earlier move here; a
+                # goal that merely lives in to_asp has nothing to move.
+                moved_here = any(
+                    g.get("status") == "superseded" and g.get("rehomed_to") == to_asp
+                    for a in items if isinstance(a, dict) and a.get("id") != to_asp
+                    for g in (a.get("goals") or [])
+                    if isinstance(g, dict) and g.get("id") == goal_id)
+                if not moved_here:
+                    return Response.error(400, "invalid_target",
+                                          f"{goal_id} already lives in {to_asp}; nothing to move")
+                return Response.json({"ok": True, "dry_run": dry_run, "goal_id": goal_id,
+                                      "from_asp": None, "to_asp": to_asp,
+                                      "adopted_new": False, "already_rehomed": True})
+            holder, goal = outside[0]
+            from_asp = str(holder.get("id"))
+            target = next((a for a in items if isinstance(a, dict)
+                           and a.get("id") == to_asp), None)
+            if (target is None or to_asp == from_asp
+                    or target.get("status") in ("completed", "retired")
+                    or target.get("archived")):
+                return Response.error(400, "invalid_target",
+                                      f"{to_asp} is not a live aspiration other than {from_asp}")
+            now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            if goal_id not in {g.get("id") for g in (target.get("goals") or [])
+                               if isinstance(g, dict)}:
+                adopted = dict(goal)
+                adopted["rehomed_from"] = from_asp
+                adopted["rehomed_at"] = now
+                adopted["rehome_reason"] = reason
+                adopted["last_modified"] = now
+                target.setdefault("goals", []).append(adopted)
+                adopted_new = True
+            prior_note = goal.get("outcome_note") or ""
+            goal["status"] = "superseded"
+            goal["recurring"] = False
+            goal["rehomed_to"] = to_asp
+            goal["rehomed_at"] = now
+            goal["superseded_by_goal"] = goal_id
+            goal["disposition_reason"] = reason
+            goal["outcome_note"] = (f"REHOMED {now}: the live copy is {goal_id} in {to_asp} "
+                                    f"({reason})." + (f"\n\n{prior_note}" if prior_note else ""))
+            goal["last_modified"] = now
+            _recompute_progress(target)
+            _recompute_progress(holder)
+            if not dry_run:
+                history.snapshot(live_path, base_dir, agent,
+                                 summary=f"rehome-goal {goal_id} {from_asp} -> {to_asp}")
+                _atomic_write_jsonl(live_path, items)
+                changelog.append(base_dir, agent, live_path, "edit",
+                                 summary=f"rehome-goal {goal_id} {from_asp} -> {to_asp}",
+                                 lines_changed=len(items))
+                _jsonl_cache().invalidate(live_path)
+    except OSError as e:
+        return Response.error(500, "write_failed", str(e))
+    return Response.json({"ok": True, "dry_run": dry_run, "goal_id": goal_id,
+                          "from_asp": from_asp, "to_asp": to_asp,
+                          "adopted_new": adopted_new})
+
+
 def archive_sweep(ctx) -> "Response":  # type: ignore[name-defined]
     """POST /v1/aspirations/archive-sweep?source=<world|agent>
 
@@ -9393,6 +9552,13 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
         if sig_result.get("auto_derived") and sig_result.get("origin_signal"):
             g["origin_signal"] = sig_result["origin_signal"]
 
+    # Intake routing per goal (; goal-intake-management.md §3) —
+    # AFTER the origin-signal gate, exactly as in _run_add_goal_pipeline.
+    intake_cfg = _intake_route_config(ctx.paths.project_root)
+    for g in asp.get("goals", []):
+        _intake_route_apply(g, config=intake_cfg, source=source,
+                            agent_name=ctx.paths.agent_name)
+
     # Goal-source auto-derive (AFTER origin-signal gate — order matters)
     for g in asp.get("goals", []):
         _apply_goal_source_default(g)
@@ -9945,6 +10111,7 @@ def register(routes) -> None:
     routes[("POST", "/v1/aspirations/claim")] = claim
     routes[("POST", "/v1/aspirations/archive-sweep")] = archive_sweep
     routes[("POST", "/v1/aspirations/rehome-recurring-backfill")] = rehome_recurring_backfill
+    routes[("POST", "/v1/aspirations/rehome-goal")] = rehome_goal
     routes[("POST", "/v1/aspirations/meta-update")] = meta_update
     routes[("POST", "/v1/aspirations/clear-stale-claims")] = clear_stale_claims
     routes[("POST", "/v1/aspirations/add")] = add

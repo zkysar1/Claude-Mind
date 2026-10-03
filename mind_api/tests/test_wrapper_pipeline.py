@@ -72,8 +72,12 @@ def pipeline_daemon(running_daemon):
 
 
 def _run_wrapper(project_root: Path, port: int, script_name: str,
-                 args: list, *, stdin_data: str = ""):
-    """Run a pipeline wrapper script against the test daemon."""
+                 args: list, *, stdin_data: "str | bytes" = "", timeout: int = 15):
+    """Run a pipeline wrapper script against the test daemon.
+
+    Bytes stdin_data is sent as is, and the outputs come back as bytes. A text-mode
+    pipe on Windows adds a carriage return before every newline.
+    """
     # Use the real repo scripts but point env at the test daemon's dirs.
     script = REPO_ROOT / "core" / "scripts" / script_name
     env = os.environ.copy()
@@ -86,7 +90,7 @@ def _run_wrapper(project_root: Path, port: int, script_name: str,
 
     result = subprocess.run(
         [_bash(), script.as_posix()] + args,
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=not isinstance(stdin_data, bytes), timeout=timeout,
         input=stdin_data or None,
         env=env,
     )
@@ -204,3 +208,52 @@ def test_wrapper_update_field_reflected(pipeline_daemon):
     rec = next(r for r in items if r["id"] == "2026-05-12_test-active")
     assert rec["reflected"] is True
     assert rec.get("reflected_date") is not None
+
+
+# ---------------------------------------------------------------------------
+# The value on stdin ()
+# ---------------------------------------------------------------------------
+
+def test_wrapper_update_field_refuses_two_value_sources(pipeline_daemon):
+    project_root, port = pipeline_daemon
+    live = project_root / "world" / "pipeline.jsonl"
+    before = live.read_bytes()
+
+    result = _run_wrapper(project_root, port, "pipeline-update-field.sh",
+                          ["2026-05-12_test-active", "rationale", "positional",
+                           "--value-stdin"], stdin_data="from stdin")
+    assert result.returncode == 2, f"stderr: {result.stderr}"
+    assert live.read_bytes() == before
+
+
+def test_store_field_append_stores_a_long_composed_value_exactly(pipeline_daemon):
+    """A composed value over 8,186 characters is stored exactly, end to end.
+
+    On Windows, Git bash cuts an argv word holding whitespace at 8,186 characters
+    with rc=0. store-field-append used to send the composed value as the last
+    argv word of the write, so on Windows this test fails on that code. On every
+    platform it runs the stdin path through the real wrappers and the endpoint.
+    The appended text carries a newline, so a carriage return added on the way
+    in also fails it. The shape is the measured one: a long field plus a short
+    append, so the TEXT itself stays short.
+    """
+    project_root, port = pipeline_daemon
+    live = project_root / "world" / "pipeline.jsonl"
+    rid = "2026-05-12_test-active"
+    pre = ("an existing rationale paragraph " * 235).strip()
+    seeded = _run_wrapper(project_root, port, "pipeline-update-field.sh",
+                          [rid, "rationale", "--value-stdin"],
+                          stdin_data=pre.encode("utf-8"))
+    assert seeded.returncode == 0, seeded.stderr
+
+    text = "a new finding (measured)\n" + ("with its evidence " * 90).strip()
+    result = _run_wrapper(project_root, port, "store-field-append.sh",
+                          ["--store", "pipeline", rid, "rationale", "m-11615",
+                           "--value-stdin"],
+                          stdin_data=text.encode("utf-8"), timeout=60)
+    assert result.returncode == 0, result.stderr
+
+    expected = pre + "\n\n" + text + "\n[appended:m-11615]"
+    assert len(expected) > 9000
+    rec = next(r for r in _read_jsonl(live) if r["id"] == rid)
+    assert rec["rationale"] == expected

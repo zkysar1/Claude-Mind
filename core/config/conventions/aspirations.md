@@ -28,7 +28,8 @@ time, and they **share the ID `asp-001`** by convention:
 | Source | ID | Title | Seeded by |
 |---|---|---|---|
 | `world/aspirations.jsonl` | `asp-001` | Explore and Learn | `init-world.sh` (copies `core/config/world-aspirations-initial.jsonl`) |
-| `world/aspirations.jsonl` | `asp-002` | Operating Rhythm | `init-world.sh` (same seed file — never-terminal recurring container carrying the `/sprint-planning` cadence goal `g-002-01`; world-scope, so ONE agent claims each firing rather than every agent running its own sprint) |
+| `world/aspirations.jsonl` | `asp-002` | Operating Rhythm | `init-world.sh` (same seed file — never-terminal recurring container carrying the `/sprint-planning` cadence goal `g-002-01` (world-scope, so ONE agent claims each firing rather than every agent running its own sprint) and the candidate-grooming sweep template `g-002-03` (instantiated once per live roster agent when the candidate tier is on)) |
+| `world/aspirations.jsonl` | `asp-004` | Triage Inbox | `init-world.sh` (same seed file — seeded EMPTY and flagged `triage_inbox: true`; the home for laneless discoveries, which the grooming sweep `g-002-03` re-homes into it; `core/scripts/groom.py` finds it by that flag, never by its id) |
 | `agents/<agent>/aspirations.jsonl` | `asp-001` | Maintain Agent Health | `init-agent.sh` (copies `core/config/agent-aspirations-initial.jsonl`) |
 | `agents/<agent>/aspirations.jsonl` | `asp-003` | Orient and Specialize | `init-agent.sh` (appends `core/config/agent-aspirations-onboard.jsonl` for subsequent agents) |
 
@@ -49,6 +50,17 @@ aspiration's source (`--source world` vs `--source agent`) disambiguates.
 3. **Goal-selector already handles this**: `goal-selector.py` reads from BOTH
    queues and tags each candidate with `source: "world"` or `source: "agent"`.
    Downstream skills propagate `source` per the Source Routing Protocol below.
+4. **ID-COLLISION RULE — seed ids are NOT unique across world generations.** A
+   running world can hold archived or live aspirations under the same `asp-NNN`
+   the current seed gives to something else (measured 2026-08-28: one world's
+   archived `asp-002` and `asp-003` were different aspirations from the seed's).
+   The seed files define FRESH-world day-one state only, and `init-world.sh`
+   copies one only when its target is absent (`seed_needed`). An existing world
+   adopts a new seed record, the Triage Inbox for one, through `create-aspiration`
+   at the next free `asp-NNN` (see "ID Allocation" below), NEVER by inserting the
+   seed's id. Find a seeded record by its role flag or title, not by its seed id:
+   the Triage Inbox is the live aspiration with `triage_inbox: true`. Pinned by
+   `core/scripts/tests/test_world_seed_goal_intake.py`.
 
 ## ID Allocation (g-328-29 — server-side, in-lock)
 

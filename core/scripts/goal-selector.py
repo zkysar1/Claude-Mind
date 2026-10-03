@@ -123,6 +123,7 @@ from _runner_capabilities import (  # noqa: E402  ( per-runner capability filter
     capability_block_detail)
 from _drain_title import is_drain_action_title  # noqa: E402  ( owner-scope drain SSOT)
 import reducer_selection_policy  # noqa: E402  ( reducer selection policy)
+import recheck_marker  # noqa: E402  ( owned-redetection recheck predicate, SSOT)
 from _dependency_graph import supersession_satisfied_ids  # noqa: E402  ( SSOT, guard-547)
 from _board_paths import channel_paths, read_paths  # noqa: E402  ( reader seam)
 SKIP_STATUSES = TERMINAL_GOAL_STATUSES | {"in-progress"}              # not selectable
@@ -1435,6 +1436,53 @@ def load_fan_in_config():
 FAN_IN_CONFIG = load_fan_in_config()
 
 
+# --- OWNED-REDETECTION FLOOR () ---
+# HOISTED to module level like _PULL_BOOST_DEFAULTS above, for the same
+# mutation-proofing reason (guard-3534): the loader swallows every overlay
+# failure, so a world whose aspirations.yaml carries no owned_redetection
+# block runs on exactly these numbers, and a test that pins the EFFECTIVE
+# config alone cannot catch damage to the fallback literal.
+_OWNED_REDETECTION_DEFAULTS = {
+    "enabled": True,
+    "min_agents": 2,        # the goal's own verification threshold: re-detected by at least 2 agents
+    "window_days": 7,       # ...within 7 days
+}
+
+
+def load_owned_redetection_config():
+    """Load owned-redetection floor params from core/config/aspirations.yaml.
+
+    g-115-11721 (2026-10-02). An OWNED regression — a detector re-firing on a
+    finding whose owner goal is open — drew appended READINGS instead of work
+    for weeks: g-115-10165 took 35 appended readings from five agents in ~2
+    weeks and was never claimed, because nothing converted the repeats into a
+    selection signal. This floor is the conversion: recheck markers (one short
+    line per re-detecting agent, the stated disposal for the 0.5k ratchet
+    lanes) become a selection-time hoist once DISTINCT agents re-detect an
+    unclaimed owner within the window. Same overlay/type-coerce shape as the
+    sibling loaders.
+    """
+    defaults = dict(_OWNED_REDETECTION_DEFAULTS)
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_config_overlay", Path(__file__).parent / "_config_overlay.py"
+        )
+        overlay = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(overlay)
+        asp_config = overlay.merged_config("aspirations.yaml")
+        od = asp_config.get("owned_redetection", {})
+        if isinstance(od, dict):
+            for k, default in defaults.items():
+                v = od.get(k)
+                if v is not None:
+                    defaults[k] = type(default)(v)
+    except Exception:
+        pass
+    return defaults
+
+
+OWNED_REDETECTION_CONFIG = load_owned_redetection_config()
 
 
 def pull_signal_live_age_hours(sig, config, now=None):
@@ -2697,8 +2745,9 @@ def get_interval_hours(goal):
     """Get the recurring interval in hours for a goal.
 
     Reads interval_hours first, falls back to remind_days * 24, defaults to 24.
+    A cleared interval_hours (None) reads as absent (g-115-11591).
     """
-    if "interval_hours" in goal:
+    if goal.get("interval_hours") is not None:
         return goal["interval_hours"]
     if "remind_days" in goal:
         return goal["remind_days"] * 24
@@ -2912,12 +2961,14 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
         for goal in asp.get("goals", []):
             if goal_record_id(asp, goal) is None:
                 continue  # string ref / id-less stub: warned once, never a candidate
-            # +candidate — §11b/ (world/conventions/goal-intake-management.md):
-            # the collection loop itself. Without this a candidate-status goal never
-            # becomes a scoring candidate at all — the highest-severity row of batch 2.
-            # (NB the word "candidate" on the line above means a SCORING candidate;
-            # the status of the same name is unrelated to it.)
-            if goal.get("status") not in ("pending", "candidate"):
+            # pending ONLY (spec §2, world/conventions/goal-intake-management.md): a
+            # candidate-status goal is selector-invisible until grooming promotes it.
+            # §11b row 23a /  widened this loop to admit candidates because the
+            # sweep had no "intended" column and rated the free property a defect;
+            #  restored it. collect_blocked reports the same goals as
+            # candidate_tier, so each is visible in exactly one direction (guard-1698).
+            # Pinned by test_goal_selector_candidate_tier_visibility.py (rb-12687).
+            if goal.get("status") != "pending":
                 continue
 
             # Self-abstention check: skip goals this agent previously abstained from.
@@ -3567,6 +3618,9 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
 
     Checks blocking conditions in priority order (first match = primary reason):
       explicit_status  — goal.status == "blocked"
+      candidate_tier   — goal.status == "candidate": selector-invisible until grooming
+                         promotes it (goal-intake-management.md §2, g-353-165). Carries
+                         no blocker_ref on purpose: the agent itself can lift it
       infrastructure   — goal.skill in known_blockers affected_skills
       dependency       — blocked_by contains unmet prerequisite IDs
       deferred         — deferred_until is in the future
@@ -3718,11 +3772,23 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
                 blocked.append(entry)
                 continue
 
+            # A candidate (spec §2) is not selectable until grooming promotes it and
+            # collect_candidates keeps only `pending`, so it is reported HERE under its
+            # own reason instead of falling out of both lists (guard-1698, ).
+            # No blocker_ref is synthesized, the one deliberate exception to rb-3009's
+            # invariant: the agent can lift this block itself (a promote), so the queue
+            # is NOT structurally gated and quiescence C2 must refuse to approve a
+            # sleep over it. A synthesized ref would launder an internal lever into an
+            # external gate.
+            if status == "candidate":
+                entry["block_reason"] = "candidate_tier"
+                entry["block_detail"] = ("candidate-status goal awaiting a grooming "
+                                         "promote (goal-intake-management.md §2)")
+                blocked.append(entry)
+                continue
+
             # Only pending goals from here
-            # +candidate — §11b/ (world/conventions/goal-intake-management.md):
-            # a candidate falls past the blocked.append branch above and was then
-            # continue'd, so it was reported neither as selectable NOR as blocked.
-            if status not in ("pending", "candidate"):
+            if status != "pending":
                 continue
 
             # 2. Infrastructure blocker (skill-based, primary)
@@ -5806,6 +5872,18 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
         # not a WEIGHTS/scoring field, so guard-760 and the KNOWN_CRITERIA contract
         # do not apply. Absent on ~every goal; None is the overwhelming case.
         "pull_signal": goal.get("pull_signal"),
+        # : recheck-marker lines ([recheck:<agent> <YYYY-MM-DD>]) live
+        # in progress_note; the owned-redetection floor (post-sort, in cmd_select)
+        # reads them to hoist an unclaimed owner that DISTINCT agents have
+        # re-detected. IN-PROCESS TRANSPORT ONLY: cmd_select strips this key
+        # before emission (1,352 note-carrying candidates total ~7.6 MB,
+        # measured 2026-10-02; the loop's bare `goal-selector.sh` call emits
+        # the FULL list every iteration, so a note pile in the emission would
+        # be selection noise in LLM-visible stdout AND truncate the ranked
+        # view — guard-2518: the projection is a schema in its own right).
+        # Not a WEIGHTS/scoring field, so guard-760 and the KNOWN_CRITERIA
+        # contract do not apply.
+        "progress_note": goal.get("progress_note"),
         # : the class_balance penalty waived by 13b-i for a goal inside a
         # LIVE strategic_focus lane (None when no waiver fired — the common case).
         # Telemetry, same posture as created_at above: passthrough only, not a
@@ -6985,6 +7063,132 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     return picked, status
 
 
+def apply_owned_redetection_floor(scored, prior_hoist_fired=False):
+    """Hard selection-time floor for owned redetection ().
+
+    REORDERS so the most strongly re-detected UNCLAIMED owner goal takes the
+    top slot when its progress_note carries live recheck markers from at least
+    OWNED_REDETECTION_CONFIG["min_agents"] DISTINCT agents within
+    ["window_days"] (defaults 2 / 7 — the goal's own verification threshold).
+    Returns (picked_row_or_None, status_dict). Like apply_drain_lane and
+    apply_strategic_focus_floor it never writes `score`: non-floor picks stay
+    byte-identical to pre-floor behavior.
+
+    WHY A FLOOR AND NOT A SCORE TERM (the whole design of this goal).
+    (1) rb-597: a priority bump alone loses to a saturated queue — a score-side
+    lift competes, and on this queue the deterministic span is multi-points
+    against an exploration_noise width of ~1.22, so a lift sized below the
+    contested band "looks like a fix" and does nothing (guard-1895 rule (2)).
+    (2) rb-600's force-gate direction: selection-INDEPENDENT removal from the
+    competition is the structurally correct remedy — and the drain lane and
+    strategic-focus floor already proved this shape twice.
+    (3) The signal is EVENT-keyed (distinct agents re-detecting), so it cannot
+    be folded into any existing weighted criterion: KNOWN_CRITERIA is a fixed
+    manifest (test_goal_selector_weights_contract pins raw-keys == manifest),
+    and the recheck marker is not a goal field any weight could read — it is
+    a line inside progress_note, parsed by recheck_marker.lift_for (SSOT).
+
+    ELIGIBILITY is deliberately the whole scored pool plus the lift predicate.
+    Every row in `scored` has already passed collection's claim/defer/
+    capability/intended_agent filters, so "in the pool" means claimable by
+    THIS agent; the floor adds exactly one test — the lift. lane_nominee_
+    exclusion is NOT reused: it encodes the strategic-focus DIRECTIVE's own
+    exclusion classes (recurring sweeps, hypothesis resolution, owner-parked),
+    and an owner goal that is itself a routine sweep is precisely the case
+    this floor exists to rescue, not to exclude.
+
+    YIELDING: runs after the drain lane and strategic-focus floor and yields
+    to either (prior_hoist_fired) — a starving recurring goal or a standing
+    user directive outrank this policy — and BEFORE the reducer-only floor,
+    whose OWNER DIRECTIVE outranks everything except itself. All four hoists
+    write index 0, so whichever runs last wins; the ordering is the contract.
+    BEFORE write_scorer_verdict (the call site in cmd_select) for guard-2331's
+    reason: without the verdict sidecar recording the hoist, the claim
+    chokepoint would REFUSE the promoted goal as unsanctioned divergence.
+
+    Fail-open throughout: never raises, never blocks selection.
+    """
+    status = {"eligible": 0, "picked": None,
+              "yielded_to_prior_hoist": bool(prior_hoist_fired), "reason": None}
+    if not OWNED_REDETECTION_CONFIG.get("enabled", True):
+        status["reason"] = "disabled"
+        return None, status
+    if not scored:
+        status["reason"] = "no-candidates"
+        return None, status
+    if prior_hoist_fired:
+        status["reason"] = "yielded"
+        return None, status
+    min_agents = OWNED_REDETECTION_CONFIG.get("min_agents", 2)
+    window_days = OWNED_REDETECTION_CONFIG.get("window_days", 7)
+    today = date.today()
+    eligible = []
+    for s in scored:
+        note = s.get("progress_note")
+        if not note:
+            continue
+        st = recheck_marker.lift_for(
+            note, now=today, min_agents=min_agents, window_days=window_days)
+        if st["lift"]:
+            # Telemetry on the ROW (same posture as pull_signal passthrough):
+            # the banner and the verdict sidecar read it without re-parsing.
+            s["owned_redetection_lift"] = {
+                "agents_in_window": st["agents_in_window"],
+                "min_agents": min_agents,
+                "window_days": window_days,
+            }
+            eligible.append(s)
+    status["eligible"] = len(eligible)
+    if not eligible:
+        status["reason"] = "no-eligible"
+        return None, status
+    # MOST distinct re-detecting agents wins (the strength of the "nothing is
+    # taking this" signal); score breaks ties. max() returns the FIRST maximal
+    # element and `eligible` preserves the candidate_sort_key order of `scored`,
+    # so an all-equal set picks exactly the highest-ranked row deterministically.
+    picked = max(eligible, key=lambda s: (
+        len(s["owned_redetection_lift"]["agents_in_window"]),
+        float(s.get("score") or 0.0),
+    ))
+    if scored[0] is not picked:
+        scored.remove(picked)
+        scored.insert(0, picked)
+    picked["owned_redetection_pick"] = True
+    status["picked"] = picked.get("goal_id")
+    status["reason"] = "fired"
+    return picked, status
+
+
+def emit_owned_redetection_banner(picked, status):
+    """stderr-only (stdout JSON is what the orchestrator parses) + recorded on
+    the verdict sidecar's banners dict (the sidecar backstop, g-115-4296).
+    Says WHY the top pick is not the scorer's, so an LLM does not read a floor
+    pick as a scoring anomaly. Silence when the floor did not fire is
+    deliberate: a banner on every quiet iteration would train the reader to
+    skip it (the drain-lane banner's own rule). RETURNS a one-element list
+    holding the banner text (or an empty list when the floor did not fire),
+    the same list-of-text shape emit_strategic_focus_banner returns, so the
+    call site in cmd_select can record it on the verdict sidecar's banners
+    dict WITHOUT re-calling this function — a second call would print the
+    banner twice (the same reason _sf_inert_warnings is captured, not
+    re-emitted)."""
+    if picked is None:
+        return []
+    lift = picked.get("owned_redetection_lift") or {}
+    agents = lift.get("agents_in_window") or []
+    text = (
+        f"[goal-selector] OWNED-REDETECTION FLOOR (g-115-11721): "
+        f"{picked.get('goal_id')} is the sanctioned top pick this iteration — "
+        f"{len(agents)} distinct agents ({', '.join(agents)}) re-detected the "
+        f"finding this goal owns within {lift.get('window_days')} days while it "
+        "stayed unclaimed, and the repeat-detection lift applies. This is a "
+        "selection hoist (a reordering of the pool's top slot), not a score "
+        "change; the goal competes normally on other iterations. Claim it if "
+        "it is in your lane.")
+    print(text, file=sys.stderr)
+    return [text]
+
+
 def _reducer_policy_inputs(agent_dir):
     """The three role signals + the team-state snapshot, read once.
 
@@ -7843,13 +8047,55 @@ def cmd_select(args):
         print(f"[goal-selector] strategic-focus floor error "
               f"({type(e).__name__}: {e})", file=sys.stderr)
 
-    # REDUCER-ONLY FLOOR (, OWNER DIRECTIVE 2026-09-03). Runs AFTER both
-    # prior hoists and yields to either, for the reason apply_strategic_focus_floor
-    # already records: all three write index 0, so whichever runs last wins, and
-    # this one carries no cadence bound and can take the very next invocation. A
-    # standing user directive and a starving recurring goal both outrank a policy
-    # preference. BEFORE write_scorer_verdict for the same reason the other two
-    # are: without that ordering the promoted goal is UNCLAIMABLE at
+    # OWNED-REDETECTION FLOOR (). Runs AFTER the strategic-focus
+    # floor and yields to either prior hoist (a starving recurring goal or a
+    # standing user directive outrank this policy), and BEFORE the
+    # reducer-only floor, whose owner directive outranks it in turn — all
+    # four hoists write index 0, so whichever runs last wins, and that
+    # ordering is the contract. BEFORE write_scorer_verdict below so the
+    # verdict sidecar records the hoist as the sanctioned top and the claim
+    # chokepoint accepts it without a deviation code (guard-2331). Same
+    # defensive wrapper: a floor bug must never suppress the ranked output
+    # every agent depends on.
+    # _od_banner is pre-bound for the same reason _sf_pick is: the except arm
+    # below prints but does not assign, so a floor error would leave the name
+    # UNBOUND and the banners dict below would raise NameError — pre-binding
+    # makes an error here mean "no hoist, no banner", which is true.
+    _od_pick = None
+    _od_status = {}
+    _od_banner = []
+    try:
+        _od_pick, _od_status = apply_owned_redetection_floor(
+            scored,
+            prior_hoist_fired=(_lane_pick is not None or _sf_pick is not None))
+        _od_banner = emit_owned_redetection_banner(_od_pick, _od_status) or []
+    except Exception as e:  # pragma: no cover - defensive; floor must never block
+        _od_pick = None
+        print(f"[goal-selector] owned-redetection floor error "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+    # progress_note is an IN-PROCESS transport, not output schema. score_goal
+    # carries it onto the rows (guard-1362: a floor predicate that reads a
+    # field the projection omits is a silent zero) and the owned-redetection
+    # floor above is the SOLE reader; nothing between there and _emit_select
+    # reads it. Stripping here keeps the emitted schema byte-identical to
+    # pre-: 1,352 of the ~4,000 candidates carry notes totaling
+    # ~7.6 MB (measured 2026-10-02), and the bare `goal-selector.sh` call the
+    # loop makes every iteration emits the FULL list — a 7.6 MB note pile in
+    # LLM-visible stdout would be selection noise AND truncate the ranked view
+    # (guard-2518: the projection is a schema in its own right). A future
+    # note-reading pass must run ABOVE this strip.
+    for s in scored:
+        s.pop("progress_note", None)
+
+    # REDUCER-ONLY FLOOR (, OWNER DIRECTIVE 2026-09-03). Runs AFTER all
+    # prior hoists and yields to any of them, for the reason
+    # apply_strategic_focus_floor already records: all four write index 0, so
+    # whichever runs last wins, and this one carries no cadence bound and can
+    # take the very next invocation. A standing user directive and a starving
+    # recurring goal both outrank a policy preference. BEFORE
+    # write_scorer_verdict for the same reason the other three are: without
+    # that ordering the promoted goal is UNCLAIMABLE at
     # aspirations-claim.sh (guard-2331 direction B). Same defensive wrapper — a
     # policy bug must never suppress the ranked output every agent depends on.
     #
@@ -7861,7 +8107,8 @@ def cmd_select(args):
     try:
         _ro_pick, _ro_status = apply_reducer_only_floor(
             scored, AGENT_DIR,
-            prior_hoist_fired=(_lane_pick is not None or _sf_pick is not None))
+            prior_hoist_fired=(_lane_pick is not None or _sf_pick is not None
+                               or _od_pick is not None))
         emit_reducer_only_floor_banner(_ro_pick, _ro_status)
     except Exception as e:  # pragma: no cover - defensive; policy must never block
         print(f"[goal-selector] reducer-only floor error "
@@ -7899,7 +8146,8 @@ def cmd_select(args):
     # backstops. `errors` is carried for the same reason: an emitter that RAISED
     # also reports only to stderr, so without it an exception would be
     # indistinguishable from "ran and had nothing to say".
-    banners = {"directive_honor": [], "strategic_focus": [], "errors": []}
+    banners = {"directive_honor": [], "strategic_focus": [],
+               "owned_redetection": [], "errors": []}
 
     try:
         banners["directive_honor"] = emit_directive_honor_banner(scored, AGENT_NAME) or []
@@ -7935,6 +8183,15 @@ def cmd_select(args):
     # (a second call would print the banner twice).
     if _sf_inert_warnings:
         banners["strategic_focus"] = list(banners["strategic_focus"]) + _sf_inert_warnings
+
+    # The OWNED-REDETECTION floor banner () belongs here too: it is a
+    # floor emission (stderr-only), and without a sidecar record a reader of
+    # scorer-verdict.json cannot distinguish "the floor hoisted this goal" from
+    # "the scorer ranked it" — the exact question the strategic_focus key above
+    # answers for that floor. The value was captured at the floor call site
+    # above (a second call would print the banner twice).
+    if _od_banner:
+        banners["owned_redetection"] = list(banners["owned_redetection"]) + _od_banner
 
     # Second, ADDITIVE sidecar write (). It must stay AFTER both
     # emitters — that ordering is the entire reason it is a separate writer from

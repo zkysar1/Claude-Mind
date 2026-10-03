@@ -72,6 +72,35 @@ real drift with a real remedy (give those goals a clock), but it is a different
 metric with a different fix, and mixing them would hide both. Worth its own
 baseline key once someone owns that backfill; deliberately not claimed here.
 
+═══ THE `no_clock` FIGURE IS SPLIT BY REASON (g-115-9632, guard-6445) ═══
+
+The population is the selector's `blocked[]`, and that list answers "which goals
+cannot run FOR THIS CALLER", not "which goals are stuck". Three block_reason
+values are runner-relative (`routed_to_agent`, `not_my_lane`,
+`fresh_session_only`) and `candidate_tier` is a goal that is not active yet. A
+goal blocked only for one of those has no clock because nothing ever blocked it,
+so counting it as a coverage gap was the defect, not the missing stamp.
+
+Measured 2026-10-02 from one caller's vantage (the canonical dry run joined by
+goal id to `goal-selector.sh blocked`, 691 blocked rows): the 578 no_clock goals
+were routed_to_agent 442, candidate_tier 75, precondition_unmet 27,
+hypothesis_gate 23, deferred 6, not_my_lane 5. That is 522 (90%) caller-relative
+or not yet active, and 56 intrinsic. All 448 routed rows named a peer and none
+named the caller, which is why the figure swings by hundreds between callers. No
+no_clock goal was status=blocked, and none was dependency-blocked (the 24
+dependency goals all carried a clock), so the account of what no_clock holds in
+the previous section is a 2026-09-04 reading, not a standing fact.
+
+So an UNCLOCKED goal is reported under its reason class: `runner_relative`,
+`candidate`, or `no_clock`, which now means "blocked for a reason true for
+everyone, age unknown" and also holds any reason this module does not know (a
+new selector reason must land in the old reported-not-counted bucket, never
+vanish). A CLOCKED goal is aged exactly as before, whatever its reason, so
+routing a stalled goal to a peer cannot lift it out of `stalled_goals`.
+`drift_total` and `human_blocked_total`, the two baseline keys, are unchanged by
+construction. Only the unmeasured remainder is named, and the printed
+"of N blocked" no longer counts the first two buckets.
+
 ═══ `human_blocked:` gets its OWN ratchet — the second anti-laundering move ═══
 
 A `human_blocked:` defer is by design un-clearable by any agent
@@ -107,6 +136,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -132,6 +162,14 @@ TERMINAL_STATUSES = {
 STALL_CLOCK_FIELDS = ("blocked_since", "defer_reason_set_at", "deferred_at")
 
 _HUMAN_BLOCKED_PREFIX = "human_blocked:"
+
+# The selector's block_reason values that describe the CALLER or intake state
+# rather than a goal being stuck (guard-6445; goal-selector.py collect_blocked).
+# An UNCLOCKED goal with one of these reasons was never blocked in the sense a
+# clock measures, so it is named apart from `no_clock` (see the module
+# docstring). Exact names: an unknown or absent reason stays `no_clock`.
+RUNNER_RELATIVE_REASONS = ("routed_to_agent", "not_my_lane", "fresh_session_only")
+NOT_ACTIVE_REASONS = ("candidate_tier",)
 
 
 # ─────────────────────────────── pure core ────────────────────────────────
@@ -182,9 +220,19 @@ def classify(goal, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
     terminal      — closed; never stalled
     executable    — the selector does not consider it blocked
     human_blocked — non-executable by operator design; reported, not counted
-    no_clock      — blocked, but stall duration is UNKNOWN; reported, not counted
+    runner_relative — no clock, and blocked only for THIS caller (routed to a peer,
+                    lane pin, fresh-session gate); reported, not counted
+    candidate     — no clock, and not an active goal yet; reported, not counted
+    no_clock      — blocked for a reason true for everyone, stall duration UNKNOWN
+                    (also any reason this module does not know); reported, not counted
     stalled       — blocked, measurably, for longer than the threshold
     young         — blocked, measurably, but not yet long enough to be debt
+
+    `blocked_ids` is either a plain id set (reasons unknown: every unclocked goal
+    is `no_clock`) or a mapping of id -> the selector's block_reason, which names
+    the unclocked remainder. The clock is tested FIRST: a goal that carries one is
+    aged whatever its reason, so routing a stalled goal to a peer cannot lift it
+    out of `stalled`.
     """
     if str(goal.get("status") or "").lower() in TERMINAL_STATUSES:
         return "terminal"
@@ -195,6 +243,11 @@ def classify(goal, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
         return "human_blocked"
     age, basis = stall_age_days(goal, now)
     if age is None or basis == "no_clock":
+        reason = blocked_ids.get(gid) if isinstance(blocked_ids, Mapping) else None
+        if reason in RUNNER_RELATIVE_REASONS:
+            return "runner_relative"
+        if reason in NOT_ACTIVE_REASONS:
+            return "candidate"
         return "no_clock"
     return "stalled" if age > threshold_days else "young"
 
@@ -205,6 +258,9 @@ def census(goals, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
     `drift_total = stalled` — ONLY the measured, agent-clearable bucket.
     `no_clock` is unmeasurable (357 of 499 blocked goals; folding it in would
     swamp the signal 16:1) and rides in `breakdown` as a coverage figure.
+    `runner_relative` and `candidate` name the unclocked goals that are not a
+    coverage gap at all (see the module docstring); they are counts only, with no
+    `rows`, since nothing consumes them.
     `human_blocked_total` is returned SEPARATELY and ratchets under its own
     baseline key, so relabeling a stall as `human_blocked:` moves debt between
     two visible counters instead of deleting it.
@@ -215,8 +271,8 @@ def census(goals, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
     defer_reason.
     """
     buckets = {k: [] for k in
-               ("terminal", "executable", "human_blocked", "no_clock",
-                "stalled", "young")}
+               ("terminal", "executable", "human_blocked", "runner_relative",
+                "candidate", "no_clock", "stalled", "young")}
     for g in goals:
         if not isinstance(g, dict):
             continue
@@ -276,7 +332,11 @@ def _blocked_ids():
     reading it keeps this module's predicate identical to the one that creates
     its population instead of a second definition free to drift (guard-1802).
 
-    An empty set is NOT a valid reading — see the refuse-to-seed guard in
+    Returns {goal id: block_reason}, the reason being None when a row carries
+    none, so classify() can name the unclocked remainder. Membership tests
+    behave as they did on the id set this used to return.
+
+    An empty result is NOT a valid reading — see the refuse-to-seed guard in
     main(). A live fleet always has some blocked goals; zero means the probe
     failed, and seeding a 0 baseline off a failed probe would mark every future
     real reading `regressed` forever.
@@ -290,10 +350,10 @@ def _blocked_ids():
     try:
         data = json.loads(proc.stdout)
     except ValueError:
-        return set()
+        return {}
     rows = data if isinstance(data, list) else (
         data.get("blocked_goals") or data.get("goals") or [])
-    return {r.get("goal_id") or r.get("id")
+    return {r.get("goal_id") or r.get("id"): r.get("block_reason")
             for r in rows if isinstance(r, dict)}
 
 
@@ -387,18 +447,23 @@ def main(argv=None):
     # The denominator is printed on purpose: `stalled=22` alone is unreadable
     # without knowing how many goals were even eligible, and `no_clock` is the
     # instrument's blind spot — a reader who cannot see it cannot tell a real
-    # improvement from a coverage collapse.
+    # improvement from a coverage collapse. The denominator leaves out the
+    # unclocked runner_relative and candidate goals (guard-6445): they are blocked
+    # for the caller or not active yet, and counting them made "of N blocked" read
+    # as stuck work. They are named in the bracket instead.
     b = result["breakdown"]
     blocked_pop = (b["stalled"] + b["young"] + b["no_clock"] + b["human_blocked"])
     # Under --json the summary goes to STDERR: stdout must stay parseable JSON
     # or the flag is a trap for every caller that pipes it.
     print("%s: %s=%d (blocked >%.0fd, of %d blocked) | %s: %s=%d "
-          "[not counted: no_clock=%d, young=%d] scanned=%d"
+          "[not counted: no_clock=%d, young=%d, runner_relative=%d, "
+          "candidate=%d] scanned=%d"
           % (str(verdicts[METRIC_KEY]).upper(), METRIC_KEY,
              result["drift_total"], result["threshold_days"], blocked_pop,
              str(verdicts[HUMAN_METRIC_KEY]).upper(), HUMAN_METRIC_KEY,
              result["human_blocked_total"],
-             b["no_clock"], b["young"], result["scanned"]),
+             b["no_clock"], b["young"], b["runner_relative"], b["candidate"],
+             result["scanned"]),
           file=sys.stderr if args.json else sys.stdout)
     if hard_gate and "regressed" in verdicts.values():
         return 1

@@ -186,7 +186,8 @@ def cmd_apply():
         return data
 
     # guard-366 / : single locked read-modify-write, no split.
-    locked_modify_yaml(TREE_PATH, _backfill)
+    # : a run with nothing drifted writes nothing (no new index version).
+    locked_modify_yaml(TREE_PATH, _backfill, skip_if_unchanged=True)
     print(json.dumps({
         "mode": "apply",
         "tree_path": TREE_PATH,

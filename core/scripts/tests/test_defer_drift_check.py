@@ -1,9 +1,10 @@
-"""Tests for defer-drift-check.py ().
+"""Tests for defer-drift-check.py (; apply path ).
 
 The guard flags goals whose deferred_until has gone PAST while a structured-
 defer marker persists (deferred_readiness selector pollution — canonical
-g-304-11). Detective only; these tests pin the eligibility ladder and the
-pure helpers.
+g-304-11). These tests pin the eligibility ladder, the pure helpers, and the
+per-member open-audit dedup + --apply filing path (the old any-open-audit
+suppression was the 55-day latch behind g-115-5132).
 
 Pattern: same importlib + sys.path shape as test_unblock_parent_status_sweep.py
 (the script name has hyphens, so it cannot be a plain `import`).
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -269,3 +271,225 @@ def test_is_on_schedule_expiry_false_when_no_prose_date_or_no_du():
     mod = _import()
     assert mod._is_on_schedule_expiry("no date here", dt.datetime(2026, 6, 12)) == (False, None)
     assert mod._is_on_schedule_expiry("completes ~2026-06-12", None) == (False, None)
+
+
+# ── main() per-member dedup + --apply () ─────────────────────────
+#
+# The old LLM-side dedup (any open class-keyed audit suppresses every filing)
+# was the 55-day latch behind . The new rule, in-script: an open
+# audit covers a drifted id IFF it NAMES it (title/description, word-
+# boundaried); uncovered ids get ONE fresh filing per run. main() is tested
+# with _read_goals and _rt.aspirations_add_goal monkeypatched (no daemon),
+# --metrics-log "" disables the metrics append (no I/O).
+
+def _audit(goal_id, title=None, description=None, status="pending"):
+    mod = _import()
+    g = {"id": goal_id, "status": status,
+         "origin_signal": mod.AUDIT_ORIGIN_SIGNAL}
+    if title is not None:
+        g["title"] = title
+    if description is not None:
+        g["description"] = description
+    return g
+
+
+def _drifted_b():
+    """A second canonical drifted goal (sibling of _goal's )."""
+    return _goal(id="g-304-15", deferred_until="2026-06-11T00:00:00")
+
+
+def _patch_main(monkeypatch, mod, world_goals):
+    # mod is the TEST-LOCAL import: each _import() re-execs a fresh module
+    # object, so the patch must land on the SAME object whose main() runs.
+    monkeypatch.setattr(mod, "_read_goals",
+                        lambda source: world_goals if source == "world" else [])
+
+
+def _patch_add(monkeypatch, mod, calls):
+    def fake_add(asp_id, record, source="world", overrides=None):
+        calls.append({"asp_id": asp_id, "record": record, "source": source,
+                      "overrides": overrides})
+        return {"goal_id": "g-115-audit-new"}
+    monkeypatch.setattr(mod._rt, "aspirations_add_goal", fake_add)
+
+
+def _run_main(monkeypatch, mod, argv, capsys):
+    """main() here takes NO argv (argparse reads sys.argv) — patch it.
+    The reason-less sibling's main() takes argv directly; this shape
+    difference is the script's, not a test defect."""
+    monkeypatch.setattr(sys, "argv", ["defer-drift-check.py"] + argv)
+    rc = mod.main()
+    return rc, json.loads(capsys.readouterr().out)
+
+
+def test_main_dry_run_reports_uncovered_but_files_nothing(monkeypatch, capsys):
+    mod = _import()
+    _patch_main(monkeypatch, mod, [_goal(), _drifted_b()])
+    calls = []
+    _patch_add(monkeypatch, mod, calls)
+    rc, res = _run_main(monkeypatch, mod, ["--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["drift_count"] == 2
+    assert res["actions_taken"] == "dry-run"
+    assert res["uncovered_ids"] == ["g-304-11", "g-304-15"]
+    assert res["investigate_filed"] is None
+    assert calls == []  # dry-run never files
+
+
+def test_main_apply_outcome2_open_audit_names_A_new_drift_B(monkeypatch, capsys):
+    """THE outcome-2 scenario: an open re-gate audit names goal A; the NEW
+    drift is goal B. B is uncovered and gets filed; A is not re-filed, and
+    the filed audit names B and not A."""
+    mod = _import()
+    goals = [
+        _goal(),                          #  = A (covered by the audit)
+        _drifted_b(),                     #  = B (new drift, uncovered)
+        _audit("g-115-5132",
+               title="Investigate: re-gate 1 drifted defer(s) g-304-11",
+               description="Drifted goals (most-overdue first):\n"
+                           "  - g-304-11 [asp-304] (world)"),
+    ]
+    _patch_main(monkeypatch, mod, goals)
+    calls = []
+    _patch_add(monkeypatch, mod, calls)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["uncovered_ids"] == ["g-304-15"]
+    assert res["open_audit_goal_ids"] == ["g-115-5132"]
+    assert res["investigate_filed"] == "g-115-audit-new"
+    assert len(calls) == 1  # exactly ONE new audit
+    rec = calls[0]["record"]
+    assert "g-304-15" in rec["title"]
+    assert "g-304-15" in rec["description"]
+    # A (covered by the older audit) is NOT re-named in the fresh filing:
+    assert "g-304-11" not in rec["title"]
+    assert "g-304-11" not in rec["description"]
+
+
+def test_main_apply_stale_audit_names_none_does_not_suppress(monkeypatch, capsys):
+    """An open audit naming NONE of the current drifted ids is stale — it
+    must NOT suppress a fresh filing (the class-keyed latch, g-115-5132)."""
+    mod = _import()
+    goals = [
+        _goal(),
+        _drifted_b(),
+        _audit("g-115-5132",
+               title="Investigate: re-gate 1 drifted defer(s) g-999-999",
+               description="Drifted goals (most-overdue first):\n"
+                           "  - g-999-999 [asp-999] (world)"),
+    ]
+    _patch_main(monkeypatch, mod, goals)
+    calls = []
+    _patch_add(monkeypatch, mod, calls)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["uncovered_ids"] == ["g-304-11", "g-304-15"]
+    assert res["investigate_filed"] == "g-115-audit-new"
+    assert len(calls) == 1
+    rec = calls[0]["record"]
+    assert "g-304-11" in rec["description"]
+    assert "g-304-15" in rec["description"]
+
+
+def test_main_apply_all_covered_files_nothing(monkeypatch, capsys):
+    """Every drifted id named by an open audit -> no filing (the idempotent
+    skip the old dedup existed for is preserved)."""
+    mod = _import()
+    goals = [
+        _goal(),
+        _drifted_b(),
+        _audit("g-115-audit",
+               title="Investigate: re-gate 2 drifted defer(s) g-304-11 g-304-15"),
+    ]
+    _patch_main(monkeypatch, mod, goals)
+    calls = []
+    _patch_add(monkeypatch, mod, calls)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["actions_taken"] == "apply"
+    assert res["uncovered_ids"] == []
+    assert res["investigate_filed"] is None
+    assert calls == []
+
+
+def test_main_apply_unreadable_audit_surface_fail_closed(monkeypatch, capsys):
+    """An open audit whose title AND description are empty has an unreadable
+    naming surface -> treated as covering (suppress the filing). A
+    cross-box duplicate never self-heals, so skip-on-uncertainty stays
+    correct (guard-487)."""
+    mod = _import()
+    goals = [_goal(), _audit("g-115-audit")]  # no title, no description
+    _patch_main(monkeypatch, mod, goals)
+    calls = []
+    _patch_add(monkeypatch, mod, calls)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["actions_taken"] == "apply"
+    assert res["open_audit_exists"] is True
+    assert res["uncovered_ids"] == []
+    assert res["investigate_filed"] is None
+    assert calls == []
+
+
+def test_main_apply_terminal_audit_does_not_cover(monkeypatch, capsys):
+    """A COMPLETED audit's naming surface is not live coverage — the drift
+    may have recurred with (the same) goals; file again."""
+    mod = _import()
+    goals = [
+        _goal(),
+        _audit("g-115-audit", status="completed",
+               title="Investigate: re-gate 1 drifted defer(s) g-304-11"),
+    ]
+    _patch_main(monkeypatch, mod, goals)
+    calls = []
+    _patch_add(monkeypatch, mod, calls)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["uncovered_ids"] == ["g-304-11"]
+    assert res["investigate_filed"] == "g-115-audit-new"
+    assert len(calls) == 1
+
+
+def test_main_apply_dup_retry_with_override(monkeypatch, capsys):
+    """ (mirrors 's sibling retry): a
+    goal_duplication_blocked refusal on the first attempt triggers ONE
+    justified X-Mind-Override-Duplication retry (the dup-gate can only
+    match COMPLETED prior recurring audits here — the per-member dedup
+    already proved no OPEN audit covers the filed ids)."""
+    mod = _import()
+    _patch_main(monkeypatch, mod, [_goal()])
+    calls = []
+
+    def fake_add(asp_id, record, source="world", overrides=None):
+        calls.append({"overrides": overrides})
+        if overrides is None:
+            raise mod._rt.RtError(
+                "blocked", status=409,
+                body='{"error": "goal_duplication_blocked", '
+                     '"gate": "goal-duplication-gate"}')
+        return {"goal_id": "g-115-audit-override"}
+
+    monkeypatch.setattr(mod._rt, "aspirations_add_goal", fake_add)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["investigate_filed"] == "g-115-audit-override"
+    assert len(calls) == 2
+    assert calls[0]["overrides"] is None
+    assert "Duplication" in (calls[1]["overrides"] or {})
+
+
+def test_main_apply_non_dup_error_surfaces_without_retry(monkeypatch, capsys):
+    mod = _import()
+    _patch_main(monkeypatch, mod, [_goal()])
+    calls = []
+
+    def fake_add(asp_id, record, source="world", overrides=None):
+        calls.append({"overrides": overrides})
+        raise mod._rt.RtError("daemon 500", status=500, body="internal error")
+
+    monkeypatch.setattr(mod._rt, "aspirations_add_goal", fake_add)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["investigate_filed"] is None
+    assert "investigate_error" in res
+    assert len(calls) == 1  # no override retry on a non-duplication error

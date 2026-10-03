@@ -42,16 +42,19 @@ FAIL-OPEN for the ledger, FAIL-CLOSED for the table:
     the gate's job is the refusal; the audit row is best-effort and its
     failure is logged to stderr, never raised.
 
-The pre-g-353-63 premise that "candidate is invisible to goal-selector" is
-STALE (g-353-82 deliberately admitted candidate at goal-selector.py) —
-which is exactly why this table must live in the status-update path:
-admitted candidates are selectable, and an ungated write could take one
-straight to in-progress, silently turning intake back into an ordinary
-queue.
+Selector invisibility (spec §2: "a candidate is invisible to goal-selector")
+is NOT what this table relies on, and it is not what keeps a candidate from
+being worked. g-353-82 once admitted candidates to the selector's scoring list
+(spec §11b row 23a), g-353-165 restored §2, and
+test_goal_selector_candidate_tier_visibility.py pins the restored state. The
+table lives in the status-update path because a status write never passes
+through the selector at all: an ungated write could take a candidate straight
+to in-progress, silently turning intake back into an ordinary queue.
 """
 
 import datetime as _dt
 import os as _os
+import re as _re
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -130,6 +133,76 @@ def evaluate(prev_status: Optional[str], new_status: Optional[str]) -> Dict[str,
         f"{', '.join(FORBIDDEN_TRANSITIONS)}). {RULE}."
     )
     return out
+
+
+# --- The caller channel () ------------------------------------------
+#
+# A status write may carry two companion keys beside its value, the way
+# outcome_note does: {"value": "pending", "ledger_evidence": {...},
+# "ledger_verdict": "..."}. Both write paths hand them to caller_channel()
+# below, so the policy exists once. An older daemon ignores both keys and
+# writes the ordinary row, so the channel is harmless to it.
+
+#: §5 verdicts a writer may NAME on its status write, keyed by the new status.
+#: The default (ALLOWED_TRANSITIONS) stays the fallback; a writer whose verdict
+#: differs from it says so — rb-route lands as `skipped`, whose default label
+#: is close-moot.
+VERDICTS_FOR_STATUS = {
+    "pending": ("promote",),
+    "superseded": ("merge",),
+    "skipped": ("close-moot", "rb-route"),
+}
+
+#: Evidence keys a writer may stamp on its own row. A closed list: the row's
+#: from/to/rule keys stay the table's, and nothing else rides in unreviewed.
+CALLER_EVIDENCE_KEYS = ("promoted_by",)
+
+# \Z, not $: with .match() a `$` also matches before a trailing newline, so
+# "starvation-failsafe\n" would pass and be stamped, and the exact-equality
+# readers (groom's promote-cap exclusion) would then miss it (guard-1283).
+_PROMOTER_RE = _re.compile(r"^[a-z0-9][a-z0-9-]{0,63}\Z")
+
+
+def caller_channel(new_status: Optional[str], raw_evidence: Any = None,
+                   raw_verdict: Any = None):
+    """Validate the writer-supplied half of one §5 row. Pure; no I/O.
+
+    Returns (verdict, evidence, error). `verdict` is None when the writer named
+    none, so the table default applies. `evidence` is the dict to merge into
+    the row's evidence. `error` is a refusal message, or None. Both write paths
+    call this only when a row is due, so a channel on a write that owes no row
+    is ignored, not refused. The wording is transport-neutral: the same text
+    is served over the CLI and the HTTP endpoint (guard-1189).
+    """
+    evidence: Dict[str, Any] = {}
+    if raw_evidence is not None:
+        if not isinstance(raw_evidence, dict):
+            return None, {}, (
+                f"BLOCKED: ledger_evidence must be an object, got "
+                f"{type(raw_evidence).__name__}")
+        unknown = sorted(str(k) for k in raw_evidence
+                         if k not in CALLER_EVIDENCE_KEYS)
+        if unknown:
+            return None, {}, (
+                f"BLOCKED: ledger_evidence key(s) {unknown} are not allowed "
+                f"(allowed: {', '.join(CALLER_EVIDENCE_KEYS)})")
+        if "promoted_by" in raw_evidence:
+            who = raw_evidence["promoted_by"]
+            if not isinstance(who, str) or not _PROMOTER_RE.match(who):
+                return None, {}, (
+                    "BLOCKED: ledger_evidence.promoted_by must be a "
+                    "lowercase kebab-case name of at most 64 characters")
+            evidence["promoted_by"] = who
+    verdict = None
+    if raw_verdict is not None:
+        allowed = VERDICTS_FOR_STATUS.get(new_status, ())
+        if raw_verdict not in allowed:
+            return None, {}, (
+                f"BLOCKED: ledger_verdict {raw_verdict!r} does not fit "
+                f"candidate -> {new_status} (allowed: "
+                f"{', '.join(allowed) or 'none'})")
+        verdict = raw_verdict
+    return verdict, evidence, None
 
 
 # --- The ledger (spec §5) ----------------------------------------------------

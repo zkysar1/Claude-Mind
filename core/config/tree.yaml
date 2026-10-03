@@ -347,6 +347,22 @@ retrieval:
   # (byte-identical to pre-). Only active on the real-embedding path;
   # the TF-IDF fallback is untouched.
   cosine_reserved_slots: 3
+  # Exact-key slot reservation (). exact_key is the strongest
+  # lexical channel (CHANNEL_SCORES 4.0) — the query IS the node's key — yet
+  # it had no guaranteed slot: its base lead over a semantic neighbour is a
+  # fraction of a point, so a utility_weight penalty from times_noise or a
+  # high real cosine on the neighbour flips the sort, and MMR drops the key
+  # as redundant. Measured 2026-09-29 (frozen snapshot): the node was MATCHED
+  # (channel exact_key, 1 of 31 candidates) but ranked 13 of 109 pre-MMR and
+  # was absent from the 15-slot shallow page. The window is widest between a
+  # node's write and the next index build, when the unindexed-floor imputation
+  # () is the node's only edge. Same shape as cosine_reserved_slots:
+  # reserved nodes are GUARANTEED a slot but NOT promoted (union re-sorted by
+  # effective score); capped at limit-1 so MMR keeps authority; exact-key
+  # reservations take precedence over cosine ones and the combined total never
+  # takes every slot. Channel-based, so BOTH the TF-IDF and the real-embedding
+  # paths are protected. Set 0 to disable (byte-identical to pre-).
+  exact_key_reserved_slots: 2
   # Embedding-cosine bonus weight on the real-embedding path (2026-09-03).
   # COSINE_BONUS_WEIGHT (2.0, tree_match.py) was tuned for the TF-IDF fallback,
   # where a good match scores 0.5-1.0; real embedding cosines span a far

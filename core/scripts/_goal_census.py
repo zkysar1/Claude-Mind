@@ -46,6 +46,39 @@ TERMINAL_STATUSES = ABANDONED_STATUSES | frozenset({"completed"})
 CENSUS_KEY = "archived_census"
 
 
+# The closer role of each evicted COMPLETED goal, as {role: [goal-ids]} ().
+# Eviction drops the whole record, `completed_by_role` with it, so before this a
+# closure that left the live list could no longer be told apart from any other
+# completed goal. The post-hoc close-review lane selects closures by that role and
+# needs the ones that aged out unreviewed. An id set merged by union, like
+# `evicted_ids` (guard-1153).
+CLOSER_ROLE_KEY = "evicted_by_closer_role"
+
+# The census keys holding {bucket: [goal-ids]}: unioned by the cross-box merge,
+# and dropped from the compact summary's shell, where unbounded id sets would
+# starve the goal rows.
+CENSUS_ID_SET_KEYS = ("evicted_ids", CLOSER_ROLE_KEY)
+
+
+def _census_id_sets(asp, key):
+    """{bucket: [sorted deduped goal-ids]} under archived_census[key], or {}.
+    Tolerant of absent/partial/garbage shape."""
+    c = asp.get(CENSUS_KEY)
+    if not isinstance(c, dict):
+        return {}
+    ids = c.get(key)
+    if not isinstance(ids, dict):
+        return {}
+    out = {}
+    for bucket, v in ids.items():
+        if not isinstance(v, list):
+            continue
+        vals = sorted({str(x) for x in v})
+        if vals:
+            out[bucket] = vals
+    return out
+
+
 def census_evicted_ids(asp):
     """Return {status: [sorted goal-ids]} recorded by post-cutover eviction.
 
@@ -55,20 +88,14 @@ def census_evicted_ids(asp):
     double as tombstones that stop _merge_goals resurrecting evicted goals.
     Tolerant of absent/partial/garbage shape; values normalized to sorted
     deduped string lists."""
-    c = asp.get(CENSUS_KEY)
-    if not isinstance(c, dict):
-        return {}
-    ids = c.get("evicted_ids")
-    if not isinstance(ids, dict):
-        return {}
-    out = {}
-    for status, v in ids.items():
-        if not isinstance(v, list):
-            continue
-        vals = sorted({str(x) for x in v})
-        if vals:
-            out[status] = vals
-    return out
+    return _census_id_sets(asp, "evicted_ids")
+
+
+def census_closer_role_ids(asp):
+    """Return {role: [sorted goal-ids]} of evicted completed goals that carried a
+    `completed_by_role` (g-375-38). It holds only goals evicted since that change:
+    an earlier eviction kept no role, so it says nothing about older closures."""
+    return _census_id_sets(asp, CLOSER_ROLE_KEY)
 
 
 def all_evicted_ids(asp):

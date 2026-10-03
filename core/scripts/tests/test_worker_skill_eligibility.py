@@ -682,6 +682,49 @@ def test_worker_loop_phase_1_teaches_all_three_verdict_words():
         assert word in src, f"Phase 1 never names the {word!r} verdict"
 
 
+def test_worker_loop_claims_first_and_judges_the_role_under_the_claim():
+    """: the role read runs UNDER the claim. A record read between the walk
+    and the claim cost small-model Bodies 12 to 46+ min and let siblings converge on
+    one row; the property it protected (no worker EXECUTES a reducer-only goal)
+    needs the read before the first action, which Phase 2.9 is. ORDER is the
+    load-bearing half: presence alone stays green if the read moves back above the
+    claim, so the walk, the claim, the judgment and the typed release are pinned in
+    that order, and nothing between the walk and the claim may read the record."""
+    src = WORKER_LOOP_SKILL.read_text(encoding="utf-8")
+    walk = src.find("worker_execute.py select-walk")
+    claim = src.find("aspirations-claim.sh <goal-id>")
+    judge = src.find("THEN JUDGE THE ROLE")
+    release = src.find("--reason-kind role")
+    assert -1 < walk < claim < judge < release, (walk, claim, judge, release)
+    assert "--goal-field id <goal-id> --full" not in src[walk:claim], (
+        "Phase 1 must not read the record before the claim: judge it at Phase 2.9")
+    phase_2_9 = src[src.find("# Phase 2.9 "):src.find("# Phase 2.95")]
+    assert "THEN JUDGE THE ROLE" in phase_2_9
+    # Neither the scorer nor select-walk reads release_negatives, so a fresh walk
+    # ranks the released row first again and hands it straight back.
+    assert "NEXT row of the same walk" in phase_2_9, (
+        "after a role release the Body must take the next row it already walked")
+    # A released row stays in the walk's census, and supply_gap_refusals counts every
+    # census row, so a supply-gap park refuses until that row is declined too.
+    park = src[src.find("park --supply-gap"):]
+    assert "released ones too" in park[:park.find("EXIT 5")], (
+        "the supply-gap park must tell the Body to decline the rows it released")
+    release_line = phase_2_9[phase_2_9.find("aspirations-release.sh <goal-id>"):]
+    release_line = release_line.split("\n", 1)[0]
+    assert "--reason " in release_line and "--reason-kind role" in release_line, (
+        f"a role misfit must be released with a typed reason, got: {release_line!r}")
+
+
+def test_the_claim_boundary_role_refusal_names_the_typed_release():
+    """ outcome 3 counts role misfits as release_negatives entries of kind
+    role. A reducer-STAMPED goal reaches a worker only past the selector, where the
+    claim wrapper's recheck warns (g-306-449); the release it tells the Body to run
+    must carry the same kind, or that misfit is the one the count cannot see."""
+    src = (CORE_SCRIPTS / "aspirations-claim.sh").read_text(encoding="utf-8")
+    line = next(l for l in src.splitlines() if "ROLE REFUSAL" in l and "echo" in l)
+    assert "aspirations-release.sh" in line and "--reason-kind role" in line, line
+
+
 # ---------------- the drain-lane banner must not waive on a role mismatch ----
 
 

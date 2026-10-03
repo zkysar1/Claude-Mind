@@ -70,6 +70,63 @@ def test_missing_base_is_empty_not_an_exception(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Worker-Body carrier union: the base seam ()
+# --------------------------------------------------------------------------
+#
+# The union's carrier root is `world/body-diaries/<agent>` and `world/` is NOT
+# derivable from the agents root a non-default `base` selects — so a tmp-root
+# read must NOT union (before the fix it unioned the LIVE fleet's Body rows
+# into every hermetic test that names a real agent — the 9 reds of ),
+# and the union lives on the production path (`base=None`, both roots patched
+# to the tmp tree). This file pins BOTH directions of that contract.
+
+def _carrier_row(goal: str) -> str:
+    return (
+        '{"agent": "alpha", "goal_id": "' + goal + '", "goal": "' + goal + '", '
+        '"entry_type": "decision", "outcome": "force-override", "body_sid": "sid-A"}'
+    )
+
+
+def test_non_default_base_does_not_read_carriers_outside_the_root(tmp_path):
+    """A carrier row OUTSIDE the test root is not read from a tmp-root read:
+    before g-306-575 the carrier half read this module's WORLD_DIR regardless
+    of `base`, so a test seeding 3 rows counted the live fleet's ~46 carrier
+    rows too (e.g. 49)."""
+    agents = tmp_path / "agents"
+    world = tmp_path / "world"
+    _mk_agent(agents, "alpha", ['{"a": 1}', '{"a": 2}', '{"a": 3}'])
+    (world / "body-diaries" / "alpha").mkdir(parents=True)
+    (world / "body-diaries" / "alpha" / "sid-A.jsonl").write_text(
+        _carrier_row("g-body-outside") + "\n", encoding="utf-8")
+
+    got = dict(_fleet_diary.read_fleet_diaries(agents))
+    assert got["alpha"].splitlines() == ['{"a": 1}', '{"a": 2}', '{"a": 3}'], \
+        "a tmp-root read must yield the agent-wide diary verbatim, nothing unioned"
+
+
+def test_production_shape_unions_carriers_seeded_under_the_test_root(tmp_path):
+    """A carrier row seeded UNDER the test root IS unioned — on the production
+    path (`base=None`, both roots patched to the tmp tree), which is what a
+    consumer of Body rows must see."""
+    import json
+    agents = tmp_path / "agents"
+    world = tmp_path / "world"
+    _mk_agent(agents, "alpha", ['{"a": 1}'])
+    (world / "body-diaries" / "alpha").mkdir(parents=True)
+    (world / "body-diaries" / "alpha" / "sid-A.jsonl").write_text(
+        _carrier_row("g-body-inside") + "\n", encoding="utf-8")
+
+    with unittest.mock.patch.object(_fleet_diary, "agents_root", lambda: agents), \
+         unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
+        got = dict(_fleet_diary.read_fleet_diaries())
+
+    lines = got["alpha"].splitlines()
+    assert lines == ['{"a": 1}', _carrier_row("g-body-inside")], \
+        "the union must add the seeded carrier row verbatim"
+    assert json.loads(lines[1])["goal_id"] == "g-body-inside"
+
+
+# --------------------------------------------------------------------------
 # Roster union (the property the glob did not have)
 # --------------------------------------------------------------------------
 

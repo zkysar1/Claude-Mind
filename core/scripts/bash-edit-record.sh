@@ -47,6 +47,13 @@
 # increase shared-index .lock contention (more commit failures, the opposite of
 # the goal). A walk of core/ + .claude/ is index-lock-free.
 #
+# GIT-IGNORED TREES ARE NOT WALKED () — the hooks rewrite files under
+# core/logs/ on every Bash call and, since rows dedup on (file, mtime), each touch
+# became a row: 36k a day per agent, none committable, all re-read by every call
+# (0.7 s on a 27 MB log) and re-uploaded with the log. _edit_record_skip.py names
+# the trees (the .gitignore directory rules under the two scan roots), so the walk
+# needs no git to leave them out.
+#
 # Fail-open EVERYWHERE (guard-141): a record failure must NEVER block the LLM's
 # command. No `set -e`. No `set -o pipefail`. Every probe guarded.
 
@@ -165,8 +172,15 @@ except Exception:
     def attribute(mtime, windows):
         return "", []
 
+# Without the module the walk skips only the names it skipped before the list
+# existed: extra rows are noise, a dropped edit is not.
+try:
+    from _edit_record_skip import skip_dir
+except Exception:
+    def skip_dir(rel_dir, name):
+        return name in (".git", ".python-shim", "__pycache__", "node_modules", ".pytest_cache")
+
 scan_roots = [os.path.join(proot, "core"), os.path.join(proot, ".claude")]
-SKIP_DIRS = {".git", ".python-shim", "__pycache__", "node_modules", ".pytest_cache"}
 
 # Dedup on (file, mtime) against what is already logged (the Write/Edit
 # recorder + prior runs). A change already recorded, by its writer's own
@@ -194,7 +208,8 @@ for root in scan_roots:
     if not os.path.isdir(root):
         continue
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        rel_dir = os.path.relpath(dirpath, proot).replace("\\", "/")
+        dirnames[:] = [d for d in dirnames if not skip_dir(rel_dir, d)]
         for fn in filenames:
             fp = os.path.join(dirpath, fn)
             try:

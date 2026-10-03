@@ -621,6 +621,117 @@ def test_unparseable_base_degrades_open():
     assert out == cm.merge_handler_for(_AGENT_ASP)(ours, theirs)
 
 
+# ── : the world and meta changelog keep a ROTATION through a merge,
+# and only a rotation. A plain line union put every rotated-out row back, so the
+# tracked world changelog regrew toward the push size limit. The agent-ledger
+# rule would fix that and also read a truncated stub () as a deletion
+# of the whole history. Each test below is falsified by a distinct wrong build:
+#
+#   * ship nothing (the shipped defect)        -> rotation_stays_rotated
+#   * the plain agent rule (any one-sided
+#     delete counts)                           -> truncation / stub tests
+#   * a front-slice test with no minimum
+#     window                                   -> short_tail_is_not_a_rotation
+#   * honour only one side's cut               -> different_amounts_converge
+
+_WORLD_CHG = ".mind-data/world/changelog.jsonl"
+_META_CHG = ".mind-data/meta/changelog.jsonl"
+
+
+def _chg(first, count, agent="w"):
+    """`count` distinct dated changelog rows, row i stamped i seconds in."""
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 9, 1)
+    return [{"timestamp": (t0 + timedelta(seconds=i)).strftime("%Y-%m-%dT%H:%M:%S"),
+             "agent": agent, "file": f"f{i}", "action": "append"}
+            for i in range(first, first + count)]
+
+
+def _window():
+    import coordination_merge as cm
+    return cm._ROTATED_WINDOW_MIN_RECORDS
+
+
+@pytest.mark.parametrize("path", [_WORLD_CHG, _META_CHG])
+def test_changelog_rotation_stays_rotated(path):
+    """THE DEFECT. One box rotated the oldest rows out and the other still holds
+    the pre-rotation copy. The rotated rows must stay gone, every row after the
+    cut and both sides' new rows must survive, and both vantages must write the
+    same bytes."""
+    w, cut = _window(), 300
+    base = _chg(0, w + cut)
+    rotated = base[cut:] + _chg(w + cut, 2, agent="a")
+    stale = base + _chg(w + cut + 2, 3, agent="b")
+    ab = drv.merge_bytes(path, _jsonl(*rotated), _jsonl(*stale), _jsonl(*base))
+    ba = drv.merge_bytes(path, _jsonl(*stale), _jsonl(*rotated), _jsonl(*base))
+    assert ab == ba
+    files = {r["file"] for r in _lines(ab)}
+    assert not files & {r["file"] for r in base[:cut]}
+    assert files == {r["file"] for r in base[cut:] + rotated[w:] + stale[w + cut:]}
+
+
+@pytest.mark.parametrize("path", [_WORLD_CHG, _META_CHG])
+def test_changelog_truncation_that_lost_the_newest_rows_drops_nothing(path):
+    """A side that lost the base's NEWEST rows was truncated, not rotated, so
+    nothing may be dropped (the trio a downstream operator asked for,
+    msg-20260929-075602-omni-3403)."""
+    w = _window()
+    base = _chg(0, w + 300)
+    truncated = base[:w] + _chg(w + 300, 1, agent="a")
+    out = drv.merge_bytes(path, _jsonl(*truncated), _jsonl(*base), _jsonl(*base))
+    assert {r["file"] for r in base} <= {r["file"] for r in _lines(out)}
+
+
+@pytest.mark.parametrize("path", [_WORLD_CHG, _META_CHG])
+def test_changelog_stub_drops_nothing(path):
+    """'s shape: a failed integrate left a one-row stub (a fresh
+    heartbeat) and it was committed. The full history must come through."""
+    base = _chg(0, _window() + 300)
+    stub = _chg(10 ** 6, 1, agent="a")
+    out = _lines(drv.merge_bytes(path, _jsonl(*base), _jsonl(*stub), _jsonl(*base)))
+    assert {r["file"] for r in out} == {r["file"] for r in base + stub}
+
+
+def test_changelog_short_tail_is_not_a_rotation():
+    """A copy that kept only the base's newest few rows starts at a base row,
+    with a clean front slice gone, so it looks like a rotation. It holds fewer
+    rows than any rotation leaves, so nothing may be dropped."""
+    base = _chg(0, _window() + 300)
+    tail = base[-5:]
+    out = drv.merge_bytes(_WORLD_CHG, _jsonl(*tail), _jsonl(*base), _jsonl(*base))
+    assert len(_lines(out)) == len(base)
+
+
+def test_changelog_rotations_of_different_amounts_converge_on_the_larger_cut():
+    """Rotators are not serialized across boxes (), so two boxes can cut
+    the same base by different amounts. Each rotation archived what it cut, so
+    the merge keeps the larger cut."""
+    w = _window()
+    base = _chg(0, w + 400)
+    small_cut, large_cut = base[300:], base[400:]
+    out = drv.merge_bytes(_WORLD_CHG, _jsonl(*small_cut), _jsonl(*large_cut),
+                          _jsonl(*base))
+    assert [r["file"] for r in _lines(out)] == [r["file"] for r in large_cut]
+
+
+@pytest.mark.skipif(subprocess.run(["git", "--version"], capture_output=True).returncode != 0,
+                    reason="git not available")
+def test_live_git_merge_keeps_a_world_changelog_rotation(tmp_path):
+    """END-TO-END on the production routing line: real git hands the driver the
+    real %P, so this fails if the path predicate does not match what git sends."""
+    repo = _init_ledger_repo(tmp_path, ".mind-data/world/**/*.jsonl merge=ayoai-ledger\n")
+    log = repo / ".mind-data" / "world" / "changelog.jsonl"
+    w, cut = _window(), 300
+    base = _chg(0, w + cut)
+    res = _diverge(repo, log,
+                   base=_jsonl(*base),
+                   ours=_jsonl(*base[cut:] + _chg(w + cut, 1, agent="a")),
+                   theirs=_jsonl(*base + _chg(w + cut + 1, 1, agent="b")))
+    assert res.returncode == 0, f"merge aborted (driver not invoked?): {res.stderr}"
+    files = [r["file"] for r in _lines(log.read_bytes())]
+    assert files == [r["file"] for r in base[cut:] + _chg(w + cut, 2)]
+
+
 # ── retrieval_stats merged per field (, rb-12157) ──────────────────
 # The whole-record arms above pick ONE side, and the both-edited / no-base arm
 # picks by a lexicographic canonical compare that prefers null over any date and

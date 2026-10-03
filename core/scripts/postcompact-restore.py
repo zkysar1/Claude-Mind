@@ -100,12 +100,15 @@ def _format_slot_value(value):
 
 
 def _read_diary_entries(limit=10):
-    """Read the last N entries from the execution diary."""
+    """Read the last N entries from the execution diary (every entry when limit is None).
+
+    Undecodable bytes are replaced, so one damaged line costs that line and not the read.
+    """
     if not DIARY_PATH.exists():
         return []
     entries = []
     try:
-        with open(DIARY_PATH, "r", encoding="utf-8") as f:
+        with open(DIARY_PATH, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -116,7 +119,7 @@ def _read_diary_entries(limit=10):
                     pass
     except Exception:
         return []
-    return entries[-limit:]
+    return entries if limit is None else entries[-limit:]
 
 
 def _read_reasoning_snapshot():
@@ -251,6 +254,56 @@ def _goal_live_status(goal_id, source):
     return result
 
 
+# The close phases iteration-close.sh brackets with diary markers, in run order, as
+# (step, diary phase name). Its PHASE_NAME map is the SSOT for the names. Verify,
+# state-update and learning-gate run with --goal, so their markers carry the goal id.
+# The productivity-check runs without it: its marker is goal-less, and its phase_end is
+# the close-finished signal precheck-gap-check.py and skill-attribution.py already read.
+_VERIFY_PHASE = "phase-5-verify"
+_PRODUCTIVITY_PHASE = "phase-12-productivity"
+_CLOSE_TAIL = (
+    ("state-update", "phase-8-state-update"),
+    ("learning-gate", "phase-12-learning-gate"),
+    ("productivity-check", _PRODUCTIVITY_PHASE),
+)
+
+
+def _close_tail_owed(goal_id):
+    """Close steps still owed for a goal whose verify phase already ran. NEVER raises.
+
+    Returns the owed step names in run order, or [] when the close finished or the
+    diary holds no verify for this goal. iteration-close --phase verify marks the goal
+    completed BEFORE state-update, learning-gate and productivity-check run, and the
+    checkpoint's `phase` is written at selection and never advanced, so a compaction in
+    that window leaves a terminal goal that is not a leftover anchor (guard-7366,
+    guard-4245; the recurrence is recorded on g-115-5048).
+
+    Evidence is the diary in FILE order, not by timestamp: the goal's LAST verify
+    phase_end, then which tail phases ended after it. The close is finished once the
+    productivity-check has ended after that verify, whichever goal id it carries. A
+    phase_end row proves a phase ran, not that it passed (iteration-close's EXIT trap
+    writes it on a failure too), so the banner built on this says "no phase_end".
+    """
+    try:
+        rows = [r for r in _read_diary_entries(limit=None) if isinstance(r, dict)]
+        verified = None
+        for i, row in enumerate(rows):
+            if (row.get("entry_type") == "phase_end"
+                    and row.get("phase") == _VERIFY_PHASE
+                    and row.get("goal_id") == goal_id):
+                verified = i
+        if verified is None:
+            return []
+        ended = [(r.get("phase"), r.get("goal_id")) for r in rows[verified + 1:]
+                 if r.get("entry_type") == "phase_end"]
+        if any(phase == _PRODUCTIVITY_PHASE for phase, _gid in ended):
+            return []
+        return [step for step, phase in _CLOSE_TAIL if (phase, goal_id) not in ended]
+    except Exception as e:
+        log(f"close-tail read failed: {e}")
+        return []
+
+
 def _format_iteration_ckpt_block(iter_ckpt, reselect="/aspirations precheck + select"):
     """Format the in-flight goal block for the restore output.
 
@@ -285,6 +338,11 @@ def _format_iteration_ckpt_block(iter_ckpt, reselect="/aspirations precheck + se
     # free to keep producing stale anchors with nothing left to notice them.
     live = _goal_live_status(goal_id, iter_ckpt.get("source"))
     is_terminal = live["checked"] and live["status"] in _TERMINAL_STATUSES
+    # : terminal is not always leftover. Verify sets the status first, so a
+    # compaction before the close tail ran leaves a goal whose close is still owed.
+    # Reducer only: a worker Body runs no iteration-close, and sending it to one is the
+    # reducer-only re-entry guard-517/guard-463 forbid.
+    close_owed = _close_tail_owed(goal_id) if is_terminal and BODY_DIR is None else []
 
     # : NOT-IN-FLIGHT WITHOUT BEING TERMINAL. The terminal branch below
     # () covers completed/skipped/expired, which caught zeta's
@@ -320,7 +378,41 @@ def _format_iteration_ckpt_block(iter_ckpt, reselect="/aspirations precheck + se
         stale_reason = (f"it is DEFERRED (status '{live['status']}', "
                         f"defer_reason: {live['defer_reason']})")
 
-    if is_terminal:
+    if close_owed:
+        # Terminal, but the diary shows verify ran and the productivity-check did not
+        # follow it. Same protection as the branch below (never execute the goal again,
+        # never hand-write an outcome_note), and the opposite order on re-selecting: the
+        # owed close comes FIRST, because "pick fresh work" abandons it with no error
+        # anywhere (guard-7366, guard-4245). The ban is on a HAND-written note only: the
+        # close phases are scripts and write the fields they own. Process state comes
+        # before any phase: each one is its own, often backgrounded, process and the diary
+        # cannot say whether one is still running (rb-1906, guard-2638).
+        out.extend([
+            "",
+            f"CLOSE OWED — DO NOT RE-SELECT YET. This checkpoint names {goal_id}, "
+            f"whose live status is '{live['status']}' because iteration-close "
+            "--phase verify already ran for it, but the execution diary shows its "
+            f"close unfinished: no phase_end after that verify for {', '.join(close_owed)}. "
+            "(A phase_end row proves a phase ran, not that it passed.)",
+            "This is not a leftover anchor: the checkpoint 'phase' above is the "
+            "selection stamp and the close phases never advance it, so it says "
+            "nothing about how far the close got (guard-7366, guard-4245).",
+            "ACTION: first run bash core/scripts/proc-match.sh iteration-close and "
+            "bash core/scripts/proc-match.sh recurring-close, each as its own command. "
+            "rc 0 means a close is still running: wait for it to exit and start no "
+            "phase it will run, because re-running one that already finished sweeps a "
+            "partner's uncommitted edit into your commit (rb-1906, guard-2638). rc 1 "
+            "means none is alive and the owed phases are yours. Then run "
+            "bash core/scripts/orchestrator-entry-battery.sh. A "
+            "'pending_phase_6_spark' ENTRY line means the spark is owed, and a missing "
+            "line does NOT mean it is not (guard-4245: read spark_fired_session for "
+            f"{goal_id}). Then finish the owed close in order (the spark when the "
+            "outcome was deep, then state-update, learning-gate, productivity-check), "
+            f"and only then re-run {reselect} to pick fresh work. Do NOT execute "
+            f"{goal_id} again and do NOT hand-write an outcome_note onto that "
+            "record; the close phases write what they own.",
+        ])
+    elif is_terminal:
         # The one branch that must NOT tell the model to resume. An in-flight
         # assertion about a closed goal is self-falsifying, and the previous
         # wording forbade the two actions that would have caught it (re-running

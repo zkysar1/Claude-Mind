@@ -132,6 +132,31 @@ Consequences for readers: `stage=archived` records in the LIVE file are
 normal (not corruption); an id may exist in BOTH files by design —
 `compute_meta` (CLI + daemon) dedups the join by id so nothing double-counts.
 
+## A member's forget and undo, and the merge (g-335-1726 u7a)
+
+A member's soft forget of a hypothesis (`knowledge-edit-apply.py`) stamps `forgotten_at` and
+blanks the statement (`claim`, `title`). Its undo stamps `restored_at` FIRST, puts the statement
+back, and clears `forgotten_at` LAST (the key stays, set to null). Exposure reads `forgotten_at`
+alone (`knowledge_projection.is_forgotten`); `restored_at` never decides what is shown. Both stamps
+are whole-second UTC and each is pushed past the stamps the record already carries
+(`knowledge_retention.strictly_after`), so two events in one second, or a box whose clock runs
+behind, still order forget < undo < forget.
+
+`coordination_merge._merge_pipeline_record` takes the statement and both stamps as ONE group, whole,
+from the copy whose event is later (`_forget_event`: the later stamp, then hidden over shown, then a
+finished undo over one that has not cleared the marker, then the group's content). A record nobody
+forgot merges exactly as before. So a stale copy at a higher stage cannot bring a forgotten
+statement back, a stale copy of a forget cannot undo an undo, and a merge only ever produces a
+state a writer passed through. Residue: two copies of ONE event caught at different writes (marker
+stamped, text not yet blanked) are ordered by content, so the unblanked one can stand; the erase
+sweep (`knowledge_erase.py`, g-335-1726 u4) owns re-blanking a marked record whose window has closed
+and whose text is not the tombstone, and with it the record's supporting prose (a field is blanked when
+its VALUE is text, decided by shape and not by a list of names: the statement fields are the one
+exception that is blanked by name, and the identity names are never blanked). The supporting prose is
+NOT in the merge's forget group, so a stale copy from another box can bring it back: a hardening unit,
+not part of u4.
+Why the sweep is what it is, and what it leaves open: `core/config/rationale/knowledge-erase-sweep.md`.
+
 ## The outcome enum — and why there is no REFUTED (g-115-399, 2026-09-05)
 
 `VALID_OUTCOMES = {"CONFIRMED", "CORRECTED", "EXPIRED", "UNRESOLVABLE"}`

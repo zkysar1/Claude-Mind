@@ -987,3 +987,27 @@ def test_pinned_description_indices_marker_set_plus_unconditional_block0_floor()
     # the marker must be the PIN marker: an ordinary [appended:] sentinel is not one
     plain = [_desc_block("body with the word hoisted mid-text", marker="m")]
     assert GFA.pinned_description_indices(plain) == [0]
+
+
+# ── 10. The read's status filter covers every status (, 2026-10-02) ──
+# aspirations-query.sh returns a goal only when its status is in --goal-status.
+# A hand-kept copy of the list lacked `candidate` and `superseded`, so an append to
+# a newly filed goal (every goal starts as a candidate) died as an empty read.
+def test_the_status_filter_is_the_owners_set_not_a_copy():
+    """Pinned by IDENTITY (rb-6371): an equal-but-separate literal would pass ==
+    on the day it was written and drift again."""
+    import aspirations
+    assert GFA.VALID_GOAL_STATUSES is aspirations.VALID_GOAL_STATUSES
+    assert set(GFA.ALL_STATUSES.split(",")) == aspirations.VALID_GOAL_STATUSES
+
+
+@pytest.mark.parametrize("status", ["candidate", "superseded", "pending"])
+def test_the_read_finds_a_goal_in_every_status(monkeypatch, status):
+    record = {"goal_id": "g-1-1", "status": status, "priority": "MEDIUM", "progress_note": ""}
+
+    def fake_query(argv, **kw):
+        wanted = argv[argv.index("--goal-status") + 1].split(",")
+        return _Res(stdout=json.dumps([record] if status in wanted else []))
+
+    monkeypatch.setattr(GFA, "_run", fake_query)
+    assert GFA.read_goal("g-1-1", "world")["status"] == status

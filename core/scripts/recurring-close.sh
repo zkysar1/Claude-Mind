@@ -9,7 +9,7 @@
 #   bash aspirations-update-goal.sh <id> lastAchievedAt "$(date +%Y-%m-%dT%H:%M:%S)"
 #
 # Now one command:
-#   bash recurring-close.sh <goal-id> <outcome-class> [--source world|agent] \
+#   bash recurring-close.sh <goal-id> <outcome-class> --source <world|agent> \
 #                           [--summary "..."] [--override-uncommitted "<reason>"]
 #     outcome-class ∈ {routine, deep}
 #

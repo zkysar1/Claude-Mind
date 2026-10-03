@@ -43,7 +43,7 @@ WHAT DIFFERS FROM THE GOAL-SIDE SSOT, and why
      retained because "does not project today" is a property of the current
      daemon build, not of the contract, and the cost of being wrong is a
      silently destroyed field. It refuses on a record carrying NONE of the
-     store's long-text/structured canaries.
+     store's long-text or structured canaries.
 
   2. AN OPTIONAL ``--anchor``. The goal-side has marker + projection + verify.
      The hand-rolled store procedure this replaces also checked that expected
@@ -66,14 +66,15 @@ VERIFICATION
 The post-write assertion compares against the PRE value, never against the
 string this script constructed — comparing to your own construction only proves
 the write echoed (sig-40). Asserts the sentinel is present, PRE survived
-verbatim, and length GREW.
+verbatim, and length GREW. When it fails, ``restore_pre`` writes PRE back by
+compare-and-swap, and only while the field still holds what this run stored
+(g-115-11615).
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -190,8 +191,10 @@ def _die(code: int, msg: str):
     sys.exit(code)
 
 
-def _run(argv):
-    return subprocess.run(argv, capture_output=True, text=True)
+def _run(argv, **kw):
+    # The SSOT's runner. It sends an input= value as UTF-8 BYTES, because text
+    # mode on Windows turns every \n into \r\n on the way in ().
+    return _gfa._run(argv, **kw)
 
 
 def _bash(script_name: str, *args) -> list:
@@ -258,6 +261,65 @@ def read_record(store: str, record_id: str) -> dict:
              "appending onto this read could silently destroy the field. Refusing "
              "(guard-1251).")
     return row
+
+
+def written_value(stdout: str, field: str):
+    """The text THIS run's write stored, taken from the write's own response.
+
+    Each write wrapper prints the record its endpoint returned from inside the
+    locked write, so this is what the write put in the field, not what was sent.
+    None when the response holds no such text field.
+    """
+    try:
+        rec = _parse_json_tail(stdout)
+    except Exception:  # noqa: BLE001
+        return None
+    value = rec.get(field) if isinstance(rec, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def restore_pre(store, record_id, field, pre, written, current, sentinel) -> str:
+    """After a failed verify, write PRE back by compare-and-swap ().
+
+    Returns one sentence for the rc=7 message. PRE is written back only when all
+    four of these hold:
+      - the write's response says what this run stored (``written``);
+      - that stored value fails verification itself. If it passed, the failed
+        re-read is a lag or a later writer, not damage done by this run;
+      - the field still holds exactly that value (``current``, the re-read just
+        taken). Any other value is another writer's, and it is never overwritten;
+      - PRE is not empty, because the write wrappers refuse an empty value.
+    """
+    if written is None:
+        return ("PRE was NOT restored: the write's response did not show what it stored, "
+                "so this run cannot tell its own value from another writer's.")
+    if not verify_post(pre, written, sentinel):
+        return ("PRE was NOT restored: the write stored a sound value, so the failed re-read "
+                "is a lag or a later writer's change, not damage done by this run.")
+    if current != written:
+        return ("PRE was NOT restored: the field no longer holds this run's value. Another "
+                "writer changed it, and their value is not overwritten.")
+    if not pre:
+        return (f"PRE was NOT restored: the field was empty before this run, and the write "
+                f"wrappers refuse an empty value. It holds the {len(written)} characters this "
+                "run wrote, without the marker, and a re-run would append after them.")
+    res = _run(_bash(STORES[store]["write"], "--value-stdin", record_id, field), input=pre)
+    if res.returncode != 0:
+        return (f"Restoring PRE FAILED (rc={res.returncode}): {res.stderr.strip()[:300]}. "
+                f"The field still holds the {len(written)} characters this run wrote.")
+    # The wrappers' value reader drops trailing newlines, so that is what comes back.
+    kept = pre.rstrip("\n")
+    try:
+        again = read_record(store, record_id).get(field)
+    except SystemExit:
+        again = None
+    if again != kept:
+        return ("PRE was written back, but a re-read does not show it, so the field's state "
+                "is unknown. Read the record before doing anything else.")
+    dropped = len(pre) - len(kept)
+    return (f"PRE was restored ({len(kept)} characters) and a re-read confirms it"
+            + (f", minus {dropped} trailing newline(s) the write wrapper drops" if dropped else "")
+            + ". Re-running the identical command starts again from PRE.")
 
 
 def main(argv=None) -> int:
@@ -357,19 +419,26 @@ def main(argv=None) -> int:
              "lost. Re-run the identical command: the fresh read picks up their text and "
              "the marker keeps the retry idempotent (g-115-5638).")
 
-    # WRITE positionally. Never a flag in the value slot: these wrappers refuse
-    # unknown leading-dash args with exit 2, and the pre-strict versions slid the
-    # next token into VALUE and clobbered guard-1615 at rc=0 ().
+    # WRITE on STDIN, never in argv (). On Windows, Git bash cuts an
+    # argv word that holds whitespace or a glob character to 8,186 characters,
+    # at rc=0. On ZDS a composed value of 8,296 characters was stored cut
+    # mid-sentence, sentinel lost. --value-stdin is an
+    # accepted flag on all three write wrappers. Any OTHER flag is refused with
+    # exit 2: the pre-strict versions slid the next token into VALUE and clobbered
+    # guard-1615 at rc=0 ().
     cfg = STORES[args.store]
-    res = _run(_bash(cfg["write"], args.record_id, args.field, new))
+    res = _run(_bash(cfg["write"], "--value-stdin", args.record_id, args.field), input=new)
     if res.returncode != 0:
         _die(RC_WRITE_FAILED, f"write failed (rc={res.returncode}): {res.stderr.strip()[:600]}")
+    written = written_value(res.stdout, args.field)
 
     # VERIFY by RE-READING, and against PRE — never against `new`.
     post_row = read_record(args.store, args.record_id)
     problems = verify_post(pre, post_row.get(args.field), sentinel)
     if problems:
-        _die(RC_VERIFY_FAILED, "post-write verification FAILED: " + "; ".join(problems))
+        _die(RC_VERIFY_FAILED, "post-write verification FAILED: " + "; ".join(problems) + ". "
+             + restore_pre(args.store, args.record_id, args.field, pre, written,
+                           post_row.get(args.field), sentinel))
 
     print(json.dumps({"ok": True, "changed": True, "store": args.store, "id": args.record_id,
                       "field": args.field, "marker": args.marker,

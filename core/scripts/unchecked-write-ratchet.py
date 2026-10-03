@@ -173,7 +173,8 @@ def main():
                 f"WARN: unchecked write sites grew from baseline "
                 f"{prior_baseline} to {current} (+{current - prior_baseline}). "
                 f"Run `bash core/scripts/unchecked-write-audit.sh "
-                f"--list-unverified 20` to inspect the new sites."
+                f"--new-since baseline` to name the sites that joined the "
+                f"unverified set since the baseline reading."
             )
         elif current < prior_baseline:
             verdict = "ratcheted"

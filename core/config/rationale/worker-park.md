@@ -213,6 +213,47 @@ instruction away from the check. It is FIRST in each hook list: a harness that
 runs PreToolUse hooks in order threads each rewrite forward, and the agent-inject
 hook prepends exports that would hide a lone echo.
 
+## A parked Body rejoins when its reducer returns (g-375-103)
+
+The orbit made a returned reducer wait for its workers: a parked Body saw the
+claim again only at its next FULL re-poll, up to 4h later. Over the 7 days to
+2026-09-30, 576 of 1839 parked Body-minutes came after the reducer's claim was
+live again (g-375-103).
+
+`body-manifest.py rejoin-wait` is a background claim waiter that THE PARK
+SEQUENCE launches on a Phase 0.5 FIRST park only. Every 120s it runs
+`runner-claim.sh status --agent`, the same argv the Phase 0.5 poll runs, and
+judges the read with the poll's own `decide(..., body_state="parked")` against
+the poll's state file, which it reads and never writes. It fires only on a
+genuine LIVE read (rc 0 and a parsed machine) that `decide()` answers CONTINUE
+and whose heartbeat (now minus its age) is later than `last_parked_at`. A claim
+whose last beat predates the park is what the poll that parked the Body already
+judged. A takeover onto another box is WIND_DOWN there, so the waiter keeps
+waiting and no re-park loop can start. On fire it writes
+`sessions/<SID>/park-rejoin.json` and exits 0, and both harnesses deliver the
+exit as a new turn. `park-due` answers DUE while that signal is newer than
+`last_parked_at`, so that turn re-polls at once. The next park retires the signal
+by re-stamping `last_parked_at`; nothing deletes it.
+
+Why only that park: the manifest records no park reason, so the launch site is
+the discriminator. A supply-gap park sits beside a LIVE reducer, where a claim
+test fires at once and would loop through re-poll, no goal, re-park. /stop and
+the exhaustion fence launch nothing. A waiter left from an earlier reducer-gone
+park exits with no signal on `stop-requested` (Phase -0-stop runs before
+park-due in any case), when the Body leaves the park (not parked, or `parked_at`
+changed), or at the 60h cap. It prints facts only, because a line naming a skill
+in request shape trips a harness's skill-coverage backstop (rb-12040).
+
+Cost per parked hour: 30 claim reads at about 0.1s each (3 runs on cc-14,
+g-375-103) and one idle process, with no model calls. The hourly park wakeup is
+unchanged.
+
+The limit: one waiter per park episode. If the waiter fires and the re-poll
+finds the reducer gone again, the re-park prints `already-parked`, no second
+waiter starts, and that episode falls back to the orbit. Only a reducer that
+drops again inside one re-poll hits this; the field measurement (g-375-103 O3)
+decides whether it needs a relaunch rule.
+
 ## Context pressure is not a close condition — the Phase 1 text, measured
 
 Moved verbatim from worker-loop Phase 1 (the no-goal branch) on 2026-09-23
@@ -269,6 +310,8 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   dead worker Body (the Zak-Code side of the same incident)
 - g-375-98 / g-375-104 — a turn opened by a background-command exit skipped the
   park check; `core/scripts/parked-body-gate.py` holds work until it runs
+- g-375-103 — the rejoin waiter (`body-manifest.py rejoin-wait`,
+  `park-rejoin.json`, `park_due`'s early DUE)
 - `core/scripts/body-manifest.py` (`park`, `resume`, `park-expired`,
   `PARK_MAX_HOURS`), `core/scripts/stop-reason-record.py` (`NO_NOTIFY_PATHS`),
   `core/scripts/deadman-directive.sh` (resumable branch),

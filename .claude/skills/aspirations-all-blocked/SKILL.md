@@ -219,6 +219,9 @@ IF current.b2_empty_at_completed == completed_now AND current.b2_empty_at_comple
     blocked_idle_attempts.append("create-aspiration: skipped (empty last time, portfolio unchanged)")
     Output: "▸ Skipping aspiration generation — last result was empty and no goal has completed since"
 ELSE:
+    # §4 idle ladder (B3 g-353-66): generation is the LAST rung.
+    Bash: bash core/scripts/precheck-eval.sh pipeline-depth --apply → IF candidate_tier=="on" AND groomable_count>0:
+        LOOP_CONTINUE if promoted, else ONE grooming bite (g-353-65) then LOOP_CONTINUE
     Output: "▸ Attempting constraint-aware aspiration generation..."
     invoke /create-aspiration from-self --plan with: constraint_context
     # constraint_context.directives is SCOPE (what the operator/peer put in or out of bounds),

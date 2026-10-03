@@ -285,6 +285,11 @@ def main():
         "reasoning_bank": audit.load_reasoning_bank(),
         "guardrails": audit.load_guardrails(),
         "pipeline": audit.load_pipeline(),
+        # : the archive is a resolution TARGET (unioned into the
+        # pipeline id set by build_id_sets). Without this, a ref to an
+        # archived hypothesis reads dangling and --apply NULLS it — the 191
+        # measured in 's write-class incident.
+        "pipeline_archive": audit.load_pipeline_archive(),
         "pattern_signatures": audit.load_pattern_signatures(),
         "experience": audit.load_all_experiences(),
     }

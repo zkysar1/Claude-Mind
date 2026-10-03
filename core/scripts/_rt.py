@@ -265,6 +265,20 @@ def aspirations_complete_by(goal_id, source="world", agent_name=None,
         rt_call("POST", "/v1/aspirations/complete-by", query=query))
 
 
+def aspirations_rehome_goal(goal_id, to_asp, reason=None, source="world",
+                            dry_run=False):
+    """POST /v1/aspirations/rehome-goal (): move ONE goal into `to_asp`
+    under its SAME id; the source copy becomes a superseded pointer. Raises
+    RtError on any non-2xx, like every rt_call. Returns the parsed response."""
+    query = "goal_id=%s&to_asp=%s&source=%s" % (_q(goal_id), _q(to_asp), _q(source))
+    if reason:
+        query += "&reason=%s" % _q(reason)
+    if dry_run:
+        query += "&dry_run=true"
+    return json.loads(
+        rt_call("POST", "/v1/aspirations/rehome-goal", query=query))
+
+
 def aspirations_update_goal(goal_id, field, value, source="world"):
     """POST /v1/aspirations/update-goal. Returns the parsed daemon response.
 

@@ -597,6 +597,348 @@ def vacuum_skips_yaml_named_source_dir(sandbox, store):
 
 
 # ---------------------------------------------------------------------------
+#  — fast path must not inherit encoding=dropped after a vacuum
+# ---------------------------------------------------------------------------
+
+@with_sandbox
+def fast_path_does_not_inherit_dropped_after_vacuum(sandbox, store):
+    """: a metadata-only vacuum rewrites the newest manifest to
+    encoding=dropped and deletes its blob. A save of UNCHANGED content must NOT
+    inherit that dropped encoding (which would publish a manifest whose restore
+    raises, while history-save still exits 0). It must re-anchor with a fresh
+    full blob so the snapshot is restorable again."""
+    file_path = _make_file(sandbox, "data.jsonl", b"")
+    content = b'{"id":"a","v":1}\n{"id":"b","v":2}\n'
+    store.save(file_path, content, sandbox, agent="alpha")
+    snaps = store.list_snapshots(file_path, sandbox)
+    assert_eq(snaps[0]["encoding"], "full", "seed snapshot is full")
+
+    # Backdate the manifest so a metadata-only vacuum drops it.
+    long_ago = time.time() - 999 * 86400
+    for m_path in (sandbox / ".history" / "snapshots").rglob("*.yaml"):
+        os.utime(m_path, (long_ago, long_ago))
+    result = store.vacuum(sandbox, dry_run=False, metadata_only_after_days=1)
+    assert_eq(result["manifests_dropped"], 1, "vacuum drops the sole manifest")
+    blobs_after_vac = list((sandbox / ".history" / "blobs").rglob("*.gz"))
+    assert_eq(len(blobs_after_vac), 0, "vacuum deleted the blob")
+
+    # THE DEFECT SCENARIO: save the SAME bytes again.
+    time.sleep(0.01)
+    store.save(file_path, content, sandbox, agent="beta")
+    snaps2 = store.list_snapshots(file_path, sandbox)
+    newest = snaps2[0]
+    # The new manifest must be a real, restorable snapshot — NOT dropped.
+    assert_eq(newest["encoding"], "full",
+              "unchanged-content save after vacuum must re-anchor as full, not inherit dropped")
+    # A fresh blob must have been written.
+    blobs_after_save = list((sandbox / ".history" / "blobs").rglob("*.gz"))
+    assert_eq(len(blobs_after_save), 1, "re-anchor wrote a fresh full blob")
+    # restore() must return the exact bytes (the goal's prescribed test).
+    restored = store.restore(file_path, newest["snapshot_id"], sandbox)
+    assert_eq(restored, content, "post-vacuum unchanged-content snapshot restores byte-exact")
+
+
+# ---------------------------------------------------------------------------
+#  — >5MB files skip the delta attempt (whole-file gzip per save)
+# ---------------------------------------------------------------------------
+
+@with_sandbox
+def large_file_pure_append_uses_suffix_delta_not_full(sandbox, store):
+    """ o1: a pure append to a file LARGER than 5MB must write a
+    delta (suffix) entry, not a full blob. Pre-fix, the 5MB cap in can_try_delta
+    made every save of such a file a whole-file gzip copy (measured: a 5.8MB
+    file averaged 5.42MB per save over 2,550 saves)."""
+    file_path = _make_file(sandbox, "big.jsonl", b"")
+    # ~6MB baseline of hard-to-compress unique lines (51 bytes/line).
+    base = b"".join(
+        f"row_{i:06d}_alpha_beta_gamma_delta_{i * 97}_{i * 137}\n".encode("utf-8")
+        for i in range(120000)
+    )
+    assert_true(len(base) > store.DEFAULT_FULL_BLOB_MAX_SIZE,
+                f"baseline must exceed the 5MB cap, got {len(base)}")
+    store.save(file_path, base, sandbox, agent="alpha")
+    snaps = store.list_snapshots(file_path, sandbox)
+    assert_eq(snaps[0]["encoding"], "full", "first snapshot is full")
+
+    # Append one record to the >5MB file.
+    appended = base + b'{"id":"next","seq":120000,"v":42}\n'
+    time.sleep(0.01)
+    store.save(file_path, appended, sandbox, agent="beta")
+    snaps2 = store.list_snapshots(file_path, sandbox)
+    newest = snaps2[0]
+    assert_eq(newest["encoding"], "delta",
+              f">5MB pure append must be a delta (suffix), got {newest['encoding']}")
+    # The stored delta payload must be TINY (just the appended tail).
+    patch = (sandbox / ".history" / "patches" /
+             store._hash(appended)[:2] /
+             f"{store._hash(appended)[2:]}.from.{store._hash(base)}.gz")
+    assert_true(patch.exists(), f"suffix patch landed at {patch}")
+    assert_true(patch.stat().st_size < 4096,
+                f"suffix patch must be tiny, got {patch.stat().st_size} bytes")
+    # Restore byte-exact.
+    restored = store.restore(file_path, newest["snapshot_id"], sandbox)
+    assert_eq(restored, appended, ">5MB append restores byte-exact")
+
+
+@with_sandbox
+def large_file_non_append_edit_restores_byte_exact(sandbox, store):
+    """ o2 regression control: a NON-append edit to a >5MB file may
+    still store a full blob (the difflib path stays size-capped — it is O(n^2)
+    and rarely beats a full gzip on large non-appends), but it MUST restore
+    byte-exact. Dropping the cap for appends must not break large non-appends."""
+    file_path = _make_file(sandbox, "big2.jsonl", b"")
+    base = b"".join(
+        f"row_{i:06d}_gamma_delta_epsilon_{i * 131}_{i * 71}\n".encode("utf-8")
+        for i in range(120000)
+    )
+    assert_true(len(base) > store.DEFAULT_FULL_BLOB_MAX_SIZE,
+                f"baseline must exceed the 5MB cap, got {len(base)}")
+    store.save(file_path, base, sandbox, agent="alpha")
+    # Mutate the FIRST line — a non-append edit.
+    lines = base.split(b"\n")
+    lines[0] = b"row_000000_MUTATED_non_append_edit"
+    mutated = b"\n".join(lines)
+    assert_true(not mutated.startswith(base), "mutation is not a pure append")
+    time.sleep(0.01)
+    store.save(file_path, mutated, sandbox, agent="beta")
+    snaps = store.list_snapshots(file_path, sandbox)
+    newest = snaps[0]
+    restored = store.restore(file_path, newest["snapshot_id"], sandbox)
+    assert_eq(restored, mutated, ">5MB non-append edit restores byte-exact")
+
+
+# ---------------------------------------------------------------------------
+#  — Windows 259-char temp path drops delta saves (forced-limit tests)
+# ---------------------------------------------------------------------------
+#
+# The defect: _unique_tmp() used to name the temp file <target name> + a
+# 26-27 char suffix. On the ZDS Windows box (LongPathsEnabled=0) the FINAL
+# patch path was 236 chars — under 259 — but the temp path was 261-263, so
+# open() raised FileNotFoundError and 9,593 delta saves were silently dropped
+# (full snapshots on shorter paths still landed). This box is Linux with no
+# MAX_PATH enforcement, so the tests FORCE the limit: a guarded open() refuses
+# paths over 259 chars (the exact cross-platform clause the goal prescribes).
+#
+# Path geometry (chosen so the FORCED limit reproduces the ZDS failure shape
+# on any box): the store base_dir is a directory whose ABSOLUTE path is
+# exactly _DEEP_BASE_LEN chars (computed dynamically, nested under the temp
+# sandbox). Suffix lengths (measured on this box, 7-digit pid): patch =
+# base + 156 ("/.history/patches/aa/62.from.64.gz"); blob = base + 84;
+# manifest = base + 69 ("store.jsonl/26-char-ts_agent.yaml"). With base = 103:
+#   final patch path  = 259            (fits, exactly at the limit; headroom
+#                                       0 < the 26 the goal names)
+#   old tmp patch path = 259 + 29      = 288 (OVER -> refused: the ZDS
+#                                       failure shape, 27-28 with a shorter pid)
+#   blob final path   = 187; old blob tmp = 187 + 29 = 216 (fits — matches
+#                       ZDS where full snapshots DID land while delta temps
+#                       overflowed)
+#   new (fixed) tmp   = 146 (short name in the target's own dir)
+#   manifest path     = 172 (fits)
+# ---------------------------------------------------------------------------
+
+_WINDOWS_MAX_PATH = 259
+_DEEP_BASE_LEN = 103
+
+
+def _force_max_path_limit(limit=_WINDOWS_MAX_PATH):
+    """Context manager: make open() refuse string paths longer than `limit`
+    chars, simulating the Windows MAX_PATH (259) refusal on Linux.
+
+    BOTH builtins.open and io.open are patched, because pathlib's
+    Path.open/write_bytes/read_bytes call io.open DIRECTLY (the C
+    implementation), not the builtins alias — patching only builtins.open
+    would leave the store's Path-based writes unguarded (the guard would be
+    vacuous). Mirrors the OS behavior the defect depends on: open() raises
+    FileNotFoundError for the over-long path; syscalls that don't go through
+    open (mkdir/stat/replace/unlink) are untouched, exactly as on Windows
+    (where MAX_PATH historically applies to the path used by the C runtime
+    open)."""
+    import builtins
+    import io as _io
+    real_builtins_open = builtins.open
+    real_io_open = _io.open
+
+    def guarded_open(file, *args, **kwargs):
+        try:
+            p = os.fspath(file)
+        except TypeError:
+            p = None
+        if isinstance(p, str) and len(p) > limit:
+            raise FileNotFoundError(
+                3, f"[simulated Windows MAX_PATH] path over {limit} chars", p)
+        return real_builtins_open(file, *args, **kwargs)
+
+    class _Guard:
+        def __enter__(self):
+            builtins.open = guarded_open
+            _io.open = guarded_open
+            return self
+        def __exit__(self, *exc):
+            builtins.open = real_builtins_open
+            _io.open = real_io_open
+            return False
+    return _Guard()
+
+
+def _deep_base_dir(sandbox, target_len=_DEEP_BASE_LEN):
+    """Create a store base_dir whose absolute path is exactly target_len chars
+    (one long-named dir under the temp sandbox), and return it."""
+    prefix = str(sandbox) + os.sep
+    name_len = target_len - len(prefix)
+    assert_true(name_len >= 1,
+                f"sandbox prefix {len(prefix)} leaves no room for a "
+                f"{target_len}-char base dir")
+    base = sandbox / ("p" * name_len)
+    base.mkdir(parents=True, exist_ok=False)
+    assert_eq(len(str(base)), target_len, "base_dir path is exactly the target length")
+    return base
+
+
+def _old_unique_tmp(target):
+    """The PRE-FIX _unique_tmp (reproduced verbatim): the target's name plus a
+    26-27 char suffix — the exact naming that overflowed MAX_PATH on Windows."""
+    suffix = f".{os.getpid()}-{os.urandom(8).hex()}.tmp"
+    return target.with_suffix(target.suffix + suffix)
+
+
+def _patch_path_for(store, sandbox, current, base):
+    return (sandbox / ".history" / "patches" /
+            store._hash(current)[:2] /
+            f"{store._hash(current)[2:]}.from.{store._hash(base)}.gz")
+
+
+@with_sandbox
+def forced_max_path_delta_saves_and_restores_byte_for_byte(sandbox, store):
+    """ o4: with the patch path in the <26-headroom band below 259
+    and open() forced to refuse >259-char paths, the FIXED code (short tmp name
+    in the target's own dir) still saves the delta and restores byte-for-byte.
+    Under the pre-fix naming the SAME save's temp open would be refused (see
+    the positive control below)."""
+    base_dir = _deep_base_dir(sandbox)
+    file_path = base_dir / "store.jsonl"
+    content_base = b"".join(
+        f"line_{i:04d}_zeta_eta_theta_{i * 83}_{i * 113}\n".encode("utf-8")
+        for i in range(40)
+    )
+    store.save(file_path, content_base, base_dir, agent="alpha")
+
+    # Confirm the geometry is the ZDS failure band before the assertion that
+    # matters: final patch path fits under 259 with <26 chars of headroom.
+    appended = content_base + b'{"id":"tail","seq":40}\n'
+    patch = _patch_path_for(store, base_dir, appended, content_base)
+    final_len = len(str(patch))
+    assert_true(final_len <= _WINDOWS_MAX_PATH,
+                f"final patch path must fit: {final_len}")
+    assert_true(_WINDOWS_MAX_PATH - final_len < 26,
+                f"final patch path must leave <26 chars of headroom (the band "
+                f"the goal names), got {259 - final_len}")
+
+    time.sleep(0.01)
+    with _force_max_path_limit():
+        store.save(file_path, appended, base_dir, agent="beta")
+    snaps = store.list_snapshots(file_path, base_dir)
+    newest = snaps[0]
+    assert_eq(newest["encoding"], "delta", "delta saved despite the forced limit")
+    restored = store.restore(file_path, newest["snapshot_id"], base_dir)
+    assert_eq(restored, appended, "content restores byte-for-byte")
+
+
+@with_sandbox
+def forced_max_path_delta_write_raises_falls_back_to_full(sandbox, store):
+    """ o5: when the DELTA write raises (forced limit + the pre-fix
+    long tmp naming, whose temp path really does overflow it while the final
+    name fits), save() must NOT drop the snapshot: it records ok=true with a
+    FULL snapshot instead of ok=false with nothing. The full-blob path stays
+    under the limit here (as on ZDS, where fulls still landed)."""
+    base_dir = _deep_base_dir(sandbox)
+    file_path = base_dir / "store2.jsonl"
+    content_base = b"".join(
+        f"line_{i:04d}_iota_kappa_lambda_{i * 67}_{i * 97}\n".encode("utf-8")
+        for i in range(40)
+    )
+    store.save(file_path, content_base, base_dir, agent="alpha")
+    appended = content_base + b'{"id":"tail","seq":40}\n'
+    patch = _patch_path_for(store, base_dir, appended, content_base)
+
+    # Pre-fix long tmp naming so the delta temp path genuinely overflows the
+    # forced limit (final name fits, only the tmp does — the ZDS shape).
+    orig_unique_tmp = store._unique_tmp
+    store._unique_tmp = _old_unique_tmp
+    try:
+        time.sleep(0.01)
+        with _force_max_path_limit():
+            store.save(file_path, appended, base_dir, agent="beta")
+    finally:
+        store._unique_tmp = orig_unique_tmp
+
+    snaps = store.list_snapshots(file_path, base_dir)
+    newest = snaps[0]
+    # A snapshot MUST exist and restore byte-exact (ok=true semantics).
+    restored = store.restore(file_path, newest["snapshot_id"], base_dir)
+    assert_eq(restored, appended, "fallback snapshot restores byte-exact")
+    # Proof the fallback fired: the overflowing delta patch is absent, and a
+    # full blob for the new content landed.
+    assert_true(not patch.exists(),
+                "the overflowing delta patch was NOT written (delta write raised)")
+    blob = (base_dir / ".history" / "blobs" /
+            store._hash(appended)[:2] /
+            f"{store._hash(appended)[2:]}.gz")
+    assert_true(blob.exists(), "fallback wrote a full blob (ok=true, not a drop)")
+
+
+@with_sandbox
+def forced_max_path_positive_control_old_scheme_raises(sandbox, store):
+    """ o6 POSITIVE CONTROL: the test is not vacuous. Under the
+    forced limit, the PRE-FIX tmp naming (reproduced verbatim) makes the delta
+    write raise FileNotFoundError and leaves no patch on disk — the exact
+    ok=false / no-snapshot loss the goal describes (pre-fix code had no
+    fallback, so the exception propagated to the telemetry layer as
+    ok=false; here we exercise the identical write call directly)."""
+    base_dir = _deep_base_dir(sandbox)
+    content_base = b"".join(
+        f"line_{i:04d}_mu_nu_xi_{i * 53}_{i * 73}\n".encode("utf-8")
+        for i in range(40)
+    )
+    content_new = content_base + b'{"id":"tail","seq":40}\n'
+    patch = _patch_path_for(store, base_dir, content_new, content_base)
+    final_len = len(str(patch))
+    assert_true(final_len <= _WINDOWS_MAX_PATH, f"final name fits: {final_len}")
+
+    # Document the failure shape: old tmp over the limit, final name under it.
+    old_tmp_len = final_len + len(f".{os.getpid()}-") + 16 + len(".tmp") + 1
+    assert_true(old_tmp_len > _WINDOWS_MAX_PATH,
+                f"old tmp path must overflow the limit: {old_tmp_len}")
+
+    orig_unique_tmp = store._unique_tmp
+    # Phase 1 (positive control): old tmp scheme under the forced limit.
+    store._unique_tmp = _old_unique_tmp
+    try:
+        with _force_max_path_limit():
+            try:
+                store._atomic_write_bytes(patch, b"delta-payload")
+            except FileNotFoundError as e:
+                exc = e
+            else:
+                raise AssertionError(
+                    "positive control failed: old tmp scheme should raise "
+                    "FileNotFoundError under the forced limit")
+    finally:
+        store._unique_tmp = orig_unique_tmp
+    # The exception is the recorded pre-fix signal (ok=false, FileNotFoundError).
+    assert_true(isinstance(exc, FileNotFoundError), "pre-fix signal: FileNotFoundError")
+    assert_true(not patch.exists(), "pre-fix: no patch landed (the lost snapshot)")
+    # Phase 2: the FIXED short tmp name does NOT overflow — the same write
+    # succeeds under the identical forced limit.
+    fixed_tmp_len = len(str(patch.parent)) + 1 + 22
+    assert_true(fixed_tmp_len <= _WINDOWS_MAX_PATH,
+                f"fixed tmp path must fit: {fixed_tmp_len}")
+    with _force_max_path_limit():
+        store._atomic_write_bytes(patch, b"delta-payload")
+    assert_true(patch.exists(), "fixed short tmp: same write lands")
+    assert_eq(patch.read_bytes(), b"delta-payload", "fixed write content intact")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -628,6 +970,15 @@ TESTS = [
     atomic_write_uses_unique_tmp_suffix,
     # -a regression (2026-07-20): .yaml-named source dir must not abort vacuum
     vacuum_skips_yaml_named_source_dir,
+    #  regression (2026-10-01): fast path must not inherit encoding=dropped
+    fast_path_does_not_inherit_dropped_after_vacuum,
+    #  regressions (2026-10-01): >5MB appends get a suffix delta
+    large_file_pure_append_uses_suffix_delta_not_full,
+    large_file_non_append_edit_restores_byte_exact,
+    #  regressions (2026-10-01): forced 259-char limit (cross-platform)
+    forced_max_path_delta_saves_and_restores_byte_for_byte,
+    forced_max_path_delta_write_raises_falls_back_to_full,
+    forced_max_path_positive_control_old_scheme_raises,
 ]
 
 

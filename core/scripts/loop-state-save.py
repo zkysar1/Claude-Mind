@@ -116,7 +116,23 @@ def _checkpoint_path() -> Path:
     `.name` of agents/<name> IS the agent name (see _paths.agent_dir); taking
     it from _agent_dir keeps that function the single env-read + fail-loud
     point rather than adding a second parallel accessor.
+
+    Test seam (g-115-11509): MIND_CHECKPOINT_PATH, when set, overrides the
+    resolved path outright and is read on EVERY call (not cached at import),
+    so a wrapper-test harness can point the redirect at its own tmp root and
+    all four commands (init/read/clear/update) follow the same file. It
+    bypasses the MIND_AGENT fail-loud in _agent_dir() by design: a redirect
+    is self-contained and its caller already knows the target tree. No test
+    relies on the ambient value — each test-tree conftest scrubs it — so a
+    value present here is always a deliberate per-harness pin. The write path
+    (_atomic_write) mkdirs the parent itself, so the seam needs no implicit
+    mkdir. The sibling commands already treat an absent path as a no-op
+    (read -> null/1, clear -> no-op, update -> fail-open no-op), so pointing
+    the seam at a not-yet-created file is safe before the first init.
     """
+    override = os.environ.get("MIND_CHECKPOINT_PATH")
+    if override:
+        return Path(override)
     return _body_state_path(_agent_dir().name, "iteration-checkpoint.json")
 
 

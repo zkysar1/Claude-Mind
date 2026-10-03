@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.92",
+    "previous_version": "2.12.91",
+    "date": "2026-10-03",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "v2.12.92: opt-in C4 baseline differential for framework_pull --adopt (g-115-11870, omni-448); candidate-tier groom tools; worker-loop role-claim fixes (g-375-110); erase lanes (g-335-1726 u3b/u4); 149 framework commits since v2.12.91 (time-push cut at 50.8h)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.91",
+    "previous_version": "2.12.90",
+    "date": "2026-10-01",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "world/meta changelog keeps its rotation through the ayoai-ledger git merge (g-115-11474), plus the other framework commits since v2.12.90",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.90",
     "previous_version": "2.12.89",
     "date": "2026-09-30",

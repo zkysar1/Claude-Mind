@@ -582,6 +582,41 @@ _raw_policy = (
 COMMONS_POLICY = _raw_policy if _raw_policy in ("private", "selective", "public") else "private"
 
 
+# Roots seen to exist in this process (). Only a success is kept, so
+# a missing root is refused on every call and one created later is accepted on
+# its next check; the memo holds resolve_file_path's per-node loops (tree.py,
+# tree_match.py, embedding-index-build.py) to one stat per root.
+_ROOTS_SEEN: set = set()
+
+
+def _refuse_missing_root(module_name: str, name: str, root: Path) -> None:
+    """Raise when a RESOLVED world/meta root is not a directory ().
+
+    A missing root reads as an empty store: every read answers 'nothing found'
+    and a write creates a tree nobody reads (a /c/ root inherited under
+    MSYS_NO_PATHCONV=1 became a phantom C:/c/ tree). Local storage only, on the
+    predicate get_backend() selects its backend by: under own-cloud the local
+    tree is a read-through cache, so its absence proves nothing (guard-980).
+    The daemon's twin is AgentPathResolver._missing_roots in
+    mind_api/src/agent_paths.py.
+    """
+    if root in _ROOTS_SEEN:
+        return
+    if os.environ.get("STORAGE_BACKEND", "local").strip().lower() == "own-cloud":
+        return
+    if root.is_dir():
+        _ROOTS_SEEN.add(root)
+        return
+    sys.stderr.write(
+        f"ERROR: {module_name}: {name} root {root} does not exist. Refusing to "
+        f"serve it: a missing root reads as an empty store, so every read answers "
+        f"'nothing found' and a write lands in a tree nobody reads (g-115-11554). "
+        f"Create the root (init-world.sh / init-meta.sh) or fix MIND_WORLD / "
+        f"MIND_META / local-paths.conf.\n"
+    )
+    raise RuntimeError(f"{module_name}: {name} root {root} does not exist (g-115-11554)")
+
+
 def assert_world_dir(module_name: str = "<unknown>") -> None:
     """Guard: raise loud RuntimeError if WORLD_DIR is None (no external path resolved).
 
@@ -592,8 +627,9 @@ def assert_world_dir(module_name: str = "<unknown>") -> None:
     `TypeError: unsupported operand type(s) for /: 'NoneType' and 'str'` deep
     inside import machinery. Mirrors `assert_agent_dir` for the same purpose.
 
-    When WORLD_DIR IS set: silent no-op (return None). Module-level callers
-    see byte-identical behavior to the pre-guard path.
+    When WORLD_DIR IS set: silent no-op (return None), unless that root does
+    not exist on local storage, which raises too (g-115-11554;
+    _refuse_missing_root).
     """
     if WORLD_DIR is None:
         msg = (
@@ -614,11 +650,13 @@ def assert_world_dir(module_name: str = "<unknown>") -> None:
         raise RuntimeError(
             f"{module_name}: WORLD_DIR unresolved — external path not configured"
         )
+    _refuse_missing_root(module_name, "world", WORLD_DIR)
 
 
 def assert_meta_dir(module_name: str = "<unknown>") -> None:
-    """Guard: raise loud RuntimeError if META_DIR is None. Mirror of
-    assert_world_dir for the meta/ tier. See that function for full rationale."""
+    """Guard: raise loud RuntimeError if META_DIR is None, or names a root that
+    does not exist on local storage. Mirror of assert_world_dir for the meta/
+    tier. See that function for full rationale."""
     if META_DIR is None:
         msg = (
             f"ERROR: {module_name}: META_DIR unresolved (no MIND_META env "
@@ -629,6 +667,7 @@ def assert_meta_dir(module_name: str = "<unknown>") -> None:
         raise RuntimeError(
             f"{module_name}: META_DIR unresolved — external path not configured"
         )
+    _refuse_missing_root(module_name, "meta", META_DIR)
 
 
 def assert_agent_dir(module_name: str = "<unknown>") -> None:

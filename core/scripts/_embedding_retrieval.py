@@ -78,6 +78,7 @@ def _resolve_index_dir(index_dir):
 
 _encoders = {}  # model_name -> encoder adapter (see _embedding_model)
 _index_cache = {}  # str(index_dir) -> (mtime_ns, embeddings float32, id_list, model_name)
+_docs_cache = {}   # str(index_dir) -> (meta_mtime_ns, {doc_id: builder doc type})
 
 
 def _get_model(model_name=MODEL_NAME):
@@ -179,6 +180,55 @@ def last_degradation():
     return _last_degradation
 
 
+def doc_types(index_dir=None):
+    """{doc_id: builder doc type} for the index at `index_dir`.
+
+    The index's meta.json is the SSOT — embedding-index-build.py writes
+    'guardrail' / 'rb' / 'signature' / 'tree' / 'framework' per row at build
+    time, and the query side must read it from THERE rather than re-derive it
+    (the g-306-45 anti-pattern: a join whose two halves are written twice).
+
+    Returns {} on missing meta, malformed meta, or ANY error — the caller
+    treats unknown types as "not the caller's store" and serves nothing.
+    json-only, mtime-invalidated cache; no numpy needed, so a box without the
+    vendor stack can still partition its index.
+    """
+    try:
+        d = _resolve_index_dir(index_dir)
+        meta_p = d / "meta.json"
+        if not meta_p.exists():
+            return {}
+        mtime = meta_p.stat().st_mtime_ns
+        key = str(d)
+        cached = _docs_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        import json
+        meta = json.loads(meta_p.read_text(encoding="utf-8"))
+        out = {}
+        for rec in meta.get("docs", []):
+            if isinstance(rec, dict) and rec.get("id"):
+                out[rec["id"]] = rec.get("type")
+        _docs_cache[key] = (mtime, out)
+        return out
+    except Exception:
+        return {}
+
+
+def index_model(index_dir=None):
+    """The model name the index at `index_dir` was built with (meta.json —
+    the build-time SSOT the query side is checked against), or None when the
+    meta is missing/malformed. json-only: no numpy needed."""
+    try:
+        d = _resolve_index_dir(index_dir)
+        import json
+        meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        m = (meta.get("model") or "").strip()
+        return m or MODEL_NAME
+    except Exception:
+        return None
+
+
 def cosine_scores(query, index_dir=None):
     """{doc_id: cosine_similarity} for `query` against the persisted index.
 
@@ -195,6 +245,13 @@ def cosine_scores(query, index_dir=None):
     if not query or not isinstance(query, str):
         return _degrade("empty-query", warn=False)
     try:
+        # : resolve the vendor dir at CALL time, not only at import. The
+        # import-time append runs once, so a daemon that started before the stack
+        # was installed kept failing `import numpy` below until a restart — while
+        # embedding_channel_status() read 'alive'. One stat plus a list-membership
+        # test per call; the encoder itself stays lazy and cached.
+        import _vendor_path
+        _vendor_path.ensure_vendor_path()
         d = _resolve_index_dir(index_dir)
         emb, ids, model_name = _load_index(d)
         if emb is None or emb.shape[0] == 0 or not ids:
@@ -227,6 +284,7 @@ def clear_caches():
     global _last_degradation
     _encoders.clear()
     _index_cache.clear()
+    _docs_cache.clear()
     # Reset the degradation state too. Without this a test that provokes a
     # degradation leaks BOTH the recorded reason and the warn-once suppression
     # into every later test in the same process — and the suppression is the

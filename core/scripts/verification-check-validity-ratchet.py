@@ -35,7 +35,7 @@ WHAT IS RATCHETED, AND WHY IT IS NOT THE OBVIOUS THING.
   points, integers, for diffability) plus the raw populations. Ratcheting
   structured-share would re-create the anti-detector — it falls when authors file
   prose, with no defect introduced. This mirrors the disposition in the sibling
-  `goal-field-census-ratchet.py`, which ratchets `distinct_keys` and reports
+  `goal-field-census-ratchet.py`, which ratchets `undeclared_names` and reports
   `stray_occurrences` for the same class of reason (guard-1816: a ratchet on a
   number the available write paths cannot lower produces a permanent WARN that
   everyone learns to ignore, which is worse than not measuring it).

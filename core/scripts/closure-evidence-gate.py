@@ -27,6 +27,14 @@ THE RECORD. It comes from the per-goal aspirations-query.sh projection, and
 falls back to the whole-aspiration aspirations-read.sh when the query does not
 return exactly one record. load_goal says why, with the measured latency.
 
+THE ADVISORY (g-375-52). Whatever the verdict, the note it read is also
+checked for session-scratch citations that lack their inline lines or a host.
+The advisory goes to STDERR, because do_verify sends stdout to a log and lets
+stderr through to the closer, and it is also recorded in the JSON line as
+scratch_citations so its firing rate can be counted from that log. A check
+that faulted is recorded as scratch_advisory_error, so a skip never counts as
+quiet. It never changes the rc.
+
 rc: 0 = pass / noop / override / gate error (fail-open, guard-142).  3 = REFUSED.
 Never 1: Python exits 1 on any uncaught exception, so a refusal on 1 would be
 indistinguishable from a crash or an unimportable module, and the caller would
@@ -39,6 +47,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from datetime import datetime
@@ -49,8 +58,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 # No fallbacks on these imports (guard-391): one that fails crashes the gate
 # with rc 1, which do_verify reports as a fault and proceeds past.
-from gates.closure_evidence import evaluate, refusal_text  # noqa: E402
-from _paths import PROJECT_ROOT, WORLD_DIR, META_DIR, agents_root  # noqa: E402
+from gates.closure_evidence import (  # noqa: E402
+    advisory_text, evaluate, refusal_text, scratch_citations)
+from _paths import PROJECT_ROOT, WORLD_DIR, META_DIR, SESSIONS_DIRNAME, agents_root  # noqa: E402
 from _gate_log import log as _gate_log  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402  guard-580/581: never a bare "bash"
 
@@ -178,6 +188,25 @@ def _emit(decision: str, goal_id: str, override: str | None = None, **fields) ->
                      ensure_ascii=True))
 
 
+def scratch_advisory(goal_id: str, note: str) -> tuple[list, str, str]:
+    """(findings, stderr text, error) for the  advisory. Never raises:
+    the verdict outranks it, and a crash here exits 1, which do_verify reads as
+    a gate fault and proceeds past, so a refusal would be lost with it. The
+    error is returned so the JSON line can tell a skipped check from a quiet
+    one (guard-2421)."""
+    try:
+        host = socket.gethostname()
+        found = scratch_citations(note, sessions_dirname=SESSIONS_DIRNAME, hostname=host)
+        return found, (advisory_text(goal_id, found, host) if found else ""), ""
+    except Exception as e:
+        return [], f"{GATE_ID}: session-scratch advisory skipped ({e})", str(e)
+
+
+def _advise(text: str) -> None:
+    if text:
+        print(text, file=sys.stderr)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--goal", required=True)
@@ -220,17 +249,25 @@ def main(argv=None) -> int:
 
     fields = {"note_source": note_source, "problems": result.get("problems"),
               "warnings": result.get("warnings"), "reason": result.get("reason")}
+    found, advice, advice_error = scratch_advisory(args.goal, note)
+    if found:
+        fields["scratch_citations"] = found
+    if advice_error:
+        fields["scratch_advisory_error"] = advice_error
     if result["decision"] != "block":
         _emit(result["decision"], args.goal, **fields)
+        _advise(advice)
         return 0
     if args.override:
         _emit("override", args.goal, override=args.override, **fields)
+        _advise(advice)
         return 0
     try:
         text = refusal_text(args.goal, result, note_source)
     except Exception as e:  # guard-3803: a bug in the message must not cancel the refusal
         text = f"{GATE_ID}: REFUSED. {args.goal}: {result.get('problems')} (message failed: {e})"
     print(text, file=sys.stderr)
+    _advise(advice)  # after the refusal, which must stay the first screen ()
     _emit("block", args.goal, **fields)
     return REFUSED
 

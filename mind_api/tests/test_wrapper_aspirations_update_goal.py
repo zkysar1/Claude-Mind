@@ -163,9 +163,10 @@ def test_wrapper_defer_reason_clear_via_daemon(running_daemon):
     assert rc == 0, f"wrapper exit {rc}: stderr={err}"
     parsed = json.loads(out)
     assert parsed["defer_reason"] is None
-    # Daemon-side defer-clear cascade dropped both companions
+    # Daemon-side defer-clear cascade cleared both companions; blocker_ref is
+    # written None, never popped ().
     assert parsed.get("defer_reason_set_at") is None
-    assert "blocker_ref" not in parsed
+    assert "blocker_ref" in parsed and parsed["blocker_ref"] is None
 
 
 def test_wrapper_defer_reason_with_blocker_ref_via_daemon(running_daemon):
@@ -389,9 +390,10 @@ def test_wrapper_recurring_false_via_daemon(running_daemon):
     assert rc == 0, f"wrapper exit {rc}: stderr={err}"
     parsed = json.loads(out)
     assert parsed["recurring"] is False
-    # Daemon cascade dropped the recurring-shape fields
-    assert "interval_hours" not in parsed
-    assert "lastAchievedAt" not in parsed
+    # Daemon cascade cleared the recurring-shape fields to None, never popped
+    # ().
+    for key in ("interval_hours", "lastAchievedAt"):
+        assert key in parsed and parsed[key] is None, key
 
 
 def test_wrapper_blocked_by_via_daemon(running_daemon):

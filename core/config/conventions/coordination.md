@@ -122,7 +122,11 @@ After completing a world goal that involves code changes:
 
 1. Executing agent posts `review-request` to coordination channel with goal ID
 2. Executing agent sets `review_requested` timestamp on the goal
-3. Reviewing agent scans for `review-request` during idle time
+3. Reviewing agent scans for `review-request` during idle time. Step 2's field is the
+   durable queue: `close-review-queue.py list` offers every request no verdict answers
+   yet to the peers' recurring reviewer, ahead of worker closures (g-375-116). A verdict
+   answers only a request made at or before it, so after rework the executing agent sets
+   the field again to be reviewed again (g-375-119)
 4. Reviewing agent reads the experience trace and checks for issues
 5. Posts result: `complete` (review passed) or creates investigation goal (issues found)
 

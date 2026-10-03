@@ -605,3 +605,339 @@ def test_valid_record_still_lands_a_firing(seeded):
     rows = _firings(meta)
     assert len(rows) == 1, rows
     assert rows[0]["decision"] == "noop"
+
+
+# --------------------------------------------------------------------------- #
+# 6. The semantic tier ( unit C)
+#
+# Advisory-only: a second stderr block when the top same-store embedding cosine
+# clears the store's calibrated threshold. Every test below monkeypatches the
+# retrieval-module SURFACE (cosine_scores / doc_types / index_model /
+# last_degradation / index_available) — no model loads, no real index is read,
+# and conftest's MIND_EMBEDDING_INDEX_DIR pin is never touched. `check()` is
+# called in-process with corpus= supplied, so no live store is read either
+# (guard-692).
+# --------------------------------------------------------------------------- #
+
+import _embedding_retrieval as er  # noqa: E402
+import _dupe_semantic_thresholds as dst  # noqa: E402
+
+_CAND = {"id": "guard-0009",
+         "rule": "Always pass grep -a when grepping a captured test log, because a "
+                 "binary-classified log makes grep silently emit nothing."}
+
+_SCORES = {"guard-0001": 0.901, "guard-0002": 0.851, "guard-0003": 0.801,
+           "guard-0004": 0.701, "rb-0001": 0.99, "sig-0001": 0.98}
+
+
+def _stub(monkeypatch, scores=_SCORES, types=None, model=dst.CALIBRATED_MODEL,
+          available=None):
+    """Point the retrieval surface at canned data. `types` defaults to a
+    doc-type for every id in `scores` (derived from the TEST fixture's id
+    prefixes — the production code never parses ids for type; it reads the
+    index meta.json, which is exactly what `doc_types` stands in for here)."""
+    monkeypatch.setattr(er, "index_model", lambda index_dir=None: model)
+    monkeypatch.setattr(er, "cosine_scores",
+                        lambda q, index_dir=None: dict(scores))
+    monkeypatch.setattr(er, "last_degradation", lambda: None)
+    if types is None:
+        types = {i: ("guardrail" if i.startswith("guard-")
+                     else "rb" if i.startswith("rb-") else "signature")
+                 for i in scores}
+    monkeypatch.setattr(er, "doc_types", lambda index_dir=None: dict(types))
+    if available is None:
+        available = True
+    monkeypatch.setattr(er, "index_available", lambda index_dir=None: available)
+
+
+def test_semantic_fire_emits_scores_and_never_blocks(monkeypatch):
+    """The positive control (guard-1465): a near-verbatim guardrail whose
+    embedding cosine clears the calibrated bar MUST be named, with scores, on
+    stderr — rc 0, the lexical line untouched, the block labelled non-blocking."""
+    _stub(monkeypatch)
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Always pass grep -a when grepping a "
+                                       "captured test log, because a binary-classified "
+                                       "log makes grep silently emit nothing."),
+                            ("guard-0002", "Never deploy on a Friday without a rollback "
+                                           "plan reviewed by a peer.")],
+                    detail=d)
+    assert out is not None
+    assert "SEMANTIC" in out
+    assert "guard-0001" in out and "0.901" in out
+    assert "guard-0002" in out and "0.851" in out
+    assert "guard-0003" in out and "0.801" in out          # top-3, ranked
+    assert "guard-0004" not in out                          # below top-3
+    assert "NOT blocked" in out
+    assert "ADVISORY" in out                                # lexical line intact
+    assert d["decision"] == "pass"
+    assert d["semantic_fired"] is True
+    assert d["semantic_top1"] == "guard-0001"
+    assert d["semantic_top1_cosine"] == 0.901
+
+
+def test_semantic_only_firing_warns_and_records_pass(monkeypatch):
+    """The unit-C case: a paraphrase the LEXICAL tier misses (low jaccard) but
+    the embedding scores high. The user sees the warning and the record must
+    not say the gate was silent — a stderr line emitted under `decision=noop`
+    is the g-115-3093 misdescription class."""
+    _stub(monkeypatch)
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Rotate the signing certificate ninety days "
+                                       "before expiry and verify the new chain against "
+                                       "the staging endpoint first.")],
+                    detail=d)
+    assert out is not None
+    assert "SEMANTIC" in out and "ADVISORY" not in out      # semantic tier ONLY
+    assert "guard-0001" in out
+    assert d["decision"] == "pass"
+    assert d["semantic_fired"] is True
+
+
+def test_below_threshold_is_silent_with_reason(monkeypatch):
+    """Top cosine under the store bar -> the tier serves nothing. The reason
+    is in the record so a later reader can tell 'scanned and clear' from any
+    other silence."""
+    _stub(monkeypatch, scores={i: s - 0.3 for i, s in _SCORES.items()})
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is None
+    assert d["decision"] == "noop"
+    assert d["semantic_reason"] == "below-threshold"
+
+
+def test_other_store_rows_are_partitioned_out(monkeypatch):
+    """Same-store partitioning reads the BUILDER's per-row doc type from the
+    index (the SSOT): a reasoning-bank row at cosine 0.99 must not appear in a
+    guardrails advisory, and a store whose rows are all typed elsewhere serves
+    nothing at all."""
+    _stub(monkeypatch)
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is not None                        # guard rows exist and fire
+    assert "rb-0001" not in out and "sig-0001" not in out
+    assert d["semantic_top1"] == "guard-0001"
+
+    _rb_cand = {"id": "rb-9001",
+                "title": "A restatement of something entirely different here."}
+    _stub(monkeypatch, scores={"guard-0001": 0.99, "sig-0001": 0.98})
+    d2 = {}
+    out2 = sdw.check(_rb_cand, "reasoning-bank",
+                     corpus=[("rb-0001", "A title the lexical tier will not match.")],
+                     detail=d2)
+    assert out2 is None
+    assert d2["decision"] == "noop"
+    assert d2["semantic_reason"] == "no-same-store-rows"
+
+
+def test_candidates_own_index_row_is_excluded(monkeypatch):
+    """A re-run (or a record already appended by a concurrent writer) must not
+    report the entry as a semantic duplicate of itself — the lexical tier's
+    self-exclusion has its twin here. The candidate's own row scores 1.0 (the
+    strongest possible) and is the ONLY same-store row: if self-exclusion is
+    missing, this fires; with it, the partition is empty."""
+    _stub(monkeypatch, scores={"guard-0009": 1.0, "rb-0001": 0.901})
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is None
+    assert d["semantic_reason"] == "no-same-store-rows"
+
+
+def test_index_absent_fail_opens(monkeypatch):
+    _stub(monkeypatch, model=None, available=False)
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is None
+    assert d["semantic_reason"] == "index-absent"
+    assert d["decision"] == "noop"
+
+
+def test_meta_unreadable_fail_opens(monkeypatch):
+    """Index files PRESENT but meta unreadable (torn/partial build write):
+    'build the index' and 'fix the meta' are different operator actions, so the
+    reason must name the latter, not 'index-absent'."""
+    _stub(monkeypatch, model=None, available=True)
+    d = {}
+    sdw.check(_CAND, "guardrails",
+              corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+              detail=d)
+    assert d["semantic_reason"] == "index-meta-unreadable"
+    assert d["decision"] == "noop"
+
+
+def test_model_mismatch_stays_off(monkeypatch):
+    """guard-1511: the thresholds were calibrated on all-MiniLM-L6-v2. An index
+    rebuilt under another model voids the numbers, so the tier must stay OFF
+    and say why — never serve with a threshold that no longer means anything."""
+    _stub(monkeypatch, model="bge-small-en-v1.5")
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is None
+    assert d["semantic_reason"] == "model-mismatch:bge-small-en-v1.5"
+    assert d["decision"] == "noop"
+
+
+def test_encoder_error_fail_opens(monkeypatch):
+    """cosine_scores degrades to {} on a runtime error and records the reason —
+    the tier must carry that reason through, silently."""
+    _stub(monkeypatch)
+    monkeypatch.setattr(er, "cosine_scores", lambda q, index_dir=None: {})
+    monkeypatch.setattr(er, "last_degradation",
+                        lambda: {"reason": "encoder-or-runtime-error",
+                                 "detail": "RuntimeError: onnx not found"})
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is None
+    assert d["semantic_reason"] == "encoder-or-runtime-error"
+    assert d["decision"] == "noop"
+
+
+def test_bad_meta_fail_opens(monkeypatch):
+    """doc_types() returns {} for malformed meta — the tier serves nothing
+    (unknown types are 'not this store'), with the reason in the record."""
+    _stub(monkeypatch, types={})
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is None
+    assert d["semantic_reason"] == "doc-types-unreadable"
+    assert d["decision"] == "noop"
+
+
+def test_no_semantic_text_fail_opens(monkeypatch):
+    """A record whose SUPPLEMENTARY_TEXT_FIELDS are all empty has nothing to
+    embed. The lexical tier already noops it (no signal text); the tier's own
+    reason must exist for a future field split where the two differ."""
+    _stub(monkeypatch)
+    import retrieve as r
+    monkeypatch.setattr(r, "supplementary_text_parts", lambda e: [])
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                    detail=d)
+    assert out is None
+    assert d["semantic_reason"] == "no-semantic-text"
+
+
+def test_semantic_surfaces_the_builders_embedding_surface(monkeypatch):
+    """The candidate must be embedded on retrieve.supplementary_text_parts —
+    the surface the builder embedded the rows on (the g-306-45 anti-pattern is
+    the second, hand-maintained field list). Capturing the query proves the
+    call went through that helper, not a copy of it."""
+    _stub(monkeypatch)
+    seen = []
+    monkeypatch.setattr(er, "cosine_scores",
+                        lambda q, index_dir=None: (seen.append(q), dict(_SCORES))[1])
+    import retrieve as r
+    sdw.check(_CAND, "guardrails",
+              corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+              detail={})
+    assert seen, "cosine_scores was never called — the semantic tier did not run"
+    expected = " ".join(r.supplementary_text_parts(_CAND)).strip()
+    assert seen[0] == expected
+
+
+def test_semantic_never_flips_the_lexical_result(monkeypatch):
+    """The tier adds lines and fields; it cannot remove the lexical line or
+    change its verdict. Lexical warn + semantic fire -> both blocks, decision
+    pass. Lexical clear + semantic silent -> None, decision noop."""
+    _stub(monkeypatch)
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Always pass grep -a when grepping a "
+                                       "captured test log, because a binary-classified "
+                                       "log makes grep silently emit nothing.")],
+                    detail=d)
+    assert "ADVISORY" in out and "SEMANTIC" in out
+    assert d["decision"] == "pass"
+    assert d["nearest_id"] == "guard-0001"        # lexical evidence intact
+    assert d["semantic_fired"] is True
+
+    _stub(monkeypatch, scores={i: s - 0.3 for i, s in _SCORES.items()})
+    d2 = {}
+    out2 = sdw.check(_CAND, "guardrails",
+                     corpus=[("guard-0001", "Some unrelated rule about certificates.")],
+                     detail=d2)
+    assert out2 is None
+    assert d2["decision"] == "noop"
+    assert d2["semantic_reason"] == "below-threshold"
+
+
+def test_semantic_thresholds_are_not_vacuous():
+    """guard-1465 for the calibrated constants: each sits inside the measured
+    non-twin nearest-neighbour band of its store (calibration-v2.json — floor
+    p50 0.6788 / p99 0.8832 guardrails; p99 rarity bound 0.844 rb; p99 0.7299
+    signatures, max 0.7312). A later 'tighten it a bit' that pushes a value
+    above the floor max or at/below the floor p50 would ship a tier that fires
+    on noise or on nothing — this test fails either way."""
+    floors = {"guardrails": (0.6788, 1.0), "reasoning-bank": (0.0, 1.0),
+              "pattern-signatures": (0.5653, 0.7312)}
+    for store, (lo, hi) in floors.items():
+        t = dst.SEMANTIC_THRESHOLDS[store]
+        assert lo < t <= hi, (f"{store} semantic threshold {t} left the measured "
+                              f"band ({lo}, {hi}] — vacuous or noise-firing")
+    # And the model identity is pinned to the one the sweep ran on: moving
+    # either side without re-running the sweep voids the constants (guard-1511).
+    assert dst.CALIBRATED_MODEL == "all-MiniLM-L6-v2"
+
+
+def test_subprocess_rc_zero_and_semantic_fail_open_child(tmp_path):
+    """End-to-end through the wrapper's exact call shape (JSON on stdin, real
+    child process): the child resolves the hermetic index (conftest's pin is
+    NOT inherited by a subprocess, but neither is a real index here — the box
+    default may or may not exist, so BOTH child outcomes are asserted-safe:
+    rc must be 0 and the lexical line must be intact whichever way the tier
+    lands). The firing path itself is proven in-process above, where the stub
+    actually controls the retrieval surface."""
+    import subprocess
+    import os
+    world = tmp_path / "world"
+    world.mkdir()
+    _write_store(world, "guardrails.jsonl", [
+        {"id": "guard-0001", "status": "active",
+         "rule": "Always pass grep -a when grepping a captured test log, because a "
+                 "binary-classified log makes grep silently emit nothing."},
+    ])
+    r = subprocess.run(
+        [sys.executable, str(HELPER), "--store", "guardrails", "--world-dir", str(world)],
+        input=json.dumps(_CAND), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert "ADVISORY" in r.stderr                 # lexical tier fired in the child
+
+
+def test_firing_record_carries_semantic_fields_not_stale_seed(monkeypatch):
+    """Telemetry contract: a semantic fire on a lexical-clear add produces
+    decision=pass, the semantic evidence fields, and no leftover SEED
+    `reason` (the _mark clear covers the new path too)."""
+    _stub(monkeypatch)
+    d = {}
+    out = sdw.check(_CAND, "guardrails",
+                    corpus=[("guard-0001", "Rotate the signing certificate ninety days "
+                                       "before expiry and verify the new chain against "
+                                       "the staging endpoint first.")],
+                    detail=d)
+    assert out is not None
+    assert d["decision"] == "pass"
+    assert d["semantic_fired"] is True
+    assert d["semantic_top1"] == "guard-0001"
+    assert d["semantic_top1_cosine"] == 0.901
+    # main()'s seed (reason='unreached') must not survive into a reached
+    # record (the _mark clear covers the new path). A LEGITIMATE lexical
+    # reason ('no comparable neighbour' / near-miss evidence) may be present
+    # beside the semantic fields — that is the lexical tier's own evidence.
+    assert d.get("reason") != "unreached"

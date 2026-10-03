@@ -81,6 +81,39 @@ rewrite `baseline` / `last_recorded` / `last_verdict` atomically
 - `ratcheted` — current < baseline. Baseline shrinks to current (one-way).
 - `regressed` — current > baseline. Baseline **does not grow**. Surfaces as a warning.
 
+## Merge across boxes
+
+The file is merge-protected: when two boxes' copies diverge,
+`coordination_merge.merge_audit_baselines` merges them per metric key. That handler is
+the source of truth; each row below was confirmed by running it on synthetic entries.
+
+| Field | Merge rule |
+|---|---|
+| `baseline` | MIN of the two sides. A merge never grows it. |
+| `history` | Content-union of the two lists; identical rows collapse. |
+| `last_recorded` | The later of the two. |
+| `last_verdict` | The verdict of the side that recorded last. |
+| Every other key (`matcher`, `unit`, anything new) | Taken WHOLE from the side whose canonical JSON sorts higher; a key on one side only is kept. There is no per-key rule. |
+
+The last row is the trap for a new field. `baseline` sorts first in that canonical JSON,
+so the winning side is typically the one with the HIGHER baseline, and a value stored
+beside the scalar can come from a different reading than the MIN baseline next to it.
+Measured: with baselines 444 and 446 the merged baseline was 444 and the merged extra
+key was the 446 side's. A field that must survive a merge needs its own rule in the
+handler first, and that rule must reach every box before any box writes the field.
+
+## Localising a regression
+
+A ratchet records a count, so a regression arrives as "+N" with nothing naming the sites.
+Do not persist the members (see above). When the counted corpus is tracked in git,
+rebuild the old corpus from its revision, run the CURRENT audit over both, and diff the
+audit's own records. For the unchecked-write ratchet,
+`bash core/scripts/unchecked-write-audit.sh --new-since baseline` names the sites that
+joined (and left) the unverified set since the commit at the recorded baseline reading,
+and the ratchet's REGRESSED line prints that command. `--new-since <rev>` and
+`--until <rev>` name the revisions explicitly. The command reads this file and writes
+nothing. Why this design: `core/config/rationale/unchecked-write-delta-localisation.md`.
+
 ## Integration with /verify-learning
 
 Each baseline gets one check line in `.claude/skills/verify-learning/SKILL.md`:
@@ -109,5 +142,8 @@ pattern-signatures, and the knowledge tree. Baseline seeded 2026-04-23 at 0.
 - Seeding a predicate the commissioning goal NAMED but nobody RAN — that is a
   wrong question, not a wrong number, and it ships permanently red (`guard-5994`)
 - Letting the baseline grow on regression (defeats the ratchet)
+- Storing a member set, or any new key, beside `baseline`: the merge takes every key it
+  has no rule for whole from one side, so it can disagree with the MIN baseline it sits
+  next to (see § Merge across boxes)
 - Keeping unbounded history (current cap: 50 entries, enforced by writer)
 - Using this file as a dashboard replacement (it's a guard, not a feed)

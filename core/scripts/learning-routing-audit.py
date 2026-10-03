@@ -53,6 +53,7 @@ TREE_YAML = WORLD_DIR / "knowledge" / "tree" / "_tree.yaml"
 RB_JSONL = WORLD_DIR / "reasoning-bank.jsonl"
 GUARDRAILS_JSONL = WORLD_DIR / "guardrails.jsonl"
 PIPELINE_JSONL = WORLD_DIR / "pipeline.jsonl"
+PIPELINE_ARCHIVE_JSONL = WORLD_DIR / "pipeline-archive.jsonl"
 SIGNATURES_JSONL = WORLD_DIR / "pattern-signatures.jsonl"
 
 # Set by load_all_experiences(); None until it runs.
@@ -253,6 +254,32 @@ def load_pipeline():
     return _read_through_backend(PIPELINE_JSONL)
 
 
+def load_pipeline_archive():
+    """Read pipeline-archive.jsonl through the backend, same contract as
+    `load_pipeline` (g-115-11522).
+
+    `pipeline-archive.jsonl` is the append-only destination the sweep moves
+    aged pipeline records into (core/config/conventions/pipeline.md); it shares
+    the record shape AND the merge flow — `coordination_merge` registers it
+    under `merge_pipeline`, and `pipeline.py` / `experience.py` /
+    `hypothesis-capitalization.py` all read the live+archive pair for id
+    resolution. The audit's resolver did NOT: it unioned only `pipeline.jsonl`,
+    so every hypothesis ref whose record had aged into the archive read as
+    dangling, and `learning-routing-repair.py --apply` (fired automatically by
+    `tree.py::_post_remove_sweep_dangling`) NULLS whatever this audit calls
+    dangling. Measured when the write-class gate was filed (g-115-5659): 191
+    `hypothesis_id` refs that resolve in the archive were being nulled — the
+    same archive-blindness `load_all_experiences` fixed for the experience
+    axis, one axis later.
+
+    Used ONLY for id resolution (see `build_id_sets`), never as an out-bound
+    scan source: archived records are aged OUT, and a sweep that re-audits
+    their outbound refs would resurrect records the pipeline moved on
+    purpose.
+    """
+    return _read_through_backend(PIPELINE_ARCHIVE_JSONL)
+
+
 def load_pattern_signatures():
     return _read_through_backend(SIGNATURES_JSONL)
 
@@ -402,10 +429,26 @@ def load_tree_node_keys():
 
 
 def build_id_sets(stores):
+    """Resolve-target id sets. The pipeline set is LIVE + ARCHIVE ().
+
+    `pipeline-archive.jsonl` holds records the sweep aged OUT of the live file;
+    it is still a resolution TARGET — a `source_hypothesis` / `hypothesis_id`
+    ref to an archived record is valid, and calling it dangling is the exact
+    false-positive class `--apply` destroys data over. Same precedent as the
+    experience axis, which already unions `experience.jsonl` +
+    `experience-archive.jsonl` in `load_all_experiences` (g-115-5646).
+
+    The union is ids ONLY. `stores["pipeline"]` (the live file) stays the sole
+    out-bound scan source in `audit_cross_refs` — re-auditing archived
+    records' outbound refs would resurrect records the pipeline aged on
+    purpose — and `learning-routing-repair.py`'s `STORE_PATHS` stays live-only,
+    so a repair can never write into the archive through this path.
+    """
     return {
         "rb": {r.get("id") for r in stores["reasoning_bank"] if r.get("id")},
         "guard": {r.get("id") for r in stores["guardrails"] if r.get("id")},
-        "pipeline": {r.get("id") for r in stores["pipeline"] if r.get("id")},
+        "pipeline": ({r.get("id") for r in stores["pipeline"] if r.get("id")}
+                     | {r.get("id") for r in stores.get("pipeline_archive", []) if r.get("id")}),
         "sig": {r.get("id") for r in stores["pattern_signatures"] if r.get("id")},
         "exp": {r.get("id") for r in stores["experience"] if r.get("id")},
     }
@@ -612,8 +655,8 @@ def format_report(dangling, prose, doc_findings, catalog_findings, stats):
     out.append("=" * 60)
     out.append(
         f"Stores loaded — rb:{stats['rb']} guard:{stats['guard']} "
-        f"pipeline:{stats['pipeline']} sig:{stats['sig']} exp:{stats['exp']} "
-        f"tree:{stats['tree']}"
+        f"pipeline:{stats['pipeline']} (+archive {stats['pipeline_archive']}) "
+        f"sig:{stats['sig']} exp:{stats['exp']} tree:{stats['tree']}"
     )
     # Never let a skipped axis read as a clean one (guard-1760). exp:0 has two
     # causes and they demand opposite responses: a foreign world means the
@@ -694,6 +737,7 @@ def main():
         "reasoning_bank": load_reasoning_bank(),
         "guardrails": load_guardrails(),
         "pipeline": load_pipeline(),
+        "pipeline_archive": load_pipeline_archive(),
         "pattern_signatures": load_pattern_signatures(),
         "experience": load_all_experiences(),
     }
@@ -712,6 +756,7 @@ def main():
         "rb": len(ids["rb"]),
         "guard": len(ids["guard"]),
         "pipeline": len(ids["pipeline"]),
+        "pipeline_archive": len(stores["pipeline_archive"]),
         "sig": len(ids["sig"]),
         "exp": len(ids["exp"]),
         "tree": len(tree_keys),

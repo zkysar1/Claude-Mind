@@ -33,6 +33,21 @@ refused outright when the diff carries the substitution signature. The machine
 still grants nothing: an attested id leaves the veto on the reviewer's recorded
 word, and the approval remains the reviewer's own assertion.
 
+THE FOUNDING SHAPE IS KEPT KIND BY KIND, NOT ONLY IN TOTAL (g-375-58). Coach
+g-012-02 kept every kind's count (4 goal ids, 4 guardrails, 4 rb, 2 asp, 1 sq,
+1 sig) and replaced six ids inside those kinds. The signature used to test only
+the totals, `len(missing) == len(invented)`, and an outcome note that ADDS as many
+evidence ids (shas, dates, carrier goals) as its source CITES meets that by
+coincidence. Every firing on the live ledger was such a coincidence, named so by
+its reviewer, and because the signature refuses attestation a sound close could
+not be approved (g-335-1719; g-335-1601 and g-335-1730 went unreviewed). It now
+fires only when missing and invented hold the same number of ids of EVERY kind,
+with the reviewed goal's own id left out of invented: most outcome notes name
+their goal, and that one id would unbalance the goal kind. Replayed 2026-10-02
+over the 163 ledger entries: the totals fired on 4, kind by kind on 0, and the
+coach shape still fires. Firing when ANY one kind balances was measured too and
+rejected: 39 firings, most of them on sound approvals.
+
 THE RECORD REPRODUCES ITS OWN VERDICT (guard-3743). The artifact carries the
 source set, the artifact set, and both directions of the diff — not just the
 conclusion. A later reader can recompute REJECT from the record without the
@@ -70,6 +85,16 @@ archived or when it is evicted, so its verdict fell out of its role's rate. A go
 not found live at write time leaves the fields absent, loudly: nothing is guessed.
 Older verdicts got the fields once, from goal records that still existed, in the
 g-375-84 backfill (each entry marked `closer_backfilled_at`).
+
+A REJECT OF A SANCTIONED DEFERRAL IS TOLD SO (g-375-100). guard-7517 lets a goal
+close completed with `OUTCOME n: NOT MET — <gap>; deferred to <goal-id>` while that
+goal is live. A reviewer rejected exactly that row twice (g-377-50-a on 2026-09-28,
+g-335-1719 on 2026-09-30), the second time two days after the guardrail existed,
+because nothing at the moment of the verdict said so. A guard-7517 advisory now
+names each such row whose carrier is live. It prints on the read-only probe, where
+the reviewer decides, and on `--reject` before anything is written: the documented
+REJECT passes `--reject` and `--write` in one call, so advice printed only there
+would arrive with the verdict. It never refuses: a deferral can still be wrong.
 """
 from __future__ import annotations
 
@@ -91,6 +116,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _fileops import locked_modify_json  # noqa: E402
+from gates.closure_evidence import DEFERRED_RE, parse_rows  # noqa: E402
+from gates.residual_work import ACTIVE_STATUSES  # noqa: E402
 from goal_close_risk_tier import named_entities  # noqa: E402
 from q4_provenance_sample import (  # noqa: E402
     direction_fidelity, direction_findings)
@@ -186,8 +213,21 @@ def _sha_partner(token: str, own_side: set, other_side: set):
     return None
 
 
+def _kind_profile(ids: list) -> dict:
+    """How many ids of each KIND a list holds (): the family prefix of a
+    prefixed id (``g``, ``guard``, ``rb`` ...), and ``hex`` for a bare sha or
+    digit run. Read off the token itself, so a hyphenated family added to the
+    regex is already a kind here, with no table to keep in step."""
+    out: dict = {}
+    for t in ids:
+        kind = t.split("-", 1)[0] if "-" in t else "hex"
+        out[kind] = out.get(kind, 0) + 1
+    return out
+
+
 def source_fidelity(source_text: str, artifact_text: str,
-                    citations: dict | None = None) -> dict:
+                    citations: dict | None = None,
+                    goal_id: str | None = None) -> dict:
     """Check 2, mechanised: every entity enumerated in the source, verbatim.
 
     Returns both directions, because they diagnose different faults and a
@@ -196,9 +236,12 @@ def source_fidelity(source_text: str, artifact_text: str,
       ``missing``  — enumerated in the source, ABSENT from the artifact. The
                      work was not done, or was done under a different identity.
       ``invented`` — present in the artifact, absent from the source. Where
-                     ``missing`` and ``invented`` are both non-empty and equal
-                     in size, that is the SUBSTITUTION signature of the founding
-                     incident, not two unrelated faults.
+                     ``missing`` is non-empty and ``invented`` holds the same
+                     number of ids of every kind, that is the SUBSTITUTION
+                     signature of the founding incident, not two unrelated
+                     faults. Equal totals alone are not (g-375-58). The
+                     reviewed goal's own id (``goal_id``) is not invented: an
+                     artifact naming its goal is recorded as ``self_reference``.
 
     ``counts_match`` is reported deliberately: it is the criterion the coach
     goal actually shipped with, and recording that it was GREEN beside a failing
@@ -227,8 +270,13 @@ def source_fidelity(source_text: str, artifact_text: str,
     src = named_entities(source_text)
     art = named_entities(artifact_text)
     # (source_token, artifact_token): a reader recomputes `missing` as the
-    # source-side tokens of src - art not listed here, less citations_attested.
+    # source-side tokens of src - art not listed here, less citations_attested,
+    # and `invented` as the artifact-side ones, less self_reference.
     sha_pairs, missing, invented = set(), [], []
+    # : 115 of the 163 ledger reviews named their own goal in the artifact
+    # only. Counted as invented, that id unbalanced the goal kind and hid a goal-id
+    # substitution in exactly the closes this check reviews.
+    own, self_reference = str(goal_id or "").strip().lower(), None
     for t in sorted(src - art):
         p = _sha_partner(t, src, art)
         if p:
@@ -239,6 +287,8 @@ def source_fidelity(source_text: str, artifact_text: str,
         p = _sha_partner(t, art, src)
         if p:
             sha_pairs.add((p, t))
+        elif t == own:
+            self_reference = t
         else:
             invented.append(t)
     citations = {str(k).strip().lower(): v for k, v in (citations or {}).items()}
@@ -248,8 +298,12 @@ def source_fidelity(source_text: str, artifact_text: str,
         "missing": missing,
         "invented": invented,
         "counts_match": len(src) == len(art),
-        "substitution_signature": bool(missing) and len(missing) == len(invented),
+        # : the shape kept kind by kind, which equal totals alone are not.
+        "substitution_signature": (bool(missing)
+                                   and _kind_profile(missing) == _kind_profile(invented)),
     }
+    if self_reference:
+        out["self_reference"] = self_reference
     if sha_pairs:
         out["sha_identity"] = [list(p) for p in sorted(sha_pairs)]
     if citations:
@@ -286,11 +340,12 @@ def fidelity_findings(fid: dict) -> list:
             f"{'y' if len(fid['invented']) == 1 else 'ies'} appear in the artifact "
             f"but not in the source: {', '.join(fid['invented'])}")
     if fid["substitution_signature"]:
+        shape = ", ".join(f"{k} {n}" for k, n in sorted(_kind_profile(fid["missing"]).items()))
         out.append(
-            f"{FIDELITY_CHECK}: equal counts missing and invented "
-            f"({len(fid['missing'])}) is the SUBSTITUTION signature — the artifact "
-            f"kept the shape and replaced the identities, which a count-based "
-            f"criterion reports as green (counts_match={fid['counts_match']}).")
+            f"{FIDELITY_CHECK}: missing and invented hold the same number of ids of "
+            f"every kind ({shape}), the SUBSTITUTION signature — the artifact kept "
+            f"the shape and replaced the identities, which a count-based criterion "
+            f"reports as green (counts_match={fid['counts_match']}).")
     # : an attestation narrows a veto on the reviewer's word, so it is
     # always SAID — never a silent exemption (guard-6989).
     att = fid.get("citations_attested") or {}
@@ -528,11 +583,53 @@ def route_only(goal_id: str, reviewer: str, source: str) -> int:
     return 0 if ok else 4
 
 
-def closer_of(goal_id: str) -> dict:
+#: The carrier id, lettered child included. DEFERRED_RE stops at the digits, but
+#: aspirations.py GOAL_ID_RE admits a `-[a-z]` child, and an id fed to a lookup
+#: must keep it (guard-2414):  is a different goal from -b.
+#: The residual-work gate's own id pattern still drops it ().
+_CARRIER_RE = re.compile(r"\bg-\d{1,4}-\d+\b(?:-[a-z]\b)?")
+
+
+def deferral_advisories(artifact_text: str) -> list:
+    """guard-7517 advisories for a review that is not approving (): one per
+    sanctioned deferral row, ``OUTCOME n: NOT MET — <gap>; deferred to <goal-id>``,
+    whose carrier is live.
+
+    The rows and the "deferred to" pattern are the closure-evidence gate's own, and
+    "live" is the residual-work gate's own status set. A carrier the store cannot
+    resolve, or one already terminal, gets no advisory: no live goal stands behind
+    that deferral any more.
+    """
+    out = []
+    for row in parse_rows(artifact_text)["rows"]:
+        text = row["text"].lower()
+        m = DEFERRED_RE.search(text) if row["status"] == "NOT MET" else None
+        if not m:
+            continue
+        # The first id after "deferred to" is the one DEFERRED_RE ended on.
+        carrier = _CARRIER_RE.search(text, m.start()).group(0)
+        status = _gate().load_goal(carrier, "world").get("status")
+        if status in ACTIVE_STATUSES:
+            out.append(
+                f"close-review-verdict: ADVISORY (guard-7517) — OUTCOME {row['n']} is NOT "
+                f"MET and deferred to {carrier}, which is live ({status}). A completed close "
+                f"may leave an outcome to a live carrier (goal-schemas.md § Closure Evidence "
+                f"Table), so this row is not by itself a defect. Reject on it only for a "
+                f"reason beyond the deferral, such as a carrier that does not cover the gap, "
+                f"and name that reason in a --finding.")
+    return out
+
+
+def closer_of(goal_id: str) -> tuple[dict, str | None]:
     """The CLOSER_FIELDS of the goal record, read live through the gate's `load_goal`
-    (one definition of the lookup), or {} when no live record is found."""
+    (one definition of the lookup), and the record's status; ({}, None) when no live
+    record is found. The status is what tells a missing record from a live goal whose
+    record names no closer yet, such as an open goal under review (g-375-117)."""
     goal = _gate().load_goal(goal_id, "world")
-    return {k: goal[k] for k in CLOSER_FIELDS if goal.get(k)}
+    if not goal:
+        return {}, None
+    return ({k: goal[k] for k in CLOSER_FIELDS if goal.get(k)},
+            str(goal.get("status") or "unknown"))
 
 
 def write_verdict(goal_id: str, payload: dict) -> Path:
@@ -654,16 +751,22 @@ def main(argv=None) -> int:
 
     source = _read(args.source_file, args.source_text, "source")
     artifact = _read(args.artifact_file, args.artifact_text, "artifact")
-    fid = source_fidelity(source, artifact, citations)
+    fid = source_fidelity(source, artifact, citations, goal_id=args.goal)
     # citations-MATCH (). Computed unconditionally beside the id-diff:
     # the two are complements, and the one that catches a reversed claim is the
     # one the id-diff is blind to.
     dir_fid = direction_fidelity(source, artifact)
     mechanical_ok = fid["passed"] and dir_fid["passed"]
+    approving = args.approve or args.approve_with_notes
+
+    # : on the read-only probe, where the reviewer decides, and on a REJECT
+    # before it is written. Advice, never a refusal; an approval needs none.
+    if not approving:
+        for line in deferral_advisories(artifact):
+            print(line, file=sys.stderr)
 
     # A verdict is never invented. Refusing here rather than defaulting is what
     # keeps "the reviewer did not say" distinguishable from "the reviewer said no".
-    approving = args.approve or args.approve_with_notes
     if not (approving or args.reject):
         print(json.dumps({"fidelity": fid, "direction": dir_fid, "verdict": None},
                          indent=2, sort_keys=True))
@@ -726,11 +829,20 @@ def main(argv=None) -> int:
             return 1
 
     if args.write:
-        closer = closer_of(args.goal)
-        if not closer:
+        closer, status = closer_of(args.goal)
+        if status is None:
             print(f"close-review-verdict: no live goal record for {args.goal} at write "
                   f"time, so the verdict does not name its closer (stats resolves it "
                   f"through the archive)", file=sys.stderr)
+        elif not closer and status in ("pending", "candidate", "in-progress", "blocked"):
+            # A review request () is often reviewed before its goal closes, so
+            # the record names no closer yet. That is expected, not a missing record.
+            print(f"close-review-verdict: {args.goal} is still open ({status}), so the "
+                  f"verdict names no closer; the goal names one when it closes, and stats "
+                  f"reads it from there", file=sys.stderr)
+        elif not closer:
+            print(f"close-review-verdict: the record of {args.goal} ({status}) names no "
+                  f"closer, so neither does the verdict", file=sys.stderr)
         payload.update(closer)
         p = write_verdict(args.goal, payload)
         print(f"close-review-verdict: {payload['verdict']} written -> {p}")

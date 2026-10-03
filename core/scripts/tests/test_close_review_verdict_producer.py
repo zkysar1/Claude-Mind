@@ -592,6 +592,37 @@ def test_a_written_verdict_names_its_closer_from_the_goal_record(tmp_path, monke
     assert "does not name its closer" in capsys.readouterr().err
 
 
+def test_an_open_goal_is_reported_open_and_only_a_missing_record_reads_missing(
+        tmp_path, monkeypatch, capsys):
+    """. closer_of() answered {} both for a goal with no live record and for a
+    live goal whose record names no closer, so every review of an open review request
+    (g-375-116 offers them) printed "no live goal record" over a record that exists. The
+    open goal, the closed record without a closer and the missing record now print
+    apart, and none of the three verdicts carries a closer field."""
+    m = _producer_module()
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    records = {"g-9-5": {"id": "g-9-5", "status": "pending", "claimed_by": "alpha"},
+               "g-9-6": {"id": "g-9-6", "status": "completed"}}
+    monkeypatch.setattr(m._gate(), "load_goal", lambda gid, source: records.get(gid, {}))
+    base = ["--reviewer", "peer", "--source-file", str(_source(tmp_path)),
+            "--artifact-file", str(_fixture(tmp_path, SOURCE_ENTITIES)), "--approve", "--write"]
+    assert m.main(["--goal", "g-9-5"] + base) == 0
+    err = capsys.readouterr().err
+    assert "g-9-5 is still open (pending)" in err and "no live goal record" not in err
+    assert m.main(["--goal", "g-9-6"] + base) == 0
+    err = capsys.readouterr().err
+    assert "the record of g-9-6 (completed) names no closer" in err
+    assert "no live goal record" not in err and "still open" not in err
+    # POSITIVE CONTROL (guard-2903): the two absence checks above can fail, since the
+    # missing record still prints the very line they look for.
+    assert m.main(["--goal", "g-9-4"] + base) == 0
+    err = capsys.readouterr().err
+    assert "no live goal record for g-9-4" in err and "still open" not in err
+    for gid in ("g-9-5", "g-9-6", "g-9-4"):
+        assert not any(k in _latest_verdict(tmp_path, gid) for k in m.CLOSER_FIELDS)
+
+
 def test_approve_with_notes_releases_the_close_AND_routes_its_notes(tmp_path, monkeypatch):
     """F3. The binary forced a reviewer with non-blocking observations to either
     REJECT a sound close or drop the observations.
@@ -878,3 +909,198 @@ def test_a_malformed_citation_is_refused(tmp_path, bad):
              "--approve", "--citation", bad)
     assert r.returncode == 2, r.stdout + r.stderr
     assert "one-line role reason" in r.stderr   # the usage line alone names --citation
+
+
+# ─── : the substitution signature is the shape KIND BY KIND ──────────
+#
+# The signature tested only the totals, so an outcome note that adds as many
+# evidence ids as its source cites met it by coincidence, and the refused
+# attestation left sound closes unrecordable. Each case is a measured diff
+# (missing, invented): equal totals, unequal kinds.
+
+COINCIDENCES = {
+    # bravo, cc-05, 2026-09-28. The reviewed goal's own id is among the invented.
+    "g-326-1040": (["g-326-394", "g-326-991", "g-335-1623", "g-358-220",
+                    "guard-1270", "guard-5389", "guard-5514"],
+                   ["20260924", "g-115-7301", "g-326-1040", "g-326-594",
+                    "g-326-983", "guard-1450", "guard-724"]),
+    # bravo, cc-05, 2026-09-28; its ledger finding names the coincidence.
+    "g-115-11101": (["20260718", "g-115-2548", "g-115-2549"],
+                    ["g-115-11101", "g-115-8433", "guard-1685"]),
+    # zeta, cc-02, 2026-09-30. One sha in three spellings; the note does not give
+    # its 40-character tail, so the zeros stand in for it.
+    "g-335-1601": (["20260924", "9057016", "asp-335", "asp-370", "g-016-352",
+                    "g-016-353", "g-016-360", "g-335-418"],
+                   ["e3a5090", "e3a5090bad24", "e3a5090bad24dba4" + "0" * 24,
+                    "g-335-1601", "g-335-1602", "0448512", "9c5cc235", "e1595dd"]),
+    # bravo, cc-05, 2026-09-30.
+    "g-335-1719": (["guard-3834", "guard-5389", "guard-7350", "g-369-378",
+                    "g-374-408", "g-375-20", "sq-013", "13b1198", "20260930"],
+                   ["91d7e2a", "bb75db2", "cfc5d04", "e885558", "e5db8860",
+                    "562929f537b8", "g-335-1719", "g-335-1721", "g-335-1722"]),
+    # echo, cc-03, 2026-10-01. The same KINDS on both sides, in other counts:
+    # hex 2 against 3, goal ids 3 against 2.
+    "g-335-1730": (["4ec78f5c6", "bc70b135c10395da", "g-016-408", "g-335-1707",
+                    "g-374-397"],
+                   ["20261001", "647438f", "9c6d0db", "g-335-1748", "g-335-1749"]),
+}
+
+
+def _coincidence_texts(goal):
+    missing, invented = COINCIDENCES[goal]
+    return "Per " + ", ".join(missing) + ".", "Done: " + ", ".join(invented) + "."
+
+
+@pytest.mark.parametrize("goal", sorted(COINCIDENCES))
+def test_equal_totals_over_unequal_kinds_are_not_a_substitution(goal):
+    missing, invented = COINCIDENCES[goal]
+    crv = _crv()
+    # The predicate alone, on the measured diff with the equal totals the old
+    # test fired on.
+    fid = crv.source_fidelity(*_coincidence_texts(goal))
+    assert sorted(fid["missing"]) == sorted(missing)
+    assert sorted(fid["invented"]) == sorted(invented)
+    assert len(fid["missing"]) == len(fid["invented"])
+    assert fid["substitution_signature"] is False, fid
+    # As main() calls it, with --goal: still clear, and the record still
+    # reproduces the measured diff, the own id under self_reference (guard-3743).
+    fid = crv.source_fidelity(*_coincidence_texts(goal), goal_id=goal)
+    seen = fid["invented"] + ([fid["self_reference"]] if "self_reference" in fid else [])
+    assert sorted(seen) == sorted(invented)
+    assert fid["substitution_signature"] is False, fid
+
+
+def test_a_coincidence_is_attestable_and_its_approval_producible(tmp_path):
+    """Outcome 1 on the canonical entry point (guard-920): the reviewer of
+    g-326-1040 attests the seven cited ids, and the APPROVE is produced. Before
+    g-375-58 this call was refused, and every citation with it."""
+    missing, _ = COINCIDENCES["g-326-1040"]
+    source, artifact = _coincidence_texts("g-326-1040")
+    cites = [a for m in missing for a in ("--citation", f"{m}=cited by the source, not a target")]
+    r = _run(tmp_path, "--goal", "g-326-1040", "--reviewer", "peer", "--closer", "alpha",
+             "--source-text", source, "--artifact-text", artifact, "--approve", *cites)
+    assert r.returncode == 0, r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    fid = payload["fidelity"]
+    assert payload["verdict"] == "APPROVE" and fid["passed"] is True
+    assert fid["counts_match"] is True            # the totals still agree
+    assert sorted(fid["citations_attested"]) == sorted(missing)
+    assert "citations_refused" not in fid
+    assert fid["self_reference"] == "g-326-1040" and "g-326-1040" not in fid["invented"]
+
+
+def test_the_founding_shape_still_fires_kind_by_kind():
+    """Outcome 2, and the control for the narrowing above (guard-4166): the coach
+    fixture swapped rb for rb, asp for asp, sq for sq and sig for sig, so every
+    kind holds the same number on both sides. The signature fires, attestation
+    is refused, and the finding names the shape. So does the smallest such swap,
+    one goal id for one."""
+    crv = _crv()
+    missing = sorted(set(SOURCE_ENTITIES) - set(ARTIFACT_ENTITIES))
+    fid = crv.source_fidelity(COACH_SOURCE, " ".join(ARTIFACT_ENTITIES),
+                              {m: "only a citation" for m in missing})
+    assert fid["substitution_signature"] is True and fid["passed"] is False
+    assert fid["citations_refused"] == missing
+    assert any("every kind (asp 2, rb 2, sig 1, sq 1)" in f
+               for f in crv.fidelity_findings(fid)), crv.fidelity_findings(fid)
+    one = crv.source_fidelity("Close g-900-02.", "Closed g-900-09.",
+                              {"g-900-02": "only a citation"})
+    assert one["substitution_signature"] is True
+    assert one["citations_refused"] == ["g-900-02"]
+
+
+def test_an_artifact_naming_its_own_goal_cannot_hide_a_substitution():
+    """115 of the 163 ledger reviews named their own goal in the artifact only.
+    Counted as invented, that one id unbalances the goal kind and the founding
+    shape stops firing. Recorded as self_reference, it fires."""
+    crv = _crv()
+    artifact = "Closing g-012-90: " + " ".join(ARTIFACT_ENTITIES)
+    hidden = crv.source_fidelity(COACH_SOURCE, artifact)
+    assert hidden["substitution_signature"] is False and "g-012-90" in hidden["invented"]
+    fid = crv.source_fidelity(COACH_SOURCE, artifact, goal_id=" G-012-90 ")
+    assert fid["substitution_signature"] is True
+    assert fid["self_reference"] == "g-012-90" and "g-012-90" not in fid["invented"]
+
+
+# ─── : a REJECT of a sanctioned deferral is told so (guard-7517) ─────
+#
+# guard-7517 sanctions a completed close whose row reads `OUTCOME n: NOT MET —
+# <gap>; deferred to <goal-id>` while that goal is live. Reviewers rejected that
+# row twice (-a, then ), because nothing said so at verdict
+# time. The fixture keeps 's shape: one NOT MET row deferred to
+# , between two MET rows.
+
+DEFERRAL_NOTE = (
+    "OUTCOME 1: MET — the purge left 0 rows under the account's partition "
+    "(run log at 14:11Z).\n\n"
+    "OUTCOME 2: NOT MET — a write from a second device still recreates the row "
+    "after a finished deletion; deferred to g-335-1722.\n\n"
+    "OUTCOME 3: MET — 86 rows counted at about 14:05Z.\n")
+ADVISORY = "ADVISORY (guard-7517)"
+
+
+def test_a_reject_of_a_live_deferral_is_advised_before_the_write_and_only_then(
+        tmp_path, monkeypatch, capsys):
+    """Both outcomes of  on one input. A live carrier: the advisory names
+    the row, the carrier and its status on stderr, on the read-only probe and
+    before a REJECT is written, and the REJECT is still written, because the
+    advisory never refuses. A terminal or unresolvable carrier: silence. The
+    silence counts as evidence only because the same input fires a few lines
+    earlier (guard-4166)."""
+    m = _producer_module()
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("STORAGE_BACKEND", "local")
+    store = {}
+    monkeypatch.setattr(m._gate(), "load_goal",
+                        lambda gid, source: {"status": store[gid]} if gid in store else {})
+    before_write = []
+    real_write = m.write_verdict
+
+    def spy(goal_id, payload):
+        before_write.append(capsys.readouterr().err)
+        return real_write(goal_id, payload)
+    monkeypatch.setattr(m, "write_verdict", spy)
+
+    def review(*extra):
+        return m.main(["--goal", "g-9-9", "--reviewer", "peer",
+                       "--source-text", "Purge the account's rows; no device may recreate one.",
+                       "--artifact-text", DEFERRAL_NOTE, *extra])
+
+    store["g-335-1722"] = "in-progress"
+    assert review("--reject", "--write") == 3
+    said = [line for line in before_write[-1].splitlines() if ADVISORY in line]
+    assert len(said) == 1, before_write[-1]
+    assert "OUTCOME 2 is NOT MET" in said[0]
+    assert "deferred to g-335-1722, which is live (in-progress)" in said[0]
+    assert _latest_verdict(tmp_path, "g-9-9")["verdict"] == "REJECT"
+    # The documented REJECT writes in the same call, so the read-only probe, where
+    # the reviewer decides, must say it too. So does a dry run.
+    assert review() == 2
+    assert ADVISORY in capsys.readouterr().err
+    assert review("--reject") == 3
+    assert ADVISORY in capsys.readouterr().err
+
+    for terminal in ("completed", "skipped", None):        # None: no record in the store
+        store.pop("g-335-1722", None)
+        if terminal:
+            store["g-335-1722"] = terminal
+        assert review("--reject", "--write") == 3
+        assert ADVISORY not in before_write[-1] + capsys.readouterr().err, terminal
+    assert len(_entries(tmp_path, "g-9-9")) == 4           # every REJECT was written
+
+
+def test_the_carrier_is_the_whole_id_after_deferred_to(monkeypatch):
+    """guard-2414: a lettered child is its own goal, so the lookup asks for
+    g-335-1697-b and not its parent. The id read is the one after "deferred to",
+    not the first id in the row. A MET row is never a deferral."""
+    m = _producer_module()
+    asked = []
+    monkeypatch.setattr(m._gate(), "load_goal",
+                        lambda gid, source: asked.append(gid) or {"status": "pending"})
+    out = m.deferral_advisories(
+        "OUTCOME 4: NOT MET — g-335-1719's gap; deferred to g-335-1697-b.")
+    assert asked == ["g-335-1697-b"]
+    assert len(out) == 1 and "OUTCOME 4 is NOT MET" in out[0]
+    asked.clear()
+    assert m.deferral_advisories("OUTCOME 1: MET — 3 rows; deferred to g-335-1722.") == []
+    assert asked == []

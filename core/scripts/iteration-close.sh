@@ -669,13 +669,21 @@ _print_recovery_instructions() {
             [[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && cmd+=" --override-domain-suite \"$OVERRIDE_DOMAIN_SUITE\""
             [[ -n "$OVERRIDE_CLOSURE_EVIDENCE" ]] && cmd+=" --override-closure-evidence \"$OVERRIDE_CLOSURE_EVIDENCE\""
             [[ -n "$OUTCOME_NOTE_FILE" ]] && cmd+=" --outcome-note-file \"$OUTCOME_NOTE_FILE\""
-            echo "  Retry: $cmd" >&2
-            # The revert line is now CONDITIONAL. Offering it when the record is
-            # already closed is a destructive remedy for a state that does not
-            # need one (guard-2760: a destructive remedy needs evidence a
-            # reversible one is insufficient).
-            if [[ -n "$_vlive" && "$_vlive" != "$GOAL_STATUS" ]]; then
-                echo "  Revert (mark pending): bash core/scripts/aspirations-update-goal.sh --source ${SOURCE:-world} ${GOAL_ID:-<id>} status pending" >&2
+            if [[ "$_vlive" == "candidate" && "$GOAL_STATUS" == "completed" ]]; then
+                # g-375-118: a candidate cannot be completed until it is pending,
+                # so a bare retry is refused again. Here the pending write is a
+                # PROMOTE that has to come first, not a revert.
+                echo "  Promote first: bash core/scripts/aspirations-update-goal.sh --source ${SOURCE:-world} ${GOAL_ID:-<id>} status pending" >&2
+                echo "  Then retry: $cmd" >&2
+            else
+                echo "  Retry: $cmd" >&2
+                # The revert line is now CONDITIONAL. Offering it when the record is
+                # already closed is a destructive remedy for a state that does not
+                # need one (guard-2760: a destructive remedy needs evidence a
+                # reversible one is insufficient).
+                if [[ -n "$_vlive" && "$_vlive" != "$GOAL_STATUS" ]]; then
+                    echo "  Revert (mark pending): bash core/scripts/aspirations-update-goal.sh --source ${SOURCE:-world} ${GOAL_ID:-<id>} status pending" >&2
+                fi
             fi
             ;;
         state-update)
@@ -1165,6 +1173,47 @@ except Exception:
 }
 
 # --------------------------- phase: verify ---------------------------
+
+# A candidate cannot be completed (g-375-118). The intake tier's transition table
+# (world/conventions/goal-intake-management.md section 2) has a candidate pass
+# through pending first, and the daemon refuses candidate -> completed with
+# candidate_transition_forbidden. That refusal came only at the status write, after
+# every gate in do_verify had run: measured 2026-10-02 on cc-14, a self-filed
+# candidate's close spent 16 minutes in the domain-suite gate and was then refused.
+# do_verify calls this before its gates. It is a function so the tests can source
+# it. Returns 1 to refuse; the EXIT trap's verify branch then prints the promote step.
+#
+# THE READ IS THE SINGLE-GOAL QUERY, NOT _probe_goal_status. That helper reads the
+# WHOLE aspiration, and this check runs on every completed close. Measured on cc-14
+# the same day: aspirations-read.sh took 0.52 s for asp-375 (732 KB) and 2.09 s for
+# asp-115 (22.7 MB); aspirations-query.sh --goal-field id took 0.04 to 0.31 s.
+# status is one of the query's six default keys (mind_api aspirations_query.py), so
+# no --full is needed. Only a CLEAN positive read refuses: a row for this goal, from
+# the caller's store, with no read_from (that key marks a peer-mirror row, which can
+# lag the store of record). Anything else passes, including a failed query, a goal
+# the live store no longer holds and a reply that is not JSON, and the status
+# write's own refusal still stands behind it.
+_refuse_candidate_close() {
+    [[ "$GOAL_STATUS" == "completed" ]] || return 0
+    local live
+    live="$(bash "$SCRIPT_DIR/aspirations-query.sh" --goal-field id "$GOAL_ID" 2>/dev/null \
+        | RCC_GID="$GOAL_ID" RCC_SRC="$SOURCE" python3 -c '
+import json, os, sys
+try:
+    rows = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for r in rows if isinstance(rows, list) else []:
+    if (isinstance(r, dict) and r.get("goal_id") == os.environ["RCC_GID"]
+            and r.get("source") == os.environ["RCC_SRC"] and not r.get("read_from")):
+        sys.stdout.write(str(r.get("status") or ""))
+        break
+' 2>/dev/null)" || live=""
+    [[ "$live" == "candidate" ]] || return 0
+    echo "verify: $GOAL_ID is a candidate, and a candidate cannot be completed until it is pending (goal-intake-management.md section 2). Nothing was written and no gate ran." >&2
+    return 1
+}
+
 do_verify() {
     _CURRENT_PHASE="verify"
     # CRITICAL — DO NOT add a "default --status from disk" fallback here.
@@ -1228,6 +1277,9 @@ do_verify() {
             exit 2
         fi
     fi
+
+    # Before any gate: a candidate's close is refused at once (g-375-118).
+    _refuse_candidate_close || exit 2
 
     # ── Pending-deploys ENFORCE gate (SG-b, g-115-2688-b) ───────────────────
     # Refuse CLEAN-SUCCESS closure while a deploy THIS goal pushed is unverified.
@@ -1296,8 +1348,9 @@ do_verify() {
     # test modules that could not import shipped through worker closes and every
     # later goal in the lane "verified" against a suite that could not collect.
     # guard-399: the instruction needed a gate. Cheap until it fires (a stat
-    # walk; the suite runs only when a domain code file is newer than the
-    # claim), FAIL-OPEN on its own errors (decision=error, rc 0), and BEFORE
+    # walk plus one read of the session's edit log; the suite runs only when
+    # a domain code file THIS unit's sessions wrote is newer than the claim,
+    # g-115-9084), FAIL-OPEN on its own errors (decision=error, rc 0), and BEFORE
     # the status write so a refusal leaves the goal open — the EXIT trap's
     # verify branch then prints the retry line, carrying --override-domain-suite.
     # Both roles close through here (worker Phase 4a and the reducer's verify),
@@ -2609,7 +2662,10 @@ else:
         sa_session_count="$(bash "$SCRIPT_DIR/aspirations-read.sh" --meta 2>/dev/null \
             | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("session_count",0))
-except: print(0)' 2>/dev/null || echo 0)"
+except: print(0)' 2>/dev/null)" || true
+        # Capture, then default: a fallback inside the $(...) would APPEND a
+        # second 0 after python's own (g-115-11570).
+        case "$sa_session_count" in ''|*[!0-9]*) sa_session_count=0;; esac
         local sa_track="$AGENT_DIR/session/aspirations-incremented-session-${sa_session_count}.txt"
         if ! grep -qx "$asp_id" "$sa_track" 2>/dev/null; then
             mkdir -p "$AGENT_DIR/session" 2>/dev/null || true
@@ -4028,7 +4084,10 @@ try:
     print(len(d) if isinstance(d, list) else 0)
 except Exception:
     print(0)
-" || { echo "[iteration-close] WARN: tree-read --decompose-candidates failed — defaulting to 0 (decompose surfacing disabled this iteration)" >&2; echo "0"; })"
+")" || echo "[iteration-close] WARN: tree-read --decompose-candidates failed — defaulting to 0 (decompose surfacing disabled this iteration)" >&2
+    # Capture, then default: an `echo 0` inside the $(...) APPENDED to the 0
+    # python had already printed, giving "0\n0" (g-115-11570).
+    case "$decompose_count" in ''|*[!0-9]*) decompose_count=0;; esac
     if [[ "$decompose_count" -gt 0 ]]; then
         echo "[iteration-close] INFO: $decompose_count tree-node decompose candidates"
     fi
@@ -4575,8 +4634,9 @@ do_productivity_check() {
 
     # Embedding-index freshness tick (g-306-84) — per-box staleness check for
     # the retrieval embedding index. Silent no-op while embedding_blend_enabled
-    # is false (one YAML read) or the index is absent (initial build is a
-    # deliberate operator action, never hook-spawned). When the blend is live
+    # is false (one YAML read) or the index is absent (this tick never builds
+    # one; the initial build is the SessionStart hook's job, g-306-574, via
+    # embedding-index-freshness.py --session-start). When the blend is live
     # and a corpus source is newer than the index — rb, guardrails, OR the
     # knowledge tree (_tree.yaml + node .md bodies, added g-115-3763) — spawns
     # `embedding-index-build.py --update` DETACHED (incremental — re-embeds

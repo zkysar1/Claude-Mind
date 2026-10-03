@@ -196,6 +196,129 @@ def test_no_clock_is_reported_but_not_counted():
     assert c["drift_total"] == 0, "an unmeasurable goal must not inflate drift"
 
 
+# ═════════════ the unclocked remainder is named by the selector's reason ═════════════
+#  / guard-6445. blocked[] answers "cannot run FOR THIS CALLER", so most
+# unclocked goals were never blocked in the sense a clock measures.
+
+def test_unclocked_runner_relative_goal_is_named_not_filed_as_a_coverage_gap():
+    """Routed to a peer, lane-pinned elsewhere, or fresh-session-gated: a property of
+    the CALLER. Measured 2026-10-02: 442 of the 578 no_clock goals were routed."""
+    g = _goal("g-r", intended_agent="bravo")
+    for reason in ("routed_to_agent", "not_my_lane", "fresh_session_only"):
+        assert sgr.classify(g, {"g-r": reason}, NOW) == "runner_relative", reason
+
+
+def test_unclocked_candidate_is_named_candidate():
+    """A candidate is not an active goal yet (grooming promotes it): not a stall."""
+    g = _goal("g-c", status="candidate")
+    assert sgr.classify(g, {"g-c": "candidate_tier"}, NOW) == "candidate"
+
+
+def test_intrinsic_reasons_without_a_clock_stay_no_clock():
+    """The residue the name is FOR: blocked for a reason true for everyone, age unknown."""
+    g = _goal("g-i")
+    for reason in ("explicit_status", "infrastructure", "dependency", "deferred",
+                   "hypothesis_gate", "precondition_unmet"):
+        assert sgr.classify(g, {"g-i": reason}, NOW) == "no_clock", reason
+
+
+def test_an_unknown_or_absent_reason_falls_back_to_no_clock():
+    """A selector that grows a new reason must not make an unclocked goal vanish: the
+    fallback is the pre-existing reported-not-counted bucket."""
+    g = _goal("g-u")
+    assert sgr.classify(g, {"g-u": "a_reason_added_later"}, NOW) == "no_clock"
+    assert sgr.classify(g, {"g-u": None}, NOW) == "no_clock"
+    assert sgr.classify(g, _ids(g), NOW) == "no_clock"   # a plain id set carries no reasons
+
+
+def test_a_clocked_goal_is_aged_whatever_its_reason():
+    """ANTI-LAUNDERING: routing a stalled goal to a peer must not lift it out of
+    stalled_goals. Only the UNMEASURED remainder is renamed."""
+    old = _goal("g-old", blocked_since=_iso(30))
+    new = _goal("g-new", blocked_since=_iso(2))
+    for reason in ("routed_to_agent", "not_my_lane", "fresh_session_only", "candidate_tier"):
+        assert sgr.classify(old, {"g-old": reason}, NOW) == "stalled", reason
+        assert sgr.classify(new, {"g-new": reason}, NOW) == "young", reason
+
+
+def test_the_split_moves_no_baseline_key():
+    """Differential on one corpus: a plain id set (the old call shape) and the reason
+    mapping give the same drift_total, human_blocked_total and stalled rows. Only
+    unclocked rows leave no_clock, and the buckets still partition the population."""
+    goals = [
+        _goal("s1", blocked_since=_iso(30)),                           # stalled
+        _goal("s2", blocked_since=_iso(30), intended_agent="bravo"),   # stalled AND routed
+        _goal("y1", defer_reason_set_at=_iso(3)),                      # young
+        _goal("h1", defer_reason="human_blocked: x"),                  # human_blocked
+        _goal("n1"), _goal("n2"), _goal("n3"), _goal("n4"), _goal("n5"),   # no clock
+        _goal("x1", status="completed"),                               # terminal
+        _goal("e1"),                                                   # executable
+    ]
+    reasons = {"s1": "deferred", "s2": "routed_to_agent", "y1": "deferred",
+               "h1": "deferred", "n1": "routed_to_agent", "n2": "not_my_lane",
+               "n3": "candidate_tier", "n4": "precondition_unmet", "n5": "a_new_reason"}
+    old = sgr.census(goals, set(reasons), NOW)
+    new = sgr.census(goals, reasons, NOW)
+    assert new["drift_total"] == old["drift_total"] == 2
+    assert new["human_blocked_total"] == old["human_blocked_total"] == 1
+    assert new["rows"]["stalled"] == old["rows"]["stalled"]
+    assert old["breakdown"]["no_clock"] == 5
+    assert new["breakdown"] == dict(old["breakdown"], no_clock=2, runner_relative=2,
+                                    candidate=1)
+    assert sum(new["breakdown"].values()) == new["scanned"] == len(goals)
+
+
+def test_reason_sets_are_pinned_and_match_what_the_selector_emits():
+    """The sets are guard-6445's, stated literally so shrinking the constant fails here
+    and not silently in the loops above. Drift guard: the names are matched by string,
+    so a rename in goal-selector.py would send every runner-relative goal back into
+    no_clock."""
+    assert set(sgr.RUNNER_RELATIVE_REASONS) == {"routed_to_agent", "not_my_lane",
+                                                "fresh_session_only"}
+    assert set(sgr.NOT_ACTIVE_REASONS) == {"candidate_tier"}
+    src = (SCRIPTS / "goal-selector.py").read_text(encoding="utf-8")
+    for name in sgr.RUNNER_RELATIVE_REASONS + sgr.NOT_ACTIVE_REASONS:
+        assert 'entry["block_reason"] = "%s"' % name in src, name
+
+
+class _Proc:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
+def test_blocked_ids_returns_each_rows_block_reason(monkeypatch):
+    """The only place the reasons enter: the selector's rows, whichever id spelling."""
+    payload = ('{"blocked_goals": [{"goal_id": "a", "block_reason": "routed_to_agent"},'
+               ' {"id": "b"}, "junk"]}')
+    monkeypatch.setattr(sgr.subprocess, "run", lambda *a, **k: _Proc(payload))
+    assert sgr._blocked_ids() == {"a": "routed_to_agent", "b": None}
+
+
+def test_blocked_ids_on_unparseable_output_is_empty(monkeypatch):
+    """Empty is the probe-failure signal main() refuses to seed a baseline from."""
+    monkeypatch.setattr(sgr.subprocess, "run", lambda *a, **k: _Proc("not json"))
+    assert sgr._blocked_ids() == {}
+
+
+def test_summary_names_the_split_and_keeps_it_out_of_the_denominator(monkeypatch, capsys):
+    """The headline is what readers quote. guard-6445: runner-relative and candidate
+    goals are not stuck work, so "of N blocked" must not count them, and the bracket
+    must name them so the figure cannot be mistaken for the raw selector count."""
+    def real(days_ago):                  # main() ages against the real clock
+        return (dt.datetime.now() - dt.timedelta(days=days_ago)).isoformat(timespec="seconds")
+    goals = [_goal("s1", blocked_since=real(30)), _goal("y1", blocked_since=real(2)),
+             _goal("n1"), _goal("r1"), _goal("r2"), _goal("c1", status="candidate")]
+    reasons = {"s1": "deferred", "y1": "deferred", "n1": "precondition_unmet",
+               "r1": "routed_to_agent", "r2": "not_my_lane", "c1": "candidate_tier"}
+    monkeypatch.setattr(sgr, "_load_population", lambda: goals)
+    monkeypatch.setattr(sgr, "_blocked_ids", lambda: reasons)
+    assert sgr.main(["--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "stalled_goals=1 (blocked >14d, of 3 blocked)" in out
+    assert "[not counted: no_clock=1, young=1, runner_relative=2, candidate=1]" in out
+    assert "scanned=6" in out
+
+
 def test_unparseable_timestamp_is_no_clock_not_a_crash():
     """A corrupt stamp must degrade to the honest bucket, never raise — this
     runs over a live store where a hand-edited field is always possible."""
@@ -339,6 +462,7 @@ def test_real_corpus_mix_reproduces_the_measured_shape():
     blocked = _ids(*goals) - {"g-live"}
     c = sgr.census(goals, blocked, NOW)
     assert c["breakdown"] == {"terminal": 0, "executable": 1, "human_blocked": 1,
+                              "runner_relative": 0, "candidate": 0,
                               "no_clock": 2, "stalled": 3, "young": 1}
     assert c["drift_total"] == 3            # stalled only
     assert c["human_blocked_total"] == 1    # its own ratchet

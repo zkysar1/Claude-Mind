@@ -119,6 +119,9 @@ PIPELINE_KNOWN_FIELDS = frozenset((
     "falsification",
     "falsifier",
     "filed_by",
+    # : stamped by knowledge-edit-apply.py when a member forgets a hypothesis,
+    # and read by knowledge_projection.is_forgotten (the exposure cut).
+    "forgotten_at",
     "formed",
     "formed_at",
     "formed_date",
@@ -198,6 +201,9 @@ PIPELINE_KNOWN_FIELDS = frozenset((
     "resolves_by",
     "resolves_no_earlier_than",
     "resolves_when",
+    #  u7a: stamped by knowledge-edit-apply.py when a member's undo begins, and read
+    # by coordination_merge._merge_pipeline_record to order that undo against a stale copy.
+    "restored_at",
     "result",
     "settling_signal",
     "sibling",

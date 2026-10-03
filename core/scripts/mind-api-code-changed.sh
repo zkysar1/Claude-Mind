@@ -27,6 +27,7 @@
 #                                            core/scripts/git_ref_claim.py
 #                                            core/scripts/liveness_check.py
 #                                            core/scripts/body_diary_carrier.py
+#                                            core/scripts/knowledge_projection.py
 #
 #      peer_surface.py added 2026-08-14 (): board_write.py's post
 #      handler now imports suspected_routing_tags from it for the routing-tag
@@ -52,6 +53,16 @@
 #      mind_api/src/endpoints/skill_discovery.py lazily imports _fleet_diary, so
 #      the module is in the daemon's surface while its own path was not. Caught by
 #      test_daemon_import_surface.py in the scoped run that consumed the carrier.
+#
+#      knowledge_projection.py added 2026-10-03 ( u3b, found by the scoped suite run for
+#      the guardrail erase). coordination_merge.py, which is in the list, imports it at module top
+#      since c621d7cac1 (u7a: the two stamps the pipeline merge orders a forget and an undo by, and
+#      the statement-field table), so the daemon holds it in-process while its own path was not in
+#      the pathspec. A commit touching ONLY knowledge_projection.py diffed clean, post-commit
+#      skipped the restart, and the daemon would keep ordering forgets by the old stamps. The fifth
+#      instance of guard-7548's shape. test_daemon_import_surface.py was red on it at HEAD (run on a
+#      `git archive HEAD` export, 2026-10-03), unnoticed since u7a because that unit ran its own
+#      suites and not this pin.
 #
 #      predicate.py + aspirations.py added 2026-08-08 (, reducer pass on
 #      hostname cc-04, uname -r 6.8.0-136-generic). Both entered the daemon surface
@@ -204,6 +215,7 @@ DAEMON_PATHSPEC=(
     core/scripts/git_ref_claim.py
     core/scripts/liveness_check.py
     core/scripts/body_diary_carrier.py
+    core/scripts/knowledge_projection.py
 )
 
 # --print-pathspec: emit the boundary, one entry per line, exit 0. For consumers

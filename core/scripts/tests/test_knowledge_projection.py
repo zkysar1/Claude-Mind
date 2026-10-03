@@ -261,9 +261,9 @@ def _fixtures() -> dict[str, list[dict[str, object]]]:
              "failure_lesson": "_BFS_MAX_NODES=1024 in ReachabilityNav.plan_route"},
         ],
         "guardrails": [
-            {"category": "marine-biology/method", "rule": "Verify every claim against two sources."},
-            {"category": "framework-architecture", "rule": "Never critical() in a handler."},
-            {"rule": "Untagged framework guardrail — must fail closed."},
+            {"status": "active", "category": "marine-biology/method", "rule": "Verify every claim against two sources."},
+            {"status": "active", "category": "framework-architecture", "rule": "Never critical() in a handler."},
+            {"status": "active", "rule": "Untagged framework guardrail — must fail closed."},
         ],
         "hypotheses": [
             {"category": "marine-biology/reefs", "claim": "Warmer water bleaches reefs faster.",
@@ -995,9 +995,9 @@ def _item_stores() -> dict[str, list[dict[str, object]]]:
              "claim": "The veto budget bounds continuations.", "stage": "active"},
         ],
         "guardrails": [
-            {"id": "guard-9001", "category": "marine-biology/method",
+            {"id": "guard-9001", "status": "active", "category": "marine-biology/method",
              "rule": "Verify every claim against two sources."},
-            {"id": "guard-9002", "category": "framework-architecture",
+            {"id": "guard-9002", "status": "active", "category": "framework-architecture",
              "rule": "Never critical() in a handler."},
         ],
     }
@@ -1076,6 +1076,83 @@ def test_resolve_item_refuses_every_item_the_projection_hides() -> None:
         assert _resolve(handle) is None, (kind, iid)
 
 
+def test_a_guardrail_the_resident_no_longer_follows_is_neither_published_nor_addressable() -> None:
+    """Shown == used: only ``status == "active"``, the resident's own test, is exposed. A
+    member's correction supersedes a rule by retiring it, so the retired rule must leave
+    the view and stop resolving, or the member would see the old text beside the new."""
+    s = _item_stores()
+    cat = "marine-biology/method"  # in the allowlist: the category filter alone exposes all
+    s["guardrails"] = [
+        {"id": "guard-9101", "status": "active", "category": cat, "rule": "Active rule."},
+        {"id": "guard-9102", "status": "retired", "category": cat, "rule": "Retired rule."},
+        {"id": "guard-9103", "category": cat, "rule": "No status at all."},
+        {"id": "guard-9104", "status": "Active", "category": cat, "rule": "Wrong case."},
+    ]
+    allow = kp.domain_categories(s["tree_nodes"])
+    assert all(kp.is_exposed_by_category(g, allow) for g in s["guardrails"]), "positive control"
+    bundle = project(tree_nodes=s["tree_nodes"], reasoning=[], guardrails=s["guardrails"],
+                     hypotheses=[], redactor=Redactor(), item_handle_secret=_HANDLE_SECRET,
+                     environment_id=_ENV)
+    assert [g["rule"] for g in bundle.guardrails] == ["Active rule."]
+    for g in s["guardrails"]:
+        handle = kp.item_handle("guardrail", g["id"], _HANDLE_SECRET, _ENV)
+        got = kp.resolve_item_handle(handle, tree_nodes=s["tree_nodes"], hypotheses=[],
+                                     guardrails=s["guardrails"], secret=_HANDLE_SECRET,
+                                     environment_id=_ENV)
+        assert got == (("guardrail", g["id"]) if g["id"] == "guard-9101" else None), g["id"]
+
+
+def test_a_hypothesis_the_member_forgot_is_neither_published_nor_addressable() -> None:
+    """Shown == forgotten: ``forgotten_at`` is the one field the cut reads, and a record stays in
+    its store because its lifecycle only moves forward. An undo clears the marker to null (the
+    store's field writer has no delete), so a null, an empty string and an absent marker all
+    show the record, and any stamp hides it, at any stage."""
+    s = _item_stores()
+    cat = "marine-biology/reefs"
+    stamp = "2026-10-02T00:00:00+00:00"
+    s["hypotheses"] = [
+        {"id": "2026-09-30_shown-absent", "category": cat, "claim": "No marker at all.", "stage": "active"},
+        {"id": "2026-09-30_shown-null", "category": cat, "claim": "Marker cleared by an undo.",
+         "stage": "active", kp.FORGOTTEN_FIELD: None},
+        {"id": "2026-09-30_shown-empty", "category": cat, "claim": "Empty marker.",
+         "stage": "active", kp.FORGOTTEN_FIELD: ""},
+        {"id": "2026-09-30_gone-active", "category": cat, "claim": "Hidden.",
+         "stage": "active", kp.FORGOTTEN_FIELD: stamp},
+        {"id": "2026-09-30_gone-resolved", "category": cat, "claim": "Resolved and hidden.",
+         "stage": "resolved", kp.FORGOTTEN_FIELD: stamp},
+    ]
+    allow = kp.domain_categories(s["tree_nodes"])
+    assert all(kp.is_exposed_by_category(h, allow) for h in s["hypotheses"]), \
+        "positive control: the category filter alone exposes all five"
+    bundle = project(tree_nodes=s["tree_nodes"], reasoning=[], guardrails=[],
+                     hypotheses=s["hypotheses"], redactor=Redactor(),
+                     item_handle_secret=_HANDLE_SECRET, environment_id=_ENV)
+    assert [h["statement"] for h in bundle.hypotheses] == [
+        "No marker at all.", "Marker cleared by an undo.", "Empty marker."]
+    for h in s["hypotheses"]:
+        handle = kp.item_handle("hypothesis", h["id"], _HANDLE_SECRET, _ENV)
+        got = kp.resolve_item_handle(handle, tree_nodes=s["tree_nodes"], hypotheses=s["hypotheses"],
+                                     guardrails=[], secret=_HANDLE_SECRET, environment_id=_ENV)
+        assert got == (None if "gone" in h["id"] else ("hypothesis", h["id"])), h["id"]
+
+
+def test_is_forgotten_reads_the_marker_by_truthiness() -> None:
+    assert kp.is_forgotten({kp.FORGOTTEN_FIELD: "2026-10-02T00:00:00+00:00"}) is True
+    for unmarked in ({}, {kp.FORGOTTEN_FIELD: None}, {kp.FORGOTTEN_FIELD: ""}):
+        assert kp.is_forgotten(unmarked) is False, unmarked
+
+
+def test_item_text_fields_is_the_table_item_text_reads() -> None:
+    """One table: what a forget blanks is what the member was shown and an edit replaces."""
+    record = {"claim": "The claim.", "title": "The title.", "body": "The body.", "rule": "The rule."}
+    for kind in ("node", "hypothesis", "guardrail"):
+        fields = kp.item_text_fields(kind)
+        assert fields and kp.item_text(kind, record) == record[fields[0]], kind
+    assert kp.item_text_fields("hypothesis") == ("claim", "title")
+    assert kp.item_text("hypothesis", {"title": "Only a title."}) == "Only a title.", "no claim shows the title"
+    assert kp.item_text_fields("not-a-kind") == ()
+
+
 def test_resolve_item_returns_none_for_every_miss() -> None:
     handle = kp.item_handle("node", "reefs", _HANDLE_SECRET, _ENV)
     assert _resolve(handle) == ("node", "reefs")  # positive control for the misses below
@@ -1122,3 +1199,157 @@ def test_project_publishes_an_id_less_record_without_a_handle() -> None:
                      item_handle_secret=_HANDLE_SECRET, environment_id=_ENV)
     assert len(bundle.hypotheses) == 1 and "handle" not in bundle.hypotheses[0]
     assert "handle" in bundle.tree[0]
+
+
+# ── unredacted: a correction may replace only text the member saw whole () ──
+
+#: One text per way the view alters what is stored. Each is a positive control: the test
+#: first asserts the view really differs, so a False below tests the predicate and not a
+#: text the redactor never touches.
+_ALTERED_BY_THE_VIEW = {
+    "absolute path": "Survey notes live in /srv/survey/reefs.md for now.",
+    "slash inside a word": "Count the fish and/or the coral.",
+    "agent name": "Nova counted the fish twice.",
+    "framework id": "The count follows guard-12 closely.",
+    "secret value": "Log in with s3cr3t-value-for-tests, then count.",
+    "secret shape": "API_KEY=hunter2plaintext done",
+    "high-entropy token": "opaque aZ9x2Qm7Lp4Wd8Rt6Yv3Nb1Kc5Hj0Fg tail",
+    "collapsed spaces": "Reef A  and reef B.",
+    "indented first line": "    count = 3\nThe reef has three fish.",
+}
+_VIEW_REDACTOR = Redactor(agent_names=("nova",), secret_values=("s3cr3t-value-for-tests",))
+
+
+def test_is_unredacted_is_false_for_every_text_the_view_alters() -> None:
+    for why, text in _ALTERED_BY_THE_VIEW.items():
+        assert _VIEW_REDACTOR(text) != text, f"not a positive control: {why}"
+        assert not kp.is_unredacted(text, _VIEW_REDACTOR), why
+
+
+def test_is_unredacted_is_true_when_only_the_ends_are_trimmed() -> None:
+    for text in ("Coral reefs bleach in warm water.", "", "Line one.\n\nLine two.\n",
+                 "\n\nA body read after its front matter.\n"):
+        assert kp.is_unredacted(text, _VIEW_REDACTOR), repr(text)
+
+
+def test_project_marks_unredacted_only_on_addressable_rows_whose_text_shows_whole() -> None:
+    """The flag answers the member's "is what I see all there is?", for every kind a member
+    can correct: a node, a hypothesis and (by supersede) a guardrail."""
+    nodes = [
+        {"key": "reefs", "category": "marine-biology/reefs", "body": "Reefs bleach when warm.\n"},
+        {"key": "vents", "category": "marine-biology/vents",
+         "body": "Vent logs live in /srv/vents/log.md."},
+    ]
+    hyps = [
+        {"id": "h-clean", "category": "marine-biology/reefs", "claim": "Warm water bleaches reefs."},
+        {"id": "h-named", "category": "marine-biology/reefs", "claim": "Nova saw it first."},
+        {"id": "h-titled", "category": "marine-biology/reefs", "title": "Reefs recover slowly."},
+    ]
+    guards = [{"id": "guard-9001", "status": "active", "category": "marine-biology/method",
+               "rule": "Verify every claim against two sources."},
+              {"id": "guard-9003", "status": "active", "category": "marine-biology/method",
+               "rule": "Ask Nova before sampling."}]
+
+    def run(secret: str, env: str) -> ProjectedBundle:
+        return project(tree_nodes=nodes, reasoning=[], hypotheses=hyps, guardrails=guards,
+                       redactor=_VIEW_REDACTOR, item_handle_secret=secret, environment_id=env)
+
+    wired = run(_HANDLE_SECRET, _ENV)
+    assert [r["key"] for r in wired.tree if r.get("unredacted")] == ["reefs"]
+    # A hypothesis with no claim shows its title, so the flag reads the title.
+    assert [bool(r.get("unredacted")) for r in wired.hypotheses] == [True, False, True]
+    # A guardrail's correctable text is its rule; the agent name is redacted in the second.
+    assert [bool(r.get("unredacted")) for r in wired.guardrails] == [True, False]
+    assert all("handle" in r for r in wired.guardrails)
+    # "No" is an absent key, never False, so a present key always means yes.
+    assert all(r.get("unredacted", True) is True
+               for r in wired.tree + wired.hypotheses + wired.guardrails)
+    # What the flag promises, read off the published values: shown == stored.
+    assert wired.tree[0]["body"] == nodes[0]["body"].strip()
+    assert wired.hypotheses[2]["statement"] == hyps[2]["title"]
+    # No secret or no environment: no handle, so no flag, and every row keeps its shape.
+    for bundle in (run("", ""), run(_HANDLE_SECRET, ""), run("", _ENV)):
+        rows = bundle.tree + bundle.hypotheses + bundle.guardrails
+        assert rows and all("unredacted" not in r for r in rows), rows
+
+
+def test_project_never_marks_a_body_its_reader_cut() -> None:
+    """A cut body is not the stored body, however whole its text looks ( finding 7)."""
+    def row(**mark: object) -> dict[str, object]:
+        node = {"key": "reefs", "category": "marine-biology/reefs",
+                "body": "Reefs bleach when warm.", **mark}
+        return project(tree_nodes=[node], reasoning=[], hypotheses=[], guardrails=[],
+                       redactor=_VIEW_REDACTOR, item_handle_secret=_HANDLE_SECRET,
+                       environment_id=_ENV).tree[0]
+
+    # Positive controls: the same row with no mark, or marked whole, is flagged.
+    assert row().get("unredacted") is True
+    assert row(body_truncated=False).get("unredacted") is True
+    cut = row(body_truncated=True)
+    assert "handle" in cut and "unredacted" not in cut
+    # The mark is read, never published: nothing else about the row changes.
+    assert cut == {k: v for k, v in row().items() if k != "unredacted"}
+
+
+# ── item_text / view_digest: the base a correction carries () ──────────────
+
+def test_item_text_is_the_text_each_published_row_shows() -> None:
+    """project() publishes redactor(item_text(...)) for every kind, so the member-edit
+    applier hashes the very field the member was shown."""
+    nodes = [{"key": "reefs", "category": "marine-biology/reefs", "body": "Reefs bleach.\n"}]
+    hyps = [
+        {"id": "h-claim", "category": "marine-biology/reefs",
+         "claim": "Warm water bleaches reefs.", "title": "A title the row does not show."},
+        {"id": "h-titled", "category": "marine-biology/reefs", "title": "Reefs recover slowly."},
+        {"id": "h-empty", "category": "marine-biology/reefs"},
+    ]
+    guards = [{"id": "guard-9001", "status": "active", "category": "marine-biology/method",
+               "rule": "Nova verifies every claim."}]
+    bundle = project(tree_nodes=nodes, reasoning=[], hypotheses=hyps, guardrails=guards,
+                     redactor=_VIEW_REDACTOR)
+    assert bundle.guardrails[0]["rule"] != guards[0]["rule"], "not a positive control"
+    assert [r["body"] for r in bundle.tree] == [
+        _VIEW_REDACTOR(kp.item_text("node", n)) for n in nodes]
+    assert [r["statement"] for r in bundle.hypotheses] == [
+        _VIEW_REDACTOR(kp.item_text("hypothesis", h)) for h in hyps]
+    assert [r["rule"] for r in bundle.guardrails] == [
+        _VIEW_REDACTOR(kp.item_text("guardrail", g)) for g in guards]
+    assert [kp.item_text("hypothesis", h) for h in hyps] == [
+        "Warm water bleaches reefs.", "Reefs recover slowly.", ""]
+    assert kp.item_text("lesson", {"body": "not an item kind"}) == ""
+
+
+#: Digest prefixes a browser produced for these strings (a JS TextEncoder, then SHA-256),
+#: measured 2026-10-01. A JS string holds UTF-16 code units, so each key is the same
+#: code-unit sequence on both sides: a split pair, lone surrogates, and plain text.
+_BROWSER_DIGEST_PREFIXES = {
+    "abc": "ba7816bf8f01cfea",
+    "": "e3b0c44298fc1c14",
+    "\U0001F600": "f0443a342c5ef547",
+    chr(0xD83D) + chr(0xDE00): "f0443a342c5ef547",
+    chr(0xD800): "83d544ccc223c057",
+    chr(0xDC00): "83d544ccc223c057",
+    chr(0xD800) + "a": "94b964456d33b6a0",
+    "a" + chr(0xD83D): "51d277510ba4bf97",
+    "x" + chr(0xD800) + chr(0xD800) + "y": "1f85bdc75f53cb4f",
+}
+
+
+def test_view_digest_matches_what_a_browser_hashes() -> None:
+    assert kp.view_digest("abc") == (
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    for text, prefix in _BROWSER_DIGEST_PREFIXES.items():
+        digest = kp.view_digest(text)
+        assert len(digest) == 64 and digest.startswith(prefix), ascii(text)
+
+
+def test_handle_inputs_present_is_the_rule_both_handle_functions_apply():
+    """: one predicate, read by the drain before it applies a member's write. It
+    must say False exactly where goal_handle and item_handle return "" for a valid id."""
+    for secret in ("", " ", "s3cret"):
+        for env in ("", "  ", "env-1"):
+            present = kp.handle_inputs_present(secret, env)
+            assert present == bool(kp.goal_handle("g-1-1", secret, env)), (secret, env)
+            assert present == bool(kp.item_handle("node", "acme", secret, env)), (secret, env)
+    assert kp.handle_inputs_present(" ", "env-1"), "the secret is taken as given, unstripped"
+    assert not kp.handle_inputs_present("s3cret", " \t"), "a blank environment_id is absent"

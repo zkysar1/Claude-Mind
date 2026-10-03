@@ -204,19 +204,29 @@ def test_verify_recovery_revert_line_is_CONDITIONAL():
     """Reverting a goal whose status already landed re-opens a closed goal.
 
     guard-2760: a destructive remedy needs evidence a reversible one is
-    insufficient. Offering it unconditionally is the opposite.
+    insufficient. Offering it unconditionally is the opposite. Since g-375-118 the
+    branch has one more pending write, a candidate's promote, and it must be
+    conditional too, offered only while the live status reads candidate.
     """
     branch = _recovery_verify_branch()
-    revert = [ln for ln in branch.splitlines() if "status pending" in ln and "echo" in ln]
+    pending = [ln for ln in branch.splitlines() if "status pending" in ln and "echo" in ln]
+    revert = [ln for ln in pending if "Revert" in ln]
+    promote = [ln for ln in pending if "Promote first" in ln]
     assert revert, "the verify recovery branch no longer offers a revert at all"
     assert len(revert) == 1, f"expected exactly one revert line, found {len(revert)}"
-    indent = len(revert[0]) - len(revert[0].lstrip())
-    assert indent > 12, (
-        "the revert line sits at top-level branch indent, i.e. it is offered "
-        "UNCONDITIONALLY again. It must stay inside the `if` that fires only "
-        "when the live status differs from the status this call was writing "
-        "(g-115-7663)"
+    assert len(promote) <= 1 and len(pending) == len(revert) + len(promote), (
+        "a pending write in the verify recovery branch is neither the revert nor "
+        f"the candidate's promote: {[ln.strip() for ln in pending]}"
     )
+    for line in pending:
+        indent = len(line) - len(line.lstrip())
+        assert indent > 12, (
+            "a pending write sits at top-level branch indent, i.e. it is offered "
+            "UNCONDITIONALLY again. The revert must stay inside the `if` that fires "
+            "only when the live status differs from the status this call was writing "
+            "(g-115-7663), and the promote inside the one that fires only on a "
+            f"candidate (g-375-118). Line: {line.strip()}"
+        )
 
 
 def test_verify_recovery_distinguishes_landed_from_not_landed():

@@ -67,6 +67,26 @@ phase_aliases:
   state-update: state
   learning-gate: learn
 
+# CLAIMED CONDITION -> SCHEMA TOKEN (, measured 2026-10-02).
+# A claim names its condition in the agent's own words, and `condition not in allowed` was
+# exact membership, so a TRUE condition written as `zone tight` scored "schema disallows
+# this condition" without ever reaching the runtime check. The auditor's own parser read
+# 233 claim lines in one journal corpus snapshot (5 agents, one box): 12 of them were such
+# wording, 5 `zone tight` and 7 `outcome_class routine`, and the two claims the goal
+# `Investigate: false-abbreviation-claims` was filed over (state-update and learning-gate
+# at zone tight, each logged twice) were among them. Keys are compared lower-cased with
+# whitespace collapsed, AFTER the trailing explanation is cut. Each target is a canonical
+# token, so the runtime check still decides: `zone tight` at runtime zone normal stays
+# invalid ("observed zone=normal but claim says tight"). Only wordings seen in the corpus
+# are listed; an unlisted wording passes through unchanged and still fails (rb-1915).
+# Both auditors read this map, as they read phase_aliases, so it cannot drift between them.
+condition_aliases:
+  zone tight: context_budget.zone == tight
+  zone=tight: context_budget.zone == tight
+  context zone tight: context_budget.zone == tight
+  outcome_class routine: outcome_class == routine
+  outcome_class=routine: outcome_class == routine
+
 obligations:
 
   verify:

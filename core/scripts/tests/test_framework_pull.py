@@ -1012,3 +1012,266 @@ def test_main_own_repo_as_project_root_needs_no_world_dir(tmp_path, monkeypatch)
     own = SCRIPTS.resolve().parent.parent
     assert fp.main(["--project-root", str(own)]) == fp.EXIT_OK
     assert seen["project_root"] == own
+
+
+# ════════════════════════════════════════════════════════
+# C4 baseline differential (opt-in): green iff the adoption added no red test.
+# Strict C4 stays the default; --c4-baseline compares the failing node ids of
+# the adopt-commit run with the same suite run on the pre-adopt commit.
+# ════════════════════════════════════════════════════════
+
+_POST, _PRE = "a" * 40, "b" * 40
+_GENUINE = "VERDICT: GENUINE failures -- trustworthy, act on them"
+_HALVES_OK = [{"half": "invisible", "rc": 0}, {"half": "deferred", "rc": 0},
+              {"half": "domain", "rc": 0}]
+_A = "core/scripts/tests/test_a.py::test_one"
+_B = "core/scripts/tests/test_a.py::test_two"
+_C = "core/scripts/tests/test_b.py::TestK::test_three"
+
+
+def _scripted_verifier(by_sha):
+    """Stands in for verify_in_worktree: canned (rc, verdict, meta) per sha, and
+    every call recorded. A sha with no script raises KeyError, so an unwanted
+    second suite run fails the test instead of passing quietly."""
+    calls = []
+
+    def verifier(root, sha, log, agent=None, collect_failures=False):
+        calls.append((sha, Path(log).name, collect_failures))
+        rc, verdict, meta = by_sha[sha]
+        return rc, verdict, dict(meta)
+
+    verifier.calls = calls
+    return verifier
+
+
+def _run_baseline(post, base=None):
+    by_sha = {_POST: post}
+    if base is not None:
+        by_sha[_PRE] = base
+    v = _scripted_verifier(by_sha)
+    out = fp.verify_with_baseline(Path("/proj"), _POST, _PRE, Path("verify.log"),
+                                  agent="a", verifier=v)
+    return out, v.calls
+
+
+def test_failing_node_ids_keeps_full_ids_and_drops_the_message():
+    text = "\n".join([
+        "..F.F.                                                     [100%]",
+        "=========================== short test summary info ===========",
+        "FAILED core/scripts/tests/test_a.py::TestX::test_one - AssertionError: boom",
+        "FAILED core/scripts/tests/test_a.py::test_param[a-b] - assert 1 == 2",
+        "ERROR core/scripts/tests/test_b.py::test_setup - fixture error",
+        "ERROR core/scripts/tests/test_c.py - ImportError: no module",
+        "FAILED core/scripts/tests/test_d.py::test_without_a_message",
+        # shapes that must NOT enter the set
+        "ERROR: usage: pytest [options] [file_or_dir]",
+        "ERROR collecting core/scripts/tests/test_e.py",
+        "  FAILED core/scripts/tests/test_f.py::test_indented_is_prose",
+        "FAILED to start the daemon",
+        "2 failed, 3 passed in 0.12s",
+    ])
+    assert fp.failing_node_ids(text) == {
+        "core/scripts/tests/test_a.py::TestX::test_one",
+        "core/scripts/tests/test_a.py::test_param[a-b]",
+        "core/scripts/tests/test_b.py::test_setup",
+        "core/scripts/tests/test_c.py",
+        "core/scripts/tests/test_d.py::test_without_a_message",
+    }
+    assert fp.failing_node_ids("") == set()
+    assert fp.failing_node_ids(None) == set()
+
+
+def test_failing_node_ids_reads_real_pytest_output(tmp_path):
+    """The parser against the installed pytest's own summary, not a hand-typed
+    copy of its format: one plain failure, one failing parameter, one error."""
+    (tmp_path / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (tmp_path / "test_sample.py").write_text(
+        "import pytest\n"
+        "def test_ok():\n    assert True\n"
+        "def test_red():\n    assert 1 == 2\n"
+        "@pytest.mark.parametrize('n', [1, 2])\n"
+        "def test_param(n):\n    assert n == 1\n"
+        "@pytest.fixture\n"
+        "def broken():\n    raise RuntimeError('fixture exploded')\n"
+        "def test_errors(broken):\n    pass\n", encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    p = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                        "-c", str(tmp_path / "pytest.ini"), "--rootdir", str(tmp_path),
+                        "test_sample.py"],
+                       cwd=str(tmp_path), capture_output=True, text=True, env=env,
+                       timeout=120)
+    assert p.returncode == 1, p.stdout[-400:] + p.stderr[-400:]
+    assert fp.failing_node_ids(p.stdout) == {
+        "test_sample.py::test_red", "test_sample.py::test_param[2]",
+        "test_sample.py::test_errors"}
+
+
+def test_failing_node_ids_from_dir_reads_top_level_chunk_logs_only(tmp_path):
+    (tmp_path / "chunk-00.log").write_text(
+        f"FAILED {_A} - x\nFAILED {_B} - y\n", encoding="utf-8")
+    (tmp_path / "chunk-01.log").write_text(
+        f"FAILED {_B} - y\nFAILED {_C}\n", encoding="utf-8")
+    (tmp_path / "prev").mkdir()
+    (tmp_path / "prev" / "chunk-00.log").write_text(
+        "FAILED stale/test_old.py::test_gone - z\n", encoding="utf-8")
+    (tmp_path / "notes.txt").write_text(
+        "FAILED stale/test_note.py::test_gone - z\n", encoding="utf-8")
+    assert fp.failing_node_ids_from_dir(tmp_path) == {_A, _B, _C}
+    assert fp.failing_node_ids_from_dir(tmp_path / "absent") == set()
+    assert fp.failing_node_ids_from_dir(None) == set()
+
+
+def test_verify_in_worktree_collects_failures_only_when_asked(pinned_repo, tmp_path,
+                                                             monkeypatch):
+    out = tmp_path / "suite-out"
+    out.mkdir()
+    (out / "chunk-00.log").write_text(f"FAILED {_A} - boom\n", encoding="utf-8")
+    monkeypatch.setattr(fp, "suite_out_dir", lambda root: out)
+
+    def runner(root, log):
+        return 1, _GENUINE, ""
+
+    sha = _head(pinned_repo)
+    _, _, off = fp.verify_in_worktree(pinned_repo, sha, pinned_repo / "v.log",
+                                      runner=runner, bridger=lambda *a: [])
+    _, _, on = fp.verify_in_worktree(pinned_repo, sha, pinned_repo / "v.log",
+                                     runner=runner, bridger=lambda *a: [],
+                                     collect_failures=True)
+    assert "failed" not in off
+    assert on["failed"] == [_A]
+
+
+def test_baseline_not_taken_when_strict_is_green():
+    (green, _, meta), calls = _run_baseline(
+        (0, "VERDICT: CLEAN", {"halves": _HALVES_OK, "failed": []}))
+    assert green is True and meta["c4_mode"] == "strict"
+    assert [c[0] for c in calls] == [_POST]
+
+
+def test_baseline_green_when_every_red_was_already_red():
+    post = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [_A, _B]})
+    base = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [_A, _B, _C]})
+    (green, verdict, meta), calls = _run_baseline(post, base)
+    assert green is True
+    assert (meta["post_reds"], meta["baseline_reds"], meta["new_reds"]) == (2, 3, [])
+    assert "0 new" in verdict
+    # The baseline ran on the PRE-adopt commit, after the adopt-commit run, in
+    # its own log, and both runs asked for the failing node ids.
+    assert calls == [(_POST, "verify.log", True), (_PRE, "verify-baseline.log", True)]
+
+
+def test_baseline_red_when_the_adoption_added_a_red():
+    post = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [_A, _C]})
+    base = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [_A]})
+    (green, verdict, meta), _ = _run_baseline(post, base)
+    assert green is False
+    assert meta["new_reds"] == [_C]
+    assert "1 new" in verdict
+
+
+def test_baseline_sees_a_new_failing_parameter_of_an_already_red_test():
+    one, two = _A + "[p1]", _A + "[p2]"
+    post = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [one, two]})
+    base = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [one]})
+    (green, _, meta), _ = _run_baseline(post, base)
+    assert green is False and meta["new_reds"] == [two]
+
+
+def test_baseline_clean_before_means_every_post_red_is_new():
+    post = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [_A]})
+    base = (0, "VERDICT: CLEAN", {"halves": _HALVES_OK, "failed": []})
+    (green, _, meta), _ = _run_baseline(post, base)
+    assert green is False and meta["new_reds"] == [_A]
+
+
+@pytest.mark.parametrize("post,why", [
+    ((2, "VERDICT: INVALID (contended) -- this number means NOTHING",
+      {"halves": _HALVES_OK, "failed": [_A]}), "did not conclude"),
+    ((1, None, {"halves": _HALVES_OK, "failed": [_A]}), "did not conclude"),
+    # INVALID outranks every other word on the line: a verdict that names both
+    # is still a run whose numbers mean nothing.
+    ((1, "VERDICT: INVALID (tree-moved) -- the GENUINE failures below mean NOTHING",
+      {"halves": _HALVES_OK, "failed": [_A]}), "did not conclude"),
+    ((1, _GENUINE, {"halves": _HALVES_OK, "failed": []}), "no FAILED/ERROR node id"),
+    ((1, _GENUINE, {"halves": [{"half": "invisible", "rc": 1},
+                               {"half": "deferred", "rc": 0}], "failed": [_A]}),
+     "framework-owned half"),
+    ((1, _GENUINE, {"halves": [], "failed": [_A]}), "framework-owned half"),
+    ((1, _GENUINE, {"failed": [_A]}), "framework-owned half"),
+    ((1, "VERDICT: CLEAN", {"halves": [{"half": "invisible", "rc": 1}], "failed": []}),
+     "chunked half is clean"),
+])
+def test_baseline_refuses_without_paying_for_a_second_run(post, why):
+    (green, _, meta), calls = _run_baseline(post)
+    assert green is False
+    assert why in meta["baseline_refused"]
+    assert [c[0] for c in calls] == [_POST]
+
+
+@pytest.mark.parametrize("base,why", [
+    ((2, "VERDICT: INVALID (tree-moved) -- this number means NOTHING", {"failed": [_A]}),
+     "pre-adopt baseline run did not conclude"),
+    ((None, "VERDICT: INVALID (verify-worktree-unavailable) x", {}),
+     "pre-adopt baseline run did not conclude"),
+    ((1, _GENUINE, {"failed": []}), "no node id was read"),
+])
+def test_baseline_refuses_when_the_baseline_cannot_be_compared(base, why):
+    post = (1, _GENUINE, {"halves": _HALVES_OK, "failed": [_A]})
+    (green, _, meta), calls = _run_baseline(post, base)
+    assert green is False and why in meta["baseline_refused"]
+    assert [c[0] for c in calls] == [_POST, _PRE]
+
+
+def test_baseline_tolerates_a_red_domain_half_like_strict_c4_does():
+    halves = [{"half": "invisible", "rc": 0}, {"half": "deferred", "rc": 0},
+              {"half": "domain", "rc": 1}]
+    run = (1, _GENUINE, {"halves": halves, "failed": [_A]})
+    (green, _, _), _ = _run_baseline(run, run)
+    assert green is True
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_adopt_uses_the_baseline_verifier_only_when_asked(repo_pair, monkeypatch, flag):
+    source, target = repo_pair
+    pre = fp.git(target, "rev-parse", "HEAD")[1]
+    seen = {"baseline": [], "strict": []}
+
+    def fake_baseline(root, adopt_sha, pre_sha, log, agent=None, verifier=None):
+        seen["baseline"].append((adopt_sha, pre_sha))
+        return True, "VERDICT: GENUINE -- baseline differential: 0 new", {
+            "c4_mode": "baseline-differential", "post_reds": 3, "baseline_reds": 2,
+            "new_reds": []}
+
+    def fake_strict(root, sha, log, agent=None, runner=None, bridger=None,
+                    collect_failures=False):
+        seen["strict"].append(sha)
+        return 0, "VERDICT: CLEAN", {"halves": []}
+
+    monkeypatch.setattr(fp, "verify_with_baseline", fake_baseline)
+    monkeypatch.setattr(fp, "verify_in_worktree", fake_strict)
+    plan = {"gate": {"grafts": []}, "daemon_recycle_required": False}
+    kwargs = {"c4_baseline": True} if flag else {}   # False = the default, unspelled
+    result = fp.adopt(project_root=target, source_repo=source, newest="v1.1.0",
+                      plan=plan, world_dir=target / "world",
+                      restart=lambda root: True, pusher=lambda: True, **kwargs)
+    assert result["adopted"] is True
+    adopt_sha = fp.git(target, "rev-parse", "HEAD")[1]
+    assert adopt_sha != pre
+    step = next(s for s in result["steps"] if s["step"] == "verify")
+    doc = fp.parse_installed_release(
+        (target / "world" / "installed-release.yaml").read_text(encoding="utf-8"))
+    assert doc["verified"] is True
+    if flag:
+        assert seen == {"baseline": [(adopt_sha, pre)], "strict": []}
+        assert step["c4_mode"] == "baseline-differential" and step["new_reds"] == []
+        # `verified: true` alone cannot tell this adoption from a strict one.
+        assert (doc["c4_mode"], doc["baseline_reds"]) == ("baseline-differential", 2)
+    else:
+        assert seen == {"baseline": [], "strict": [adopt_sha]}
+        assert "c4_mode" not in step and "c4_mode" not in doc
+
+
+def test_cli_documents_c4_baseline(capsys):
+    with pytest.raises(SystemExit):
+        fp.main(["--help"])
+    assert "--c4-baseline" in capsys.readouterr().out

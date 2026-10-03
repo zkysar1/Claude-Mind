@@ -291,6 +291,16 @@ def _audit_override(world_dir: Optional[Path], agent_name: str,
         pass
 
 
+def world_user_context(source, agent_name) -> bool:
+    """A world-source filing with no agent behind it is the owner's own context.
+
+    This gate skips such filings, and gates.intake_route files them pending;
+    both read this one predicate.
+    """
+    return (str(source or "agent").strip().lower() == "world"
+            and not agent_name)
+
+
 def evaluate(payload: dict, *, override_signal: Optional[str] = None,
              agent_name: str = "", world_dir: Optional[Path] = None) -> dict:
     """Run the gate. Returns the JSON payload that the legacy CLI prints to
@@ -310,7 +320,7 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
     Side effects: see module docstring. Both happen inside this call.
     """
     source = (payload.get("source") or "agent").strip().lower()
-    world_user_context = (source == "world" and not agent_name)
+    user_context = world_user_context(source, agent_name)
 
     # ---- Batch mode --------------------------------------------------------
     if isinstance(payload.get("batch"), list):
@@ -321,7 +331,7 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
         for g in payload["batch"]:
             gid = g.get("id")
             gsig = g.get("origin_signal")
-            if world_user_context:
+            if user_context:
                 results.append({"id": gid, "would_block": False,
                                 "reason": "world-source user context",
                                 "origin_signal": gsig})
@@ -359,7 +369,7 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
 
         # Decision derivation for telemetry.
         decision_path = None  # branch label (guard-502); only auto-derive labeled today
-        if world_user_context:
+        if user_context:
             decision = "noop"
             trigger = None
         elif any_blocked:
@@ -403,7 +413,7 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
                 "any_blocked": any_blocked,
                 "override_used": override_used,
                 "auto_derived_count": auto_derived_count,
-                "world_user_context": world_user_context,
+                "world_user_context": user_context,
                 "decision_path": decision_path,
             },
         )
@@ -413,11 +423,11 @@ def evaluate(payload: dict, *, override_signal: Optional[str] = None,
     signal = payload.get("origin_signal")
     single_extra = {
         "mode": "single",
-        "world_user_context": world_user_context,
+        "world_user_context": user_context,
         "title_present": bool(payload.get("title")),
     }
 
-    if world_user_context:
+    if user_context:
         _gate_log(
             "origin-signal-gate", "noop",
             trigger_matched=None,

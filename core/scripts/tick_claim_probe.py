@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tick_claim_probe.py -- does this box's worker Body hold a claim right now? ()
+"""tick_claim_probe.py -- who may merge on this box right now? (, )
 
 Asked by `iteration-push.sh --ff-only`, the root-cron sync tick. The tick used to take
 a clean fast-forward only and LOG every other shape. Measured 2026-09-30 (g-375-94):
@@ -8,25 +8,54 @@ behind origin between units while every tick only logged. The decided rule: when
 box's Body holds no claim, the tick runs the loop's own --no-push integrate, which is
 the same integrate the loop runs at its next boundary.
 
+A box that no worker Body has run on had no answer, so the tick only logged there too.
+Measured 2026-10-01 on cc-14 (g-375-108), five agents configured and interactive seats
+only: 250 log-only ticks after its last integrate on 2026-09-24, and 232 commits (9.5 h)
+behind, because own-cloud keeps a few tracked agents/* store files modified there and no
+loop ever merged them. The decided rule: when no loop runs on the box, the tick
+fast-forwards around those files itself (iteration-push.sh _ip_tick_churn_ff).
+
 This script answers that one question and nothing else. It prints ONE line:
 
     <verdict> <agent> <evidence>
 
-verdict is `none` (positively no claim held on this box), `held`, or `unknown`, and
-agent is `-` when it could not be resolved. Only `none` licenses the handoff. The tick
+verdict is `none` (positively no claim held by this box's worker Body), `noloop` (no
+worker Body has run here and no loop runs here now), `held`, or `unknown`. agent is `-`
+when it could not be resolved, and always `-` for `noloop`. `none` licenses the handoff
+to the loop's integrate, and `noloop` the fast-forward around agents/* files. The tick
 treats `held`, `unknown`, a crash or any other output as "log only", which is exactly
-its behaviour before this change. Always exits 0.
+its behaviour before either change. Always exits 0.
 
 WHAT "THIS BOX'S BODY" MEANS. A root cron has no session: no MIND_AGENT, no MIND_SID.
   agent     MIND_AGENT when set, else the ONE agent with a local-paths.conf on this box.
             Zero or several -> unknown: a multi-resident box is out of scope.
   sessions  the per-session dirs under agents/<agent>/sessions/. They are gitignored and
             never synced, so they name exactly the sessions that ran on this box. Every
-            one must be a worker Body session (it carries body-manifest.yaml). Any other
-            session -> unknown: a reducer claims in the agent-level `in_flight` row, which
-            carries no sid, so a box that may host the reducer cannot be answered.
+            one must be a worker Body session: its body-manifest.yaml records role
+            worker, since /start writes that file for a reducer and an observer seat too
+            (g-375-113). Any other session -> unknown: a reducer claims in the
+            agent-level `in_flight` row, which carries no sid, so a box that may host
+            the reducer cannot be answered.
   claim     agent_status.<agent>.in_flight_bodies.<sid> for each of those sessions. A row
             holds a claim while the goal it names is not closed.
+
+A BOX NO WORKER BODY HAS RUN ON (g-375-108). The rule above needs one agent and Body
+sessions only. When no session on the box, of any agent configured here, records the
+worker role, the question is whether a loop runs here at all, and the box-local answer
+is the file the loop's own stop hook reads: agents/<agent>/session/agent-state.
+  worker    a session's body-manifest.yaml records its role. /start writes the same file
+            for a reducer and for an observer seat (body-manifest.py VALID_ROLES), so
+            only `role: worker` makes a box a worker Body box, and a manifest with no
+            role reads as the writer's default, `worker`. A manifest that cannot be read
+            may be a worker's, so it answers unknown, and so does a role outside
+            VALID_ROLES, which may be a newer kind of session that runs a loop. The
+            role is read first because a worker Body's loop leaves agent-state IDLE: on
+            2026-10-02 all ten zc Bodies had one worker-role session and read IDLE
+            (g-375-108).
+  RUNNING   for any agent configured here -> unknown: that loop's integrate owns the
+            merge. The loop running here writes it, so a copy that came from another
+            box, or one a crash left behind, can only err toward unknown. A missing file
+            is not RUNNING, since /start writes it before a loop runs.
 
 WHY THIS BOX'S OWN ROW FILE, NOT THE DAEMON. A Body writes its claim, and its own release,
 into this box's row file first; the store of record catches up from here. So for this
@@ -45,14 +74,15 @@ err toward `none` if a closed goal is reopened and claimed again before the copy
 up: an integrate during that unit, the case measured low-harm (g-375-93, g-375-94).
 
 FAIL-SAFE. Every doubt answers `unknown`: the synced repo is not this script's tree, a
-non-Body session ran here, the row file is missing or unreadable, a goal id does not
-resolve, or anything raises.
+non-Body session ran on a worker Body box, a session's manifest cannot be read or records
+a role this probe does not know, an agent is RUNNING, the row file is missing or
+unreadable, a goal id does not resolve, or anything raises.
 
 SIDE EFFECTS. Takes no lock and writes nothing of its own. Resolving a row's goal is not
 free: goal-resolve.py first refreshes the world archive from the store (one HEAD, plus a
 GET when the local copy is stale) and may rewrite that local copy. From root cron the
 store credentials come from .env.local, which get_backend() loads itself. A box with no
-row reads nothing from the store.
+row reads nothing from the store, and neither does a box no worker Body has run on.
 
     python3 core/scripts/tick_claim_probe.py --repo /opt/ayoai-mind
 """
@@ -75,8 +105,18 @@ CLOSED = frozenset({"completed", "skipped", "expired", "decomposed", "superseded
 # A session dir's name IS its sid: 32 hex for a zakcode Body, a dashed UUID for others.
 SID_RE = re.compile(r"^[0-9a-f][0-9a-f-]{7,63}$")
 
-# The file only a worker Body's session dir carries.
+# The file a session dir carries once /start has run in it. A reducer and an observer
+# seat write it too, so the role inside it, not its presence, marks a worker Body
+# ().
 BODY_MARKER = "body-manifest.yaml"
+
+# The role /start records for a worker Body (body-manifest.py VALID_ROLES).
+WORKER_ROLE = "worker"
+
+# Every role /start can record, as body-manifest.py VALID_ROLES lists them (a test keeps
+# the two equal). A role outside it is a doubt: it may name a newer kind of session that
+# runs a loop.
+KNOWN_ROLES = ("reducer", "worker", "observer")
 
 
 def resident_agent(conf_agents, env_agent):
@@ -91,18 +131,48 @@ def resident_agent(conf_agents, env_agent):
 
 
 def local_sessions(sessions_root):
-    """-> {sid: is_worker_body} for the session dirs under sessions_root (empty if absent)."""
+    """-> {sid: manifest_role} for the session dirs under sessions_root (empty if absent)."""
     root = Path(sessions_root)
     if not root.is_dir():
         return {}
-    return {p.name: (p / BODY_MARKER).is_file()
+    return {p.name: manifest_role(p)
             for p in root.iterdir() if p.is_dir() and SID_RE.match(p.name)}
+
+
+def manifest_role(session_dir):
+    """-> the role session_dir's manifest records: '' when it has no manifest, and None
+    when the manifest cannot be read as a mapping. A manifest with no role field reads
+    as `worker`: the writer's default, and how decide() read every manifest before
+    g-375-113."""
+    path = Path(session_dir) / BODY_MARKER
+    if not path.is_file():
+        return ""
+    import yaml
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh)
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    return str(doc.get("role") or WORKER_ROLE)
+
+
+def agent_state(agent_dir):
+    """-> agent_dir's agent-state with all whitespace removed, as session-state-get.sh
+    prints it, or None when the file is absent. Any other read error raises, and main()
+    then answers unknown."""
+    try:
+        text = (Path(agent_dir) / "session" / "agent-state").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    return "".join(text.split())
 
 
 def decide(sessions, row, status_of):
     """-> (verdict, evidence). Pure, so the rule is testable without a box.
 
-    sessions   {sid: is_worker_body} for this box (local_sessions)
+    sessions   {sid: True when its manifest records the worker role} for this box
     row        the agent's team-state row as a dict, or None when it could not be read
     status_of  goal_id -> status string, or None when the id does not resolve
     """
@@ -133,6 +203,29 @@ def decide(sessions, row, status_of):
     return "none", f"no in-flight row for this box's {len(sessions)} Body session(s)"
 
 
+def no_loop(roles, states):
+    """-> (verdict, evidence) for a box no worker Body has run on, or None when one has
+    and decide() answers instead (g-375-108). Pure, so the rule is testable without a box.
+
+    roles   {sid: manifest_role} for every session dir on this box, of every agent
+    states  {agent: agent_state} for every agent with a local-paths.conf on this box
+    """
+    if WORKER_ROLE in roles.values():
+        return None
+    unread = sorted(sid for sid, role in roles.items() if role is None)
+    if unread:
+        return "unknown", f"session {unread[0][:8]} has a {BODY_MARKER} that cannot be read"
+    odd = sorted(sid for sid, role in roles.items() if role and role not in KNOWN_ROLES)
+    if odd:
+        return "unknown", (f"session {odd[0][:8]} records role {roles[odd[0]]!r}, "
+                           f"which this probe does not know")
+    running = sorted(agent for agent, state in states.items() if state == "RUNNING")
+    if running:
+        return "unknown", f"{running[0]} is RUNNING here, so its loop owns the merge"
+    return "noloop", (f"no loop runs here: {len(states)} agent(s) configured, none RUNNING; "
+                      f"{len(roles)} session(s), none a worker Body")
+
+
 def _goal_status_resolver(world):
     """goal_id -> status via goal-resolve.py (live, archived or evicted), else None."""
     spec = importlib.util.spec_from_file_location("goal_resolve", HERE / "goal-resolve.py")
@@ -152,13 +245,22 @@ def probe(repo):
     if Path(repo).resolve() != root:
         return "unknown", "-", f"--repo {repo} is not this script's tree ({root})"
     confs = [c.parent.name for c in _paths.enumerate_agent_confs()]
+    # A box no worker Body has run on is answered from this box's own files ().
+    roles = {}
+    for conf_agent in confs:
+        roles.update(local_sessions(_paths.agent_sessions_root(conf_agent)))
+    answer = no_loop(roles, {a: agent_state(_paths.agent_dir(a)) for a in confs})
+    if answer:
+        return answer[0], "-", answer[1]
     agent, why = resident_agent(confs, os.environ.get("MIND_AGENT", "").strip())
     if not agent:
         return "unknown", "-", why
     world = _paths.WORLD_DIR
     if not world:
         return "unknown", agent, "WORLD_PATH does not resolve"
-    sessions = local_sessions(_paths.agent_sessions_root(agent))
+    # A session is a worker Body by the role its manifest records ().
+    sessions = {sid: role == WORKER_ROLE
+                for sid, role in local_sessions(_paths.agent_sessions_root(agent)).items()}
     import yaml
     import _team_state
     try:
@@ -171,8 +273,9 @@ def probe(repo):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Does this box's worker Body hold a claim? "
-                                             "Prints '<none|held|unknown> <agent> <evidence>'.")
+    ap = argparse.ArgumentParser(description="Who may merge on this box: does its worker Body "
+                                             "hold a claim, or does no loop run here at all? "
+                                             "Prints '<none|noloop|held|unknown> <agent> <evidence>'.")
     ap.add_argument("--repo", required=True, help="the tree the sync tick is about to integrate")
     args = ap.parse_args(argv)
     try:

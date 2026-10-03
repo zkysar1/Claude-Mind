@@ -636,7 +636,7 @@ plateau_detection:
 
 cycle_detection:
   lookback_window: 3              # Number of recent goals to check for cycles
-  report_signal_age_days: 7       # zero_learning_velocity suppression: any <agent>/temp/*.md mtime within N days for recent goal IDs counts as substantive learning artifact (g-115-188 false-positive fix; reports/ abolished 2026-06-02, temp/ is the scan target — key name retained for consumer compat)
+  report_signal_age_days: 7       # zero_learning_velocity suppression: any <agent>/temp/*.md mtime within N days for recent goal IDs, or any <agent>/experience/exp-<goal-id>[-slug].md mtime within N days, counts as substantive learning artifact (g-115-188 false-positive fix; reports/ abolished 2026-06-02, temp/ and experience/ are the scan targets — key name retained for consumer compat)
   checks:                         # What the precheck skill looks for
     - repeated_failure             # Almost all recent goals skipped/blocked
     - zero_learning_velocity       # Same-category goals producing no learning artifacts
@@ -2284,7 +2284,7 @@ multi_agent:
   claim_timeout_hours: 4            # Claims older than this are treated as expired
   abstention_timeout_hours: 72      # Abstentions older than this expire (fail-open: re-attempt)
   defer_reason_timeout_hours: 120   # defer_reason without deferred_until expires after this
-  dependency_timeout_hours: 48      # blocked_by deps older than this expire (fail-open: attempt goal)
+  dependency_timeout_hours: 48      # blocked_by expires past this age ONLY if every unmet dep is dead/orphan; a live dep keeps the goal blocked (g-115-1344)
 
   # Parallelizability classification: aspirations declare whether their goals are
   # independent (parallel), chained (serial), or mixed. Advisory field — blocked_by
@@ -2603,6 +2603,35 @@ reducer_selection_policy:
   # down against a fleet that is not there.  owns CLEARING those rows;
   # this threshold must be correct while they are still present.
   claim_fresh_hours: 6.0
+
+# ---------------------------------------------------------------------------
+# owned_redetection (, 2026-10-02)
+# ---------------------------------------------------------------------------
+# A detector re-firing on a finding whose owner goal is OPEN and UNCLAIMED drew
+# appended readings instead of work:  took 35 appended readings from
+# five agents in ~2 weeks and was never claimed, because nothing converted the
+# repeat into a selection signal. The conversion is a FLOOR in goal-selector.py
+# (apply_owned_redetection_floor), not a scoring weight: rb-597 measured that a
+# scalar lift loses to a saturated queue (guard-1895 rule 2), and the signal is
+# EVENT-keyed (distinct agents re-detecting), which no weighted criterion can
+# read.
+#
+# The input is one short line per re-detecting agent — the stated disposal for
+# the 0.5k ratchet lanes: [recheck:<agent> <YYYY-MM-DD>] in the owner goal's
+# progress_note (goal-field-append.sh, marker token recheck-<agent>-<YYYYMMDD>).
+# The predicate (recheck_marker.lift_for, SSOT): at least min_agents DISTINCT
+# agents carry a marker within window_days of today -> the owner is hoisted to
+# the top selection slot (yielding to the drain-lane and strategic-focus
+# hoists, outranked by the reducer-only floor).
+owned_redetection:
+  enabled: true
+  # DISTINCT re-detecting agents required. The goal's own verification
+  # threshold. One agent re-measuring is the precheck's normal behavior (the
+  # noise this disposal removes); two independent agents seeing the same
+  # unclaimed owner is the "nothing is taking this" signal.
+  min_agents: 2
+  # Days a [recheck:<agent> <date>] marker stays live before it ages out.
+  window_days: 7
 
 reducer_promotion:
   # G1 master kill switch. Only an explicit `true` enables; absent means off.
@@ -3099,3 +3128,25 @@ aspirations_eviction:
   interval_hours: 24
   age_days: 3
   apply: true
+
+# Candidate tier (world/conventions/goal-intake-management.md §8; B2, ).
+# core/scripts/gates/intake_route.py reads `enabled` and the two origin lists:
+# a new goal whose origin_signal head is a candidate origin is filed as
+# `candidate` instead of `pending`. It ships dark. Only a literal `enabled: true`
+# turns it on, and a missing block or key reads as off. The other keys belong to
+# the later increments (B3 starvation fail-safe, B4 grooming).
+# ON in this (dev) world since 2026-10-02 (B6, ). Kill switch, in this order: set
+# `enabled: false` and commit it FIRST, then run drain-candidates-to-pending.sh --apply on every
+# box. The dev->staging promotion must carry `enabled: false` until staging's own activation.
+candidate_tier:
+  enabled: true             # feature flag — dev world first, then staging, then prod
+  candidate_origins: [investigate, idea, maintain]
+  exempt_origins: [unblock, alert-email, failing_test, drift_detected,
+                   user_directive, user_directed, decomposition, insight_trigger]
+  auto_promote_batch: 5     # starvation fail-safe promotion size
+  groom_bite: 20            # candidates per grooming firing
+  promote_cap_per_firing: 3
+  touch_stale_hours: 20     # cross-agent bite-collision guard
+  coverage_target_days: 14  # metric (d)
+  keep_share_ceiling: 0.176    # ADOPTED 2026-08-31 (bravo) — see 8a
+  promote_share_ceiling: 0.182 # ADOPTED 2026-08-31 (bravo) — see 8a

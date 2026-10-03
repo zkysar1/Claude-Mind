@@ -4,9 +4,9 @@ The defect: `execution-diary.py` appends box-locally to the agent-tree diary and
 has NO store delivery in the append path; the agent-tree claim fence refuses a
 worker Body's push (the reducer holds the claim); so a worker's rows — including
 scorer_override rows — strand box-local and `read_fleet_diaries` (the audit's
-roster) is blind to them. Measured 2026-09-28: a Body's local diary held 28
-scorer_override rows in the window while the store held 0, and the audit
-printed clean over the only force-override.
+roster) is blind to them. Measured 2026-09-28 (g-306-555, alpha worker Body,
+cc-07): a Body's local diary held 28 scorer_override rows in the window while
+the store held 0, and the audit printed clean over the only force-override.
 
 Seams covered:
  1. body_diary_carrier round-trip (record_local -> read_carrier_lines):
@@ -198,6 +198,9 @@ def _mk_carrier(world: Path, agent: str, sid: str, lines: list[str]) -> None:
 
 
 def test_fleet_reader_unions_carrier_rows(tmp_path):
+    """The UNION lives on the production path (): `base=None`, both
+    roots patched to the tmp tree. A non-`None` `base` skips the union — that
+    is the hermetic-test seam, and it is pinned in test_fleet_diary.py."""
     agents = tmp_path / "agents"
     world = tmp_path / "world"
     wide = _row("alpha", "g-wide", "g-t", "precondition-fail", 1)
@@ -205,8 +208,9 @@ def test_fleet_reader_unions_carrier_rows(tmp_path):
     _mk_agent(agents, "alpha", [wide])
     _mk_carrier(world, "alpha", "sid-A", [body])
 
-    with unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
-        got = dict(_fleet_diary.read_fleet_diaries(agents))
+    with unittest.mock.patch.object(_fleet_diary, "agents_root", lambda: agents), \
+         unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
+        got = dict(_fleet_diary.read_fleet_diaries())
 
     # Compare FULL verbatim lines (a goal id occurs twice inside one row, so
     # substring counts are meaningless).
@@ -225,8 +229,9 @@ def test_fleet_reader_does_not_double_count_identical_rows(tmp_path):
     _mk_agent(agents, "alpha", [row])
     _mk_carrier(world, "alpha", "sid-A", [row])
 
-    with unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
-        got = dict(_fleet_diary.read_fleet_diaries(agents))
+    with unittest.mock.patch.object(_fleet_diary, "agents_root", lambda: agents), \
+         unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
+        got = dict(_fleet_diary.read_fleet_diaries())
 
     assert got["alpha"].splitlines() == [row], "identical line must count once"
 
@@ -238,8 +243,9 @@ def test_fleet_reader_no_carrier_unchanged(tmp_path):
     row = _row("alpha", "g-1", "g-t", "self-abstention", 1)
     _mk_agent(agents, "alpha", [row])
 
-    with unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
-        got = dict(_fleet_diary.read_fleet_diaries(agents))
+    with unittest.mock.patch.object(_fleet_diary, "agents_root", lambda: agents), \
+         unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
+        got = dict(_fleet_diary.read_fleet_diaries())
 
     assert got["alpha"].splitlines() == [row]
 
@@ -261,8 +267,11 @@ def test_audit_counts_body_rows_via_carrier(tmp_path):
                 [_row("alpha", f"g-b{i}", f"g-btop{i}", "force-override", 2, "sid-B0")
                  for i in range(4)])
 
-    with unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
-        r = soa.audit(since_hours=36, root=agents)
+    # Production shape (): root=None so the carrier union is live;
+    # both roots patched to the tmp tree.
+    with unittest.mock.patch.object(_fleet_diary, "agents_root", lambda: agents), \
+         unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
+        r = soa.audit(since_hours=36)
 
     assert r["per_agent"]["alpha"]["total"] == 7, "3 reducer + 4 Body rows"
     assert r["per_agent"]["alpha"]["force"] == 4
@@ -281,8 +290,9 @@ def test_audit_window_excludes_out_of_window_body_rows(tmp_path):
     _mk_carrier(world, "alpha", "sid-B0",
                 [_row("alpha", f"g-b{i}", f"g-btop{i}", "force-override", 50, "sid-B0")
                  for i in range(5)])
-    with unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
-        r = soa.audit(since_hours=soa.DEFAULT_SINCE_HOURS, root=agents)
+    with unittest.mock.patch.object(_fleet_diary, "agents_root", lambda: agents), \
+         unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
+        r = soa.audit(since_hours=soa.DEFAULT_SINCE_HOURS)
     assert r["total_overrides"] == 1
     assert r["hits"] is False
 
@@ -294,8 +304,11 @@ def test_audit_no_carrier_rows_stays_clean(tmp_path):
     world.mkdir()
     _mk_agent(agents, "alpha",
               [_row("alpha", "g-w", "g-t", "precondition-fail", 1)])
-    with unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
-        r = soa.audit(since_hours=36, root=agents)
+    # Production shape (): root=None so the carrier union is live;
+    # both roots patched to the tmp tree.
+    with unittest.mock.patch.object(_fleet_diary, "agents_root", lambda: agents), \
+         unittest.mock.patch.object(_fleet_diary, "WORLD_DIR", world):
+        r = soa.audit(since_hours=36)
     assert r["total_overrides"] == 1
     assert r["hits"] is False
 

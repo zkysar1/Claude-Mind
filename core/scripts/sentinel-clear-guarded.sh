@@ -244,9 +244,13 @@ VERIFY_RC=$?
 REASON=""
 if [[ $VERIFY_RC -ne 0 ]]; then
     REASON="read-back exited rc=${VERIFY_RC}"
-elif [[ -z "${VERIFY_OUT//[[:space:]]/}" ]]; then
+elif [[ ! "$VERIFY_OUT" =~ [^[:space:]] ]]; then
     # Empty stdout is the signature of the rc=0-on-refusal case: the producing
     # command claimed success and the record is simply not there.
+    # LINEAR regex test, NOT `-z "${VERIFY_OUT//[[:space:]]/}"` (, guard-7491):
+    # that global substitution is superlinear in the read-back size (measured here
+    # 50 KB 2.8 s, 100 KB 12 s, 200 KB 45 s; a 453 KB read-back spun ~5 min at 98% CPU
+    # with no child process, which reads as a hang). The first non-space byte ends this match.
     REASON="read-back returned EMPTY (producing command exited 0 but wrote nothing — the rc=0-on-refusal case)"
 elif [[ -n "$EXPECT" && "$VERIFY_OUT" != *"$EXPECT"* ]]; then
     REASON="read-back stdout did not contain --expect '${EXPECT}'"
