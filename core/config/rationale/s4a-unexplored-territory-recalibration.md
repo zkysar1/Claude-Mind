@@ -81,7 +81,7 @@ research and competitive-analysis material nobody has revisited in months
 phase asks.
 
 Default window is `3 x knowledge_staleness_days` (90d here) rather than a new required
-config key. It DEFAULTS rather than raising for the `guard-4653` promotion-coupling
+config key. It DEFAULTS rather than raising for the `guard-4654` promotion-coupling
 reason the sibling temp-pressure check documents: S4a is a LOW observational signal, so
 a lagging config on a promoted box must degrade to a working default, not brick the
 whole S4 phase.

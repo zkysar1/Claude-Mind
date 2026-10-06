@@ -17,9 +17,12 @@ a worker whose MIND_AGENT or MIND_SID is missing: no line beats a wrong one.
 
 TWO LINES, BECAUSE A DESCRIPTION IS READ AS SCOPE AND A NOTE IS NOT.
   note      "Auto-signed: <agent> worker Body <sid8>, hostname <host>."
-            goal-field-append.py (a progress_note or outcome_note block) and
+            goal-field-append.py (a progress_note or outcome_note block),
             closure-evidence-write.sh (the closure narrative that becomes
-            outcome_note).
+            outcome_note) and aspirations-update-goal.sh (a progress_note or
+            outcome_note value it replaces, and an outcome_note riding a status
+            write; g-375-115). The first two pass MIND_NOTE_SIGNED=1 when they
+            write through the third, so no note is signed twice.
   filing    "Auto-signed: filed by <agent> worker Body on hostname <host>."
             aspirations-add-goal.sh (a filed goal's description).
 A description carries no sid, so goal-field-append.py appends to one unsigned.

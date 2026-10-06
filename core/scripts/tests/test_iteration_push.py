@@ -3107,3 +3107,163 @@ def test_untrack_ahead_keeps_an_untracked_upstream_ignored_file_out_of_the_self_
     assert _SPOOL not in _must(a, "ls-tree", "-r", "--name-only", "origin/main").splitlines()
     assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained\n"
     assert _untracked_and_ignored(a, _SPOOL)
+
+
+# --------------------------------------------------------------------------- #
+# : the untrack-ahead exclusion is a bridge, not a standing rule
+# --------------------------------------------------------------------------- #
+def _exclude_lines(a: Path) -> list:
+    p = a / ".git" / "info" / "exclude"
+    return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+
+
+def test_untrack_ahead_exclusion_is_pruned_once_the_merge_lands_the_rule(tmp_path):
+    """Outcome 1. untrack-ahead bridges the window until upstream's ignore rule is
+    in HEAD with an info/exclude line (g-306-536). The line never expired, so it
+    outlived the rule it stood in for: pre-fix it is still there after the run that
+    landed the rule. Now that run takes it down, and the committed .gitignore alone
+    ignores the path."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "undrained-line\n"})
+    _upstream_untracks_spool(b, ignore=True)
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{_SPOOL}") in r.stderr, r.stderr  # the bridge was built ...
+    assert f"/{_SPOOL}" not in _exclude_lines(a), _exclude_lines(a)  # ... and taken down
+    assert ("pruned from info/exclude (HEAD's .gitignore now ignores it): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained-line\n"
+    assert _untracked_and_ignored(a, _SPOOL)  # by the committed rule alone now
+
+
+def test_untrack_ahead_a_later_retrack_does_not_replace_the_local_copy(tmp_path):
+    """Outcome 2, the shape the permanent line turned into silent loss. Upstream
+    untracks and ignores the spool, later DROPS the rule (the path is plainly
+    untracked again), then re-adds it as tracked. git refuses to overwrite a path
+    nothing ignores but treats an info/exclude line as expendable (measured on
+    2.43.0): pre-fix the line hid the undrained bytes through all three upstream
+    commits and the third merge replaced them with rc=0. Now the line is gone
+    before the rule is, so that merge is a loud conflict and the bytes survive."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "s1\n"})
+    _upstream_untracks_spool(b, ignore=True)
+    r1 = _run_push_env(a, "alpha", *_default_flags("--strict"))  # lands the rule
+    assert r1.returncode == 0, r1.stderr
+    local = "s1\nundrained-after-the-merge\n"
+    (a / _SPOOL).write_text(local, encoding="utf-8", newline="\n")  # the box keeps writing
+    _must(b, "pull", "-q", "origin", "main")  # B picks up A's merge before building on it
+    (b / ".gitignore").write_text("", encoding="utf-8", newline="\n")  # upstream drops the rule
+    _must(b, "add", ".gitignore")
+    _must(b, "commit", "-q", "-m", "B: drop the spool rule")
+    _must(b, "push", "-q", "origin", "main")
+    r2 = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r2.returncode == 0, r2.stderr
+    assert (a / _SPOOL).read_text(encoding="utf-8") == local
+    _commit_file(b, _SPOOL, "upstream-retracked\n", "B: track the spool again")
+    _must(b, "push", "-q", "origin", "main")
+
+    r3 = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r3.returncode == 1, r3.stderr
+    assert "MERGE CONFLICT" in r3.stderr, r3.stderr
+    assert (a / _SPOOL).read_text(encoding="utf-8") == local  # not replaced by upstream's
+    assert _must(a, "show", f"HEAD:{_SPOOL}") == local.strip()  # and committed, so not lost
+    assert not (a / ".git" / "MERGE_HEAD").exists()
+
+
+def test_untrack_ahead_prunes_only_the_redundant_exclude_lines(tmp_path):
+    """Boxes that ran the  version already carry the permanent line: its
+    merge landed the rule long ago and the line stayed. The next run clears it, and
+    nothing else. A comment, a glob and an anchored path no committed rule covers
+    are not this mechanism's, and are left byte for byte and in order."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "s1\n"})
+    _upstream_untracks_spool(b, ignore=True)
+    _must(a, "pull", "-q", "origin", "main")  # the rule lands by a plain pull
+    (a / _SPOOL).parent.mkdir(parents=True, exist_ok=True)  # the pull removed the emptied dir
+    (a / _SPOOL).write_text("undrained\n", encoding="utf-8", newline="\n")
+    excl = a / ".git" / "info" / "exclude"
+    keep = ["# kept by hand", "*.local-glob", "/not-covered-by-any-rule.txt"]
+    excl.write_text(excl.read_text(encoding="utf-8") + f"/{_SPOOL}\n" + "\n".join(keep) + "\n",
+                    encoding="utf-8", newline="\n")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert ("pruned from info/exclude (HEAD's .gitignore now ignores it): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    after = _exclude_lines(a)
+    assert f"/{_SPOOL}" not in after, after
+    assert [ln for ln in after if ln in keep] == keep, after
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained\n"
+    assert _untracked_and_ignored(a, _SPOOL)
+
+
+def test_untrack_ahead_prunes_after_the_push_race_recovery_merge(tmp_path):
+    """The recovery merge never reaches the integrate step's own pruning, so it
+    prunes for itself: pre-fix the line it wrote stays after the push lands."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "undrained-line\n"})
+    _must(a, "fetch", "origin", "main")  # fresh FETCH_HEAD: the 60-min throttle skips the pre-push fetch
+    _upstream_untracks_spool(b, ignore=True)
+    _commit_file(a, "from_a.txt", "a\n", "A: change")
+
+    r = _run_push_env(a, "alpha", "--min-commits", "1", "--fetch-interval-min", "60",
+                      "--strict")
+    assert r.returncode == 0, r.stderr
+    assert "push-race recovery OK" in r.stderr, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert f"/{_SPOOL}" not in _exclude_lines(a), _exclude_lines(a)
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained-line\n"
+    assert _untracked_and_ignored(a, _SPOOL)
+
+
+def test_untrack_ahead_prunes_a_line_written_for_a_path_with_glob_characters(tmp_path):
+    """The pruner reads back what _ip_exclude_locally wrote. A name with glob
+    characters is written backslash-escaped, so it must be matched by its LITERAL
+    name, or the line it wrote would never be pruned. Pins the two halves together."""
+    odd = "agents/alpha/stats [1].spool"
+    origin, a, b = _clone_pair(tmp_path)
+    (a / odd).parent.mkdir(parents=True, exist_ok=True)
+    (a / odd).write_text("undrained-line\n", encoding="utf-8", newline="\n")
+    _must(a, "--literal-pathspecs", "add", odd)
+    _must(a, "commit", "-q", "-m", "seed the odd spool")
+    _must(a, "push", "-q", "origin", "main")
+    _must(b, "pull", "-q", "origin", "main")
+    _must(b, "--literal-pathspecs", "rm", "-q", "--", odd)
+    (b / ".gitignore").write_text("**/stats*.spool\n", encoding="utf-8", newline="\n")
+    _must(b, "add", ".gitignore")
+    _must(b, "commit", "-q", "-m", "B: untrack the odd spool")
+    _must(b, "push", "-q", "origin", "main")
+
+    r = _run_push_env(a, "alpha", *_default_flags("--strict"))
+    assert r.returncode == 0, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{odd}") in r.stderr, r.stderr
+    assert ("pruned from info/exclude (HEAD's .gitignore now ignores it): "
+            f"{odd}") in r.stderr, r.stderr
+    assert not [ln for ln in _exclude_lines(a) if "stats" in ln], _exclude_lines(a)
+    assert (a / odd).read_text(encoding="utf-8") == "undrained-line\n"
+
+
+def test_untrack_ahead_prunes_on_a_no_push_run(tmp_path):
+    """A worker box never runs the full push: its loop calls `iteration-push.sh
+    --no-push` at the top of every cycle and `--push-worker-ref` after a unit. That
+    is the run that lands upstream's rule there, so it must prune too. The prune
+    sits before the --no-push exit; pre-fix, and with the prune moved below that
+    exit, the line stays on the one kind of box that writes these lines."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {_SPOOL: "undrained-line\n"})
+    _upstream_untracks_spool(b, ignore=True)
+
+    r = _run_push_env(a, "alpha", "--no-push", "--fetch-interval-min", "0")
+    assert r.returncode == 0, r.stderr
+    assert "--no-push: fetch+integrate complete, skipping push decision" in r.stderr, r.stderr
+    assert ("untrack-ahead: untracked (kept on disk, now in info/exclude): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert f"/{_SPOOL}" not in _exclude_lines(a), _exclude_lines(a)
+    assert ("pruned from info/exclude (HEAD's .gitignore now ignores it): "
+            f"{_SPOOL}") in r.stderr, r.stderr
+    assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained-line\n"
+    assert _untracked_and_ignored(a, _SPOOL)

@@ -8,6 +8,8 @@ Query parameters:
     include_framework=1       include framework rules + conventions
     read_only=1               optional — absent ⇒ counter-bump path
     goal=<goal-id>            optional — scopes the retrieval-session manifest
+                              and the experiences lane (that goal's own records
+                              are added to the category matches, g-115-5619)
     tree_nodes=<k1,k2>        optional — extra node keys recorded in manifest
     entry_type=<type>         optional — restrict reasoning_bank/meta_lessons to
                               records whose entry_type equals it (e.g. procedure)
@@ -84,6 +86,10 @@ from _utilization_store import (  # noqa: E402
 
 from ..yaml_cache import cache as _yaml_cache
 from ..jsonl_cache import cache as _jsonl_cache
+# : the goal-id derivation `/v1/experience/read?goal=` matches on. It
+# lives here, not in core retrieve.py, because core must not import `experience`
+# (daemon import surface); this module is the daemon side and may.
+from .experience_write import _derive_goal_id_from_id
 
 
 # Serialises (snapshot, swap, call, restore) so concurrent requests for
@@ -504,8 +510,19 @@ def handle(ctx) -> "Response":  # type: ignore[name-defined]
                                             read_only=read_only, as_of=as_of)
             pattern_signatures = _r.load_pattern_signatures(
                 categories, depth, read_only=read_only, as_of=as_of)
+            # : scope the experiences lane to the goal in hand. The
+            # same two-way match as `/v1/experience/read?goal=` (the record's
+            # goal_id field, or the goal id embedded in its `exp-<goal-id>-…`
+            # id), so a recurring goal reaches its own history whatever
+            # categories its runs were filed under.
+            goal_match = None
+            if effective_goal:
+                goal_match = (lambda rec, g=effective_goal:
+                              rec.get("goal_id") == g
+                              or _derive_goal_id_from_id(rec.get("id")) == g)
             experiences = _r.load_experiences(categories, depth,
-                                              read_only=read_only)
+                                              read_only=read_only,
+                                              goal_match=goal_match)
             beliefs = _r.load_beliefs(categories, as_of=as_of)
             experiential_index = _r.load_experiential_index(categories)
             # . NOT flag-gated, deliberately: the whole point is to

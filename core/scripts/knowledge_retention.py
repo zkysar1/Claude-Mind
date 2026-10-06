@@ -47,6 +47,7 @@ __all__ = [
     "retained_content",
     "is_live",
     "in_window",
+    "judged_at",
     "list_records",
     "mark_undone",
 ]
@@ -201,6 +202,25 @@ def in_window(record: Mapping[str, Any], now: datetime.datetime) -> bool:
     if until.tzinfo is None:
         until = until.replace(tzinfo=datetime.timezone.utc)
     return now <= until
+
+
+def judged_at(sent: Any, now: datetime.datetime) -> datetime.datetime:
+    """The moment a member's undo is judged against its window: when they sent it, and never
+    later than ``now``.
+
+    The window the member saw ("undo until X") can close while their undo waits for a stopped
+    home to run, so judging at apply time refuses an undo that was sent in time. ``sent`` is the
+    time the queued record carries; a stamp with no offset is UTC. One that is missing or does not
+    parse is judged at ``now``, as is one after ``now`` (a clock running ahead), so a stamp can
+    make the judgment more lenient than applying at ``now`` and never stricter.
+    """
+    try:
+        moment = datetime.datetime.fromisoformat(str(sent))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=datetime.timezone.utc)
+        return min(moment, now)
+    except ValueError:
+        return now
 
 
 def list_records(retention_dir: str | Path) -> Iterator[tuple[Path, dict]]:

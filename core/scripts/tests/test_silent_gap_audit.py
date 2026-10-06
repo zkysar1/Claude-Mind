@@ -333,6 +333,24 @@ def test_completed_corpus_old_refire_still_fires_via_is_covered():
     assert covered is False and gid is None
 
 
+def test_written_never_read_skips_date_segmented_stores():
+    # A date-segmented store's basename carries a date that appears in no source
+    # file, so the reader scan false-flags every day's segment (,
+    # ). The control store beside them proves the detector still fires.
+    with tempfile.TemporaryDirectory() as td:
+        orig_w, orig_m = sga.WORLD_DIR, sga.META_DIR
+        sga.WORLD_DIR, sga.META_DIR = td, None
+        try:
+            for name in ("retrieval-trace-2026-10-05.jsonl",
+                         "productivity-snapshots-2026-10-05.jsonl",
+                         "zz-orphan-probe-store.jsonl"):
+                (Path(td) / name).write_text(json.dumps({"v": 1}) + "\n", encoding="utf-8")
+            targets = {g["target"] for g in sga.detect_written_never_read(reader_blob="")}
+            assert targets == {"zz-orphan-probe-store.jsonl"}
+        finally:
+            sga.WORLD_DIR, sga.META_DIR = orig_w, orig_m
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

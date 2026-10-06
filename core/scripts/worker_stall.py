@@ -397,14 +397,17 @@ def _read_queue_lines(world_store: Path):
         if scripts.is_dir() and str(scripts) not in sys.path:
             sys.path.insert(0, str(scripts))
         from storage_backend import get_backend  # noqa: PLC0415
-        from _owncloud_codec import decode_response  # noqa: PLC0415  # 
+        from _owncloud_composite import decode_whole  # noqa: PLC0415  #  codec decode +  U3 composite join
 
         b = get_backend()
         key = b._s3_key(world_store)
         # : the queue may be gzip on the wire — decode through the one
         # transport seam (magic-byte authoritative; a plain object passes through).
-        body = decode_response(
-            b.s3.get_object(Bucket=b.bucket, Key=key), key=key
+        #  U3: under the composite layout the object is a small head with no goal in it;
+        # decode_whole joins it to the whole file, and a join that cannot complete raises into the
+        # local-mirror fallback below.
+        body = decode_whole(
+            b, key, b.s3.get_object(Bucket=b.bucket, Key=key)
         ).decode("utf-8")
         return body.splitlines(), "authoritative"
     except Exception:

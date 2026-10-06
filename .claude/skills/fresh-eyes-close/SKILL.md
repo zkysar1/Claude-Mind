@@ -11,6 +11,7 @@ triggers:
 tools_used: [Bash, Read, Grep]
 companion_scripts:
   - core/scripts/close-review-verdict.py
+  - core/scripts/close-review-inputs.py
   - core/scripts/close-review-gate.py
   - core/scripts/q4-provenance-sample.sh
   - core/scripts/provenance-check.sh
@@ -91,6 +92,22 @@ with the author's account of why the work is correct is no longer independent. I
 you cannot run this review without the executing context in view, escalate to a
 fresh-context reviewer per the independence order above rather than proceeding.
 
+Build the goal-record text and the artifact in one step instead of by hand (g-375-44):
+
+```bash
+py -3 core/scripts/close-review-inputs.py --goal <goal-id> --out-dir <your session scratch dir>
+```
+
+It writes `<goal-id>-source.txt` and `<goal-id>-artifact.txt` for check 2, and
+`<goal-id>-note.txt`, the outcome_note alone, for check 1's q4 sample. It prints each own
+commit's delivery verdict for check 1, lists the commits that only cite the goal, and
+prints both commands ready to run. The artifact leaves out each commit's diff under the
+agent-state directory, whose ids would swamp check 2, and is capped in size; stdout says
+what was left out (g-375-124). Exit 5 means no commit names the goal, or none that does
+changes anything outside that directory: add a deliverable that lives outside the repo,
+such as a tree node, with `--include <path>`, and never stand another commit in for it.
+It does not fetch the cited sources; that stays this section's job.
+
 ## The four mandatory checks
 
 ### 1. Requirements traceability — judgment, plus MECHANISED citations-MATCH and delivery probes
@@ -120,6 +137,11 @@ A -> B where the source asserts B -> A). The last is the one a citations-exist
 check cannot see, and the producer vetoes an APPROVE on it mechanically. Read
 `clusters_total` beside `sampled_count`: a clean verdict over 2 of 40 clusters is
 a thin one, and the reviewer says so.
+
+With close-review-inputs.py, `--artifact` is its `<goal-id>-note.txt` and each
+`--include`d file, as its first NEXT line prints them, never its `-artifact.txt`: commit
+messages there cite nothing and diff headers name `a/` and `b/` paths no session can
+fetch, so q4 fails that file whatever the closure says.
 
 **Delivery is part of traceability** (g-375-107). Evidence that never reached the
 target branch does not meet an outcome, and a closed goal is not a landed one
@@ -160,6 +182,16 @@ git -C <repo> cherry origin/main <sha> <sha>^
     close's own commit can be local-only for a few minutes (`guard-3541`).
   - **REJECT** when nothing will: `ABSENT`, or `STRANDED_LOCAL_ONLY` on a branch
     no push phase sends. The goal then has a step of its own left undone.
+  - A row `close-review-queue.py list` marks **STRANDED** is a worker closure whose
+    sha has waited 36 h or more for origin/main to contain it (g-306-558). `list`
+    holds a worker closure back until then, because 96 measured closures waited a
+    median 5.2 h and 1 reached 36 h, so a STRANDED row is the exception. A carrier ref
+    left unconsumed that long is no longer "something will still carry it", so do not
+    write APPROVE_WITH_NOTES on that ground alone. Name the ref and the wait in the
+    `--finding`, and make sure someone owns the carrier: a REJECT's `Fix:` goal does,
+    and for an approval file an `Investigate:` goal with origin_signal
+    `investigate:stranded-close:<goal-id>`, querying that signal first so a re-run
+    files nothing twice.
 - `INCONCLUSIVE` is not a pass. Re-run it, and if it persists record "delivery
   unverified" as a finding.
 - A product-repo goal runs the same lines in its own clone, with its sanctioned
@@ -349,6 +381,8 @@ skip this skill entirely and pay nothing.
 STORAGE_BACKEND=local py -3 -m pytest core/scripts/tests/test_close_review_verdict_producer.py -q
 # The delivery probe block in check 1, run line by line on a fixture origin:
 py -3 -m pytest core/scripts/tests/test_fresh_eyes_close_delivery.py -q
+# close-review-inputs.py, which builds the check 1 and check 2 inputs:
+py -3 -m pytest core/scripts/tests/test_close_review_inputs.py -q
 ```
 
 ## Chaining

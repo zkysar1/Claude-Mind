@@ -320,10 +320,10 @@ def redact(
     #     otherwise chew the scheme and leave the password standing).
     for pat in _SECRET_PATTERNS:
         out = pat.sub("[redacted]", out)
-    # 2. Explicit workspace paths (longest first), then generic absolute paths.
+    # 2. Explicit workspace paths (longest first), then generic paths. A prose slash stays.
     for wp in sorted((p for p in workspace_paths if p), key=len, reverse=True):
         out = out.replace(wp, "[path]")
-    out = _ABS_PATH_RE.sub("[path]", out)
+    out = _ABS_PATH_RE.sub(_path_or_prose, out)
     # 3. Agent names → "the agent" (word-boundary, case-insensitive, longest first).
     for name in sorted({n for n in agent_names if n}, key=len, reverse=True):
         out = re.sub(rf"\b{re.escape(name)}\b", "the agent", out, flags=re.IGNORECASE)
@@ -339,13 +339,38 @@ def redact(
     return out.strip()
 
 
-#: Absolute paths: POSIX (``/home/…``) and Windows (``C:\…`` / ``C:/…``). NOT only rooted
-#: paths, whatever an earlier note here said: the ``/`` branch has no left boundary, so
-#: ordinary prose matches too — "and/or" becomes "and[path]" and "9/30/2026" becomes
-#: "9[path]" (measured 2026-09-30, g-335-1726: 897 of 1,162 editable-size wiki bodies on
-#: one box). It over-redacts, which is the safe direction here, and it is left as it is:
-#: narrowing it changes what every bundle publishes and is its own change.
+#: Paths: POSIX (``/home/…``), Windows (``C:\…`` / ``C:/…``) and whatever else the ``/``
+#: branch reaches, because it has no left boundary: a relative path, a ``~`` or ``$VAR``
+#: path and the path of a URL are redacted too. That reach is kept on purpose. Redaction is
+#: a privacy control and each of those can name a host or a home directory
+#: ("~deploy/.ssh"), so the one thing taken back out is what is not a path at all:
+#: prose, which :func:`_path_or_prose` keeps whole.
 _ABS_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|/)[\w.\-\\/]{2,}")
+
+#: A whole token that is prose, not a path: two plain words (letters only) joined by one slash
+#: ("and/or", "dev/main", "TCP/IP") or a run of numbers ("9/30/2026", "3/4"). The loose pattern
+#: above used to turn these into "and[path]" and "9[path]" (measured 2026-09-30, g-335-1726: 897
+#: of 1,162 editable-size wiki bodies on one box), and a row so altered cannot be corrected by
+#: its member (:func:`is_unredacted`). A two-word directory ("core/scripts") has the same shape as
+#: "dev/main", so it is kept whole too. A digit, hyphen or underscore is what an identifier
+#: carries ("user/fleet-agent", "node/web-02"), so those stay redacted, as does a third segment, a
+#: dot, or a ``$``, ``~`` or ``@`` in front.
+_PROSE_SLASH_RE = re.compile(r"\d+(?:/\d+)+|[A-Za-z]+/[A-Za-z]+")
+
+
+def _path_or_prose(m: re.Match[str]) -> str:
+    """Replacement for one :data:`_ABS_PATH_RE` match: the match itself when its slash sits
+    in a prose token (:data:`_PROSE_SLASH_RE`), ``[path]`` otherwise.
+
+    The match starts at the slash, so the token's head is read back from the string, through
+    ``$``, ``~`` and ``@`` as well: glued to one of them, a token is a path. A drive-letter
+    match carries a ``:`` and so is never prose. The path class includes ``.``, so a
+    sentence's closing period rides in the match and is not part of the token.
+    """
+    text, head = m.string, m.start()
+    while head and (text[head - 1].isalnum() or text[head - 1] in "_.-\\/$~@"):
+        head -= 1
+    return m.group(0) if _PROSE_SLASH_RE.fullmatch(text[head : m.end()].rstrip(".")) else "[path]"
 
 
 def is_unredacted(text: str, redactor: Redactor) -> bool:

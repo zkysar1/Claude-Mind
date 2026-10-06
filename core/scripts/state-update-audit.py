@@ -111,8 +111,10 @@ def _close_key(goal_id):
 
     WHY NOT THE ITERATION CHECKPOINT (the original source, g-115-4542, replaced
     by g-115-5549): it named `selected_at` from
-    `agents/<agent>/session/iteration-checkpoint.json` — a single box-local slot
-    written at claim time. Any interleaving between claim and close leaves it
+    `agents/<agent>/session/iteration-checkpoint.json` [UNVERIFIED -- ephemeral
+    box-local slot, absent on this box at verify time; the paragraph's
+    measurements are g-115-5549's own (2026-08-09, cc-04), not re-run here] —
+    a single box-local slot written at claim time. Any interleaving between claim and close leaves it
     naming an EARLIER goal, the `cp.get("goal_id") != goal_id` guard fires, and
     the key is silently "". Measured 2026-08-09 on cc-04: of the closes eligible
     after that fix landed, NONE carried a key — including the fix's own close 11
@@ -610,12 +612,40 @@ def cmd_temporal_credit(args):
 
     gamma = 0.9
     propagated = []
+    # : enabled_by entries are NOT shape-validated on write — both
+    # writers pass the field through as given, and the fleet corpus carries
+    # non-dict entries (ZDS measured 41 records of bare id strings such as
+    # ["rb-1556", "guard-1268"]; which writer produced them is NOT measured).
+    # A non-dict entry raised AttributeError on .get, and that raise aborted
+    # cmd_run_all BEFORE relative-advantage ran — the  class (one bad
+    # value cost three audits) one step later. Handle the shapes explicitly the
+    # way _numeric_range handled failed_values: skip the unprocessable entry
+    # and flag the count, never raise, never coerce (coercing a bare id string
+    # into an enabler would invent a credit edge the data does not have).
+    skipped_malformed = 0
+    flags = []
     for enabler in enabled_by:
+        if not isinstance(enabler, dict):
+            skipped_malformed += 1
+            continue
+        # A dict without a usable id cannot be resolved to a record to credit;
+        # the old code passed None to experience-read.sh --id for it.
+        enabler_id = enabler.get("experience_id")
+        if not enabler_id:
+            skipped_malformed += 1
+            continue
+        # temporal_distance defaults to 0 (adjacent goal, full discount base).
+        # A present-but-non-numeric distance is the same unprocessable shape:
+        # gamma ** <str> raises TypeError in this same loop, so exclude it
+        # rather than coerce — the _numeric_range precedent (bool excluded as a
+        # coercion artefact) applies to a discount exponent just as to a range.
         dist = enabler.get("temporal_distance", 0)
+        if isinstance(dist, bool) or not isinstance(dist, (int, float)):
+            skipped_malformed += 1
+            continue
         credit = args.learning_value * (gamma ** dist)
         if credit <= 0.01:
             continue
-        enabler_id = enabler.get("experience_id")
         enabler_read, _e, rc = _run(["experience-read.sh", "--id", enabler_id])
         current = 0.0
         if rc == 0 and enabler_read.strip():
@@ -636,10 +666,16 @@ def cmd_temporal_credit(args):
                 "distance": dist,
             })
 
+    if skipped_malformed:
+        # Informational, NOT a hard fail: the credit cascade COMPLETED — the
+        # unprocessable entries were skipped, exactly the  remediation
+        # (flag the count instead of raising). HARD_FAIL_FLAGS is a denylist, so
+        # this never drives a non-zero exit and never blocks relative-advantage.
+        flags.append(f"malformed_enabled_by_entries:{skipped_malformed}")
     return {
         "subcommand": "temporal-credit",
         "summary": f"temporal-credit: propagated to {len(propagated)} enabler(s)",
-        "flags": [],
+        "flags": flags,
         "propagated": propagated,
     }
 

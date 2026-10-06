@@ -1357,6 +1357,31 @@ def do_verify_completeness(dest_root: Path, manifest: dict, source_root: Path) -
     }
 
 
+def _any_can_ship(dest_root: Path, found: list) -> bool:
+    """Could any of these on-disk paths (relative to `dest_root`) enter a commit there?
+
+    A plant at a git destination ships by `git add -A` + commit, so a path that is
+    gitignored and untracked CANNOT ship whatever the filesystem says (g-374-89).
+    False -- every match is gitignored and none is tracked.
+    True  -- a match is tracked, or untracked and NOT ignored (the next add stages it).
+    True  -- also when the destination is not a git work tree or git cannot answer
+             (dubious ownership, a broken gitdir pointer, a timeout): an unknown is
+             never read as "cannot ship", so every failure keeps the filesystem verdict.
+    """
+    if not (dest_root / ".git").exists():
+        return True
+    base = ["git", "--literal-pathspecs", "-C", str(dest_root), "ls-files", "-z"]
+    for rel in found:
+        for extra in ([], ["--others", "--exclude-standard"]):
+            try:
+                out = subprocess.run(base + extra + ["--", rel], capture_output=True, timeout=60)
+            except Exception:
+                return True
+            if out.returncode != 0 or out.stdout.strip(b"\0"):
+                return True
+    return False
+
+
 def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
     """Verify that exclude_always paths did NOT land at destination.
 
@@ -1374,6 +1399,12 @@ def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
     are normalized before matching against the special-case sets so `/world/`,
     `/agents/`, `/meta/`, `/.git/` route to the same preservation logic as
     their legacy bare-name forms.
+
+    At a git destination a present path that is gitignored and untracked cannot
+    reach a commit, so it is reported under `ignored` and is NOT a leak; a tracked
+    or untracked-not-ignored path stays one, as does any path git cannot answer
+    for (`_any_can_ship`). Runtime state the plant's own commit hook creates at the
+    destination is the case this exists for (g-374-89).
     """
     PRESERVED_AT_DEST = {
         # Directory basenames (matched against target.name)
@@ -1385,6 +1416,7 @@ def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
         PRESERVED_PATHS.add(_dlf)
     leaked = []
     info = []
+    ignored = []
     for p in manifest.get("exclude_always", []):
         # Normalize leading `/` (anchored gitignore-style) — semantically
         # equivalent at top level, which is the only place anchored patterns
@@ -1403,37 +1435,42 @@ def do_verify_leak_check(dest_root: Path, manifest: dict) -> dict:
                 if target.name in PRESERVED_AT_DEST:
                     info.append(p)
                     continue
-                leaked.append(p)
+                (leaked if _any_can_ship(dest_root, [inner]) else ignored).append(p)
         else:
             if "*" in norm or "?" in norm:
                 # Top-level glob only (don't rglob — too aggressive)
-                if list(dest_root.glob(norm)):
-                    leaked.append(p)
+                found = [m.relative_to(dest_root).as_posix() for m in dest_root.glob(norm)]
+                if found:
+                    (leaked if _any_can_ship(dest_root, found) else ignored).append(p)
             else:
                 if (dest_root / norm).exists():
-                    leaked.append(p)
-    return {"leaked": leaked, "info": info, "pass": len(leaked) == 0}
+                    (leaked if _any_can_ship(dest_root, [norm]) else ignored).append(p)
+    return {"leaked": leaked, "info": info, "ignored": ignored, "pass": len(leaked) == 0}
 
 
 def do_verify_cruft(dest_root: Path, manifest: dict) -> dict:
-    """Verify that cruft_patterns are NOT present at destination."""
+    """Verify that cruft_patterns are NOT present at destination.
+
+    Same scoping as `do_verify_leak_check`: at a git destination, cruft that is
+    gitignored and untracked cannot ship and is reported under `ignored`, not
+    `present` (g-374-89).
+    """
     present = []
+    ignored = []
     for p in manifest.get("cruft_patterns", []):
         if p.endswith("/"):
             inner = p.rstrip("/")
             if (dest_root / inner).exists():
-                present.append(p)
+                (present if _any_can_ship(dest_root, [inner]) else ignored).append(p)
         elif "*" in p or "?" in p:
-            if p.startswith("**/"):
-                if list(dest_root.rglob(p[3:])):
-                    present.append(p)
-            else:
-                if list(dest_root.glob(p)):
-                    present.append(p)
+            matches = dest_root.rglob(p[3:]) if p.startswith("**/") else dest_root.glob(p)
+            found = [m.relative_to(dest_root).as_posix() for m in matches]
+            if found:
+                (present if _any_can_ship(dest_root, found) else ignored).append(p)
         else:
             if (dest_root / p).exists():
-                present.append(p)
-    return {"present": present, "pass": len(present) == 0}
+                (present if _any_can_ship(dest_root, [p]) else ignored).append(p)
+    return {"present": present, "ignored": ignored, "pass": len(present) == 0}
 
 
 def do_verify_integrity(dest_root: Path, manifest: dict, source_root: Path) -> dict:

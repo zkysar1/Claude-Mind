@@ -397,3 +397,65 @@ def test_three_tuple_runners_still_work():
 
     assert rep["blind"], "unparseable output must still be BLIND"
     assert rep["completeness"] == "partial"
+
+
+# ──  outcome 3: an uncovered-gate skip is a finding, not silence ──
+
+def _run_with_payloads(payloads):
+    """Drive the battery with a canned JSON payload per lane script (keyed by the
+    script name); every other lane reports {} and the meter always says run."""
+    def runner(argv, timeout):
+        if argv[0].endswith("budget-meter.sh"):
+            return 0, "run", None
+        return 0, json.dumps(payloads.get(argv[0], {})), None
+
+    rep = {}
+    mb._emit = lambda r, j: rep.update(r)
+    mb.run(as_json=True, apply=False, lane_runner=runner)
+    return rep
+
+
+def _defer_lane_findings(rep):
+    return [f for f in rep["findings"] if f["name"] == "precondition-defer-recheck"]
+
+
+def test_uncovered_gate_skips_are_a_finding_with_count_and_goal_ids():
+    """Goals whose predicates ALL pass while the defer text names an untested gate
+    were counted in the sweep's result and printed nowhere, so the freeze (up to
+    the 120 h fail-open) was silent. The count AND the goal ids must reach the
+    report."""
+    rep = _run_with_payloads({"precondition-defer-recheck.sh": {
+        "cleared": 0, "would_clear": [], "skipped_uncovered_gate": 2,
+        "uncovered_gate_goals": ["g-374-162", "g-115-9"],
+    }})
+    found = _defer_lane_findings(rep)
+    assert len(found) == 1
+    assert found[0]["detail"] == ["uncovered_gate_goals=2: g-374-162, g-115-9"]
+
+
+def test_no_uncovered_gate_skip_is_no_finding():
+    """NEGATIVE control: an empty list must leave the lane clean, otherwise the
+    finding above is noise that fires every iteration."""
+    rep = _run_with_payloads({"precondition-defer-recheck.sh": {
+        "cleared": 0, "would_clear": [], "skipped_uncovered_gate": 0,
+        "uncovered_gate_goals": [],
+    }})
+    assert _defer_lane_findings(rep) == []
+
+
+def test_a_long_uncovered_gate_list_is_capped_but_still_counted():
+    ids = ["g-1-%d" % n for n in range(1, 13)]
+    rep = _run_with_payloads({"precondition-defer-recheck.sh": {
+        "cleared": 0, "would_clear": [], "uncovered_gate_goals": ids,
+    }})
+    found = _defer_lane_findings(rep)
+    assert len(found) == 1
+    assert found[0]["detail"] == [
+        "uncovered_gate_goals=12: " + ", ".join(ids[:8]) + " (+4 more)"]
+
+
+def test_the_ids_kind_is_registered_on_one_lane_only():
+    """`ids` is this battery's own finds kind; pin where it is used so a second
+    lane adopting it (or this one losing it) is a deliberate edit."""
+    users = [l["name"] for l in mb.LANES if l["finds"].get("ids")]
+    assert users == ["precondition-defer-recheck"]

@@ -12,7 +12,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Ensure stdout/stderr handle unicode on all platforms (Windows cp1252 fix)
 if hasattr(sys.stdout, "reconfigure"):
@@ -27,6 +27,8 @@ except ImportError:
     sys.exit(1)
 
 from _paths import META_DIR
+from _dt import parse_naive_iso
+from _goal_census import TERMINAL_STATUSES
 
 # : never hardcode the escalation aspiration —  is the UPSTREAM
 # deployment's queue and does not exist elsewhere, so a literal files nothing.
@@ -49,6 +51,17 @@ STRATEGY_PATH = META_DIR / "skill-quality-strategy.yaml"
 ROLLING_WINDOW = 20  # Keep last 20 evaluations per skill
 GRADE_MAP = {"good": 1.0, "average": 0.5, "poor": 0.0}
 DIMENSIONS = ["safety", "completeness", "executability", "maintainability", "cost_awareness"]
+
+# Reconsolidation bounds (). A skill is a candidate only when its failures span
+# at least MIN_DISTINCT_FAILING_GOALS distinct goals: a window confound charges ONE goal's
+# window to every skill invoked in it, so N failures can sit behind a single goal.
+# `--apply` files at most DEFAULT_MAX_FILE per run (cf. recurring-starvation-check
+# --max-file) and skips a skill whose reconsolidation goal CLOSED within
+# CLOSED_DEDUP_WINDOW_DAYS (rb-3523: the same finding inside the window is noise, after
+# it a legitimate regression -- dedup against closed-forever would blind the filer).
+MIN_DISTINCT_FAILING_GOALS = 2
+DEFAULT_MAX_FILE = 1
+CLOSED_DEDUP_WINDOW_DAYS = 14
 
 DEFAULT_WEIGHTS = {
     "safety": 0.30,
@@ -431,11 +444,15 @@ def _load_skill_attribution():
     return mod
 
 
-def build_reconsolidation_candidates(join, quality_skills, min_failures, min_fail_rate):
+def build_reconsolidation_candidates(join, quality_skills, min_failures, min_fail_rate,
+                                     min_distinct_goals=MIN_DISTINCT_FAILING_GOALS):
     """Pure: from an invocation->outcome join + quality data, build review candidates.
 
-    A skill with failing invocations at/above BOTH thresholds is a
-    reconsolidation-review candidate. reconsolidation_priority weights skills
+    A skill with failing invocations at/above BOTH thresholds, whose failures also span
+    at least `min_distinct_goals` DISTINCT goals, is a reconsolidation-review candidate;
+    every candidate reports its distinct count (g-115-4215, rb-7654: count distinct
+    events -- one goal's window charged to N invocations is ONE event).
+    reconsolidation_priority weights skills
     that are BOTH failing invocations AND low subjective quality highest
     (failure_rate * (1 - quality_overall); a skill with no quality data is
     treated as neutral 0.5). Sorted worst-first. Extracted for unit testing.
@@ -447,7 +464,13 @@ def build_reconsolidation_candidates(join, quality_skills, min_failures, min_fai
         fail_rate = (fails / classified) if classified else 0.0
         if fails < min_failures or fail_rate < min_fail_rate:
             continue
-        recent = [f["goal_id"] for f in join.get("failing", []) if f["skill"] == skill][-8:]
+        # Distinct goals in first-failure order: len() is the gate, the tail is the
+        # evidence a reviewer reads (an evidence list collapsing to one id is the tell).
+        goals = list(dict.fromkeys(
+            f["goal_id"] for f in join.get("failing", []) if f["skill"] == skill))
+        if len(goals) < min_distinct_goals:
+            continue
+        recent = goals[-8:]
         q_overall = quality_skills.get(skill, {}).get("aggregate", {}).get("overall")
         priority = round(fail_rate * (1.0 - (q_overall if q_overall is not None else 0.5)), 4)
         candidates.append({
@@ -456,6 +479,7 @@ def build_reconsolidation_candidates(join, quality_skills, min_failures, min_fai
             "classified_invocations": classified,
             "failure_rate": round(fail_rate, 4),
             "success_rate": counts.get("success_rate"),
+            "distinct_failing_goals": len(goals),
             "recent_failing_goals": recent,
             "current_quality_overall": q_overall,
             "reconsolidation_priority": priority,
@@ -469,34 +493,41 @@ def _recon_slug(s):
     return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-")[:48]
 
 
-def _open_origin_signals():
-    """Set of origin_signals across all OPEN (pending/in-progress) goals in the
-    world+agent queues — the exact-match dedup base for `reconsolidation --apply`
-    (a filed candidate carries origin_signal investigate:skill-reconsolidation-<slug>,
-    so the next cadence's read finds it and suppresses a re-file; g-115-2196 exact-
-    key dedup, NOT a title substring scan). Fail-open: a per-source read error
-    skips that source (a missed dedup files a duplicate the daemon's own
-    Duplication gate then catches — better than aborting the advisory scan).
-    Lazy `import _rt` keeps the daemon client off the module-level import path
-    of the read/report/score subcommands (no import-cycle with the daemon endpoint)."""
-    import _rt  # noqa: E402 (lazy — only the --apply path needs the daemon client)
-    sigs = set()
-    for source in ("world", "agent"):
-        try:
-            out = _rt.aspirations_read(source=source, active=True)
-        except Exception as e:  # noqa: BLE001 — fail-open per docstring
-            print(f"[skill-evaluate reconsolidation] {source} read failed: {e}", file=sys.stderr)
+def open_origin_signals(goals):
+    """Set of origin_signals across all OPEN (pending/in-progress) goals in `goals`
+    (skill-attribution read_goals records) — the exact-match dedup base for
+    `reconsolidation --apply` (a filed candidate carries origin_signal
+    investigate:skill-reconsolidation-<slug>, so the next cadence finds it and
+    suppresses a re-file; g-115-2196 exact-key dedup, NOT a title substring scan).
+    Pure: cmd_reconsolidation reads the goal store ONCE and feeds the join's status
+    oracle and both dedup halves from that single read."""
+    return {g["origin_signal"] for g in goals
+            if g.get("status") in ("pending", "in-progress") and g.get("origin_signal")}
+
+
+def recent_closed_signals(goals, window_days=CLOSED_DEDUP_WINDOW_DAYS, now=None):
+    """{origin_signal: {goal_id, status, closed_at}} for goals CLOSED (terminal status)
+    within the last `window_days` — the time-windowed half of the dedup (rb-3523): the
+    same finding inside the window is noise, after it a legitimate regression, so
+    dedup against closed-forever would blind the filer. The newest closure per signal
+    wins. A goal with no parseable closed_at cannot be windowed and is skipped (the
+    finding fires: the regression-safe direction, as in silent-gap-audit). EVICTED ids
+    all land here: the census keeps a bare id with no signal and no timestamp, so a
+    closure older than aspirations_eviction.age_days can be invisible to this dedup.
+    Pure (goals + now in) so it is unit-testable."""
+    cutoff = (now or datetime.now()) - timedelta(days=window_days)
+    best = {}
+    for g in goals:
+        sig = g.get("origin_signal")
+        if not sig or g.get("status") not in TERMINAL_STATUSES:
             continue
-        data = _rt.tolerant_decode_aggregate(f"skill-evaluate reconsolidation: {source}", out)
-        if data is None:
+        closed = parse_naive_iso(g.get("completed_at"))
+        if closed is None or closed < cutoff:
             continue
-        for asp in (data.get("aspirations") if isinstance(data, dict) else data) or []:
-            for g in asp.get("goals", []) or []:
-                if g.get("status") in ("pending", "in-progress"):
-                    sig = g.get("origin_signal")
-                    if sig:
-                        sigs.add(sig)
-    return sigs
+        if sig not in best or closed > best[sig][0]:
+            best[sig] = (closed, {"goal_id": g["id"], "status": g["status"],
+                                  "closed_at": g["completed_at"]})
+    return {sig: rec for sig, (_closed, rec) in best.items()}
 
 
 def file_reconsolidation_investigate(candidate, target_asp=ESCALATION_ASP):
@@ -506,7 +537,7 @@ def file_reconsolidation_investigate(candidate, target_asp=ESCALATION_ASP):
     skill's pseudocode against its failures, NEVER to auto-modify it (advisory-refine
     constraint, g-355-07). Best-effort, fail-open — a filing error is logged and
     returns None without aborting the scan. Returns the new goal id or None."""
-    import _rt  # noqa: E402 (lazy — see _open_origin_signals)
+    import _rt  # noqa: E402 (lazy — only the --apply path needs the daemon client)
     skill = candidate["skill"]
     sig = f"investigate:skill-reconsolidation-{_recon_slug(skill)}"
     record = {
@@ -517,8 +548,9 @@ def file_reconsolidation_investigate(candidate, target_asp=ESCALATION_ASP):
             f"{candidate.get('classified_invocations')} classified invocations "
             f"(failure_rate {candidate.get('failure_rate')}, current_quality_overall "
             f"{candidate.get('current_quality_overall')}, reconsolidation_priority "
-            f"{candidate.get('reconsolidation_priority')}). Recent failing goals "
-            f"(evidence): {candidate.get('recent_failing_goals', [])}. ADVISORY review "
+            f"{candidate.get('reconsolidation_priority')}) across "
+            f"{candidate.get('distinct_failing_goals')} distinct failing goals. Recent "
+            f"failing goals (evidence): {candidate.get('recent_failing_goals', [])}. ADVISORY review "
             "of the skill's SKILL.md against these failures — identify the recurring "
             "failure mode and refine the pseudocode. Do NOT auto-modify the skill "
             "without human/verification review (advisory-refine constraint, g-355-07)."
@@ -560,40 +592,74 @@ def cmd_reconsolidation(args):
     sa = _load_skill_attribution()
     agents = [args.agent] if args.agent else sa.find_agent_dirs()
     since_dt = sa.parse_since(args.since) if args.since else None
-    join = sa.compute_join(agents, since_dt=since_dt)
+    # ONE read of the goal store feeds the join's status oracle (a window with no local
+    # success signal is not a failure when the store says the goal completed) AND both
+    # dedup halves below ().
+    goals, goal_errors = sa.read_goals()
+    for err in goal_errors:
+        print(f"[skill-evaluate reconsolidation] goal store read failed: {err}", file=sys.stderr)
+    statuses = sa.goal_status_map(goals)
+    join = sa.compute_join(agents, since_dt=since_dt, goal_status=statuses)
 
     quality_skills = read_yaml(QUALITY_PATH).get("skills", {})
+    min_distinct = getattr(args, "min_distinct_goals", MIN_DISTINCT_FAILING_GOALS)
     candidates = build_reconsolidation_candidates(
-        join, quality_skills, args.min_failures, args.min_fail_rate)
+        join, quality_skills, args.min_failures, args.min_fail_rate, min_distinct)
 
     result = {
         "reconsolidation_candidates": candidates,
         "candidate_count": len(candidates),
-        "threshold": {"min_failures": args.min_failures, "min_fail_rate": args.min_fail_rate},
+        "threshold": {"min_failures": args.min_failures, "min_fail_rate": args.min_fail_rate,
+                      "min_distinct_goals": min_distinct},
         "agents_scanned": agents,
         "window": args.since or "all_time",
+        # Controls, emitted on EVERY run (0 candidates included) so a quiet result is
+        # distinguishable from a blind one (guard-3992, guard-3563). classifiable_ceiling
+        # is NOT an upper bound on classified_invocations (zeta 2026-08-20: 6574 against a
+        # stated 2023), so read the two figures side by side, never one as the other's cap.
+        "diary_coverage": join.get("diary_coverage"),
+        "goal_status_check": {**join.get("goal_status_check", {}), "read_errors": goal_errors},
     }
 
-    # --apply: route each candidate into an ADVISORY Investigate goal, deduped
-    # against open goals by exact origin_signal ( — exact key, never a
-    # title substring). Mirrors silent-gap-audit's self-filing so the cadence
-    # surface (strategic-scan S4.5) actually turns failing-invocation skills into
+    # --apply: route candidates into ADVISORY Investigate goals, deduped against open
+    # goals by exact origin_signal ( — exact key, never a title substring) AND
+    # against goals CLOSED within CLOSED_DEDUP_WINDOW_DAYS (rb-3523), at most --max-file
+    # per run (). Mirrors silent-gap-audit's self-filing so the cadence
+    # surface (strategic-scan S4.6) actually turns failing-invocation skills into
     # reviewable work instead of a report nobody reads. Advisory only: the filed
     # goal REVIEWS the skill against its failures, never auto-modifies it ().
     if getattr(args, "apply", False):
         target_asp = getattr(args, "target_asp", ESCALATION_ASP)
-        open_sigs = _open_origin_signals()
-        filed, suppressed_dedup = [], []
-        for c in candidates:
-            sig = f"investigate:skill-reconsolidation-{_recon_slug(c['skill'])}"
-            if sig in open_sigs:
-                suppressed_dedup.append({"skill": c["skill"], "origin_signal": sig})
-                continue
-            gid = file_reconsolidation_investigate(c, target_asp=target_asp)
-            if gid:
-                filed.append({"skill": c["skill"], "goal_id": gid, "origin_signal": sig})
+        max_file = getattr(args, "max_file", DEFAULT_MAX_FILE)
+        filed, suppressed_dedup, suppressed_closed, deferred_by_cap = [], [], [], []
+        if goal_errors or not statuses:
+            # Fail visibly, file nothing (guard-3563): a join scored without the store
+            # files exactly the false failures the status oracle exists to clear.
+            result["apply_refused"] = (
+                "goal store unreadable: " + "; ".join(goal_errors) if goal_errors
+                else "goal store returned no goals")
+        else:
+            open_sigs = open_origin_signals(goals)
+            closed_sigs = recent_closed_signals(goals)
+            for c in candidates:
+                sig = f"investigate:skill-reconsolidation-{_recon_slug(c['skill'])}"
+                if sig in open_sigs:
+                    suppressed_dedup.append({"skill": c["skill"], "origin_signal": sig})
+                elif sig in closed_sigs:
+                    suppressed_closed.append(
+                        {"skill": c["skill"], "origin_signal": sig, **closed_sigs[sig]})
+                elif len(filed) >= max_file:
+                    deferred_by_cap.append({"skill": c["skill"], "origin_signal": sig})
+                else:
+                    gid = file_reconsolidation_investigate(c, target_asp=target_asp)
+                    if gid:
+                        filed.append({"skill": c["skill"], "goal_id": gid, "origin_signal": sig})
         result["filed"] = filed
         result["suppressed_dedup"] = suppressed_dedup
+        result["suppressed_closed_recent"] = suppressed_closed
+        result["deferred_by_cap"] = deferred_by_cap
+        result["max_file"] = max_file
+        result["closed_window_days"] = CLOSED_DEDUP_WINDOW_DAYS
         result["target_asp"] = target_asp
 
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -635,9 +701,16 @@ def main():
                          help="Minimum failing invocations to flag a skill (default 2)")
     p_recon.add_argument("--min-fail-rate", type=float, default=0.20,
                          help="Minimum failure rate to flag a skill (default 0.20)")
+    p_recon.add_argument("--min-distinct-goals", type=int, default=MIN_DISTINCT_FAILING_GOALS,
+                         help="Minimum DISTINCT failing goals behind a skill's failures "
+                              f"(default {MIN_DISTINCT_FAILING_GOALS}; g-115-4215)")
+    p_recon.add_argument("--max-file", type=int, default=DEFAULT_MAX_FILE,
+                         help="With --apply, file at most this many candidates per run "
+                              f"(default {DEFAULT_MAX_FILE}; the rest are reported as deferred_by_cap)")
     p_recon.add_argument("--apply", action="store_true",
                          help="File each candidate as an advisory Investigate goal "
-                              "(exact-origin_signal dedup; advisory-refine only, g-355-07)")
+                              "(exact-origin_signal dedup, closed-within-window dedup; "
+                              "advisory-refine only, g-355-07)")
     p_recon.add_argument("--target-asp", default=ESCALATION_ASP,
                          help="Aspiration to file reconsolidation Investigate goals into "
                               f"(default {ESCALATION_ASP}, resolved per deployment)")

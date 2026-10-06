@@ -29,8 +29,10 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -48,27 +50,90 @@ BIND_FAILED = (
 
 
 def _stub_launcher(tmp_path: Path, counter: Path | None = None) -> Path:
-    """A PATH dir whose python3 refuses `-m mind_api.src` and passes the rest.
+    """A PATH dir whose python3 AND py refuse `-m mind_api.src`, pass the rest.
 
-    When `counter` is given the stub appends one line per refused daemon spawn,
-    so a caller can count how many times the wrapper actually tried to start the
-    daemon — that count is how the single-retry guarantee is measured.
+    BOTH names matter (g-115-11267, measured 2026-09-28 on DESKTOP-O91DLK2):
+    on Windows mind-api-start.sh's `_python_launcher` picks `py -3` (the MS
+    Store python3 stub makes POSIX python3 unusable there — g-115-733), so a
+    stub that only covered `python3` was silently bypassed and a REAL daemon
+    started in the test's tmp RUNTIME_DIR. The bypass is what turned these red
+    tests into live-daemon leaks that synced the real own-cloud world/meta
+    mirrors (the 678-merge incident, 2026-09-29). The `py` entry is created
+    only where a real `py` launcher exists to shadow; the python3 entry is
+    always created because POSIX wrappers always probe and spawn python3.
+
+    When `counter` is given the stub appends one line per REFUSED daemon spawn
+    (never on pass-through calls like `py -3 --version`), so a caller can (a)
+    count how many times the wrapper actually tried to start the daemon — the
+    single-retry guarantee is measured that way — and (b) prove the STUBBED
+    launcher was the one invoked: if the real launcher slipped past, the
+    spawn would not be tallied and the refusal assertions below fail loudly
+    instead of a real daemon starting.
     """
-    real = shutil.which("python3") or sys.executable
     binv = tmp_path / "stub-bin"
     binv.mkdir(parents=True, exist_ok=True)
-    stub = binv / "python3"
-    tally = f'echo x >> "{counter}"; ' if counter is not None else ""
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        'for a in "$@"; do\n'
-        f'  if [ "$a" = "mind_api.src" ]; then {tally}exit 1; fi\n'
-        "done\n"
-        f'exec "{real}" "$@"\n',
-        encoding="utf-8",
-    )
-    stub.chmod(0o755)
+
+    def _write_stub(name: str, real: str) -> None:
+        stub = binv / name
+        tally = f'echo x >> "{counter}"; ' if counter is not None else ""
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            'for a in "$@"; do\n'
+            f'  if [ "$a" = "mind_api.src" ]; then {tally}exit 1; fi\n'
+            "done\n"
+            f'exec "{real}" "$@"\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+    _write_stub("python3", shutil.which("python3") or sys.executable)
+    py_real = shutil.which("py")
+    if py_real:
+        _write_stub("py", py_real)
     return binv
+
+
+def _reap_runtime_daemon(rt: Path) -> None:
+    """Reap any daemon this test's private RUNTIME_DIR published ().
+
+    A bypassed real daemon is NOT a child of the pytest process — the wrapper
+    disowns it — so os.waitpid cannot be used; kill by the PIDs the daemon
+    published, the same PID-scoped shape the framework's own kill path uses
+    (daemon.parent.pid + daemon.pid, never a box-wide sweep). No-op when the
+    stub did its job and nothing was published.
+    """
+    def _read(name: str) -> int | None:
+        try:
+            return int((rt / name).read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return None
+
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    pids = [p for p in (_read("daemon.parent.pid"), _read("daemon.pid")) if p]
+    if not pids:
+        return
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and any(_alive(p) for p in pids):
+        time.sleep(0.1)
+    for p in pids:
+        if _alive(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def _run_start(tmp_path: Path, daemon_log, extra_env=None, counter: Path | None = None):
@@ -81,9 +146,23 @@ def _run_start(tmp_path: Path, daemon_log, extra_env=None, counter: Path | None 
     assert not (rt / "daemon.pid").exists()
     assert not (rt / "daemon.port").exists()
 
+    # Class-level guard (): under pytest the scrub strips
+    # STORAGE_BACKEND (), so a daemon the stub FAILED to stop would
+    # self-resolve the box's REAL backend — and RUNTIME_DIR is not scrubbed,
+    # so its own-cloud sync ran against the REAL world/meta mirrors (the
+    # 678-merge incident). WORLD_PATH/META_PATH are the scrub's documented
+    # sanctioned keeps (spawn-shell path channel) and win over .env.local
+    # (setdefault), so even a bypassed daemon can only reach throwaway roots.
+    world_dir = tmp_path / "world"
+    meta_dir = tmp_path / "meta"
+    world_dir.mkdir()
+    meta_dir.mkdir()
+
     env = dict(os.environ)
     env["RUNTIME_DIR"] = str(rt)
     env["STORAGE_BACKEND"] = "local"          # guard-955
+    env["WORLD_PATH"] = str(world_dir)        # 
+    env["META_PATH"] = str(meta_dir)          # 
     env["PATH"] = f"{_stub_launcher(tmp_path, counter)}{os.pathsep}" + env.get("PATH", "")
     # Never inherit an opt-in from the box running the suite.
     env.pop("MIND_API_AUTO_REAP", None)
@@ -95,6 +174,23 @@ def _run_start(tmp_path: Path, daemon_log, extra_env=None, counter: Path | None 
         cwd=str(PROJECT_ROOT), env=env,
         capture_output=True, text=True, timeout=180,
     )
+
+    # Reap first, THEN judge: the bypass detector below fails the test, and a
+    # failed test must not leave the leaked daemon running.
+    _reap_runtime_daemon(rt)
+
+    # Bypass detector (): the stub refuses `-m mind_api.src` under
+    # EVERY launcher name the wrapper can pick, so nothing in this runtime dir
+    # may ever publish a daemon. If it did, the real launcher slipped past the
+    # stub (the Windows `py` incident: the stub covered only python3) — fail
+    # loudly, naming the defect, instead of leaking a live daemon.
+    if (rt / "daemon.pid").exists() or (rt / "daemon.port").exists():
+        pytest.fail(
+            "a real daemon started in this test's RUNTIME_DIR — the stubbed "
+            "launcher was bypassed (g-115-11267: the wrapper spawned a "
+            "launcher the stub does not cover). daemon.pid/daemon.port "
+            f"published.\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
     return proc, rt
 
 

@@ -76,7 +76,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import socket
 import subprocess
 import sys
 from datetime import datetime
@@ -87,6 +86,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from _paths import META_DIR  # type: ignore  # noqa: E402
 from _fileops import locked_modify_yaml  # type: ignore  # noqa: E402
+from _ratchet_delta import box_name, describe, since_last_reading  # type: ignore  # noqa: E402
 from _goal_fields import GOAL_KNOWN_FIELDS, GOAL_STRAY_FIELDS  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402
 from aspirations import VALID_GOAL_STATUSES  # noqa: E402
@@ -267,13 +267,16 @@ def main():
             message = f"OK: undeclared goal-field names stable at baseline {cur}."
 
         history = entry.get("history") or []
+        # Read this box's previous reading BEFORE the new row is appended.
+        host = box_name()
+        captured["since"] = since_last_reading(history, cur, host, now_iso)
         history.append({
             "recorded_at": now_iso,
             "drift_total": cur,
             "verdict": verdict,
             "goals_scanned": current["goals_scanned"],
             "stray_occurrences": current["stray_occurrences"],
-            "hostname": os.environ.get("HOSTNAME") or socket.gethostname(),
+            "hostname": host,
         })
         baselines[KEY] = {
             "baseline": new_baseline,
@@ -303,7 +306,10 @@ def main():
         prior = entry.get("baseline")
         captured.update(verdict="dry-run", new_baseline=prior,
                         message=f"current={current['undeclared_names']} "
-                                f"prior_baseline={prior} (no write)")
+                                f"prior_baseline={prior} (no write)",
+                        since=since_last_reading(entry.get("history"),
+                                                 current["undeclared_names"],
+                                                 box_name(), now_iso))
     else:
         try:
             locked_modify_yaml(BASELINES_PATH, _modify, initial={})
@@ -330,6 +336,7 @@ def main():
         "current": current,
         "ratcheted_metric": "undeclared_names",
         "message": captured["message"],
+        "since_last_reading": captured.get("since"),
     }
 
     if args.json:
@@ -355,6 +362,8 @@ def main():
               f"{len(agent['undeclared'])} undeclared name(s)"
               + (": " + _names(agent["undeclared"]) if agent["undeclared"] else "")
               + " [reported, NOT ratcheted]")
+        if captured.get("since"):
+            print(f"  since last reading: {describe(captured['since'])}")
 
     if os.environ.get("VERIFY_LEARNING_DRIFT_HARD_GATE") == "1":
         return 1 if captured["verdict"] == "regressed" else 0

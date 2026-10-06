@@ -6,8 +6,8 @@
 #
 # Migrated for Phase B PR 4. Daemon path: rt_call /v1/experience/read.
 #
-# NOTE: --validate is NOT served by the daemon (cross-file scan). The wrapper
-# detects --validate and falls straight through to the fallback path.
+# NOTE: --validate IS served by the daemon (validate=1 -> endpoints/experience.py
+# _validate, the cross-file scan of JSONL content_path vs experience/*.md).
 set -euo pipefail
 
 _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"

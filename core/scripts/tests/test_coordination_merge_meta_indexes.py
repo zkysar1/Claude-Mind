@@ -872,6 +872,35 @@ def test_audit_baselines_history_collapses_identical_rows_and_verdict_follows_th
     assert (got["baseline"], got["last_verdict"]) == (3, "regressed")
 
 
+def test_audit_baselines_history_rows_carrying_head_and_dirty_survive_the_merge():
+    """: the unchecked-write ratchet records the git head and a dirty count inside
+    each row's `breakdown`. The history rule is a content-union with no key field, so a row is
+    kept or collapsed WHOLE: rows that differ in any breakdown field both stay, and a field that
+    rides inside a row needs no rule of its own (unlike a key stored beside `baseline`, which
+    the handler takes whole from one side). The all-digit head is the value a YAML round trip
+    could turn into a number."""
+    def row(at, n, **tree):
+        return {"recorded_at": at, "drift_total": n, "verdict": "x",
+                "breakdown": dict(unverified=n, **tree)}
+    older = row("2026-10-03T12:00:00", 446)                                    # written before the fields existed
+    mine = row("2026-10-03T14:36:55", 444, head="ab" * 20, dirty=0)
+    theirs = row("2026-10-03T16:02:11", 445, head="1234567890" * 4, dirty=2)
+    same_second = row("2026-10-03T16:02:11", 445, head="cd" * 20, dirty=0)    # another box, same second and count
+    a = _y({"m": _bl(444, mine["recorded_at"], "ratcheted", history=[older, mine])})
+    b = _y({"m": _bl(446, same_second["recorded_at"], "regressed",
+                     history=[older, theirs, same_second])})
+    for out in (cm.merge_audit_baselines(a, b), cm.merge_audit_baselines(b, a)):
+        got = _load(out)["m"]
+        assert got["baseline"] == 444, "still the MIN of the two sides"
+        assert len(got["history"]) == 4, "the shared older row collapses; every other row stays"
+        trees = {(r["recorded_at"], r["breakdown"].get("head")): r["breakdown"].get("dirty")
+                 for r in got["history"]}
+        assert trees == {("2026-10-03T12:00:00", None): None,
+                         ("2026-10-03T14:36:55", "ab" * 20): 0,
+                         ("2026-10-03T16:02:11", "1234567890" * 4): 2,
+                         ("2026-10-03T16:02:11", "cd" * 20): 0}
+
+
 def test_audit_baselines_a_key_beyond_the_merged_four_is_taken_whole_from_one_side():
     """Pins the table in `audit-baselines.md` (Merge across boxes). Only baseline, history,
     last_recorded and last_verdict have a rule; any other key rides WHOLE with the side whose

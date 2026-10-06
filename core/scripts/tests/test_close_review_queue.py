@@ -27,7 +27,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -142,7 +142,8 @@ def test_a_relaxed_role_queues_only_its_sample_and_counts_the_rest():
 
 def test_the_sample_plan_comes_from_the_gate_config_and_never_reads_as_zero(monkeypatch,
                                                                             capsys):
-    assert crq.sample_plan_from_config() == ([], 0.2)       # the shipped config
+    # the shipped config: worker relaxed to the sample on 2026-10-04 ()
+    assert crq.sample_plan_from_config() == (["worker"], 0.2)
     for bad in (0, -0.5, 1.5, "none"):
         monkeypatch.setattr(crq, "_gate_section", lambda bad=bad: {
             "review_sampled_roles": ["Worker"], "review_sample_rate": bad})
@@ -246,9 +247,13 @@ def test_requests_rank_open_first_then_tier_2_then_HIGH_then_the_oldest_request(
     assert rows[0]["tier"] == 2
 
 
-def _list(monkeypatch, capsys, closures, requests, *argv, answered=frozenset()):
+def _list(monkeypatch, capsys, closures, requests, *argv, answered=frozenset(), delivery=None):
     monkeypatch.setattr(crq, "load_closures", lambda role: closures)
     monkeypatch.setattr(crq, "load_requests", lambda: requests)
+    # The delivery probe fetches origin and reads git, so no test here runs it unless it asks
+    # (): `delivery` is the (probe, meta) pair setup_delivery would return.
+    monkeypatch.setattr(crq, "setup_delivery", lambda enabled=True, repo=None:
+                        delivery or (None, {"probe": "off", "reason": "test"}))
     for name in ("reviewed_ids", "answered_ids"):
         monkeypatch.setattr(crq, name,
                             lambda goals: {crq.goal_id_of(g) for g in goals} & set(answered))
@@ -653,8 +658,256 @@ def test_stats_print_coverage_beside_the_approve_rate_and_name_the_misses(capsys
 
 
 def test_the_roles_come_from_the_gate_config_section():
+    # No role is reviewed in full in the shipped config since worker moved to the sample
+    # (2026-10-04, ); the sample-plan test above pins where it went.
     roles = crq.roles_from_config()
-    assert roles == ["worker"], roles
+    assert roles == [], roles
+
+
+# ─── delivery () ─────────────────────────────────────────────────────
+#
+# A worker closure whose commit_sha is only on a carrier ref is not offered for review until
+# origin/main contains it. Only the shared predicate's definitive "pending" defers; every
+# other state lists the closure, because a false defer is a review that never happens.
+
+def sha_closure(gid: str, **kw) -> dict:
+    return closure(gid, commit_sha="a" * 40, **kw)
+
+
+def _delivery_by(states: dict, asked: list | None = None):
+    """A delivery probe with a fixed answer per goal id, recording who was asked."""
+    def probe(goal):
+        if asked is not None:
+            asked.append(goal["id"])
+        return states[goal["id"]]
+    return probe
+
+
+def _all_pending(goal):
+    return ("pending", "not on origin/main")
+
+
+class FakeProber:
+    """The slice of commit-reachability.py the shared predicate calls."""
+
+    def __init__(self, verdict):
+        self.verdict, self.calls = verdict, []
+
+    def triage(self, repo, sha, target_ref="origin/main", remote="origin",
+               worker_namespace="workers", do_fetch=True):
+        self.calls.append((repo, sha, target_ref, do_fetch))
+        return {"verdict": self.verdict, "reason": f"{self.verdict} for {sha[:7]}"}
+
+
+def test_a_worker_closure_whose_sha_is_definitively_unlanded_waits_with_its_age():
+    goals = [sha_closure("g-31-1", completed_at="2026-09-24T18:30:00"), sha_closure("g-31-2")]
+    probe = _delivery_by({"g-31-1": ("pending", "not on origin/main: STRANDED_WORKER_REF"),
+                          "g-31-2": ("delivered", "reachable")})
+    res = select(goals, delivery=probe)
+    assert [r["goal_id"] for r in res["candidates"]] == ["g-31-2"]
+    assert [r["goal_id"] for r in res["waiting_to_land"]] == ["g-31-1"]
+    row = res["waiting_to_land"][0]
+    assert row["waiting_hours"] == 2.5 and "STRANDED_WORKER_REF" in row["delivery"]
+    assert res["stranded"] == []
+    # a deferred closure is still ELIGIBLE: the count is what the lane owes, not what it offers
+    assert res["eligible_total"] == 2
+
+
+def test_a_pending_closure_is_stranded_at_the_threshold_and_not_before():
+    goals = [sha_closure("g-32-1", completed_at="2026-09-23T08:00:00"),     # 37 h
+             sha_closure("g-32-2", completed_at="2026-09-23T09:00:00"),     # 36 h exactly
+             sha_closure("g-32-3", completed_at="2026-09-24T09:00:00")]     # 12 h
+    res = select(goals, delivery=_all_pending)
+    assert [r["goal_id"] for r in res["stranded"]] == ["g-32-1", "g-32-2"]   # longest first
+    assert [r["goal_id"] for r in res["waiting_to_land"]] == ["g-32-3"]
+    assert res["strand_hours"] == crq.STRAND_HOURS == 36.0
+    # a stranded closure is OFFERED, marked; the one still inside its wait is not
+    assert [r["goal_id"] for r in res["candidates"]] == ["g-32-1", "g-32-2"]
+    assert all(r["stranded"] is True for r in res["candidates"])
+    # the threshold is the caller's: at 48 h neither of the first two is stranded yet
+    res = select(goals, delivery=_all_pending, strand_hours=48.0)
+    assert res["stranded"] == [] and res["candidates"] == []
+    assert [r["goal_id"] for r in res["waiting_to_land"]] == ["g-32-1", "g-32-2", "g-32-3"]
+
+
+def test_a_stranded_closure_is_offered_ahead_of_the_ranked_rows_inside_the_cap():
+    goals = [sha_closure("g-43-1", completed_at="2026-09-23T06:00:00"),     # 39 h: stranded
+             closure("g-43-2", priority="HIGH"), closure("g-43-3"), closure("g-43-4")]
+    res = select(goals, delivery=_delivery_by({"g-43-1": ("pending", "x")}), cap=2)
+    assert [r["goal_id"] for r in res["candidates"]] == ["g-43-1", "g-43-2"]
+    assert res["candidates"][0]["stranded"] is True and "stranded" not in res["candidates"][1]
+    assert res["candidates"][0]["waiting_hours"] == 39.0
+
+
+def test_only_a_definitive_pending_defers_and_every_other_state_lists_the_closure():
+    goals = [sha_closure(f"g-33-{i}") for i in range(4)]
+    probe = _delivery_by({"g-33-0": ("delivered", ""), "g-33-1": ("unknown", "probe could not run"),
+                          "g-33-2": ("pending", "x"), "g-33-3": ("a-state-from-the-future", "?")})
+    res = select(goals, delivery=probe, cap=10)
+    assert {r["goal_id"] for r in res["candidates"]} == {"g-33-0", "g-33-1", "g-33-3"}
+    assert [r["goal_id"] for r in res["waiting_to_land"]] == ["g-33-2"]
+
+
+def test_only_a_worker_closure_carrying_a_sha_is_asked():
+    asked: list = []
+    goals = [sha_closure("g-34-1"),                                       # asked
+             closure("g-34-2"),                                           # worker, no sha
+             sha_closure("g-34-3", completed_by_role="reducer"),          # a sha, not a worker
+             sha_closure("g-34-4", completed_by_role=None),               # no role
+             closure("g-34-5", commit_sha="  ")]                          # a blank sha
+    res = select(goals, delivery=_delivery_by({"g-34-1": ("pending", "x")}, asked), cap=10)
+    assert asked == ["g-34-1"]
+    assert {r["goal_id"] for r in res["candidates"]} == {"g-34-2", "g-34-3", "g-34-4", "g-34-5"}
+
+
+def test_the_cap_applies_after_deferral_so_a_waiting_row_never_takes_a_slot():
+    goals = [sha_closure("g-35-1", priority="HIGH"), closure("g-35-2")]
+    res = select(goals, delivery=_delivery_by({"g-35-1": ("pending", "x")}), cap=1)
+    assert [r["goal_id"] for r in res["candidates"]] == ["g-35-2"]
+    assert [r["goal_id"] for r in res["waiting_to_land"]] == ["g-35-1"]
+    # positive control: with no probe the HIGH row takes the only slot
+    res = select(goals, cap=1)
+    assert [r["goal_id"] for r in res["candidates"]] == ["g-35-1"]
+    assert res["waiting_to_land"] == [] and res["stranded"] == []
+
+
+def test_a_probe_that_raises_lists_the_closure_instead_of_stopping_the_listing():
+    def boom(goal):
+        raise RuntimeError("git hiccup")
+    res = select([sha_closure("g-36-1")], delivery=boom)
+    assert [r["goal_id"] for r in res["candidates"]] == ["g-36-1"]
+    assert res["waiting_to_land"] == []
+
+
+def test_an_unreadable_stamp_waits_with_no_age_and_is_never_stranded():
+    res = select([sha_closure("g-37-1", completed_at="soon")], delivery=_all_pending,
+                 strand_hours=0.0)
+    assert res["stranded"] == []
+    assert res["waiting_to_land"][0]["waiting_hours"] is None
+
+
+@pytest.mark.parametrize("verdict,state", [
+    ("LANDED", "delivered"), ("STRANDED_WORKER_REF", "pending"),
+    ("STRANDED_REMOTE_BRANCH", "pending"), ("STRANDED_LOCAL_ONLY", "pending"),
+    ("ABSENT", "unknown"), ("INCONCLUSIVE", "unknown"), ("A_FUTURE_VERDICT", "unknown")])
+def test_the_probe_is_the_shared_predicate_and_agrees_with_it_on_every_verdict(verdict, state):
+    import _delivery_gate as dg
+    goal = sha_closure("g-38-1")
+    got = crq.delivery_probe(repo="/r", prober=FakeProber(verdict))(goal)
+    want = dg.blocker_delivery_state(goal, repo="/r", prober=FakeProber(verdict))
+    assert got[0] == want[0] == state, (got, want)
+
+
+def test_the_probe_never_fetches_per_closure():
+    fake = FakeProber("STRANDED_WORKER_REF")
+    state, detail = crq.delivery_probe(repo="/r", prober=fake)(sha_closure("g-38-2"))
+    assert state == "pending" and "STRANDED_WORKER_REF" in detail
+    # one refresh per run (refresh_delivery_refs), so triage runs with its own fetch off
+    assert fake.calls == [("/r", "a" * 40, "origin/main", False)]
+
+
+def test_setup_delivery_is_off_when_asked_and_skipped_when_the_refresh_fails(monkeypatch):
+    assert crq.setup_delivery(enabled=False) == (None, {"probe": "off", "reason": "--no-delivery"})
+    monkeypatch.setattr(crq, "refresh_delivery_refs", lambda repo=None: (False, "rc=128 no route"))
+    probe, meta = crq.setup_delivery()
+    assert probe is None and meta["probe"] == "skipped" and "rc=128 no route" in meta["reason"]
+    monkeypatch.setattr(crq, "refresh_delivery_refs", lambda repo=None: (True, ""))
+    probe, meta = crq.setup_delivery()
+    assert callable(probe) and meta == {"probe": "on", "reason": ""}
+
+
+def test_list_prints_the_waiting_and_stranded_sections_with_age_and_reason(monkeypatch, capsys):
+    now = datetime.now()
+    at = lambda h: (now - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%S")
+    closures = [sha_closure("g-40-1", completed_at=at(3)), sha_closure("g-40-2", completed_at=at(40)),
+                closure("g-40-3", completed_at=at(1))]
+    probe = _delivery_by({"g-40-1": ("pending", "only on refs/workers/alpha/aa"),
+                          "g-40-2": ("pending", "only on refs/workers/alpha/bb")})
+    delivery = (probe, {"probe": "on", "reason": ""})
+    out = _list(monkeypatch, capsys, closures, ([], None), delivery=delivery)
+    assert "waiting_to_land=1 stranded=1" in out
+    assert "WAITING TO LAND (under 36.0h): 1" in out and "waiting=3.0h" in out
+    assert "STRANDED: waited 40.0h to land — only on refs/workers/alpha/bb" in out
+    assert "only on refs/workers/alpha/aa" in out
+    # the stranded closure is offered (first), the waiting one is held back
+    offered = out.split("WAITING TO LAND")[0]
+    assert offered.index("g-40-2") < offered.index("g-40-3")
+    assert "g-40-1" not in offered
+    # --strand-hours moves the line, and --json carries both buckets
+    res = json.loads(_list(monkeypatch, capsys, closures, ([], None), "--json",
+                           "--strand-hours", "48", delivery=delivery))
+    assert [r["goal_id"] for r in res["stranded"]] == []
+    assert [r["goal_id"] for r in res["waiting_to_land"]] == ["g-40-2", "g-40-1"]
+    assert [r["goal_id"] for r in res["candidates"]] == ["g-40-3"]
+    assert res["delivery"] == {"probe": "on", "reason": ""}
+
+
+def test_list_says_when_stranded_closures_are_beyond_the_cap(monkeypatch, capsys):
+    now = datetime.now()
+    at = lambda h: (now - timedelta(hours=h)).strftime("%Y-%m-%dT%H:%M:%S")
+    closures = [sha_closure(f"g-44-{i}", completed_at=at(40 + i)) for i in range(3)]
+    out = _list(monkeypatch, capsys, closures, ([], None), "--cap", "1",
+                delivery=(_all_pending, {"probe": "on", "reason": ""}))
+    assert "g-44-2" in out.split("STRANDED beyond")[0]          # the longest wait takes the slot
+    assert "STRANDED beyond the cap: 2 more (g-44-1, g-44-0)" in out
+
+
+def test_a_skipped_delivery_probe_says_so_and_defers_nothing(monkeypatch, capsys):
+    stamp = (datetime.now() - timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%S")
+    why = "refresh of origin and the worker refs failed: rc=128 boom"
+    out = _list(monkeypatch, capsys, [sha_closure("g-41-1", completed_at=stamp)], ([], None),
+                delivery=(None, {"probe": "skipped", "reason": why}))
+    assert f"delivery probe skipped ({why}): no closure was deferred this run" in out
+    assert "g-41-1" in out and "WAITING TO LAND" not in out
+
+
+def _git(cwd, *args):
+    ident = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True,
+                          text=True, env=dict(os.environ, **ident)).stdout.strip()
+
+
+def test_refresh_mirrors_origin_and_the_worker_refs_so_the_real_probe_sees_a_carrier(tmp_path):
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True,
+                   capture_output=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", str(origin), str(work)], check=True, capture_output=True)
+    (work / "f.txt").write_text("1")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "one")
+    _git(work, "push", "origin", "HEAD:main")
+    (work / "f.txt").write_text("2")
+    _git(work, "commit", "-am", "carried")
+    _git(work, "push", "origin", "HEAD:refs/workers/alpha/sid1")
+    sha = _git(work, "rev-parse", "HEAD")
+    reader = tmp_path / "reader"
+    subprocess.run(["git", "clone", str(origin), str(reader)], check=True, capture_output=True)
+    goal = {"id": "g-42-1", "commit_sha": sha}
+
+    ok, detail = crq.refresh_delivery_refs(reader)
+    assert ok, detail
+    state, why = crq.delivery_probe(repo=reader)(goal)
+    assert state == "pending" and "workers" in why, (state, why)
+    # positive control: once origin/main holds the commit, the same probe reads delivered
+    _git(work, "push", "origin", "HEAD:main")
+    ok, detail = crq.refresh_delivery_refs(reader)
+    assert ok, detail
+    assert crq.delivery_probe(repo=reader)(goal)[0] == "delivered"
+
+
+def test_a_failed_refresh_reports_instead_of_raising(tmp_path):
+    ok, detail = crq.refresh_delivery_refs(tmp_path / "not-a-repo")
+    assert ok is False and detail
+
+
+def test_list_help_names_the_delivery_flags(capsys):
+    with pytest.raises(SystemExit) as stop:
+        crq.main(["list", "--help"])
+    assert stop.value.code == 0
+    out = capsys.readouterr().out
+    assert "--strand-hours" in out and "--no-delivery" in out
 
 
 def test_cli_help_runs_from_a_subprocess():

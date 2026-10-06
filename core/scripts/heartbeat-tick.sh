@@ -232,10 +232,33 @@ if [ -n "${MIND_SID:-}" ]; then
         # subshell inherits $$. On failure remove only our own tmp (guard-2474). A
         # SIGKILL between write and rename can still orphan one (rb-9000): it is
         # gitignored and never synced, as the manifest glob is body-heartbeat-*.json.
+        #  U23: publish the newest origin/main commit THIS checkout
+        # contains (`git merge-base HEAD origin/main`) as `main_base`. The
+        # per-Body lane of store-cutover-check.py reads it to ask whether every
+        # live Body carries a seam commit, which its agent-keyed proofs cannot
+        # answer: one agent runs a Body on many boxes, and each proof speaks
+        # for the box that committed last (rb-8276, attested per AGENT not per
+        # BOX). A worker's HEAD is usually an unpushed local merge that no other
+        # box can resolve; its newest origin/main ancestor is a pushed commit
+        # every box can fetch.
+        #
+        # WHAT IT MEASURES (rb-8118): this checkout's commits at THIS tick. Not
+        # the daemon's loaded code, not uncommitted edits. The tick runs before
+        # the cycle's pull, and the local `origin/main` ref is only as fresh as
+        # the last fetch, so both lags can only UNDER-report, which is the
+        # fail-closed direction for the gate that reads it.
+        #
+        # EMPTY IS THE SAFE DIRECTION, as for $_HB_STATE and machine_id above: a
+        # box with no `origin/main` ref, or no git, publishes "" and the gate
+        # reports that Body `no_main_base` rather than guess. git's stderr is
+        # NOT suppressed (rb-400); a refusal also prints one line here.
+        _HB_BASE="$(git -C "$PROJECT_ROOT" merge-base HEAD origin/main)" \
+            || { echo "[heartbeat-tick] main_base not published (carrier written without it; git's message is above)" >&2; _HB_BASE=""; }
+        [[ "$_HB_BASE" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || _HB_BASE=""
         _HB_TMP="$_HB_CARRIER.tmp.${BASHPID:-$$}"
-        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s","machine_id":"%s"}\n' \
+        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s","machine_id":"%s","main_base":"%s"}\n' \
             "$MIND_SID" "${MIND_AGENT:-}" "$(hostname || echo unknown)" \
-            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" > "$_HB_TMP" \
+            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" "$_HB_BASE" > "$_HB_TMP" \
             && mv -f "$_HB_TMP" "$_HB_CARRIER" || { rm -f "$_HB_TMP" || true; }
     else
         # Say so. A silent skip here reads as "the tick ran and wrote nothing",

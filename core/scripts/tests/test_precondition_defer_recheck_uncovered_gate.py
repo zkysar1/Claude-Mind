@@ -399,3 +399,198 @@ def test_gid_tokens_is_the_one_tokenizer_for_both_sides():
     assert M._gid_tokens(None) == set()
     # membership, not containment — the whole point of the set
     assert "g-115-1" not in M._gid_tokens("g-115-1364")
+
+
+# --------------------------------------------------------------------------
+# 7. Tokenizer boundaries ()
+#
+# The goal-id pattern had no LEFT boundary, so a board message id
+# `msg-<date>-<time>-<agent>-<n>` (whose `msg-` ends in `g-`) yielded a
+# fragment `g-<date>-<time>-<agent>` that no predicate can ever mention. It had
+# no RIGHT boundary either, so a goal's OWN progress-note marker
+# `[g-N-M-progress-<agent>-<box>-<time>]` yielded `g-N-M-progress`, which the
+# self-reference exclusion never equated with the goal. Both froze a defer whose
+# predicates had all passed until the 120 h fail-open.
+#
+# Every group below asserts BOTH halves (guard-1660): the false token is gone
+# AND the real one survives. Without the second half "return nothing" passes.
+# Slugs are REDUCED to their goal id, never dropped: over-matching costs a skip,
+# never a clear (guard-2486), so a gate named only inside a branch or marker
+# stays visible as that goal.
+# --------------------------------------------------------------------------
+
+# Board message ids as they sat in live defer texts (2026-10-04 snapshot). Each
+# one used to yield a fragment `g-<date>-<time>-<agent>`.
+MEASURED_MSG_IDS = [
+    "msg-20260928-042559-alpha-117",
+    "msg-20260831-105455-zeta-6326",
+    "msg-20260905-170639-alpha-5190",
+    "msg-20260906-183524-alpha-6349",
+    "msg-20260902-231119-alpha-599",
+    "msg-20260930-051346-alpha-226",
+    "msg-20261001-155531-alpha-640",
+    "msg-20261002-014807-alpha-072",
+    "msg-20261003-062453-alpha-1011",
+    "msg-20261003-120620-alpha-3315",
+]
+
+
+def test_board_message_ids_yield_no_goal_id_token():
+    """OUTCOME 1: a board message id is not a gate."""
+    for mid in MEASURED_MSG_IDS:
+        assert M._gid_tokens(mid) == set(), mid
+        assert M._gid_tokens("(asked on %s, no reply)" % mid) == set(), mid
+        assert M._uncovered_gate_refs(
+            "precondition_unmet: waiting; asked on %s" % mid, [], "g-350-387") == [], mid
+
+
+def test_a_real_gate_next_to_a_message_id_is_still_reported():
+    """SPECIFICITY twin: the boundary removes the fragment, not the real id."""
+    for mid in MEASURED_MSG_IDS:
+        text = "precondition_unmet: gated on g-358-13, asked on %s" % mid
+        assert M._uncovered_gate_refs(text, [], "g-1-1") == ["g-358-13"], mid
+
+
+def test_message_id_plus_covered_gate_reaches_the_clear_path(monkeypatch, capsys):
+    """The replay's acceptance test: a defer quoting a message id AND a covered
+    gate has no uncovered ref. Pre-fix this skipped on the id's fragment."""
+    g = _goal(
+        defer_text=("precondition_unmet: gated on g-370-09; asked on "
+                    "msg-20261002-014807-alpha-072"),
+        pcs=[_passing_pc(pc_id="pc-g370-09", extra={"goal_id": "g-370-09"})],
+    )
+    rc, data = _run_main(monkeypatch, capsys, [g])
+    assert data["would_clear"] == [g["id"]]
+    assert data["skipped_uncovered_gate"] == 0
+    assert data["uncovered_gate_goals"] == []
+
+
+def test_message_id_plus_a_real_uncovered_gate_still_skips(monkeypatch, capsys):
+    """Same text, gate NOT covered: it still skips and names only the real id."""
+    g = _goal(defer_text=("precondition_unmet: gated on g-370-09; asked on "
+                          "msg-20261002-014807-alpha-072"))
+    rc, data = _run_main(monkeypatch, capsys, [g])
+    assert data["would_clear"] == []
+    assert _row(data, g["id"])["uncovered_gate_refs"] == ["g-370-09"]
+
+
+def test_own_progress_note_marker_is_the_goals_own_id(monkeypatch, capsys):
+    """OUTCOME 1's second shape. `[-progress-alpha-cc10-0510]` used to
+    yield g-335-1670-progress, which is not the own id g-335-1670."""
+    marker = "[g-335-1670-progress-alpha-cc10-0510]"
+    assert M._gid_tokens(marker) == {"g-335-1670"}
+    text = "precondition_unmet: waiting out the window; evidence in %s" % marker
+    assert M._uncovered_gate_refs(text, [], "g-335-1670") == []
+    g = _goal(goal_id="g-335-1670", defer_text=text)
+    rc, data = _run_main(monkeypatch, capsys, [g])
+    assert data["would_clear"] == ["g-335-1670"]
+    assert data["skipped_uncovered_gate"] == 0
+
+
+def test_own_marker_of_a_suffixed_id_is_the_goals_own_id():
+    marker = "[g-335-1696-d-progress-alpha-cc10-0901]"
+    assert M._gid_tokens(marker) == {"g-335-1696-d"}
+    assert M._uncovered_gate_refs(
+        "precondition_unmet: see %s" % marker, [], "g-335-1696-d") == []
+
+
+def test_a_suffixed_siblings_marker_is_not_the_unsuffixed_goals_own():
+    """FAIL-CLOSED twin: on  a marker of the sibling -d is a
+    foreign reference. Reading it as the goal's own would fail open."""
+    marker = "[g-335-1696-d-progress-alpha-cc10-0901]"
+    assert M._uncovered_gate_refs(
+        "precondition_unmet: see %s" % marker, [], "g-335-1696") == ["g-335-1696-d"]
+
+
+def test_a_foreign_goals_marker_stays_visible_as_that_goal():
+    marker = "[g-374-244-progress-bravo-cc05-0123]"
+    assert M._uncovered_gate_refs(
+        "precondition_unmet: see %s" % marker, [], "g-115-1") == ["g-374-244"]
+
+
+def test_branch_and_worktree_names_are_reduced_not_dropped():
+    """A gate named only inside a branch or worktree name must stay visible."""
+    assert M._gid_tokens("wt-g-377-87-unit2-lib") == {"g-377-87"}
+    assert M._gid_tokens("origin/alpha/g-363-181-sample-run") == {"g-363-181"}
+    text = "precondition_unmet: PR on origin/alpha/g-363-181-sample-run"
+    assert M._uncovered_gate_refs(text, [], "g-1-1") == ["g-363-181"]
+    # ... and it is the OWN id when the branch belongs to the goal itself
+    assert M._uncovered_gate_refs(text, [], "g-363-181") == []
+
+
+def test_real_ids_still_yield_tokens():
+    """OUTCOME 1's other half: a fixture id, a lettered child and a bare id."""
+    text = "gated on g-373-27-fixture, g-335-1631-a and g-358-13."
+    assert M._uncovered_gate_refs(text, [], "g-1-1") == [
+        "g-373-27-fixture", "g-335-1631-a", "g-358-13"]
+
+
+def test_left_boundary_positive_and_negative_controls():
+    # preceded by punctuation, a slash, an underscore, a hyphen or nothing: an id
+    for text in ("g-370-09", "(g-370-09)", "[g-370-09]", '"g-370-09"', "/g-370-09/",
+                 "wt-g-370-09", "x_g-370-09", ",g-370-09"):
+        assert M._gid_tokens(text) == {"g-370-09"}, text
+    # preceded by a letter or a digit: the tail of a longer word, not an id
+    for text in ("msg-370-09", "log-370-09", "tag-1-2", "1g-370-09", "xg-370-09",
+                 "pkg-370-09-a"):
+        assert M._gid_tokens(text) == set(), text
+
+
+def test_suffix_boundary_controls():
+    # a suffix that ends the token belongs to the id
+    assert M._gid_tokens("g-1-2-a") == {"g-1-2-a"}
+    assert M._gid_tokens("g-1-2-a, g-1-2-fixture.") == {"g-1-2-a", "g-1-2-fixture"}
+    # a suffix that runs on into more alphanumerics or another segment is a slug
+    assert M._gid_tokens("pc-g-115-11070-g37566-done") == {"g-115-11070"}
+    assert M._gid_tokens("g-1-2-fixture-run") == {"g-1-2"}
+    assert M._gid_tokens("g-1-2-fixture2") == {"g-1-2"}
+    # a single letter followed by a further segment is still a suffix
+    assert M._gid_tokens("g-335-1696-d-prod-release-landed") == {"g-335-1696-d"}
+
+
+def test_two_part_gate_whose_predicate_tests_only_the_first_still_skips(
+        monkeypatch, capsys):
+    """OUTCOME 2, the  shape: the defer names a second gate that the
+    predicate does not test. A message id in the same text must not hide it."""
+    g = _goal(
+        defer_text=("precondition_unmet: two-part gate: (1) g-370-09 promotion "
+                    "lands, then (2) g-369-316 verified on the deployed build; "
+                    "asked on msg-20261001-155531-alpha-640"),
+        pcs=[_passing_pc(pc_id="pc-g370-09", extra={"goal_id": "g-370-09"})],
+    )
+    rc, data = _run_main(monkeypatch, capsys, [g])
+    assert data["would_clear"] == []
+    assert _row(data, g["id"])["uncovered_gate_refs"] == ["g-369-316"]
+    assert data["uncovered_gate_goals"] == [g["id"]]
+
+
+def test_named_dependency_absent_from_the_predicates_still_skips(monkeypatch, capsys):
+    """OUTCOME 2, the  shape: an outcome that depends on another goal,
+    with the goal's own marker and a message id in the same text. Covering the
+    dependency restores the clear (the discriminator pair)."""
+    text = ("precondition_unmet: outcome 4 depends on g-326-844 landing; the "
+            "controlled predicate is in [g-374-244-progress-alpha-cc07-0907], "
+            "asked on msg-20260930-051346-alpha-226")
+    g = _goal(goal_id="g-374-244", defer_text=text)
+    rc, data = _run_main(monkeypatch, capsys, [g])
+    assert data["would_clear"] == []
+    assert _row(data, "g-374-244")["uncovered_gate_refs"] == ["g-326-844"]
+
+    covered = _goal(goal_id="g-374-244", defer_text=text,
+                    pcs=[_passing_pc(extra={"goal_id": "g-326-844"})])
+    rc, data = _run_main(monkeypatch, capsys, [covered])
+    assert data["would_clear"] == ["g-374-244"]
+    assert data["skipped_uncovered_gate"] == 0
+
+
+def test_uncovered_gate_goals_names_the_skipped_goals_and_is_empty_otherwise(
+        monkeypatch, capsys):
+    """OUTCOME 3's feed: the result carries the goals behind the count, and the
+    key is present when empty (an absent key reads as clean, rule of the counter
+    test above)."""
+    rc, data = _run_main(monkeypatch, capsys, [_goal()])
+    assert data["uncovered_gate_goals"] == ["g-373-27-fixture"]
+    assert data["skipped_uncovered_gate"] == len(data["uncovered_gate_goals"])
+    clean = _goal(defer_text="precondition_unmet: waiting for the settlement window")
+    rc, data = _run_main(monkeypatch, capsys, [clean])
+    assert data["uncovered_gate_goals"] == []

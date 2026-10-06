@@ -500,7 +500,8 @@ def test_CONTROL_digit_bearing_paths_are_not_mistaken_for_ratios():
         # real cluster was adjudicated rather than none forming at all.
         assert _kinds(analyze(text, retrieved=lambda k, v: False)) == [
             "decorative-citation"], token
-    # The pure-digit form is a ratio-shaped non-citation, not a node key.
+    # The pure-digit form is a ratio-shaped non-citation, not a node key
+    # ( synthetic fixture; the revenue line is a citation-free probe).
     line = ("Globex Industries reported revenue of $2.1 billion in 2025. "
             "[runs/32023260302]")
     assert source_tokens(line) == [], source_tokens(line)
@@ -599,14 +600,18 @@ def test_OUTCOME_1_g8858_bare_fractions_and_prose_pairs_are_not_node_keys():
 def test_OUTCOME_2_g8858_genuine_tree_node_keys_still_match():
     """Outcome 2: a genuine tree node key still matches.
 
-    The keys below are drawn from the live tree census (2026-10-03): every
-    multi-segment live key contains a kebab segment, and the four shapes here
-    are the ones authors actually cite -- the bare slug, the store-root form
-    (guard-6054), the .md file form, and the digit-bearing slug (the class the
-    _RATIO_RUN control protects). The file-path citations are the second half
-    of the goal's scope (the truncation fix, appended 2026-09-29): the same
-    run, terminated by a known extension, must arrive WHOLE, not truncated at
-    the first non-conforming segment.
+    The battery exercises the CITED SHAPES, not a live-key snapshot: the store-
+    root form (guard-6054), the .md file form, the digit-bearing slug (the class
+    the _RATIO_RUN control protects), and a bare live key
+    (system/daemon-only-architecture -- verified in the live tree census
+    2026-10-03, hostname zc-10). The store-root entries are SYNTHETIC shape
+    fixtures (the pearl-bridge nodes were archived in the 2026-08-31 pearl
+    split; ledger.jsonl is the external-world .jsonl class), so the assertion
+    is about the grammar, not the tree's current contents. The file-path
+    citations are the second half of the goal's scope (the truncation fix,
+    appended 2026-09-29): the same run, terminated by a known extension, must
+    arrive WHOLE, not truncated at the first non-conforming segment.
+    [UNVERIFIED -- model prior: no in-session retrieval of the fixture tokens]
     """
     node_keys = (
         "system/daemon-only-architecture",
@@ -683,8 +688,8 @@ def test_OUTCOME_3_g8858_a_cluster_with_only_a_prose_slash_pair_is_unadjudicated
 
 
 def test_g8858_a_rate_unit_in_a_sentence_is_not_a_citation():
-    """The 2026-09-25 measured variant: '$0.191/h' became the node-key
-    '191/h' and came back decorative. The digits/letters unit is the shape a
+    """The 2026-09-25 measured variant (): '$0.191/h' became the
+    node-key '191/h' and came back decorative. The digits/letters unit is the shape a
     bare 'all-digit' exclusion cannot catch, so pin the prose sentence, not
     just the token. Pre-fix the cluster was decorative on '191/h'; now the
     honest missing-citation, in either retrieved state."""

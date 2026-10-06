@@ -174,13 +174,13 @@ per-session paths use `agent_session_dir(name, sid)`.
      hand-maintained; this block carries only the file SET, which
      is what silently drifted (19 consumers missing, 2026-09-06). -->
 
-Derived cross-agent glob consumers (38 sites, 30 files):
+Derived cross-agent glob consumers (37 sites, 29 files):
 
 - `core/scripts/_frontier.py:190` — `root.glob('*/sessions/*/body-manifest.yaml')`
 - `core/scripts/_paths.py:56` — `agents_root().glob('*/local-paths.conf')`
 - `core/scripts/_paths.py:354` — `agents_root().glob('*/local-paths.conf')`
-- `core/scripts/_seed_engine.py:879` — `agents_dir.glob('*/local-paths.conf')`
-- `core/scripts/_seed_engine.py:913` — `agents_dir.glob('*/local-paths.conf')`
+- `core/scripts/_seed_engine.py:900` — `agents_dir.glob('*/local-paths.conf')`
+- `core/scripts/_seed_engine.py:934` — `agents_dir.glob('*/local-paths.conf')`
 - `core/scripts/checks/temp_durability_invariant.py:165` — `Path(agents_root()).glob('*/temp/*')`
 - `core/scripts/claim_artifact_sweep.py:297` — `agents_root().glob('*/aspirations.jsonl')`
 - `core/scripts/counted-close-revert-census.py:221` — `root.glob('*/session/working-memory.yaml')`
@@ -190,7 +190,6 @@ Derived cross-agent glob consumers (38 sites, 30 files):
 - `core/scripts/gates/defer_target_existence.py:104` — `r.glob('*/aspirations.jsonl')`
 - `core/scripts/gates/defer_target_existence.py:105` — `r.glob('*/aspirations-archive.jsonl')`
 - `core/scripts/housekeeping-tick.py:356` — `Path(ar()).glob('*/experience.jsonl')`
-- `core/scripts/human-blocked-defer-join.py:168` — `agents_root().glob('*/session/pending-questions.yaml')`
 - `core/scripts/inbound-reference-census.py:218` — `agents_root().glob('*/local-paths.conf')`
 - `core/scripts/learning-routing-repair.py:125` — `agents_root().glob('*/experience.jsonl')`
 - `core/scripts/learning-routing-repair.py:126` — `agents_root().glob('*/experience-archive.jsonl')`
@@ -206,10 +205,10 @@ Derived cross-agent glob consumers (38 sites, 30 files):
 - `core/scripts/skill-retire-candidates.py:158` — `agents_root().glob('*/skill-invocations.jsonl')`
 - `core/scripts/team-contribution-report.py:241` — `Path(agents_root).glob('*/aspirations.jsonl')`
 - `core/scripts/utilization-stats.py:485` — `_agents_root().glob('*/local-paths.conf')`
-- `core/scripts/worker_stall.py:761` — `agents_root.glob('*/session')`
-- `mind_api/src/__main__.py:462` — `resolver._agents_root().glob('*/local-paths.conf')`
-- `mind_api/src/agent_paths.py:286` — `self._agents_root().glob('*/local-paths.conf')`
-- `mind_api/src/agent_paths.py:311` — `self._agents_root().glob('*/local-paths.conf')`
+- `core/scripts/worker_stall.py:876` — `agents_root.glob('*/session')`
+- `mind_api/src/__main__.py:471` — `resolver._agents_root().glob('*/local-paths.conf')`
+- `mind_api/src/agent_paths.py:297` — `self._agents_root().glob('*/local-paths.conf')`
+- `mind_api/src/agent_paths.py:330` — `self._agents_root().glob('*/local-paths.conf')`
 - `mind_api/src/endpoints/skill_analytics.py:398` — `agents_root.glob('*/skill-invocations.jsonl')`
 - `mind_api/src/endpoints/skill_discovery.py:165` — `ctx.paths.agents_root.glob('*/journal.jsonl')`
 - `mind_api/src/endpoints/skill_discovery.py:206` — `ctx.paths.agents_root.glob('*/skill-invocations.jsonl')`

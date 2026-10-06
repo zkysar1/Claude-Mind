@@ -914,7 +914,7 @@ drive to explore and discover, not just maintain and fix.
 # SAMPLE, not the metric, was the load-bearing half.
 # Rationale (WHY category sampling + utilization_score_v2): core/config/rationale/s4b-cross-pollination-recalibration.md
 #
-# Window DEFAULTS rather than raising (guard-4653 promotion-coupling): S4a is a
+# Window DEFAULTS rather than raising (guard-4654 promotion-coupling): S4a is a
 # LOW observational signal, so a lagging config must degrade, never brick S4.
 stale_days = strategic_scan.get("subtree_staleness_days") or (
              strategic_scan.knowledge_staleness_days * 3)   # 90d on this config
@@ -994,17 +994,17 @@ FOR EACH f in filed:
 
 ## Phase S4.6: Skill-Reconsolidation Cadence (g-355-07)
 
-**READ-ONLY since 2026-10-02 (owner-approved): no `--apply`. It filed before the
-distinct-goal check could run; g-115-4215 owns the fix and the restore.**
-
 Turns the g-355-06 invocation->outcome join into ACTION on the SAME
 strategic-scan cadence as S4.5. `skill-evaluate reconsolidation` ranks skills by
 `failure_rate x (1 - quality_overall)` from the skill-attribution ledger;
 `--apply` routes each candidate at/above the threshold into ONE advisory
 Investigate goal (evidence = recent_failing_goals), deduped by EXACT
 origin_signal (`investigate:skill-reconsolidation-<skill-slug>`) against every
-open goal so re-filing is idempotent across cadences (g-115-2196 exact-key
-dedup, never a title substring). The filed goal asks the agent to REVIEW the
+open goal AND every such goal CLOSED within 14d (rb-3523), so re-filing is
+idempotent across cadences (g-115-2196 exact-key dedup, never a title
+substring). Bounded since g-115-4215 (`--apply` restored 2026-10-04): >=2 DISTINCT
+failing goals per candidate, at most `--max-file` (default 1) filings per run, and
+NOTHING filed (`apply_refused`) when the goal store was unreadable. The filed goal asks the agent to REVIEW the
 failing skill's SKILL.md against its failures and refine the pseudocode — it
 NEVER auto-modifies the skill (advisory-refine constraint). Belongs HERE (not a
 high-frequency sweep) for the SAME reason as S4.5: low cadence + exact-signal
@@ -1019,6 +1019,20 @@ reconsolidation), and rb-225/rb-247 warn off the Windows bash-subprocess hang.
 route to the authoritative store (no tmp-collision — this is production, not a
 test; guard-955 N/A).
 
+✅ **g-115-4215 (2026-10-04): THE COMMAND NOW ENFORCES THE DISCRIMINATORS THIS MARKER
+BUILT BY HAND — earlier-dated claims below describe the OLD command; this paragraph wins
+any conflict.** Every run, 0 candidates included, emits `diary_coverage` (read
+`classified_invocations` BESIDE `classifiable_ceiling`: the ceiling is NOT an upper bound)
+and `goal_status_check` (`windows_cleared`, `failure_windows_status_unknown`,
+`read_errors`). A candidate needs failures behind >=2 DISTINCT goals
+(`distinct_failing_goals`). The join clears a never-closed window whose goal the store says
+`completed`/`decomposed` (census-evicted ids included) and opens windows only on
+`phase_start`/`phase_end`/`scorer_override` rows keyed by a real `g-N-N` (no
+`precheck`/`none` tokens, no rows about another goal). NOT cleared: members whose status is
+`pending` or `skipped` (sweep-closed goals) — resolve those by hand as below. A nonzero
+`failure_windows_status_unknown` means the store could not vouch for some failures. Before/
+after (cc-05, 5 agents): 2 candidates, all failures behind `g-335-816` -> 0 (`windows_cleared` 3).
+
 ⛔ READ THE `recent_failing_goals` DISTRIBUTION BEFORE BELIEVING ANY `failure_rate`
 HERE — MEASURED 2026-08-12 (bravo, `hostname` cc-05, `uname -r` 6.8.0-137-generic),
 21 candidates, **131 failure attributions, and exactly ONE distinct failing
@@ -1027,15 +1041,16 @@ goal_id behind all of them** (`g-335-816`). So every rate on that run answered
 `fresh-eyes-tree` read 1.0 off a single invocation; `aspirations-strategic-scan`
 flagged **itself** at 0.40 for having run during that window.
 
-THE MECHANISM, and it is a default rather than a bug in the join: `g-335-816` is
+THE MECHANISM, and it was a default rather than a bug in the join: `g-335-816` is
 `status: completed` in the authoritative goal store (closed 2026-08-05), but
-`_resolve_window_outcome` never consults that store — it reads journal outcomes
-plus `phase-12-productivity` closes from the execution-diary, and its final line
-is `return 'failure'`. A window with no *locally readable* success evidence is
-classified FAILED, not `unknown`. The diary is a per-agent read-through cache
-(g-115-4143), so one peer-closed goal whose evidence never landed on this box
-turns every skill invoked in its window into a reconsolidation candidate. Absence
-of evidence is being scored as evidence of failure.
+`_resolve_window_outcome` did not consult that store until g-115-4215 (2026-10-04) —
+it read journal outcomes plus `phase-12-productivity` closes from the execution-diary,
+and its final line is still `return 'failure'` for a goal the store does not say
+completed. A window with no *locally readable* success evidence was classified FAILED,
+not `unknown`. The diary is a per-agent read-through cache (g-115-4143), so one
+peer-closed goal whose evidence never landed on this box turned every skill invoked
+in its window into a reconsolidation candidate. Absence of evidence was scored as
+evidence of failure.
 
 HOW TO TELL IN ONE LINE, before acting on any candidate:
 `{g for c in candidates for g in c.recent_failing_goals}` — PRINT THE SET, do not
@@ -1140,15 +1155,15 @@ INSTRUCTION THAT STOOD HERE FOR FOUR HOURS WAS UNFOLLOWABLE, AND ITS CLOSING CLA
 BACKWARDS.** It said to "print `ceiling_ratio` beside the candidate count, every run" and
 that "no code change is needed to see this; the field is already computed and simply is
 not read." Measured, three probes:
-  1. `skill-evaluate.py reconsolidation` emits **no `diary_coverage` key at all** — the
-     whole payload is 5 keys (`reconsolidation_candidates`, `candidate_count`,
+  1. `skill-evaluate.py reconsolidation` EMITTED (until g-115-4215, 2026-10-04) **no
+     `diary_coverage` key at all** — the whole payload was 5 keys (`reconsolidation_candidates`, `candidate_count`,
      `threshold`, `agents_scanned`, `window`). `grep ceiling_ratio core/scripts/skill-evaluate.py`
      returns **zero matches**; the field lives in a DIFFERENT script.
   2. `skill-attribution.py --with-outcomes --json` does not emit it either — top-level
      keys are `agents_scanned / distinct_skills / per_skill / total_rows / window_since`.
   3. It is computed at `skill-attribution.py:322-326` inside `compute_join()`, and the
-     only downstream reads are `join['failing']` and `join['per_skill']`. **It is computed
-     and DISCARDED on every run, by every caller.**
+     only downstream reads were `join['failing']` and `join['per_skill']`. **It was computed
+     and DISCARDED on every run, by every caller** (until g-115-4215).
 So it is not merely "not read" — it is not EMITTED, and printing it requires a code change.
 This is itself a written-never-read computation, i.e. S4.5 detector (a) firing on the
 scan's own instrumentation; recorded here rather than filed, per the product-first
@@ -1159,50 +1174,19 @@ two readings:** run `--min-failures 1` as a positive control. If it ALSO returns
 have distinguished nothing yet; a 0 at both thresholds is consistent with "no failures"
 AND with "cannot see failures", and nothing in the reconsolidation output can tell them
 apart. Treat such a 0 as **coverage-unverified** and route nothing — do not read it as a
-healthy fleet, and do not read a later non-zero as a regression. To get the real ceiling
-you must read `compute_join()`'s local diary spans yourself, or emit the field first.
+healthy fleet, and do not read a later non-zero as a regression. The real ceiling is
+`diary_coverage` in the command's own output (g-115-4215; it used to need a hand read of
+`compute_join()`'s diary spans).
 (guard-3992; guard-359 — verify a field a SKILL.md names is actually emitted before
 instructing anyone to read it; guard-2421 — the positive control is the whole discipline
 that remains once the unfollowable half is removed.)
-✔ **INDEPENDENTLY CONFIRMED, AND THAT IS THE REASON TO TRUST IT.** The paragraph
-immediately below is zeta's correction of this same instruction (cc-02, same day), reached
-from a different box without either of us seeing the other's work — and the merge of the two
-branches CONFLICTED here, which is how the duplication surfaced at all. Two independent
-measurements agreeing that `diary_coverage` is computed-and-discarded is far stronger
-evidence than either alone, so both are kept rather than folded. Read them as one finding:
-zeta's adds the CLI-path detail (which callers drop the field); this one adds the
-followable substitute. Neither is a correction of the other.
-
-⚠ **IT IS A SECOND COMMAND — `skill-evaluate reconsolidation` DOES NOT EMIT
-`diary_coverage`, AND READING IT FROM THAT OUTPUT RETURNS `None` ON EVERY RUN.**
-This paragraph said "no code change is needed; the field is already computed and
-simply is not read" until 2026-08-16 (zeta, `hostname` cc-02, `uname -r`
-6.8.0-137-generic). Half right, and the wrong half is the actionable one: it IS
-computed — `skill-attribution.py:322`, inside `compute_join` — and it was
-**discarded on every CLI path**. `--with-outcomes` folded only `join['per_skill']`
-into stats (L466-474); `--failing-invocations --json` emitted
-`failing_count/by_skill/failing/window_since/agents_scanned` (L483-489). Neither
-carried it. So the instruction above named a field no command produced, and the
-alpha row's `0.0072` cannot have come from the command this block prescribes.
-Emission was added to the `--failing-invocations --json` payload the same day, so
-the instruction is now executable — via this companion call, NOT the
-reconsolidation one:
-
-```
-py -3 core/scripts/skill-attribution.py --failing-invocations --json
-    -> .diary_coverage.{ceiling_ratio, classifiable_ceiling, invocations, per_agent}
-```
-
-Read `None` as "I ran the wrong command", never as "coverage is unknown" — the two
-are indistinguishable at the call site, and only one of them is about the fleet.
-The general form is **guard-2046**: a SKILL.md step naming BOTH a command AND a
-capture list is an UNVERIFIED PAIRING, because the capture list is prose and nothing
-checks the command emits those fields. Worth noting how it stayed hidden — the
-marker is *about* not trusting a zero, so its own unreadable field produced a
-`None` that read as one more inconclusive signal rather than as a broken
-instruction. A block warning against false all-clears can still issue one.
-(Surfaced by the mechanism-phrased retrieval query, which returned guard-2046; the
-subject-phrased query did not — `core/config/conventions/retrieval-triggers.md` § Why TWO queries.)
+⚠ **SUPERSEDED BY g-115-4215 (2026-10-04).** The 08-16 corrections above (alpha and zeta,
+independently) agreed that `diary_coverage` was computed in `compute_join` and DISCARDED by
+every command, `skill-evaluate reconsolidation` included. That command now emits it (pinned by
+`test_cmd_reconsolidation_zero_candidates_still_emits_a_nonnull_ceiling`), so read it from THIS
+command's output: a `None` there is a regression, not "coverage unknown". The lasting rule is
+**guard-2046**: a step naming BOTH a command AND a capture list is an unverified pairing, so
+verify the command emits the fields before instructing anyone to read them.
 
 NOT FILED AS A GOAL, deliberately (standing product-first directive's generation
 half): all 21 were dedup-suppressed on the measured run, so nothing spurious is
@@ -1475,17 +1459,20 @@ in-span invocations against 4410-5193 totals, i.e. ~0.5-1.0% each, unchanged in 
 from every prior row.
 
 ```
-Bash: py -3 core/scripts/skill-evaluate.py reconsolidation --min-failures 2
+Bash: py -3 core/scripts/skill-evaluate.py reconsolidation --min-failures 2 --apply
 Parse the JSON result.
-FIRST: compute the distinct-failing-goal count described above (n_distinct, not a
-JSON key) and report it alongside the candidate count. A 1-goal (or near-1)
-denominator means REPORT THE CONFOUND and route nothing — do not read the rates
-as skill quality.
-Output: ">> Skill reconsolidation: {candidate_count} candidate(s) | {n_distinct} distinct failing goal(s)"
+FIRST: report the coverage ceiling beside the candidate count. A near-0 ceiling_ratio, a
+nonzero goal_status_check.failure_windows_status_unknown, or any read_errors means this
+run is a COVERAGE measurement, not a skill-quality one: report that and route nothing.
+Output: ">> Skill reconsolidation: {candidate_count} candidate(s) | classifiable ceiling {diary_coverage.classifiable_ceiling}/{diary_coverage.invocations} (ratio {diary_coverage.ceiling_ratio}), classified {diary_coverage.classified_invocations} | {len(filed)} NEW filed | {len(suppressed_dedup)} open-dedup | {len(suppressed_closed_recent)} closed-dedup | {len(deferred_by_cap)} over cap"
 FOR EACH c in reconsolidation_candidates[:5]:
-    Output: "  [{c.skill}] failure_rate={c.failure_rate} priority={c.reconsolidation_priority} recent={c.recent_failing_goals[:3]}"
-# Files nothing. A candidate with 2+ distinct failing goals is evidence for g-115-4215.
-# Fail-open: any error is logged and the scan CONTINUES to S5.
+    Output: "  [{c.skill}] failure_rate={c.failure_rate} distinct_goals={c.distinct_failing_goals} priority={c.reconsolidation_priority} recent={c.recent_failing_goals[:3]}"
+FOR EACH f in filed:
+    Output: "  filed {f.goal_id} (reconsolidate:{f.skill})"
+IF apply_refused: Output: "  --apply REFUSED, nothing filed: {apply_refused}"
+# Fail-open: any error is logged and the scan CONTINUES to S5. Never blocks the scan.
+# A filing that times out but lands is self-corrected by next-cadence dedup (idempotent).
+# Advisory-only: filed goals REVIEW the skill, never auto-modify it.
 ```
 
 ## Phase S5: Signal Triage and Action
@@ -1570,7 +1557,7 @@ Bash: echo "Return to orchestrator -- continue to next phase"
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 1.5, conditional)
-- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `silent-gap-audit.py --apply` (Phase S4.5 — 4-detector + rb-245 + dedup orphaned-asset audit), `skill-evaluate.py reconsolidation` (Phase S4.6 — failing-invocation skill reconsolidation, read-only until g-115-4215), `/create-aspiration` (for MEDIUM signals)
+- **Calls**: `experience-read.sh`, `tree-read.sh`, `reasoning-bank-read.sh`, `aspirations-add-goal.sh --source`, `wm-set.sh`, `silent-gap-audit.py --apply` (Phase S4.5 — 4-detector + rb-245 + dedup orphaned-asset audit), `skill-evaluate.py reconsolidation --apply` (Phase S4.6 — failing-invocation skill reconsolidation, advisory Investigate goals, exact-origin_signal dedup, bounded by g-115-4215), `/create-aspiration` (for MEDIUM signals)
 - **Reads**: Aspiration compact data, experience entries, tree summary, reasoning bank, Self, config
 - **Writes**: Working memory (`last_strategic_scan`, `strategic_scan_signals`, `portfolio_health_signal` slots), investigation goals (HIGH signals), evolution log
 - **Source routing**: All `aspirations-*.sh` calls receive `--source {source}` from the orchestrator

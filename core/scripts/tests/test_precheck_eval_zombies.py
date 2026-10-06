@@ -26,6 +26,10 @@ Pins the three-kind zombie predicate:
     independently-blocked close made the flag permanent rather than
     suppressible). Without the stamp it IS flagged (complete-review owns the
     stamp-vs-close judgment).
+  - A `triage_inbox: true` aspiration is exempt from every kind (g-353-183): the
+    inbox is a queue that never completes by design, and groom.py resolves it by
+    that flag (never its id), so a flag routing an agent to close it would defer
+    every move-on-touch re-home.
 """
 
 import importlib.util
@@ -34,6 +38,8 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
+
+import groom  # noqa: E402  the resolver whose inbox predicate the exemption must match
 
 spec = importlib.util.spec_from_file_location("precheck_eval", SCRIPT_DIR / "precheck-eval.py")
 pe = importlib.util.module_from_spec(spec)
@@ -197,6 +203,72 @@ def test_fresh_blocked_not_stale_not_flagged():
     goals.append(_g("g-b", "blocked", blocked_since=now_iso))
     out = _run([_asp("asp-h", goals)])
     assert out["zombies"] == []
+
+
+# --- the Triage Inbox is a queue, never a zombie () ------------------
+#
+# Each pin carries its own control (guard-4166): the SAME profile without the
+# flag IS flagged, so a detector that flags nothing cannot pass the exemption.
+
+def _assert_inbox_exempt(goals, kind, **extra):
+    flagged = _run([_asp("asp-q", goals, **extra)])
+    assert [z["kind"] for z in flagged["zombies"]] == [kind]          # control
+    exempt = _run([_asp("asp-q", goals, triage_inbox=True, **extra)])
+    assert exempt["zombies"] == []
+    assert exempt["flags"] == []
+
+
+def test_triage_inbox_all_terminal_is_exempt():
+    """The asp-378 shape: a flagged inbox whose goals are all terminal."""
+    _assert_inbox_exempt([_g("g-1", "skipped"), _g("g-2", "completed")], "all_terminal")
+
+
+def test_triage_inbox_blocked_stale_is_exempt():
+    goals = [_g(f"g-{i}", "completed") for i in range(4)]
+    goals.append(_g("g-b", "blocked", blocked_since=STALE_ISO))
+    _assert_inbox_exempt(goals, "blocked_stale", motivation="ship the reporting pipeline")
+
+
+def test_triage_inbox_blocked_stale_no_motivation_is_exempt():
+    goals = [_g(f"g-{i}", "completed") for i in range(4)]
+    goals.append(_g("g-b", "blocked", blocked_since=STALE_ISO))
+    _assert_inbox_exempt(goals, "blocked_stale_no_motivation")
+
+
+def test_exemption_keys_on_the_flag_not_the_id():
+    """asp-378 is where this world's inbox lives and another world seeds it under
+    another id, so the id cannot be the key: asp-378 WITHOUT the flag is flagged,
+    and another id WITH the flag is not."""
+    goals = [_g("g-1", "skipped")]
+    [z] = _run([_asp("asp-378", goals)])["zombies"]
+    assert z["aspiration_id"] == "asp-378"
+    assert _run([_asp("asp-004", goals, triage_inbox=True)])["zombies"] == []
+
+
+def test_exemption_does_not_swallow_a_neighbouring_zombie():
+    """Control inside ONE scan: the inbox is skipped and the ordinary aspiration
+    beside it is still flagged."""
+    out = _run([_asp("asp-inbox", [_g("g-1", "skipped")], triage_inbox=True),
+                _asp("asp-ordinary", [_g("g-2", "completed")])])
+    assert [z["aspiration_id"] for z in out["zombies"]] == ["asp-ordinary"]
+    assert out["flags"] == ["needs_complete_review"]
+
+
+def test_exemption_is_the_predicate_groom_resolves_the_inbox_by():
+    """The two readers must agree on which aspiration is the inbox. For every value
+    of the flag, the detector exempts the aspiration exactly when groom.plan_rehome
+    would re-home into it. Groom's predicate is `is True`, so 1 and "true" are the
+    inbox for neither. True is the control: a groom that never resolves an inbox, or
+    a detector that never exempts one, disagrees on it."""
+    goal = {"id": "g-x", "status": "candidate", "recurring": False}
+    for value in (True, False, None, 1, 0, "true", "yes", ""):
+        asp = _asp("asp-i", [_g("g-1", "skipped")], triage_inbox=value)
+        resolved = groom.plan_rehome([dict(asp, archived=False)], groom.LEGACY_INBOX_ASP,
+                                     goal, "close-moot", None)
+        groom_says_inbox = resolved == {"to": "asp-i", "lane": "triage-inbox"}
+        detector_exempts = _run([asp])["zombies"] == []
+        assert groom_says_inbox is (value is True), repr(value)
+        assert detector_exempts == groom_says_inbox, repr(value)
 
 
 if __name__ == "__main__":

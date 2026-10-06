@@ -8,7 +8,8 @@ g-357-41):
 
   list   the open REVIEW REQUESTS no verdict answers yet (REVIEW REQUESTS below), then
          the closures by an UNCALIBRATED closer role (config: `close_review_gate.
-         review_closer_roles`, today `[worker]`) that no independent verdict covers yet,
+         review_closer_roles`, plus the sample of each role in `review_sampled_roles`,
+         where worker sits since 2026-10-04) that no independent verdict covers yet,
          ranked so the reviewer spends its budget where a defect costs most — tier 2
          first (`goal_close_risk_tier.classify`, the gate's own classifier), then HIGH
          priority, then the newest — and capped per run.
@@ -89,8 +90,48 @@ nothing it holds is called pre-lane. Evicted closures are counted from the censu
 `evicted_by_closer_role`, which only goals evicted since g-375-38 carry: an earlier
 eviction kept no role, and no count here includes those.
 
+DELIVERY (g-306-558). A worker closes a goal and pushes its carrier ref, and the reducer
+consumes the ref later. Until then the closer's HEAD at close (the `commit_sha`
+iteration-close stamps, g-306-442) is on refs/workers/** and not on the target branch, so
+a reviewer who looks now judges a fix that is absent from it. Measured on cc-08,
+2026-10-05, over the live worker closures (120 with a sha, 106 resolvable here): this lane
+runs every 0.89 h while a worker close waited a median 5.18 h for origin/main to contain
+its sha (96 waited, p90 23.2 h, max 37.2 h; the 37 code closes among them a median 2.19 h,
+p90 16.9 h, max 30.8 h). So `list` asks the ONE shared predicate
+(`_delivery_gate.blocker_delivery_state`, the one the dependent-release paths ask) about
+every worker closure that carries a commit_sha, code or not: the record holds no code
+signal (files touched are an execution-time fact, goal_close_risk_tier.classify) and the
+prose test the sweep uses missed 127 of 136 goals that had commits (g-115-3476):
+
+  pending    definitively not on origin/main: NOT offered while it waits. It is reported under
+             WAITING TO LAND with its age. Once that age reaches --strand-hours it is
+             STRANDED, and is offered FIRST, marked as such: a carrier ref left unconsumed
+             that long is a finding for the reviewer, whose delivery check (fresh-eyes-close
+             check 1) decides APPROVE_WITH_NOTES or REJECT, and a REJECT's Fix goal is the
+             follow-up goal. Withholding it would let it age out of --since-hours unreviewed.
+  delivered, unknown, or not asked (no worker role, no sha): offered as before.
+
+The stamped sha is the closer's HEAD, which can be a merge or another goal's commit, so a
+pending state is a first screen on the carrier and never a verdict on the goal's own commits:
+the reviewer still probes those one by one (close-review-inputs.py prints each).
+
+THE FAIL DIRECTION IS THE PREDICATE'S, AND IT IS DELIBERATE (guard-2275). Only a definitive
+"not reachable" defers. A probe that cannot run, a sha this clone never fetched and a
+verdict it does not recognise all LIST the closure, because a false defer is a review that
+never happens and a false list is the status quo. A failed refresh of origin/main and the
+worker refs turns the deferral off for the run and says so, because a stale target reads
+landed work as stranded (guard-5797). STRAND_HOURS is 36, not 24: of the 96 measured waits
+9 reached 24 h, 2 reached 30 h and 1 reached 36 h (37.2 h, a close with no code commit), and
+every one landed on its own, so 24 h would mark 9% of them STRANDED and 36 h about 1%. The
+mark is a screen for the reviewer's own probe: a wrong one costs a review slot, never a
+verdict. A closure waits inside the 72 h default of --since-hours for its whole 36 h wait;
+a --since-hours below --strand-hours would age it out unreviewed, and `stats` would count
+it under aged out.
+
 REPORT-ONLY, ALWAYS. This never mutates a goal, never writes a verdict, never blocks
-anything. The verdict is the reviewer's to assert through `/fresh-eyes-close`.
+anything. (The delivery check's one side effect is `git fetch`, which refreshes this
+clone's remote-tracking refs.) The verdict is the reviewer's to assert through
+`/fresh-eyes-close`.
 """
 from __future__ import annotations
 
@@ -142,6 +183,19 @@ TERMINAL_NOT_CLOSED = ("pending", "in-progress", "blocked", "skipped", "expired"
 #: request is moot.
 REQUEST_STATUSES = ("pending", "candidate", "in-progress", "blocked", "completed")
 
+#: The closer role whose closures carry a commit_sha and can wait on a carrier ref. Only a
+#: worker Body stamps one (iteration-close, ), so only its closures are asked.
+WORKER_ROLE = "worker"
+
+#: Hours a worker closure may wait to land before `list` reports it STRANDED. Measured, not
+#: chosen (, cc-08, 2026-10-05, 96 worker waits): 9 reached 24 h, 2 reached 30 h and
+#: 1 reached 36 h, and every one landed on its own, so 24 h would mark 9% STRANDED and 36 h
+#: about 1%. Re-measure before moving it.
+STRAND_HOURS = 36.0
+
+#: The repository the delivery probe reads: this one, whose HEAD the stamp names.
+REPO_ROOT = SCRIPT_DIR.parent.parent
+
 
 # ─── shared definitions, loaded from the gate (one definition each) ────────────
 
@@ -175,6 +229,60 @@ def _resolver():
     sys.modules["goal_resolve"] = mod
     spec.loader.exec_module(mod)  # type: ignore[union-attr]
     return mod
+
+
+class _NoFetchProber:
+    """commit-reachability.py's `triage` with its per-call fetch off. `list` refreshes the
+    refs once for the whole run (refresh_delivery_refs); a fetch per closure would turn a
+    report of a second or two into minutes."""
+
+    def __init__(self, module):
+        self._module = module
+
+    def triage(self, repo, sha, target_ref="origin/main"):
+        return self._module.triage(repo, sha, target_ref=target_ref, do_fetch=False)
+
+
+def refresh_delivery_refs(repo=REPO_ROOT, timeout: int = 300) -> tuple[bool, str]:
+    """Fetch origin's branches and the worker refs once, with the refspecs the
+    /fresh-eyes-close delivery probe uses. Returns (ok, detail). A stale origin/main reads
+    landed work as stranded (guard-5797), so the caller turns the deferral off on failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "fetch", "--prune", "origin",
+             "+refs/heads/*:refs/remotes/origin/*",
+             "+refs/workers/*:refs/remotes/_reach_workers/*"],
+            capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if proc.returncode != 0:
+        return False, f"rc={proc.returncode} {proc.stderr.strip()[:200]}"
+    return True, ""
+
+
+def delivery_probe(repo=REPO_ROOT, prober=None):
+    """goal -> (state, detail), where state is the shared predicate's delivered, pending or
+    unknown. `prober` is injectable (a commit-reachability module); the default is the
+    real one, loaded by the predicate's own loader."""
+    import _delivery_gate as dg  # type: ignore  # the ONE reachability predicate ()
+    real = prober if prober is not None else dg._load_prober(str(SCRIPT_DIR))
+    if real is None:
+        return lambda goal: (dg.UNKNOWN, "commit-reachability prober unavailable")
+    shim = _NoFetchProber(real)
+    return lambda goal: dg.blocker_delivery_state(
+        goal, repo=str(repo), target_ref="origin/main", prober=shim)
+
+
+def setup_delivery(enabled: bool = True, repo=REPO_ROOT) -> tuple[Any, dict]:
+    """(probe or None, what `list` says about it). The probe is off when asked off and when
+    the refs could not be refreshed. Both say so, and neither defers anything."""
+    if not enabled:
+        return None, {"probe": "off", "reason": "--no-delivery"}
+    ok, detail = refresh_delivery_refs(repo)
+    if not ok:
+        return None, {"probe": "skipped",
+                      "reason": f"refresh of origin and the worker refs failed: {detail}"}
+    return delivery_probe(repo), {"probe": "on", "reason": ""}
 
 
 # ─── inputs ───────────────────────────────────────────────────────────────────
@@ -448,10 +556,27 @@ def select_requests(goals: list[dict], *, reviewed: set[str], reviewer: str) -> 
             "no_closer": no_closer, "skipped": skipped}
 
 
+def _delivery_of(goal: dict, delivery) -> tuple[str, str]:
+    """(state, detail) for one closure. Only a worker closure carrying a commit_sha is asked,
+    which is the population that can wait on a carrier ref (iteration-close stamps the sha
+    on a worker close alone); any other closure reads "unasked". A probe that raises reads
+    "unknown", and "unknown" lists the closure like every state but "pending"."""
+    if (delivery is None
+            or str(goal.get("completed_by_role") or "").strip().lower() != WORKER_ROLE
+            or not str(goal.get("commit_sha") or "").strip()):
+        return "unasked", ""
+    try:
+        state, detail = delivery(goal)
+    except Exception as exc:  # one bad record must not stop the listing for every reviewer
+        return "unknown", f"delivery probe raised: {type(exc).__name__}: {exc}"
+    return str(state), str(detail)
+
+
 def select_candidates(goals: list[dict], *, reviewed: set[str], now: datetime,
                       since_hours: float, reviewer: str, cap: int,
                       sampled_roles: frozenset[str] | set[str] = frozenset(),
-                      sample_rate: float = DEFAULT_SAMPLE_RATE) -> dict:
+                      sample_rate: float = DEFAULT_SAMPLE_RATE,
+                      delivery=None, strand_hours: float = STRAND_HOURS) -> dict:
     """Pure: which closures a reviewer should look at next, and which it may not.
 
     Filters: status must be `completed` (a recurring goal rests at `pending` with its
@@ -460,7 +585,14 @@ def select_candidates(goals: list[dict], *, reviewed: set[str], now: datetime,
     re-litigated), without a verdict artifact, and, for a relaxed role in
     `sampled_roles`, inside the sample (the rest are counted as `not_sampled`). Same-mind
     closures (completed_by == reviewer) are partitioned out, never ranked, and counted so
-    the caller can see the coverage this reviewer cannot provide."""
+    the caller can see the coverage this reviewer cannot provide.
+
+    `delivery` (goal -> (state, detail), see delivery_probe) is asked about every worker
+    closure that carries a commit_sha, AFTER the ranking and BEFORE the cap, so a deferred
+    row never takes a slot from one that can be reviewed. Only the state "pending" defers
+    it, into `waiting_to_land`. Once it has waited `strand_hours` it is `stranded` instead,
+    and a stranded row is OFFERED, first (longest wait first) and inside the cap, carrying
+    `stranded: true`. With no `delivery`, nothing is deferred."""
     cutoff = (now - timedelta(hours=since_hours)).strftime("%Y-%m-%dT%H:%M:%S")
     tier_mod = _tier()
     eligible: list[tuple[tuple, dict, dict]] = []
@@ -493,14 +625,37 @@ def select_candidates(goals: list[dict], *, reviewed: set[str], now: datetime,
         tier = tier_mod.classify(g)
         eligible.append((rank_key(g, tier["tier"]), g, tier))
     eligible.sort(key=lambda t: t[0])
-    rows = [dict(_row(g, tier), kind="closure", closer=g.get("completed_by"))
-            for _, g, tier in eligible[:cap]]
+    listed: list[tuple[dict, dict]] = []
+    waiting: list[dict] = []
+    stranded: list[dict] = []
+    for _, g, tier in eligible:
+        state, detail = _delivery_of(g, delivery)
+        if state != "pending":
+            listed.append((g, tier))
+            continue
+        stamp = _instant(closure_stamp(g))
+        hours = round((now - stamp).total_seconds() / 3600.0, 1) if stamp else None
+        row = dict(_row(g, tier), kind="closure", closer=g.get("completed_by"),
+                   delivery=detail, waiting_hours=hours)
+        if hours is not None and hours >= strand_hours:
+            stranded.append(dict(row, stranded=True))
+        else:
+            waiting.append(row)
+    for bucket in (waiting, stranded):  # the one that has waited longest first
+        bucket.sort(key=lambda r: -(r["waiting_hours"] or 0.0))
+    # A stranded closure is offered FIRST, inside the cap: it is the lane's finding, and
+    # behind the ranked rows it could wait out its window unreviewed.
+    rows = (stranded + [dict(_row(g, tier), kind="closure", closer=g.get("completed_by"))
+                        for g, tier in listed])[:cap]
     return {
         "candidates": rows,
         "eligible_total": len(eligible),
         "cap": cap,
         "same_mind": same_mind,
         "skipped": skipped,
+        "waiting_to_land": waiting,
+        "stranded": stranded,
+        "strand_hours": strand_hours,
     }
 
 
@@ -750,7 +905,9 @@ def _print_list(result: dict, roles: list[str], reviewer: str, since_hours: floa
           f"sampled={result['sampled_roles']}@{result['sample_rate']} reviewer={reviewer} "
           f"since={since_hours}h eligible={result['eligible_total']} cap={result['cap']} "
           f"same_mind_left_for_another_agent={len(result['same_mind'])} "
-          f"skipped={result['skipped']}")
+          f"skipped={result['skipped']} "
+          f"waiting_to_land={len(result.get('waiting_to_land') or [])} "
+          f"stranded={len(result.get('stranded') or [])}")
     req = result.get("requests") or {}
     print(f"  review requests: eligible={req.get('eligible_total', 0)} "
           f"same_mind_left_for_another_agent={len(req.get('same_mind') or [])} "
@@ -766,10 +923,32 @@ def _print_list(result: dict, roles: list[str], reviewer: str, since_hours: floa
             print(f"  {r['goal_id']} [{r['asp_id']}] tier={r['tier']} {r['priority']} "
                   f"by={r['completed_by']}/{str(r['completed_by_sid'] or '')[:8]} "
                   f"at={r['completed_at']} — {r['title'][:90]}")
+        if r.get("stranded"):
+            print(f"      · STRANDED: waited {r['waiting_hours']}h to land — {r['delivery']}")
         for reason in r["tier_reasons"]:
             print(f"      · {reason}")
     if not result["candidates"]:
         print("  (no review request or unreviewed closure this reviewer may review)")
+    delivery = result.get("delivery") or {}
+    if delivery.get("probe") in ("off", "skipped"):
+        print(f"  delivery probe {delivery['probe']} ({delivery.get('reason')}): "
+              f"no closure was deferred this run")
+    offered = {r["goal_id"] for r in result["candidates"]}
+    unseen = [r["goal_id"] for r in result.get("stranded") or [] if r["goal_id"] not in offered]
+    if unseen:
+        print(f"  STRANDED beyond the cap: {len(unseen)} more ({', '.join(unseen)}) — "
+              f"waited {result.get('strand_hours')}h or more; raise --cap to offer them")
+    waiting = result.get("waiting_to_land") or []
+    if waiting:
+        print(f"  WAITING TO LAND (under {result.get('strand_hours')}h): {len(waiting)} — the "
+              f"closer's HEAD at close is not on origin/main yet, so these are not offered "
+              f"until it is")
+        for r in waiting:
+            age = "unknown" if r["waiting_hours"] is None else f"{r['waiting_hours']}h"
+            print(f"  {r['goal_id']} [{r['asp_id']}] tier={r['tier']} {r['priority']} "
+                  f"by={r['completed_by']}/{str(r['completed_by_sid'] or '')[:8]} "
+                  f"waiting={age} — {r['title'][:90]}")
+            print(f"      · {r['delivery']}")
 
 
 def _print_stats(stats: dict) -> None:
@@ -828,6 +1007,11 @@ def main(argv=None) -> int:
     ls.add_argument("--since-hours", type=float, default=72.0)
     ls.add_argument("--cap", type=int, default=3)
     ls.add_argument("--reviewer", default=None, help="defaults to $MIND_AGENT")
+    ls.add_argument("--strand-hours", type=float, default=STRAND_HOURS,
+                    help="hours a worker closure may wait to land before it is offered "
+                         f"first, marked STRANDED (default {STRAND_HOURS:g}, measured)")
+    ls.add_argument("--no-delivery", action="store_true",
+                    help="skip the delivery probe: no fetch, nothing deferred")
     ls.add_argument("--json", action="store_true")
     st = sub.add_parser("stats", help="pass rate and coverage per closer role + the relax-rule "
                                       "verdict")
@@ -857,10 +1041,13 @@ def main(argv=None) -> int:
             print("close-review-queue: reviewer unknown (--reviewer or $MIND_AGENT)",
                   file=sys.stderr)
             return 1
+        delivery, delivery_meta = setup_delivery(enabled=not args.no_delivery)
         result = select_candidates(goals, reviewed=reviewed_ids(goals), now=datetime.now(),
                                    since_hours=args.since_hours, reviewer=reviewer,
                                    cap=args.cap, sampled_roles=set(sampled),
-                                   sample_rate=sample_rate)
+                                   sample_rate=sample_rate, delivery=delivery,
+                                   strand_hours=args.strand_hours)
+        result["delivery"] = delivery_meta
         # Review requests go first and share the cap (): an open one holds its close
         # until a verdict exists, and every one was asked for. A goal that is both a request
         # and a closure is offered once, as the request.

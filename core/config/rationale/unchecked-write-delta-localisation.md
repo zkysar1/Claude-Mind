@@ -33,6 +33,11 @@ drop every site only one box has seen. That rule would also have to reach every 
 any box wrote the new field, which is the rollout-order trap that already applies to a
 change in the measuring code.
 
+The head the ratchet now records (g-115-11954) is not a member set and does not sit beside the
+scalar. It is one commit name inside the history row, and the handler's content-union keeps a
+row whole, so a head cannot come from a different reading than the count in the same row,
+which is exactly what a key beside `baseline` lacks. A test merges rows that carry it.
+
 A snapshot file beside the baselines has the same problem in a second store that needs its
 own handler. Listing the most recently modified unverified sites stores nothing, but it
 cannot name the two ways this ratchet has actually moved: a wrapper that gained a mutating
@@ -61,13 +66,23 @@ fixed. The regression it was built against, two sites losing the credit that a n
 header had given them (444 to 446), comes back as exactly those two sites in about a second.
 
 `--new-since baseline` finds the old revision from the history already in the file: the
-newest retained row whose count equals the baseline, mapped to the last commit at or before
-its timestamp. Row stamps are naive UTC and are handed to git as UTC.
+newest retained row whose count equals the baseline. When that row carries the `head` the
+ratchet recorded, the head is the revision, and `dirty` says how many audited inputs
+differed from it when it was read. A row without one, or with a head this checkout does not
+hold, is mapped to the last commit at or before its timestamp instead, and the report says
+which way it went. Row stamps are naive UTC and are handed to git as UTC.
+
+The clock was the only route until g-115-11954, and it could not name the tree that set a
+floor. The floor of 444 was read at 2026-10-03T14:36:55; the commit mapped from that time
+read 445 under the current matcher with nothing joined or left, so the box that set the
+floor had measured a different tree or a different matcher, and its row named neither.
 
 ## What it does not do
 
-- It is not exact about the revision. The commit is matched by date, so the report prints
-  the commit it chose, and `--new-since <sha>` overrides it.
+- It is exact about the revision only for a row that recorded its head, and even then a
+  `dirty` above 0 means that box held uncommitted edits to audited files, so the head
+  approximates its corpus. Otherwise the commit is matched by date, so the report prints
+  the commit it chose and how, and `--new-since <sha>` overrides it.
 - History is capped at 50 rows and every run appends one, regressed runs included. A
   regression left unfixed long enough pushes the last row at the baseline out of the window;
   `baseline` then fails with a message saying so instead of guessing, and a named revision
@@ -77,7 +92,9 @@ its timestamp. Row stamps are naive UTC and are handed to git as UTC.
   ratchet is not: it appends history, so run it only where the reading should be recorded.
 - It does not change what is counted. On one corpus the default census output was
   byte-identical before and after the change that added this mode, which matters because a
-  measuring change that lands on one box first moves the shared floor under the others.
+  measuring change that lands on one box first moves the shared floor under the others. The
+  later `provenance` key (g-115-11954) is the one deliberate difference in that output;
+  no count moved.
 
 ## Cross-references
 

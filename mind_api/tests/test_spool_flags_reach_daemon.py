@@ -21,6 +21,10 @@ Code's own Bash calls, and the allowlist entry that fixed it is the part that
 remained. Do not add a test here that says "flag in settings => flag in the
 allowlist": the overlay makes that false as a delivery requirement.
 
+The retrieval-trace writer flag (g-374-161) is pinned here too. It is a *_SEGMENTED
+flag, not a *_SPOOLED one, but it travels the same channel and fails the same silent
+way: a flip the daemon never reads leaves it appending to the legacy file.
+
 The source is parsed, not imported: importing `__main__` starts the daemon's
 module-level machinery, and this must stay a pure static check (same posture as
 test_owncloud_sync_controls.py).
@@ -61,4 +65,20 @@ def test_the_tree_lane_reads_the_flag_name_settings_and_the_allowlist_use():
     import _tree_retrieval_spool as trs
     assert trs.SPOOLED_ENV == "TREE_RETRIEVAL_SPOOLED", (
         "the reader's env name drifted from the one settings.json and the "
+        "allowlist carry: a flip would set a name nothing reads (guard-3485)")
+
+
+def test_the_trace_writer_flag_is_resolvable_from_env_local_by_the_daemon():
+    assert "RETRIEVAL_TRACE_SEGMENTED" in _allowed_exact(), (
+        "RETRIEVAL_TRACE_SEGMENTED is not in _N3_ALLOWED_EXACT: a value declared "
+        "in .env.local would be ignored by the daemon that writes the trace, and "
+        "a settings-only flip arms no daemon recycle (rb-8458), so the daemon "
+        "would keep appending to the legacy file with no error (guard-3485)")
+
+
+def test_the_trace_writer_reads_the_flag_name_settings_and_the_allowlist_use():
+    sys.path.insert(0, str(ROOT / "core" / "scripts"))
+    import _retrieval_trace as rt
+    assert rt.SEGMENTED_ENV == "RETRIEVAL_TRACE_SEGMENTED", (
+        "the writer's env name drifted from the one settings.json and the "
         "allowlist carry: a flip would set a name nothing reads (guard-3485)")

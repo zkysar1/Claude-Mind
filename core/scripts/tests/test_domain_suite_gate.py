@@ -267,6 +267,36 @@ def test_a_timeout_lets_the_runner_name_the_unit_it_was_on(tmp_path):
     assert not any("[2/2]" in ln for ln in doc["tail"]), "the slow unit must not have finished"
 
 
+def test_the_runner_child_gets_an_isolated_runtime_that_cannot_autospawn(tmp_path, monkeypatch):
+    # : the gate isolates the suite's daemon runtime (RUNTIME_DIR and
+    # RT_DIR -> an empty tempdir, ). Since b599f12f86 () an
+    # empty runtime dir cannot spawn a daemon while ANY live daemon exists, so every
+    # daemon-backed wrapper a unit reached waited out the ~15.5 s auto-start window
+    # and then failed anyway: 17 calls = 277 s in one unit against its 300 s
+    # PER_FILE_TIMEOUT. RT_NO_AUTOSPAWN=1 makes the same call fail in ~0.02 s with
+    # the same rc and the same "daemon is unreachable" block. The ambient value is
+    # forced to "0" so a box that already exports the flag cannot pass this without
+    # the gate setting it (rb-5433), and the child's own view is what is asserted
+    # (guard-2230), not the gate's env dict.
+    sink = tmp_path / "child-env.txt"
+    monkeypatch.setenv("CHILD_ENV_SINK", str(sink))
+    monkeypatch.setenv("RT_NO_AUTOSPAWN", "0")
+    hook = (
+        "#!/usr/bin/env bash\n"
+        'echo "autospawn=${RT_NO_AUTOSPAWN-unset}" > "$CHILD_ENV_SINK"\n'
+        'echo "runtime=${RUNTIME_DIR-unset}" >> "$CHILD_ENV_SINK"\n'
+        'echo "rtdir=${RT_DIR-unset}" >> "$CHILD_ENV_SINK"\n'
+        "exit 0\n"
+    )
+    world = _world(tmp_path, {"test_green.py": GREEN_TEST}, hook=hook)
+    rc, doc, _ = _run(tmp_path, world, "--since", OLD)
+    assert rc == 0 and doc["decision"] == "pass", doc
+    seen = dict(ln.split("=", 1) for ln in sink.read_text(encoding="utf-8").splitlines())
+    assert seen["autospawn"] == "1", seen
+    # The isolation this flag rides on must still be in force: one fresh dir, both names.
+    assert seen["runtime"] == seen["rtdir"] and seen["runtime"] != "unset", seen
+
+
 def test_failing_ids_reads_both_output_shapes():
     import importlib.util
     spec = importlib.util.spec_from_file_location("domain_suite_gate_t", GATE)

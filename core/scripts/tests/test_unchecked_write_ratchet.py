@@ -47,10 +47,14 @@ def _load_module():
     return mod
 
 
-def _audit(unverified, verified, verdict="CONFIRMED", call_sites=None):
+HEAD = "ab" * 20   # a full sha, as `git rev-parse HEAD` prints it
+_UNSET = object()
+
+
+def _audit(unverified, verified, verdict="CONFIRMED", call_sites=None, provenance=_UNSET):
     if call_sites is None:
         call_sites = unverified + verified
-    return {
+    audit = {
         "verified": verified,
         "unverified": unverified,
         "verdict": verdict,
@@ -61,6 +65,12 @@ def _audit(unverified, verified, verdict="CONFIRMED", call_sites=None):
             "call_sites": call_sites,
         },
     }
+    # The real audit always reports the tree it read; provenance=None models one that predates it.
+    if provenance is _UNSET:
+        provenance = {"head": HEAD, "dirty": 0}
+    if provenance is not None:
+        audit["provenance"] = provenance
+    return audit
 
 
 @pytest.fixture()
@@ -211,3 +221,35 @@ def test_audit_reads_the_baseline_entry_this_ratchet_writes(ratchet):
     audit = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(audit)
     assert audit.BASELINE_KEY == ratchet.KEY
+
+
+# --- the tree each reading was taken over () ------------------------
+
+def test_history_row_records_the_tree_the_reading_was_taken_over(ratchet, monkeypatch):
+    _run(ratchet, _audit(464, 73, provenance={"head": HEAD, "dirty": 3}), monkeypatch)
+    bd = _read(ratchet)[ratchet.KEY]["history"][-1]["breakdown"]
+    assert (bd["head"], bd["dirty"]) == (HEAD, 3)
+
+
+def test_a_reading_from_an_audit_without_provenance_is_still_recorded(ratchet, monkeypatch):
+    """Fail soft: an audit that predates the field, or a checkout git cannot read, may cost
+    the row its provenance and nothing else."""
+    assert _run(ratchet, _audit(464, 73, provenance=None), monkeypatch) == 0
+    entry = _read(ratchet)[ratchet.KEY]
+    bd = entry["history"][-1]["breakdown"]
+    assert (bd["head"], bd["dirty"]) == (None, None)
+    assert (entry["baseline"], entry["last_verdict"]) == (464, "seeded")
+    _run(ratchet, _audit(464, 73, provenance={"head": None, "dirty": None}), monkeypatch)
+    assert _read(ratchet)[ratchet.KEY]["last_verdict"] == "stable"
+
+
+def test_the_audit_reads_back_the_head_this_ratchet_records(ratchet, monkeypatch):
+    """Writer and reader are two files that agree only by convention: `--new-since baseline`
+    has to find the head in the row shape this writer produces."""
+    _run(ratchet, _audit(464, 73, provenance={"head": HEAD, "dirty": 2}), monkeypatch)
+    spec = importlib.util.spec_from_file_location(
+        "unchecked_write_audit_for_head", CORE_SCRIPTS / "unchecked-write-audit.py")
+    audit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audit)
+    baseline, _stamp, seen = audit.baseline_reading(ratchet.BASELINES_PATH)
+    assert baseline == 464 and seen == {"head": HEAD, "dirty": 2}

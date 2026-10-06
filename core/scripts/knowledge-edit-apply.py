@@ -101,7 +101,9 @@ safely, never because the member asked for too much:
   forget_not_a_leaf   the node has children, and dropping it would orphan them.
   index_unsupported   the index is not a mapping that holds the node (an unreadable file, or a
                       list of nodes). This writer edits only a shape it can restore.
-  undo_expired        the retention window has passed.
+  undo_expired        the retention window had passed when the member sent the undo (``--queued-at``,
+                      which the drain takes from the queued record), or, with no readable send time,
+                      when it is applied.
   undo_conflict       the index holds that key again, or a page was written at the node's file
                       since the forget, so restoring would overwrite what the member never saw.
   undo_parent_missing the node's parent is gone, and restoring would strand it.
@@ -715,10 +717,12 @@ def forget_refusal(export, world: Path, kind: str, item_id: str, record: dict,
     return None
 
 
-def undo_refusal(export, world: Path, record: dict) -> str | None:
-    """A refusal only an undo has, or ``None``. ``record`` is the retained record. Runs before
-    any write."""
-    if not knowledge_retention.in_window(record, knowledge_retention.now_utc()):
+def undo_refusal(export, world: Path, record: dict, queued_at: str = "") -> str | None:
+    """A refusal only an undo has, or ``None``. ``record`` is the retained record and
+    ``queued_at`` is when the member sent the undo, which is when its window is judged
+    (``knowledge_retention.judged_at``). Runs before any write."""
+    if not knowledge_retention.in_window(
+            record, knowledge_retention.judged_at(queued_at, knowledge_retention.now_utc())):
         return "undo_expired"
     if record.get("kind") == "hypothesis":
         return _hypothesis_undo_refusal(export, world, record)
@@ -1327,6 +1331,10 @@ def main(argv: list[str] | None = None, report: dict | None = None) -> int:
     ap.add_argument("--retention-dir", default="",
                     help="where a forgotten item's text is retained for undo (forget and undo "
                          "only); supplied by the caller, never derived")
+    ap.add_argument("--queued-at", default="",
+                    help="when the member sent the request, as the queued record carries it "
+                         "(undo only): the undo's window is judged then, never later than now. "
+                         "Absent or unreadable means judge at apply time")
     ap.add_argument("--apply", action="store_true", help="perform the write")
     ap.add_argument("--json", action="store_true", help="machine-readable plan")
     args = ap.parse_args(argv)
@@ -1347,7 +1355,7 @@ def main(argv: list[str] | None = None, report: dict | None = None) -> int:
     if refusal is None and plan.remove:
         refusal = forget_refusal(export, world, kind, item_id, record, args.retention_dir)
     if refusal is None and plan.restore:
-        refusal = undo_refusal(export, world, record)
+        refusal = undo_refusal(export, world, record, args.queued_at)
     field = EDIT_FIELDS.get(kind, "")
     text = str(plan.writes.get(field, ""))
     if refusal is None and not (plan.remove or plan.restore):

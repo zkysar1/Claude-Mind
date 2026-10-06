@@ -110,6 +110,21 @@ def _parse_ts(value):
         return None
 
 
+def _unit_key(unit):
+    """Comparison form of a unit token: case-folded, one trailing ``.sh`` dropped.
+
+    The lease is keyed on a free-form string, so two Bodies naming the same
+    wrapper ``x`` and ``x.sh`` both acquired cleanly and built it twice
+    (g-115-7170, measured 2026-08-22). Claims and releases are matched on this
+    form; the marker and ``status`` keep the token as the Body typed it, and
+    ``status`` flags two live rows that share the form. Units that merely look
+    alike (``x.j2``, ``x-write``, ``x.sh.bak``) stay distinct, because a hard
+    reject on a near-neighbour would block real work.
+    """
+    key = (unit or "").casefold()
+    return key[:-3] if key.endswith(".sh") else key
+
+
 def live_claims(records, *, now, lease_hours):
     """Map ``(goal_id, unit) -> claim record`` for every UNEXPIRED, UNRELEASED claim.
 
@@ -118,7 +133,10 @@ def live_claims(records, *, now, lease_hours):
     kept, each is cancelled only by a release from its OWN session at-or-after
     it, and the newest SURVIVOR holds the unit. A release by a DIFFERENT session
     cannot clear a claim -- otherwise a peer could free a live unit and re-create
-    the collision.
+    the collision. A release matches a claim on the unit's comparison form
+    (``_unit_key``), so releasing ``x.sh`` clears the holder's own claim posted
+    as ``x``: ``acquire`` answers ``already-mine`` for either spelling, and a
+    Body that trusts that answer must be able to release by it.
 
     KEEPING EVERY CLAIM, NOT JUST THE NEWEST, IS LOAD-BEARING. With
     newest-claim-only bookkeeping the sequence [A claims, B claims anyway
@@ -129,7 +147,7 @@ def live_claims(records, *, now, lease_hours):
     likelihood here: the cost of remembering an extra claim is a dict entry.
     """
     claims = {}    # key -> [(ts, rec), ...]
-    releases = {}  # (key, sid) -> newest release ts
+    releases = {}  # ((goal, unit comparison form), sid) -> newest release ts
     for rec in records:
         if not isinstance(rec, dict):
             continue
@@ -147,13 +165,14 @@ def live_claims(records, *, now, lease_hours):
             # A release with an unparseable timestamp cannot be shown to
             # postdate any claim, so it supersedes nothing (parity with
             # goal-pickup-coordination-check.supersede_released_claims).
-            rkey = (key, rec.get("session_id") or "")
+            rkey = ((goal, _unit_key(unit)), rec.get("session_id") or "")
             if rkey not in releases or ts > releases[rkey]:
                 releases[rkey] = ts
 
     cutoff = now - timedelta(hours=lease_hours)
     out = {}
     for key, entries in claims.items():
+        canon = (key[0], _unit_key(key[1]))
         survivors = []
         for ts, rec in entries:
             # FAIL DIRECTION, adopted from the fleet's existing posture in
@@ -168,7 +187,7 @@ def live_claims(records, *, now, lease_hours):
             # must never do.
             if ts is not None and ts < cutoff:
                 continue  # lease expired -- a dead Body must not wedge a unit
-            rel_ts = releases.get((key, rec.get("session_id") or ""))
+            rel_ts = releases.get((canon, rec.get("session_id") or ""))
             if rel_ts is not None and ts is not None and rel_ts >= ts:
                 continue  # released by its own author
             survivors.append((ts, rec))
@@ -198,6 +217,13 @@ def decide(records, *, goal_id, unit, my_sid, now, lease_hours):
     """
     live = live_claims(records, now=now, lease_hours=lease_hours)
     holder = live.get((goal_id, unit))
+    if holder is None:
+        # The same unit spelled another way is still one unit ().
+        want = _unit_key(unit)
+        for (live_goal, live_unit), rec in sorted(live.items()):
+            if live_goal == goal_id and _unit_key(live_unit) == want:
+                holder = rec
+                break
     if holder is None:
         return {"verdict": "free", "holder": None}
     holder_sid = holder.get("session_id") or ""
@@ -404,6 +430,16 @@ def main(argv=None):
                  "author": r.get("author"), "timestamp": r.get("timestamp"),
                  "message_id": r.get("id")}
                 for (g, u), r in sorted(live.items()) if g == args.goal_id]
+        # Two live rows that are one unit (a forced duplicate, or claims posted
+        # before the spellings were unified) must not read as two distinct units:
+        # each row names the spelling(s) it collides with ().
+        by_form = {}
+        for r in rows:
+            by_form.setdefault(_unit_key(r["unit"]), []).append(r["unit"])
+        for r in rows:
+            twins = [u for u in by_form[_unit_key(r["unit"])] if u != r["unit"]]
+            if twins:
+                r["same_unit_as"] = twins
         if args.json:
             print(json.dumps({"goal_id": args.goal_id, "lease_hours": lease,
                               "live_units": rows}, indent=2))
@@ -411,7 +447,8 @@ def main(argv=None):
             print(f"no live unit claims on {args.goal_id} (lease {lease}h)")
         else:
             for r in rows:
-                print(f"{r['unit']}\t{r['session_id']}\t{r['timestamp']}\t{r['message_id']}")
+                twin = f"\tSAME UNIT AS {', '.join(r['same_unit_as'])}" if "same_unit_as" in r else ""
+                print(f"{r['unit']}\t{r['session_id']}\t{r['timestamp']}\t{r['message_id']}{twin}")
         return 0
 
     if args.command == "release":

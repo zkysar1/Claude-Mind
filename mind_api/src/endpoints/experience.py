@@ -60,6 +60,37 @@ def _meta(ctx):
     return ctx.paths.agent / "experience-meta.json"
 
 
+def _resolve_content_path(ctx, cp):
+    """Absolute path a record's content_path points at, across BOTH agent-dir eras.
+
+    Current-era rows are PROJECT_ROOT-relative (agents/<agent>/experience/x.md).
+    Rows written before the Phase-2.5.D relocation carry the agent name FIRST,
+    with no agents-parent segment (<agent>/experience/x.md), and that data is
+    live: the corpus is deliberately two-era (core/scripts/experience.py
+    validate_record applies the same rule; rb-7386). The legacy form is a SECOND
+    EXACT PATH, never a basename match, so a dangling pointer stays missing
+    (guard-2860). A file found under neither form resolves to where the record's
+    own shape says it belongs, so a missing-file report names the right place.
+    """
+    from pathlib import Path
+
+    p = Path(cp)
+    if p.is_absolute():
+        return p
+    root, agents_root = ctx.paths.project_root, ctx.paths.agents_root
+    current, legacy = root / p, agents_root / p
+    # The legacy form is skipped when the path already carries the agents parent
+    # (no agents/agents/...) and when the agents root IS the project root (the
+    # pre-relocation layout, where the two forms are the same path).
+    agents_rel = agents_root.relative_to(root).parts
+    legacy_shape = bool(agents_rel) and p.parts[:len(agents_rel)] != agents_rel
+    if current.exists():
+        return current
+    if legacy_shape and legacy.exists():
+        return legacy
+    return legacy if legacy_shape else current
+
+
 def _validate(ctx):
     """Cross-file integrity check: JSONL records vs .md files.
 
@@ -72,17 +103,12 @@ def _validate(ctx):
     jc = cache()
     items = list(jc.get(_live(ctx))) + list(jc.get(_archive(ctx)))
 
-    # Resolve PROJECT_ROOT from ctx — two levels up from the agent dir.
-    project_root = ctx.paths.agent.parent if ctx.paths.agent else None
-
     # Collect all content_paths from JSONL
     jsonl_paths = {}
     for rec in items:
         cp = rec.get("content_path", "")
         if cp:
-            p = Path(cp)
-            abs_cp = p if p.is_absolute() else (project_root / cp if project_root else p)
-            jsonl_paths[str(abs_cp)] = rec.get("id", "?")
+            jsonl_paths[str(_resolve_content_path(ctx, cp))] = rec.get("id", "?")
 
     # Collect all .md files in experience dir
     experience_dir = ctx.paths.agent / "experience" if ctx.paths.agent else None

@@ -110,6 +110,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # leaves headroom for a cold daemon without letting one wedged lane hold loop
 # entry open. Mirrors the always-run battery deliberately.
 _LANE_TIMEOUT_S = 120
+# How many ids an `ids` finding prints before it says "(+N more)".
+_IDS_SHOWN = 8
 _METER = "aspirations-precheck-budget-meter.sh"
 
 
@@ -118,11 +120,15 @@ _METER = "aspirations-precheck-budget-meter.sh"
 # one consumer, so a registry module would be the single-use abstraction
 # implementation-discipline.md rule 3 forbids.
 #
-# `finds` semantics are inherited from precheck-always-run-battery.py verbatim so
-# a reader of one can read the other:
+# `finds` semantics are inherited from precheck-always-run-battery.py so a reader
+# of one can read the other -- counts, lists and false verbatim, plus one kind of
+# this battery's own:
 #   counts -- int key, >0 is a finding
 #   lists  -- list key, non-empty is a finding
 #   false  -- bool key, FALSE is a finding
+#   ids    -- list key, non-empty is a finding AND the first ids are printed with
+#             the count, because a bare count names nothing a reader can act on
+#             (; the always-run sibling has no lane that needs it)
 # Every lane additionally treats a non-empty `failed` list as BOTH finding and
 # error, so a lane that half-worked is never reported clean.
 #
@@ -213,7 +219,14 @@ LANES = (
         # population as free-form prose defers (measured 102 of 105 on cc-02).
         # That is L2 evaluability, owned by  -- running the lane does
         # not fix it, and a green report here must not be read as "defers clear".
-        "finds": {"counts": ("cleared",), "lists": ("would_clear",), "false": ()},
+        # `uncovered_gate_goals` is the other skipped population: goals whose
+        # predicates ALL pass while the defer text names a gate none of them
+        # tests. The sweep counted them and nothing printed them, so a freeze
+        # (up to the 120 h fail-open) was silent. Each is now a finding that names
+        # the goals, so a reader tells a true protection from a misparse at a
+        # glance ().
+        "finds": {"counts": ("cleared",), "lists": ("would_clear",),
+                  "ids": ("uncovered_gate_goals",), "false": ()},
     },
     {
         # Sits beside defer-recheck deliberately: it reports the population
@@ -432,10 +445,11 @@ def _meter(action, runner, sweep=None):
 def _findings_for(lane, payload):
     """Human detail strings for whatever this lane reported. Empty == clean.
 
-    Byte-identical in semantics to precheck-always-run-battery._findings_for;
-    kept as a sibling copy rather than a shared import because the two batteries
-    are independently fail-open and a shared helper would couple their blast
-    radii for eleven lines of arithmetic.
+    Same semantics as precheck-always-run-battery._findings_for for counts, lists
+    and false (`ids` is this battery's own addition); kept as a sibling copy
+    rather than a shared import because the two batteries are independently
+    fail-open and a shared helper would couple their blast radii for a few lines
+    of arithmetic.
     """
     out = []
     f = lane["finds"]
@@ -447,6 +461,12 @@ def _findings_for(lane, payload):
         v = payload.get(k)
         if isinstance(v, list) and v:
             out.append(f"{k}={len(v)}")
+    for k in f.get("ids", ()):
+        v = payload.get(k)
+        if isinstance(v, list) and v:
+            shown = ", ".join(str(x) for x in v[:_IDS_SHOWN])
+            more = f" (+{len(v) - _IDS_SHOWN} more)" if len(v) > _IDS_SHOWN else ""
+            out.append(f"{k}={len(v)}: {shown}{more}")
     for k in f.get("false", ()):
         if payload.get(k) is False:
             out.append(f"{k}=False")

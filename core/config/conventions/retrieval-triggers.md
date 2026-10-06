@@ -305,6 +305,15 @@ remedy, re-run it, cannot fix a vocabulary miss).
   silently absent (g-115-3777). Framework retrieval is token-overlap on title +
   section headers + first 500 chars, returned under `framework_rules` (closes
   G8).
+- `--goal <goal-id>` also scopes the **experiences** lane (g-115-5619): that
+  goal's own live records (the `experience-read --goal` match — the `goal_id`
+  field, or the goal id embedded in the `exp-<goal-id>[-slug]` record id) are
+  returned ahead of the category matches, newest first, up to the depth's
+  `EXP_LIMITS` on top of the category selection. A recurring goal's runs are
+  filed under each run's own topic, so no category query reaches them all.
+  With no goal (and no in-flight goal inferable) the lane is category-only,
+  exactly as before. Measured live 2026-10-04 (cc-07): a goal with 14 live
+  records under 7 categories returned 5 of them before, 14 of 14 after.
 
 ### Enforcement note — the advisory pre-edit gate
 

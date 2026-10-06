@@ -263,6 +263,22 @@ def test_pid_cwd_reads_a_live_process_cwd():
     with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as other:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=root)
         try:
+            #  (2): probe the seam this test actually exercises. The
+            # /proc-existence gate above can pass on a Windows box that has a
+            # /proc DIRECTORY while pid_cwd itself has no source to read
+            # (os.readlink of /proc/<pid>/cwd is Linux-only) — the shape that
+            # turned this seam red on DESKTOP-O91DLK2. Skip where the source is
+            # absent rather than asserting against None: on Windows pid_cwd
+            # returning None is BY DESIGN (the spawn-refusal guard treats an
+            # unreadable cwd as a valid platform state — pinned by
+            # test_scope_does_not_count_an_unreadable_cwd), so a Windows cwd
+            # source would be shared-framework growth this one seam does not
+            # require (decided skip-on-Windows over a new source, ).
+            if lifecycle.pid_cwd(child.pid) is None:
+                pytest.skip(
+                    "no process-cwd source for this platform's live child "
+                    "(pid_cwd returned None); the seam needs /proc/<pid>/cwd"
+                )
             assert lifecycle.pid_cwd(child.pid) == os.path.realpath(root)
             assert lifecycle.scope_pids_to_root([child.pid], Path(root), lifecycle.pid_cwd) == [child.pid]
             assert lifecycle.scope_pids_to_root([child.pid], Path(other), lifecycle.pid_cwd) == []

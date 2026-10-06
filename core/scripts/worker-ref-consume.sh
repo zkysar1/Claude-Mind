@@ -35,6 +35,12 @@
 #                                                           #   (with tip-SHA receipt)
 #       [--force-retire-live "<justification>"]             #   override the liveness
 #                                                           #   refusal (logged to receipt)
+#   bash core/scripts/worker-ref-consume.sh --carry <ref> --tip <sha> \
+#       --owner-goal <g-id> --reason "<why>" [--ttl-h <N>]  # HOLD a tip you audited
+#   bash core/scripts/worker-ref-consume.sh --uncarry <ref> --reason "<why>"
+#                                                           #   drop a hold early
+#   bash core/scripts/worker-ref-consume.sh --drain [--json]  # PLAN the carrier drain, READ-ONLY
+#                                                           #   (: order, verdicts, stops)
 #
 # --retire refuses unless the ref is fully reachable from refs/remotes/origin/main
 # — reachable from local HEAD is NOT enough: a merged-but-unpushed main would make
@@ -60,8 +66,41 @@
 # passes; --force-retire-live "<why>" is the operator-knows-it-is-dead override
 # and is recorded verbatim in the receipt.
 #
+# --carry records a CARRY disposition: "leave this tip outstanding on purpose".
+# The record is keyed on (ref, tip SHA) in a fleet-synced append-only ledger
+# (core/scripts/worker_ref_carries.py owns the schema). While the ref still
+# points at --tip, --check prints the tip as CARRIED with its reason and leaves
+# it out of the STRANDED thresholds AND out of the dependency-pull inputs
+# (pull_tip_count / pull_first_ref); without that a held tip re-raised both on
+# every run, on every box. A moved tip voids the hold with no action, so a NEW
+# tip is never masked by an old decision, and a hold lapses after --ttl-h
+# (default 72h) unless the reducer renews it, so a forgotten hold cannot
+# silence the detector for good. --tip is REQUIRED and must match the ref's
+# current tip: the hold attests to the commit that was audited, not to whatever
+# the ref points at when the command happens to run. --uncarry records an
+# explicit release (the ledger is append-only; nothing is deleted).
+#
+# --check ALSO audits, BY RECORD, the *.jsonl paths that make an agent-store-only ref
+# MIXED (paired +N / -M lines), and prints the verdict beside the MIXED flag.
+# carrier_merge_audit.py reads the HEAD, tip and merge-tree blob of each such path
+# (plus the merge base) and counts the records that died, were invented, were
+# duplicated or were altered; CLEARS means all four are zero. A line count cannot tell
+# a duplicate-line collapse or a delivered counter update from a stale rewrite of live
+# state (guard-6539, rb-12157); the records can. merge_record_audit.py is the other
+# tool: it audits a merge that already happened, and has no handler for the
+# experience or journal ledgers.
+#
+# --drain is the PLAN half of the one-invocation  carrier drain ()
+# and is READ-ONLY. It runs this script's own --json report, previews each outstanding
+# tip's merge in tip-date order (each preview chained onto the earlier ones), and prints a
+# verdict per tip (MERGE / MERGE-VERIFY-FIRST / CARRY / STOP) with its reasons, the retire
+# candidates, base freshness, and a pin of the worker-ref store for the terminating
+# re-read. worker_ref_drain.py owns the semantics. Merge, verify, push and retire stay
+# the reader's own steps until the apply half lands.
+# Rationale (WHY a chained read-only plan): core/config/rationale/worker-ref-drain-plan.md
+#
 # Exit: 0 = ran (whether or not refs were found; --check is advisory and exits 0
-# even on breach). 1 = a merge/retire was requested and failed or was refused,
+# even on breach). 1 = a merge/retire/carry/drain was requested and failed or was refused,
 # or the repo/remote is unusable. Reporting zero refs is exit 0 — an empty fleet
 # of workers is a normal state, not an error.
 
@@ -80,14 +119,21 @@ AS_JSON=0
 MERGE_REF=""
 RETIRE_REF=""
 DO_CHECK=0
+DO_DRAIN=0
 MAX_DEPTH="${WORKER_REF_MAX_DEPTH:-30}"
 MAX_AGE_H="${WORKER_REF_MAX_AGE_H:-24}"
 SELF_SID="${MIND_SID:-}"
 FORCE_RETIRE_LIVE_JUST=""
+CARRY_REF=""; UNCARRY_REF=""; CARRY_TIP=""; CARRY_OWNER=""; CARRY_REASON=""; CARRY_TTL_H=""
+CARRY_PY="$SCRIPT_DIR/worker_ref_carries.py"
+DRAIN_PY="$SCRIPT_DIR/worker_ref_drain.py"
 # TEST-ONLY hermeticity seam (MIND_AGENTS_ROOT precedent): the retire liveness
 # gate reads in_flight_bodies through this reader. Production NEVER sets the
 # env — the default is the real sibling, and a test pins that default.
 TEAM_STATE_READER="${WORKER_REF_TEAM_STATE_READER:-$SCRIPT_DIR/team-state-read.sh}"
+# TEST-ONLY seam, same contract as the reader above: the --check by-record audit helper.
+# Production NEVER sets the env; a test pins that the default is the real sibling.
+AUDIT_PY="${WORKER_REF_AUDIT_PY:-$SCRIPT_DIR/carrier_merge_audit.py}"
 
 log() { echo "[worker-ref-consume] $*"; }
 
@@ -96,11 +142,18 @@ while [ $# -gt 0 ]; do
     --no-fetch)   DO_FETCH=0; shift;;
     --json)       AS_JSON=1; shift;;
     --check)      DO_CHECK=1; shift;;
+    --drain)      DO_DRAIN=1; shift;;
     --max-depth)  MAX_DEPTH="${2:-30}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --max-age-h)  MAX_AGE_H="${2:-24}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --merge)      MERGE_REF="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --retire)     RETIRE_REF="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --force-retire-live) FORCE_RETIRE_LIVE_JUST="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --carry)      CARRY_REF="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --uncarry)    UNCARRY_REF="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --tip)        CARRY_TIP="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --owner-goal) CARRY_OWNER="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --reason)     CARRY_REASON="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
+    --ttl-h)      CARRY_TTL_H="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     --repo)       REPO="${2:-}"; shift $(( $# >= 2 ? 2 : 1 ));;
     -h|--help)    sed -n '1,55p' "${BASH_SOURCE[0]}"; exit 0;;
     *)            log "unknown arg: $1" >&2; shift;;
@@ -118,6 +171,34 @@ if [ "$DO_FETCH" = 1 ]; then
     log "fetch of refs/workers/* FAILED — cannot report on carrier refs" >&2
     exit 1
   fi
+fi
+
+# --carry / --uncarry write the hold ledger (header above; worker_ref_carries.py
+# owns the schema). They sit after the fetch so --tip is compared with the ref as
+# it is NOW: a Body that pushed between the audit and this call is the case --tip
+# exists to catch.
+if [ -n "$UNCARRY_REF" ]; then
+  $PYLAUNCH "$CARRY_PY" release --ref "$UNCARRY_REF" --reason "$CARRY_REASON"
+  exit $?
+fi
+
+if [ -n "$CARRY_REF" ]; then
+  git -C "$REPO" rev-parse --verify "$CARRY_REF" >/dev/null 2>&1 || {
+    log "no such ref locally: $CARRY_REF (run without --carry first to fetch+list)" >&2; exit 1; }
+  carry_cur="$(git -C "$REPO" rev-parse "$CARRY_REF^{commit}" 2>/dev/null)"
+  carry_want="$(printf '%s' "$CARRY_TIP" | tr 'A-F' 'a-f')"
+  if ! [[ "$carry_want" =~ ^[0-9a-f]{12,64}$ ]]; then
+    log "REFUSED: --carry needs --tip <sha> (at least 12 hex chars): the tip you AUDITED. $CARRY_REF is at ${carry_cur:0:12} now." >&2
+    exit 1
+  fi
+  case "$carry_cur" in
+    "$carry_want"*) ;;
+    *) log "REFUSED: $CARRY_REF is at ${carry_cur:0:12}, not $carry_want. The ref moved since you audited it: re-run --check, audit THIS tip, then carry it." >&2
+       exit 1;;
+  esac
+  $PYLAUNCH "$CARRY_PY" record --ref "$CARRY_REF" --tip "$carry_cur" --owner-goal "$CARRY_OWNER" \
+    --reason "$CARRY_REASON" ${CARRY_TTL_H:+--ttl-h "$CARRY_TTL_H"}
+  exit $?
 fi
 
 if [ -n "$MERGE_REF" ]; then
@@ -335,6 +416,22 @@ print("")' 2>/dev/null)"
   exit 1
 fi
 
+# --drain: the PLAN half of the one-invocation  drain (header; ).
+# READ-ONLY by construction. It consumes this script's own --json report, so TIP
+# selection, carry state and the per-ref counts stay with that instrument and are
+# re-derived nowhere else. It never runs --check, whose producer gate writes a
+# shared world-store field, and the helper merges, pushes and retires nothing.
+if [ "$DO_DRAIN" = 1 ]; then
+  drain_args=(); [ "$AS_JSON" = 1 ] && drain_args+=(--json)
+  drain_report="$("${BASH:-bash}" "${BASH_SOURCE[0]}" --no-fetch --json --repo "$REPO")" || {
+    log "drain plan REFUSED: the --json report it is built from failed; nothing was planned" >&2
+    exit 1
+  }
+  printf '%s' "$drain_report" \
+    | $PYLAUNCH "$DRAIN_PY" plan --repo "$REPO" --refs-json - --audit-py "$AUDIT_PY" ${drain_args[@]+"${drain_args[@]}"}
+  exit $?
+fi
+
 # Report. For each worker ref: how many commits it carries that HEAD does not,
 # and which of those touch the framework paths that motivated the carrier.
 # PREFIX form 'refs/workers/', NOT the glob 'refs/workers/*'. for-each-ref
@@ -383,7 +480,46 @@ superseding_of() {
   return 0
 }
 
-n_refs=0; n_outstanding=0; n_unreadable=0
+# One status line (tab-separated, state first) for a tip, read from the hold
+# ledger. A helper failure is its own state and never a healthy "none" (the
+# F-002 rule below): the caller prints it, treats the tip as NOT held, and the
+# detector keeps reporting the tip.
+carry_status() {
+  local out
+  out="$($PYLAUNCH "$CARRY_PY" status --ref "$1" --tip "$2")" \
+    || out=$'unreadable\t-\t-\t-\t-\t-\tworker_ref_carries.py status exited non-zero'
+  printf '%s\n' "$out"
+}
+
+# By-record audit of the *.jsonl paths that make a ref MIXED (see the header paragraph;
+# carrier_merge_audit.py owns the semantics and the verdict words). $1 = the tip commit,
+# $2 = the merge-tree result tree. Only a path that DELETES lines is audited: a path with
+# no deleted line cannot have lost or altered a record. Every failure prints its own
+# UNMEASURED line, so no failure can read as CLEARS (the F-002 rule above).
+merge_audit_paths() {
+  local tip="$1" mtree="$2" cap=6 seen=0 skipped=0 a d p out
+  if [ -z "$tip" ]; then
+    echo "        audit UNMEASURED (the tip commit did not resolve)"
+    return 0
+  fi
+  while IFS=$'\t' read -r -d '' a d p; do
+    case "$p" in *.jsonl) ;; *) continue;; esac
+    case "$d" in ''|*[!0-9]*|0) continue;; esac
+    seen=$((seen+1))
+    if [ "$seen" -gt "$cap" ]; then skipped=$((skipped+1)); continue; fi
+    out="$($PYLAUNCH "$AUDIT_PY" --repo "$REPO" --path "$p" --pre HEAD --tip "$tip" --merged "$mtree" < /dev/null)" \
+      || out="audit $p: UNMEASURED (carrier_merge_audit.py exited non-zero)"
+    printf '%s\n' "$out" | sed 's/^/        /'
+  done < <(git -C "$REPO" diff --numstat -z --no-renames HEAD "$mtree" 2>/dev/null)
+  if [ "$seen" = 0 ]; then
+    echo "        no *.jsonl path in this merge deletes a line, so the by-record audit has nothing to measure."
+  fi
+  if [ "$skipped" -gt 0 ]; then
+    echo "        ($skipped more *.jsonl path(s) that delete lines were NOT audited: cap $cap per ref)"
+  fi
+}
+
+n_refs=0; n_outstanding=0; n_unreadable=0; n_carried=0
 # Dependency-pull accumulators (): the reducer-lane producer needs to
 # know whether ANY outstanding tip carries framework content, which this loop
 # already computes exactly. Re-deriving it after the loop would be a second
@@ -672,20 +808,37 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
     *) age_h=$(( (NOW_CT - oldest_ct) / 3600 )); [ "$age_h" -lt 0 ] && age_h=0;;
   esac
   is_tip=0
+  carried=0; carry_state="none"; carry_owner="-"; carry_at="-"; carry_exp="-"; carry_by="-"; carry_rtip="-"; carry_reason="-"
+  tip_full="$(git -C "$REPO" rev-parse "$ref^{commit}" 2>/dev/null || echo '')"
   if [ "$ahead" -gt 0 ] && [ "$is_self" = 0 ] && [ -z "$superseded_by" ]; then
     is_tip=1
     n_outstanding=$((n_outstanding+1))
-    if [ "$fw_real" -gt 0 ]; then
+    # A recorded CARRY on THIS exact tip takes it out of both fleet-visible
+    # outputs below, the STRANDED thresholds and the dependency-pull inputs. A
+    # moved tip, a lapsed hold and an unreadable ledger all land here as "not
+    # held", so every failure direction keeps the tip visible. It stays in
+    # n_outstanding: it is still outstanding, on purpose.
+    if [ -n "$tip_full" ]; then
+      IFS=$'\t' read -r carry_state carry_owner carry_at carry_exp carry_by carry_rtip carry_reason <<<"$(carry_status "$ref" "$tip_full")"
+      case "$carry_state" in
+        held|lapsed|voided|released|none|unreadable) ;;
+        *) carry_reason="unexpected helper output: ${carry_state:0:60}"; carry_state="unreadable";;
+      esac
+    fi
+    if [ "$carry_state" = held ]; then
+      carried=1; n_carried=$((n_carried+1))
+    elif [ "$fw_real" -gt 0 ]; then
       pull_fw_total=$((pull_fw_total+fw_real))
       pull_tip_count=$((pull_tip_count+1))
       [ -z "$pull_first_ref" ] && pull_first_ref="$ref"
     fi
   fi
+  carry_owner_json=""; [[ "$carry_owner" =~ ^g-[0-9]+-[0-9]+$ ]] && carry_owner_json="$carry_owner"
   # Threshold evaluation — TIPS only (an ancestor's depth is contained in its
   # tip's), and evaluate BOTH axes rather than stopping at the first breach
   # (guard-3644: an AND/OR probe that reports only its first failing condition
   # hides the shape of the problem).
-  if [ "$DO_CHECK" = 1 ] && [ "$is_tip" = 1 ]; then
+  if [ "$DO_CHECK" = 1 ] && [ "$is_tip" = 1 ] && [ "$carried" = 0 ]; then
     breach=""
     [ "$ahead" -gt "$MAX_DEPTH" ] && breach="depth=$ahead>(max $MAX_DEPTH)"
     if [ "$age_h" -gt "$MAX_AGE_H" ]; then
@@ -713,8 +866,10 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
     # CONFLICT disclosure, same -1 convention: a consumer reading -1 as "clean"
     # makes exactly the claim the human line refuses to make. 0 means MEASURED
     # clean — it is set only inside the resolved-tree branch.
-    printf '{"ref":"%s","agent":"%s","sid":"%s","commits_ahead":%s,"framework_files":%s,"is_self":%s,"superseded_by":"%s","oldest_unlanded_age_h":%s,"unreadable":%s,"sync_merges":%s,"goal_ids":"%s","framework_files_real":%s,"merge_paths_real":%s,"merge_added_real":%s,"merge_deleted_real":%s,"merge_conflicts_real":%s}' \
-      "$ref" "$agent" "$sid" "$ahead" "$fw_count" "$is_self" "$superseded_by" "$age_h" "$unreadable" "$sync_merges" "$goal_ids" "$fw_real" "$mt_total" "$mt_add" "$mt_del" "$mt_conf"
+    # merge_retrack_real () is the RE-TRACK count under the same -1 convention,
+    # appended LAST so --drain's plan reads the ignore test instead of re-deriving it.
+    printf '{"ref":"%s","agent":"%s","sid":"%s","commits_ahead":%s,"framework_files":%s,"is_self":%s,"superseded_by":"%s","oldest_unlanded_age_h":%s,"unreadable":%s,"sync_merges":%s,"goal_ids":"%s","framework_files_real":%s,"merge_paths_real":%s,"merge_added_real":%s,"merge_deleted_real":%s,"merge_conflicts_real":%s,"tip_sha":"%s","carry":"%s","carry_owner_goal":"%s","merge_retrack_real":%s}' \
+      "$ref" "$agent" "$sid" "$ahead" "$fw_count" "$is_self" "$superseded_by" "$age_h" "$unreadable" "$sync_merges" "$goal_ids" "$fw_real" "$mt_total" "$mt_add" "$mt_del" "$mt_conf" "$tip_full" "$carry_state" "$carry_owner_json" "$mt_retrack"
   else
     tag=""; [ "$is_self" = 1 ] && tag="  (this body — nothing to consume)"
     [ "$sync_merges" -gt 0 ] && tag="$tag  (+$sync_merges content-free sync merge(s) of origin/main — not counted)"
@@ -726,7 +881,18 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
     # below: fw_real=0 means no FRAMEWORK payload, not an empty merge.
     [ "$fw_count" -gt 0 ] && [ "$fw_real" = 0 ] && tag="$tag  [PHANTOM framework payload: all $fw_count file(s) already at HEAD by another route — no framework payload, no pull signal raised]"
     echo "  $ref"
-    echo "      agent=$agent sid=$sid  commits_ahead=$ahead  framework_files=$fw_count  oldest_unlanded=${age_h}h$tag"
+    echo "      agent=$agent sid=$sid  commits_ahead=$ahead  framework_files=$fw_count  oldest_unlanded=${age_h}h  tip=${tip_full:0:12}$tag"
+    case "$carry_state" in
+      held)
+        echo "      CARRIED: held on this exact tip (owner $carry_owner, recorded $carry_at by $carry_by, expires $carry_exp). Left out of the STRANDED thresholds and the dependency-pull signal. Any merge recommendation printed below is the generic one: this tip was held on purpose, so read the reason first."
+        echo "      carry reason: $carry_reason";;
+      lapsed)
+        echo "      ⚠ carry LAPSED: the hold on this tip (owner $carry_owner) expired $carry_exp, so it counts again. Renew it with --carry if you still mean it. Its reason was: $carry_reason";;
+      voided)
+        echo "      carry VOIDED: held at ${carry_rtip:0:12} (owner $carry_owner), but the ref is at ${tip_full:0:12} now, so the hold no longer applies and this tip counts again. Audit it before carrying it.";;
+      unreadable)
+        echo "      ⚠ carry ledger UNREADABLE ($carry_reason): treating this tip as NOT held.";;
+    esac
     # WHAT work is stranded, not just how much (). Printed for every
     # ref with named goals — deliberately NOT folded into the --check breach
     # banner, which fires only past the depth/age thresholds: the incident ref
@@ -831,6 +997,9 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
           echo "      ⚠ DELETION-ONLY: this merge REMOVES $mt_del line(s) and adds none. A carrier is a SNAPSHOT of a moving append-only store, so this is the carrier being STALE, not content to recover. Default disposition = CARRY, do NOT merge; if you merge anyway, name the records being dropped first."
         elif [ "$mt_del" -gt 0 ] 2>/dev/null; then
           echo "      ⚠ MIXED: +$mt_add / -$mt_del. On a one-record-per-line store a paired count is a full-record OVERWRITE, not an append (guard-6539). Diff the paths above before merging."
+          # The verdict belongs beside the flag: the paired count cannot say WHAT was
+          # overwritten, and the answer used to be rebuilt by hand on every occurrence.
+          merge_audit_paths "$tip_full" "$_mt"
         elif [ "$mt_add" -gt 0 ] 2>/dev/null && [ "$mt_del" = 0 ]; then
           # -gt 0, NOT -ge 0 (occ192 residue, ): a genuine append needs
           # at least one added line. The all-binary / pure-rename case sums to
@@ -867,7 +1036,8 @@ for ref in ${REF_LIST[@]+"${REF_LIST[@]}"}; do
 done
 
 if [ "$AS_JSON" = 1 ]; then
-  printf '],"ref_count":%s,"outstanding":%s,"unreadable":%s}\n' "$n_refs" "$n_outstanding" "$n_unreadable"
+  printf '],"ref_count":%s,"outstanding":%s,"unreadable":%s,"carried":%s,"pull_tip_count":%s,"pull_first_ref":"%s"}\n' \
+    "$n_refs" "$n_outstanding" "$n_unreadable" "$n_carried" "$pull_tip_count" "$pull_first_ref"
 else
   if [ "$n_refs" -eq 0 ]; then
     # Deliberately NOT phrased as "all clear". Zero refs and a broken fetch look
@@ -875,7 +1045,8 @@ else
     log "0 worker carrier refs present. Either no worker Body has pushed one, or none exists yet — this is a normal state, not a verified-empty one."
   else
     wr_unread=""; [ "$n_unreadable" -gt 0 ] && wr_unread=" ⚠ $n_unreadable UNREADABLE ref(s) excluded from that count — see per-ref lines."
-    log "$n_refs carrier ref(s), $n_outstanding outstanding TIP(s) with commits this branch lacks (ancestor refs are contained in their tips and not counted).$wr_unread"
+    wr_carried=""; [ "$n_carried" -gt 0 ] && wr_carried=" $n_carried of them CARRIED (held on their exact tip: left out of the STRANDED thresholds and the pull signal)."
+    log "$n_refs carrier ref(s), $n_outstanding outstanding TIP(s) with commits this branch lacks (ancestor refs are contained in their tips and not counted).$wr_carried$wr_unread"
   fi
 fi
 
@@ -890,6 +1061,7 @@ if [ "$DO_CHECK" = 1 ] && [ ${#CHECK_BREACHES[@]} -gt 0 ]; then
     log "  ⚠ $b"
   done
   log "Disposition per ref: --merge (then push main, then --retire), carry specific hunks, or discard with a receipt."
+  log "To HOLD an unchanged tip on purpose instead: --carry <ref> --tip <sha> --owner-goal <g-id> --reason \"<why>\" (it voids itself the moment the tip moves)."
 fi
 
 # --- DEPENDENCY-PULL PRODUCER, reducer lane () --------------------

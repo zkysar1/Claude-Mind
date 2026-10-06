@@ -75,6 +75,8 @@ def main():
         info = data.get("info", [])
         for p_info in info:
             print(f"   INFO: {p_info} present at destination (preserved, not leaked)")
+        for p_ign in data.get("ignored", []):
+            print(f"   INFO: {p_ign} present at destination but gitignored and untracked: cannot ship (not a leak)")
         if not leaked:
             print("   PASS")
             return 0
@@ -85,6 +87,8 @@ def main():
 
     if args.cmd == "verify-cruft":
         present = data.get("present", [])
+        for p_ign in data.get("ignored", []):
+            print(f"   INFO: {p_ign} present at destination but gitignored and untracked: cannot ship")
         if not present:
             print("   PASS")
             return 0

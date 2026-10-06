@@ -370,7 +370,10 @@ def test_floor_claimed_owner_is_out_of_pool_by_construction():
     goal = {
         "id": "g-claimed", "title": "already claimed", "status": "pending",
         "participants": ["agent"], "priority": "MEDIUM",
-        "claimed_by": "bravo", "claimed_by_sid": "sid-x",
+        # Another Mind on EVERY box: the module's AGENT_NAME is the box's agent (the
+        # bash-inject hook beats the setdefault pin above), so a literal name is the
+        # running agent on exactly one box (rb-3639, rb-3643).
+        "claimed_by": gs.AGENT_NAME + "-other", "claimed_by_sid": "sid-x",
     }
     asps = [{"id": "asp-test", "status": "active", "goals": [goal]}]
     cands = gs.collect_candidates(asps, source="world")

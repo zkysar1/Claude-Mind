@@ -7,15 +7,24 @@ UNCLAIMED, the stated disposal (precheck SKILL.md 0.5k rows +
 core/config/aspirations-precheck-digest.md) is to append ONE short line to the
 owner goal's `progress_note` carrying a recheck marker:
 
-    [recheck:<agent> <YYYY-MM-DD>] <one line: what re-fired, that nothing new was found>
+    <lane> re-fired [recheck:<agent> <YYYY-MM-DD>]: <one line: what re-fired, that nothing new was found>
 
 instead of composing a full reading paragraph. The marker is the signal a
 re-detection happened AT ALL on that day; the line's body is the bounded
 counter update. goal-field-append.sh wraps the append with its own
 idempotency sentinel `[appended:<marker>]` — pass the marker as
 `recheck-<agent>-<YYYYMMDD>` (bare token, no spaces) and put the
-`[recheck:...]` line in the TEXT. The idempotency key then means one marker
+recheck line in the TEXT. The idempotency key then means one marker
 line per agent per day, which is exactly the counting unit below.
+
+THE TEXT MUST OPEN WITH A WORD, NEVER WITH THE MARKER. On a goal whose
+`progress_note` is still empty (a fresh owner) the composed value's first byte
+is the text's first byte, and goal-field-append refuses a value that starts
+with `[` or `{` (rc=5, guard-6075 cause A; measured 2026-10-04 on g-115-11975,
+where the marker-first shape was refused and the same line succeeded once a
+word led it). RECHECK_LINE_RE below is unanchored (`finditer`), so the marker
+is found wherever it sits in the line; `recheck_marker.py <goal-id>` on that
+goal reports the leading-word line as bravo / 2026-10-04.
 
 WHY A MARKER LINE AND NOT A PARAGRAPH. Measured on cc-03 2026-09-30 (omni)
 and re-measured on cc-04 2026-10-02 (alpha, this goal): g-115-10165 accumulated

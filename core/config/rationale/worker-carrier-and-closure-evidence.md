@@ -40,7 +40,8 @@ The REDUCER side is `bash core/scripts/worker-ref-consume.sh` (fetch + report;
 --merge <ref> to take one). A worker does NOT run the consumer: merging another
 Body's framework edits into the shared tree is a reducer act, and report-only
 is deliberate — a framework change that applies to drifted context is worse
-than one that is lost.
+than one that is lost. `--drain` prints the read-only plan for the whole drain,
+one verdict per tip (g-306-506; why: worker-ref-drain-plan.md).
 
 ## Phase 3.9 — why closure evidence has a producer, and why it runs after 3.7/3.8 (g-115-5158)
 

@@ -35,7 +35,10 @@ sanctioned reader, and the parsers are the tracebacks in every Body log
 (`JSONDecodeError` on a banner line, `NameError` in a one-liner, `No such
 file` on a store that lives at an external path the model guessed). The deny
 names the reader, so the fix is one copy away (g-353-71). Writes into a temp
-path (/tmp, $TMPDIR, agents/<a>/temp/) are not governed stores and pass.
+path (/tmp, $TMPDIR, agents/<a>/temp/) are not governed stores and pass. That is
+judged on the operand's own TEXT: a destination reached through a shell variable,
+or through `cd` plus a bare filename, carries no temp marker and is refused
+(g-306-576; the CW1a-adopt archive step types the path literally for that reason).
 
 Fail-open contract (CRITICAL): any parse/IO/logic error -> approve. A broken
 gate is recoverable; a fail-closed one stalls every autonomous loop.

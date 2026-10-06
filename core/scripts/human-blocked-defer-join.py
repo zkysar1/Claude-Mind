@@ -30,7 +30,7 @@ of 8 human_blocked defers on 2026-07-31, THREE named the same external resource
 Sibling detective sweeps 0.5b.12 (blocked-signal-resolution) and 0.5b.13
 (reclaim-defer-audit) take the same posture for the same reason.
 
-FOUR SIGNALS of THREE different strengths -- read `confidence`, never mere presence.
+FIVE SIGNALS of THREE different strengths -- read `confidence`, never mere presence.
 Two are deterministic and they demand OPPOSITE actions, which is the whole reason the
 strength is a field rather than an implicit ordering:
 
@@ -50,17 +50,28 @@ strength is a field rather than an implicit ordering:
                    act on this alone; open the post.
 
   pq_missing       NO CONFIDENCE (`none`). The defer cites a `pq-` id that exists in
-                   no agent's file. Nothing arrived; the defer's own citation is
-                   broken (guard-1197: confirm a block is really filed before trusting
-                   it). Ranked BELOW heuristic deliberately -- collapsing it upward
-                   made the precheck renderer announce a board post that was never
-                   found, which is this sweep manufacturing exactly the kind of
-                   confident unsupported claim it exists to catch.
+                   no agent's file, read from a COMPLETE map. Nothing arrived; the
+                   defer's own citation is broken (guard-1197: confirm a block is
+                   really filed before trusting it). Ranked BELOW heuristic
+                   deliberately -- collapsing it upward made the precheck renderer
+                   announce a board post that was never found, which is this sweep
+                   manufacturing exactly the kind of confident unsupported claim it
+                   exists to catch.
+
+  pq_unverifiable  NO CONFIDENCE (`none`), and NOT a finding about the defer. The
+                   cited id is absent from what was read, but the pending-question
+                   map is known-INCOMPLETE (see `errors`): a file could not be read,
+                   or the store listing failed. A negative needs a complete corpus,
+                   so this is the honest form of `pq_missing` when it does not have
+                   one (g-115-4265).
 
 A vacuous zero is the failure mode this sweep must not have (rb-245). If a source
 cannot be read, the verdict is `unreadable`, never a clean 0 -- a sweep that reports
 "nothing to surface" because it read nothing would hide the exact class it exists to
-catch, forever. Always exits 0: it is a precheck detective and must never block the loop.
+catch, forever. A source that fails while defers WERE examined is `partial`: records
+(possibly none) plus `errors`, never `hits` or `clean`. `errors` is the second key of
+the payload so no truncated read of it drops it. Always exits 0: it is a precheck
+detective and must never block the loop.
 """
 
 from __future__ import annotations
@@ -153,33 +164,133 @@ def _read_goals(source: str) -> tuple[list[dict], str | None]:
     return goals, None
 
 
+def _pq_rows(doc) -> dict[str, str] | None:
+    """id -> status for one parsed pending-questions document; None = unrecognised shape.
+
+    Flatten LOCK-STEP with pending-questions-sweep.py::_load_questions: shape A
+    `{"questions": [...]}`, shape B a list of such documents, shape C a bare list of
+    entries. This reader once handled A and C only, so a shape-B file read as an agent
+    with no questions.
+    """
+    if doc is None:
+        return {}
+    if isinstance(doc, dict):
+        entries = doc.get("questions")
+        if entries is None:
+            return {}
+        if not isinstance(entries, list):
+            return None
+    elif isinstance(doc, list):
+        entries = []
+        for item in doc:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("questions"), list):
+                entries.extend(item["questions"])
+            elif "id" in item:
+                entries.append(item)
+    else:
+        return None
+    return {str(e["id"]): str(e.get("status") or "")
+            for e in entries if isinstance(e, dict) and e.get("id")}
+
+
+def _load_pq_copy(read, *args) -> tuple[dict[str, str] | None, str | None]:
+    """(rows, problem) for ONE copy of ONE file; (None, None) means no such file.
+
+    `read(*args)` returns the copy's bytes. `problem` is the exception type plus the
+    parser position, never a snippet and never `str(error)`: these files hold
+    questions addressed to the owner, and a YAML error's text quotes the offending line.
+    """
+    import yaml  # noqa: PLC0415
+    try:
+        raw = read(*args)
+    except (FileNotFoundError, NotADirectoryError):
+        return None, None
+    except Exception as e:  # noqa: BLE001
+        return None, f"read failed ({type(e).__name__})"
+    try:
+        doc = yaml.safe_load(raw.decode("utf-8"))
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        at = f" line {mark.line + 1} col {mark.column + 1}" if mark is not None else ""
+        problem = str(getattr(e, "problem", "") or "")[:80]
+        return None, f"{type(e).__name__}{at}" + (f": {problem}" if problem else "")
+    except UnicodeDecodeError as e:
+        return None, f"UnicodeDecodeError at byte {e.start}"
+    except ValueError as e:  # a constructor refusing a value, e.g. an impossible date
+        return None, type(e).__name__
+    rows = _pq_rows(doc)
+    if rows is None:
+        return None, f"unrecognized top-level shape ({type(doc).__name__})"
+    return rows, None
+
+
 def _read_pending_questions() -> tuple[dict[str, str], str | None]:
     """Map pq-id -> status across EVERY agent, not just the bound one.
 
-    Routed through agents_root() per the CLAUDE.md cross-agent-glob contract: a
-    depth-1 glob matches nothing post-relocation and would silently return {},
-    which this sweep would then render as "no pq answered" -- a vacuous zero.
+    The second element is None ONLY when the map is COMPLETE. Anything that could not
+    be completed -- a corrupt or unreadable file, a failed store read or listing, no
+    backend -- is named in it, and the caller must then read a cited id it cannot
+    find as UNVERIFIABLE, never as missing (g-115-4265: a swallowed per-agent error
+    and a stale peer mirror each manufactured a confident `pq_missing` for ids that
+    were real and filed).
+
+    Per agent, the STORE OF RECORD is read (`read_authoritative_bytes`; `read_text`
+    serves a diverged local mirror) with the local mirror's rows beneath it, so a
+    question its owner filed minutes ago and the store has not received is still
+    known. The roster is the store listing plus the local agent dirs, never a glob
+    over local files: a glob cannot tell an unreadable file from an agent with none,
+    and sees nothing for a peer a cold box never materialised (guard-980,
+    guard-2549). Residual: a row filed on another box and not yet in the store still
+    reads missing for the minutes the push takes (guard-5369).
     """
     try:
-        import yaml  # noqa: PLC0415
+        import yaml  # noqa: F401, PLC0415
     except Exception as e:  # noqa: BLE001
         return {}, f"pyyaml unavailable: {e}"
     try:
-        paths = sorted(agents_root().glob("*/session/pending-questions.yaml"))
+        root = agents_root()
+    except Exception as e:  # noqa: BLE001  the lane must never raise (always exits 0)
+        return {}, f"agents_root unavailable ({type(e).__name__})"
+    failures: list[str] = []
+    backend = None
+    try:
+        from storage_backend import get_backend  # noqa: PLC0415
+        backend = get_backend()
     except Exception as e:  # noqa: BLE001
-        return {}, f"agents_root glob failed: {e}"
-    if not paths:
-        return {}, "no pending-questions.yaml found under agents_root"
-    out: dict[str, str] = {}
-    for p in paths:
+        failures.append(f"storage backend unavailable ({type(e).__name__})")
+    names: set[str] = set()
+    try:
+        names.update(d.name for d in root.iterdir() if d.is_dir())
+    except OSError as e:
+        failures.append(f"agents_root unreadable ({type(e).__name__})")
+    if backend is not None:
         try:
-            doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-        except Exception:  # noqa: BLE001, S112
-            continue  # one unreadable agent file must not blank the whole map
-        rows = doc.get("questions") if isinstance(doc, dict) else doc
-        for r in rows or []:
-            if isinstance(r, dict) and r.get("id"):
-                out[str(r["id"])] = str(r.get("status") or "")
+            names.update(Path(str(n).rstrip("/")).name for n in backend.list_dir(root))
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"store listing failed ({type(e).__name__})")
+
+    out: dict[str, str] = {}
+    files = 0
+    for name in sorted(names):
+        path = root / name / "session" / "pending-questions.yaml"
+        local, local_problem = _load_pq_copy(path.read_bytes)
+        store, store_problem = ((None, None) if backend is None else
+                                _load_pq_copy(backend.read_authoritative_bytes, path))
+        if store_problem:
+            failures.append(f"{name} store: {store_problem}")
+        if local_problem and store is None:  # a bad mirror is moot beside a good store
+            failures.append(f"{name} local: {local_problem}")
+        for rows in (local, store):  # the store last, so it wins on a shared id
+            if rows is not None:
+                files += 1
+                out.update(rows)
+    if failures:
+        more = f" (+{len(failures) - 5} more)" if len(failures) > 5 else ""
+        return out, "pending-questions map INCOMPLETE — " + "; ".join(failures[:5]) + more
+    if not files:
+        return out, "no pending-questions.yaml found in the store or under agents_root"
     return out, None
 
 
@@ -247,6 +358,7 @@ def main() -> int:
     pq_status, pq_err = _read_pending_questions()
     if pq_err:
         errors.append(pq_err)
+    pq_complete = pq_err is None  # only a COMPLETE map licenses `pq_missing`
     msgs, board_err = _read_board([c.strip() for c in args.channels.split(",") if c.strip()],
                                   args.since)
     if board_err:
@@ -268,7 +380,14 @@ def main() -> int:
         cited = [m.rstrip(_PQ_TRAILING) for m in PQ_RE.findall(reason)]
         for pq in dict.fromkeys(p for p in cited if len(p) > 3):
             st = pq_status.get(pq)
-            if st is None:
+            if st is None and not pq_complete:
+                signals.append({"signal": "pq_unverifiable", "confidence": "none", "pq": pq,
+                                "detail": "cited pending-question not found in the "
+                                          "readable files, and the pending-question map "
+                                          "is INCOMPLETE (see errors) -- NOT a broken "
+                                          "citation; re-run once the unreadable source "
+                                          "is back"})
+            elif st is None:
                 signals.append({"signal": "pq_missing", "confidence": "none", "pq": pq,
                                 "detail": "cited pending-question not found in any "
                                           "agent's file (guard-1197: verify it is "
@@ -334,17 +453,21 @@ def main() -> int:
 
     records.sort(key=lambda r: (-_CONF_RANK.get(r["best_confidence"], 0), r["goal_id"]))
 
-    # A read failure must never render as a clean zero (rb-245).
-    verdict = "unreadable" if errors and not deferred else ("hits" if records else "clean")
+    # A read failure must never render as a clean zero (rb-245), and must not hide
+    # behind `hits` either: with defers examined and a source failed, the verdict is
+    # `partial` and `errors` rides directly after it ().
+    verdict = ("unreadable" if errors and not deferred
+               else "partial" if errors
+               else "hits" if records else "clean")
     result = {
         "verdict": verdict,
+        "errors": errors,
         "scanned": len(goals),
         "human_blocked_defers": len(deferred),
         "records": records,
         "deterministic_count": sum(1 for r in records
                                    if r["best_confidence"] == "deterministic"),
         "shared_premise_clusters": {k: v for k, v in premise_counts.items() if v > 1},
-        "errors": errors,
         "mutates": False,
     }
 

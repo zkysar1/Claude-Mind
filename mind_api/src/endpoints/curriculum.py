@@ -283,12 +283,18 @@ def _evaluate_gate(gate, agent_dir, project_root, world_dir=None, agent_name=Non
         command = gate.get("command", "")
         if not command.startswith("bash core/scripts/"):
             return False, "blocked: unsafe command"
+        # The command runs as the agent whose curriculum this is. This process's MIND_AGENT
+        # belongs to the agent that spawned the daemon (guard-2480, ).
+        env = os.environ.copy()
+        if agent_name:
+            env["MIND_AGENT"] = agent_name
         try:
             result = subprocess.run(
                 command,
                 shell=True,
                 cwd=str(project_root),  # CORRECTED: PROJECT_ROOT -> project_root
                 capture_output=True,
+                env=env,
                 timeout=30,
             )
             passed = result.returncode == 0

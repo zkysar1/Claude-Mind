@@ -6,6 +6,11 @@ position-anchored, why it reads the authoritative store rather than the mirror,
 and why it must be re-run at WRITE time. Every defect below returns a
 wrong-but-well-formed N, which reads as plausible rather than as an error.
 
+Since g-115-10980 (2026-10-03) the probe is `core/scripts/fresh-eyes-series-n.sh`, called from Phase 2.0(a);
+it used to be one line of that SKILL.md. Sections below that quote the probe quote the inline form they were
+measured on: read "branch 3" as the script's third branch, and read "Why the probe is a script, and why
+branch 3 reads a row's OWN index" before relying on any statement here about what branch 3 matches.
+
 ## Why there is no fleet-wide "top" or "tail"
 
 Measured twice, 12 days apart, all five shards: `sed '1,140p'` returns one agent's
@@ -52,6 +57,11 @@ alpha 83→83 · bravo 61→61 · echo 73→73 · foxtrot 57→57 · **zeta 34�
 regressions, zero over-matches, and zeta corrected by **45**.
 
 ## Why the third branch takes the FIRST `N=` per row
+
+> **Superseded in part by g-115-10980 (2026-10-03).** "First `N=` per row" assumed a row's own index comes
+> first, and four recorded rows broke that. Branch 3 now takes the row's OWN index, the bold `N=k` that opens
+> a cell (section below). What this section rejected still stands: a max WITHIN a row is wrong (echo's N=73
+> row names N=74), and position, never wording, is the discriminator.
 
 A row's own index appears FIRST (in its date cell or at the head of its verdict
 cell); any other `N=` later in the same row is prose referring to a DIFFERENT
@@ -101,6 +111,64 @@ today, recorded so the next reader does not re-derive them: CRLF (guard-987) —
 fenced code blocks (guard-526, the `prose-filter-pattern` node) — 0
 triple-backtick lines in all five, against a positive control returning 2. Both
 become live the day a shard gains a fence.
+
+## Why the probe is a script, and why branch 3 reads a row's OWN index (g-115-10980)
+
+**The probe was inline in the SKILL.md until 2026-10-03, and a skill body is rewritten with its invocation
+arguments before it is read.** Branch 3 was `awk 'match($0, /N=[0-9]+/) ...'`. Invoked as
+`/fresh-eyes-review --cadence` (the only automatic path: the precheck always passes it) the injected copy read
+`match(--cadence, /N=[0-9]+/)`, which is valid awk (a pre-decrement of an uninitialised variable): exit 0, no
+output, no warning (guard-5508). Measured on the five live authoritative shards (alpha worker Body, `hostname`
+cc-08, `uname -r` 6.8.0-142-generic, 2026-10-03T14:54Z), on-disk form against injected form: alpha 204/204,
+bravo 200/200, echo 190/190, foxtrot 139/139, **zeta 202/34**. Only zeta is hurt, because only zeta's index lives
+exclusively in table rows (its headings max at 34, a stray prose token); there the injected probe under-reads by
+168 and the next pass would mint N=35 on top of a live row, the collision direction every other defect in this
+file is about. It was re-met on at least five cadence passes (zeta 2026-09-26 and 2026-10-03, bravo 09-29,
+foxtrot 09-30, alpha 10-02). Raw numbers: `audit-reports/g-115-10980/shard-measure.txt` in the world store.
+
+**Why a script and not `$(0)`.** The aspirations-spark fix (g-115-11212) rewrote `$1` as `$(1)`, which the
+harness's `\$\d+(?!\w)` does not match. That works, but it leaves a 781-byte line in a file with 19 bytes of
+headroom under its injection ceiling (65,517 of 65,536 B), leaves the probe untestable (no test runs a line of
+skill prose), and leans on the harness's substitution grammar staying as measured. A script file is never
+rewritten; the move also shrank the SKILL.md by 221 bytes.
+
+**Why branch 3 now reads a row's OWN index, not its first `N=`.** The first-`N=` rule assumed a row's own index
+comes first. Four recorded rows broke that, in both directions. A backward pointer ahead of the own index returned
+the PREVIOUS point, which is a collision (zeta N=183, "carried from N=182"; zeta N=200, "the 7 ids of N=199").
+In the field|value layout a value row has no index of its own, so its first `N=` was a forward pointer that
+inflated the answer (alpha N=185; alpha N=195, "carry it to N=196", guard-5784). All four were held off only by a
+write-side convention (`core/config/fresh-eyes-shard-readings.md`), which is honour-system. A row's own index is
+the bold `N=k` that OPENS a cell (`| **N=k`, leftmost in the row). Measured on the five live shards, the first
+bold `N=` token of a row opens its cell in 21 of 21 bravo rows, 46 of 46 echo rows, 126 of 126 zeta rows and 4 of
+5 alpha rows; the fifth is the closing `**` of "**Population note:**" followed by " N=201's figures", which is
+why a bare `**N=` match is too loose and the anchor is the cell head. Under that rule the script returned the
+same N as the old on-disk form on every live shard (204, 200, 190, 139, 202) and read correctly the two zeta rows
+whose first `N=` was a backward pointer (N=183 and N=193; their first `N=` were 182 and 192). The g-115-10215
+rows (N=116 "NEW", N=135 "UNCHANGED", N=164 "NOT") each carry a cell-head bold own index equal to their first
+`N=`, so they are still extracted: the match is on the token, leftmost, with no negated-class prefix.
+
+**The trade this makes, stated plainly.** A row whose own index is NOT bold now contributes nothing, which
+under-reads in the collision direction. The live-shard rows that carry an `N=` but no cell-head bold one are not
+series points: alpha 24 field rows, bravo 8 archive-index and fold rows, echo 1 carve row, zeta 1 prose row (I
+read all of echo's and zeta's and the first six of alpha's and bravo's). The defences are the existing post-write
+assert (guard-4614: after the write, re-run the script and require it to return the N you wrote; an unbolded own
+index shows up there as N-1) and the SKILL.md line that says to write the index bold. NOT changed: branches 1
+and 2, and the row-level `handoff to N=` filter. Left for its own unit: under the own-index rule that row filter
+is redundant for rows (a forward reference later in a row cannot be its leftmost cell-head bold token) and
+harmful (it erases the own index of any row whose text says "handoff to N=", guard-4614).
+
+**Pinned by** `core/scripts/tests/test_fresh_eyes_series_n_probe.py`, 15 tests: the SKILL.md carries no
+positional parameter and injection under `--cadence` is the identity on it; the call exists exactly once and no
+inline `match(` returns; six shard shapes go through the real script on a temp world; a missing, empty or
+agent-less read is fatal; the read is the store's. Mutation matrix, 14 runs on throwaway copies: the plumbed copy
+passes 15 of 15, `exit 99` fails the 9 script tests (the seam reaches the copy), and each of 12 single-site
+sabotages is killed by the test written for it. First `N=` per row is killed by the forward- and backward-pointer
+fixtures, a missing cell anchor by the closing-bold row alone, every-token-in-a-row by row N=184 alone, a
+`[^N]*` prefix by the capital-N fixture, a case-sensitive heading filter by the caps `HANDOFF` fixture, the
+empty-read and unset-agent guards by their own tests, a mirror read by the source pin, and the four SKILL.md
+sabotages by the SKILL.md tests. Not verified: a live `/fresh-eyes-review --cadence` run (the harness
+substitution is simulated with guard-5508's regex; the invariant that no `$`-digit token exists holds for any
+rule keyed on positional tokens).
 
 ## Why a wrong diagnosis kept this unfixable for a day
 
@@ -251,3 +319,6 @@ documents (`guard-1238` — never probe with a pattern the probe itself contains
   authoritative-read + write-time-allocation fix
 - `core/config/fresh-eyes-shard-readings.md` — the dated per-shard readings ledger
 - `.claude/skills/fresh-eyes-review/SKILL.md` Phase 2.0 — consumer
+- `core/scripts/fresh-eyes-series-n.sh` — the probe (g-115-10980); `core/scripts/tests/test_fresh_eyes_series_n_probe.py` — its pin
+- guard-5508 (positional parameter in a skill body), guard-5784 (forward pointers in a heading or a field row),
+  guard-4614 (assert the probe equals the N you wrote); g-115-8334 — the class-level lint, still open

@@ -850,7 +850,10 @@ def _post_rollback_board(ctx, rollback_entry):
     board_type = _FILE_KIND_TO_ROLLBACK_BOARD_TYPE.get(file_kind, "evolution-rollback")
     file_path = rollback_entry.get("file_path") or "?"
     revision_id = rollback_entry.get("revision_id") or "?"
-    agent = rollback_entry.get("agent") or os.environ.get("MIND_AGENT", "")
+    # An entry with no agent gets the caller's: this process's MIND_AGENT belongs to the
+    # agent that spawned the daemon (guard-2480, ).
+    agent = (rollback_entry.get("agent") or (ctx.headers.get("x-mind-agent") or "").strip()
+             or os.environ.get("MIND_AGENT", ""))
     reasoning = (rollback_entry.get("reasoning") or "").strip()
     body = ("**{}** — `{}`\n\n- rollback revision: `{}`\n- previous revision: `{}`\n"
             "- agent: {}\n\n{}".format(board_type, file_path, revision_id,
@@ -888,7 +891,10 @@ def _email_rollback(ctx, rollback_entry):
     file_kind = rollback_entry.get("file_kind", "")
     file_path = rollback_entry.get("file_path") or "?"
     revision_id = rollback_entry.get("revision_id") or "?"
-    agent = rollback_entry.get("agent") or os.environ.get("MIND_AGENT", "")
+    # An entry with no agent gets the caller's: this process's MIND_AGENT belongs to the
+    # agent that spawned the daemon (guard-2480, ).
+    agent = (rollback_entry.get("agent") or (ctx.headers.get("x-mind-agent") or "").strip()
+             or os.environ.get("MIND_AGENT", ""))
     reasoning = (rollback_entry.get("reasoning") or "").strip()
     subject = "Auto-rollback: {} {}".format(file_kind, file_path)
     body = ("Backpressure auto-rolled back a recent edit to {}.\n\nRollback revision: {}\n"
@@ -928,10 +934,16 @@ def _evolution_rollback(ctx, mon, ev_cfg, current_vector, vote):
         snapshot_path = Path(history_snapshot)
         version_name = snapshot_path.name
         history_script = _scripts_dir(ctx) / "history.py"
+        # history.py attributes the restore to MIND_AGENT. This process's belongs to the
+        # agent that spawned the daemon, so hand the child the caller's (guard-2480, ).
+        env = os.environ.copy()
+        req_agent = (ctx.headers.get("x-mind-agent") or "").strip()
+        if req_agent:
+            env["MIND_AGENT"] = req_agent
         try:
             result = subprocess.run(
                 ["py", "-3", str(history_script), "restore", file_path, version_name],
-                capture_output=True, text=True, timeout=30)
+                capture_output=True, text=True, env=env, timeout=30)
             if result.returncode == 0:
                 rolled_back = True
             else:

@@ -43,7 +43,8 @@ rules are short AND are the actionable content.
      a pure utility cut is unreachable for any freshly-encoded entry (see
      `_relevance_floor`).
 
-Experiences are governed by EXP_LIMITS (10/15/25). Beliefs and
+Experiences are governed by EXP_LIMITS (10/15/25); when a goal is in hand, up
+to that many of the goal's own records are added on top (g-115-5619). Beliefs and
 experiential_index remain unfiltered/uncapped — beliefs are tiny and
 experiential_index is already category-keyed at the file level.
 
@@ -2489,7 +2490,7 @@ def load_forged_skills(categories):
     matches.sort(key=lambda e: (-_query_overlap(e, categories), e["name"]))
     return matches[:FORGED_SKILLS_CAP]
 
-def load_experiences(categories, depth, read_only=False):
+def load_experiences(categories, depth, read_only=False, goal_match=None):
     """Load top N experiences matching any category. Increment retrieval counters unless read_only.
 
     Counter writes are SPOOLED and folded back by one locked RMW per interval
@@ -2497,7 +2498,18 @@ def load_experiences(categories, depth, read_only=False):
     routes through `_locked_bump_jsonl` (with the `retrieval_stats.*` field
     path — experiences nest counters there rather than under `utilization`) so
     concurrent experience-archive writes from aspirations-execute are not
-    clobbered."""
+    clobbered.
+
+    `goal_match` (g-115-5619) is an optional predicate `record -> bool` that
+    says whether a record belongs to the goal in hand. When given, up to
+    `limit` live records it accepts that the category selection did not
+    already take are returned AHEAD of that selection, newest first. The
+    union is additive: the category selection is never trimmed or reordered,
+    so with no predicate (no goal, or a caller that passes none) the result
+    is exactly what it was before. The predicate is injected rather than
+    computed here because the goal-id derivation the experience read path
+    uses lives in a module this one must not import (daemon import surface,
+    `store_registry.py:471`); the daemon endpoint supplies it."""
     if not EXP_PATH:
         return []
     records = read_jsonl(EXP_PATH)
@@ -2545,6 +2557,23 @@ def load_experiences(categories, depth, read_only=False):
     )
 
     selected = matching[:limit]
+
+    # : a recurring goal's runs are categorized by each run's topic,
+    # so its own history is scattered across the very dimension the category
+    # match above indexes on (measured on a goal with 9 records under 8
+    # categories: no category query reached more than 1-2 of them, while
+    # `experience-read --goal` returned all 9). Union in the goal's own live
+    # records. Additive — `selected` is never trimmed — and the own records
+    # are bumped below like any other returned record, because they were
+    # returned. `created` is script-stamped ISO text, so it sorts as text.
+    if goal_match is not None:
+        taken = {r.get("id") for r in selected}
+        own = [r for r in records
+               if not r.get("archived", False)
+               and r.get("id") not in taken
+               and goal_match(r)]
+        own.sort(key=lambda r: str(r.get("created") or ""), reverse=True)
+        selected = own[:limit] + selected
 
     if not read_only and selected:
         selected_ids = {r["id"] for r in selected}
@@ -3459,7 +3488,8 @@ def _strip_long_form(result):
     carry inline body content (see `load_tree_nodes` note; tree bodies are
     always loaded via the Read tool after triage). Guardrail `rule` is preserved
     because rules are short AND ARE the actionable content. Experiences are
-    preserved (already bounded by EXP_LIMITS + retrieval_count sort).
+    preserved (already bounded by EXP_LIMITS + retrieval_count sort, plus up to
+    EXP_LIMITS of the goal's own records when a goal is in hand).
 
     Preserves every discriminative field the LLM needs to decide whether to
     load deeper: title, summary, when_to_use, trigger_condition, category,

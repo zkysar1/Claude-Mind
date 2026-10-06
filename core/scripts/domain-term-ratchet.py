@@ -57,6 +57,7 @@ if str(_HERE) not in sys.path:
 
 from _paths import META_DIR  # type: ignore  # noqa: E402
 from _fileops import locked_modify_yaml  # type: ignore  # noqa: E402
+from _ratchet_delta import box_name, describe, since_last_reading  # type: ignore  # noqa: E402
 
 import yaml  # type: ignore  # noqa: E402
 
@@ -189,10 +190,14 @@ def main() -> int:
             )
 
         history = entry.get("history") or []
+        # Read this box's previous reading BEFORE the new row is appended.
+        host = box_name()
+        captured["since"] = since_last_reading(history, current, host, now_iso)
         history.append({
             "recorded_at": now_iso,
             "drift_total": current,
             "verdict": verdict,
+            "hostname": host,
             "breakdown": {
                 "gaps": current,
                 "registry_terms": registry_terms,
@@ -239,12 +244,16 @@ def main() -> int:
                     "blocklisted": blocklisted, "files_scanned": files_scanned,
                     "gap_terms": gap_terms},
         "message": captured["message"],
+        "since_last_reading": captured.get("since"),
     }
     if args.json:
         print(json.dumps(result, indent=2))
     else:
         print(f"[domain-term-ratchet] {captured['verdict'].upper()}: "
               f"{captured['message']}")
+        if captured.get("since"):
+            print(f"[domain-term-ratchet] since last reading: "
+                  f"{describe(captured['since'])}")
 
     if (captured["verdict"] in ("regressed", "error")
             and os.environ.get("VERIFY_LEARNING_DRIFT_HARD_GATE") == "1"):

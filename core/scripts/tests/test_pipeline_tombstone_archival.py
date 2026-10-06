@@ -448,6 +448,45 @@ def test_archive_sweep_fold_never_walks_the_archive_back(tmp_path):
     assert rec["reflected_date"] == "2026-07-15"
 
 
+def test_archive_sweep_fold_stale_tombstone_overwrites_unprotected_fields(tmp_path):
+    #  pins the fold's contract for a conflicting field OUTSIDE the
+    # protected rules: the tombstone wins. That is the designed case for a
+    # tombstone that lived its grace window in place (it is the later copy), and
+    # it is the KNOWN EXPOSURE for a stale copy the union merge resurrected after
+    # an earlier prune, because no write stamps a per-record edit time to tell
+    # the two apart (see _fold_tombstone). This fixture is that exposure, written
+    # down so that changing it is a decision made on purpose. It asserts what the
+    # code does, not that the result is right; the protected rules hold in the
+    # same row.
+    rid = "2026-07-01_sweep-stale-unprotected"
+    archive_copy = _rec(rid, "archived", outcome="UNRESOLVABLE",
+                        outcome_detail="re-adjudicated after the prune",
+                        reflection_note="newer note, edited on the archive row",
+                        reflected=True, reflected_date="2026-07-15",
+                        replay_metadata={"replay_count": 3,
+                                         "last_replayed": "2026-07-25"})
+    stale = _rec(rid, "archived", outcome="CORRECTED",
+                 outcome_detail="the original adjudication",
+                 reflection_note="older note",
+                 reflected=False,
+                 replay_metadata={"replay_count": 1,
+                                  "last_replayed": "2026-07-10"},
+                 archived_date=_old(pipeline_write.PRUNE_GRACE_DAYS + 3))
+    world = _seed_world(tmp_path, [stale], archive=[archive_copy])
+    body = json.loads(pipeline_write.archive_sweep(FakeCtx(world)).body)
+    assert body["pruned_count"] == 1
+    assert body["folded_count"] == 1
+    [rec] = _read_jsonl(world / "pipeline-archive.jsonl")
+    # the known exposure: unprotected fields take the tombstone's value
+    assert rec["outcome"] == "CORRECTED"
+    assert rec["outcome_detail"] == "the original adjudication"
+    assert rec["reflection_note"] == "older note"
+    # the protected rules still hold in the same fold
+    assert rec["reflected"] is True
+    assert rec["reflected_date"] == "2026-07-15"
+    assert rec["replay_metadata"] == {"replay_count": 3, "last_replayed": "2026-07-25"}
+
+
 def test_archive_sweep_fold_collapses_duplicate_archive_rows(tmp_path):
     # guard-2449: the archive carries historical duplicate-id rows. Folding
     # only the FIRST would leave a stale twin for the union merge to pick.

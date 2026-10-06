@@ -307,7 +307,10 @@ def test_reducer_lane_is_wired_into_worker_ref_consume_check():
 def test_clear_is_wired_into_recurring_close():
     src = (CORE_SCRIPTS / "recurring-close.sh").read_text(encoding="utf-8")
     assert "has_pull_signal" in src
-    assert '"pull_signal", "null"' in src
+    # : the clear rides the counter batch as a NULL value (never a key
+    # removal -- goal-schemas.md "THE CLEAR IS FRAGILE"); the route accepts the
+    # field clear-only, which test_update_goal_fields.py pins on the daemon side.
+    assert 'fields["pull_signal"] = None' in src
 
 
 def test_clear_in_recurring_close_is_gated_so_it_cannot_stamp_every_goal():

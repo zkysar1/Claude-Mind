@@ -52,7 +52,7 @@ PYLAUNCH="$(rt_python_launcher)" || PYLAUNCH=python3
 source "$SCRIPT_DIR/_platform.sh"
 # _platform.sh converts REPO_ROOT/PROJECT_ROOT/CORE_ROOT/etc but NOT SCRIPT_DIR,
 # which was set via pwd in MSYS form. The inline Python block below exports
-# SD="$SCRIPT_DIR" and does `Path(os.environ["SD"]) / "aspirations.py"` — without
+# SD="$SCRIPT_DIR" and does `Path(os.environ["SD"]) / "cargo-cult-detector.py"` — without
 # this conversion, Python receives /c/... which becomes C:\c\... on Windows
 # subprocess.run ( iter 14  trace). Convert SCRIPT_DIR too.
 if [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
@@ -658,7 +658,15 @@ _irf="$(mktemp)" || _irf=""
 if [ -n "$_irf" ] && [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
     _irf="$(cygpath -m "$_irf")"
 fi
-GID="$GOAL_ID" SF="$SRC_FILE" OUTCOME="$OUTCOME" OUTCOME_ORIGIN="$OUTCOME_ORIGIN" SRC_FLAG="$SOURCE" SD="$SCRIPT_DIR" NOW="$NOW" INTERVAL_REVIEW_FILE="$_irf" python3 - <<'PYEOF'
+# : the heredoc names the counter fields it could not write in this
+# file (first line: the names; then one repair command per field), so the PHASE
+# FAILURE banner can name them. Empty when every field landed.
+local _cff
+_cff="$(mktemp)" || _cff=""
+if [ -n "$_cff" ] && [ "${MSYSTEM:-}" != "" ] && command -v cygpath &>/dev/null; then
+    _cff="$(cygpath -m "$_cff")"
+fi
+GID="$GOAL_ID" SF="$SRC_FILE" OUTCOME="$OUTCOME" OUTCOME_ORIGIN="$OUTCOME_ORIGIN" SRC_FLAG="$SOURCE" SD="$SCRIPT_DIR" NOW="$NOW" INTERVAL_REVIEW_FILE="$_irf" COUNTER_FAILURE_FILE="$_cff" python3 - <<'PYEOF'
 import json, os, subprocess, sys
 from pathlib import Path
 import yaml
@@ -724,25 +732,42 @@ if outcome == "deep" and outcome_origin == "genuine":
 else:
     new_sub_hits = current_sub_hits
 
-upd = subprocess.run(
-    [sys.executable, str(sd / "aspirations.py"),
-     "--source", src, "update-goal", gid, "consecutive_routine", str(new_val)],
-    capture_output=True, text=True, encoding="utf-8",
-)
-if upd.returncode != 0:
-    print(f"[recurring-close] update consecutive_routine failed: {upd.stderr}", file=sys.stderr)
-    sys.exit(1)
+# : every counter field of this close lands through ONE daemon write
+# (POST /v1/aspirations/update-goal-fields), not one `update-goal` call per
+# field. Each of those calls was a full rewrite of the goal store: up to eight
+# per close, which on a versioned object store is eight new versions of the
+# hottest key (). The write is all-or-named: ANY field the daemon
+# could not confirm fails the close and is NAMED. Before this, only
+# consecutive_routine could fail it (), and the first failed write
+# dropped every later one ().
+sys.path.insert(0, str(sd))
+import _rt
 
-upd_d = subprocess.run(
-    [sys.executable, str(sd / "aspirations.py"),
-     "--source", src, "update-goal", gid, "consecutive_deep", str(new_deep)],
-    capture_output=True, text=True, encoding="utf-8",
-)
-deep_write_landed = upd_d.returncode == 0
-if upd_d.returncode != 0:
-    print(f"[recurring-close] update consecutive_deep failed: {upd_d.stderr}", file=sys.stderr)
-    # Non-fatal — auto-contract is a value-add, not load-bearing.
-    # But the narration below MUST NOT claim the transition happened ().
+
+def _write_counter_fields(counter_fields):
+    """-> (unwritten field names, detail). An empty list means every field was
+    confirmed. Never raises: a daemon refusal and an unreachable daemon both
+    come back as the fields that did not land."""
+    try:
+        resp = _rt.aspirations_update_goal_fields(gid, counter_fields, source=src)
+    except _rt.RtError as e:
+        body = {}
+        try:
+            body = json.loads(e.body or "")
+        except ValueError:
+            pass
+        if not isinstance(body, dict):
+            body = {}
+        return list(body.get("unwritten") or counter_fields), body.get("detail") or str(e)
+    # The reply must carry every value just written. A 200 over a field the
+    # daemon did not apply is the partial-apply-while-printing-success shape
+    # (ZDS guard-920), so the client checks it rather than trusting the status.
+    persisted = resp.get("goal") or {}
+    missing = [n for n, v in counter_fields.items() if persisted.get(n) != v]
+    return missing, ("the reply's goal does not carry the value written" if missing else "")
+
+
+fields = {"consecutive_routine": new_val, "consecutive_deep": new_deep}
 
 # Persist last_outcome_origin on the goal for audit / observability ().
 # Overwritten each close. Lets future debugging trace WHY consecutive_deep
@@ -750,44 +775,18 @@ if upd_d.returncode != 0:
 # Only meaningful when outcome=deep; for routine closes we still write
 # "genuine" (the natural state — no flip happened, the LLM's routine claim
 # was honored).
-upd_o = subprocess.run(
-    [sys.executable, str(sd / "aspirations.py"),
-     "--source", src, "update-goal", gid, "last_outcome_origin", outcome_origin],
-    capture_output=True, text=True, encoding="utf-8",
-)
-if upd_o.returncode != 0:
-    print(f"[recurring-close] update last_outcome_origin failed: {upd_o.stderr}", file=sys.stderr)
-    # Non-fatal — purely observability field.
+fields["last_outcome_origin"] = outcome_origin
 
 # : persist the lifetime substantive-hit tally — the WRITER half of the
 # chronic-low detector (reader is cargo-cult-detector.py _score_recurring /
 # cmd_audit_all). Writer+reader ship together; reader-without-writer is the
-# retired-Path-A trap. All writes are NON-FATAL: the tally is detection
-# value-add, never load-bearing for the close.
-upd_sr = subprocess.run(
-    [sys.executable, str(sd / "aspirations.py"),
-     "--source", src, "update-goal", gid, "substantive_runs", str(new_sub_runs)],
-    capture_output=True, text=True, encoding="utf-8",
-)
-if upd_sr.returncode != 0:
-    print(f"[recurring-close] update substantive_runs failed: {upd_sr.stderr}", file=sys.stderr)
+# retired-Path-A trap.
+fields["substantive_runs"] = new_sub_runs
 if new_sub_hits != current_sub_hits:
     # A GENUINE deep advanced the tally — write the count + stamp the last-catch
     # timestamp (R1 'last catch'). NOW is local system time, passed via env.
-    upd_sh = subprocess.run(
-        [sys.executable, str(sd / "aspirations.py"),
-         "--source", src, "update-goal", gid, "substantive_hits", str(new_sub_hits)],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    if upd_sh.returncode != 0:
-        print(f"[recurring-close] update substantive_hits failed: {upd_sh.stderr}", file=sys.stderr)
-    upd_lsa = subprocess.run(
-        [sys.executable, str(sd / "aspirations.py"),
-         "--source", src, "update-goal", gid, "last_substantive_at", os.environ["NOW"]],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    if upd_lsa.returncode != 0:
-        print(f"[recurring-close] update last_substantive_at failed: {upd_lsa.stderr}", file=sys.stderr)
+    fields["substantive_hits"] = new_sub_hits
+    fields["last_substantive_at"] = os.environ["NOW"]
 
 # : CLEAR the dependency-pull signal on close. This goal has now RUN,
 # so whatever the producer pulled it for has been consumed; leaving the signal
@@ -805,45 +804,52 @@ if new_sub_hits != current_sub_hits:
 # goal carries, and destroying the "absence is the no-op path" property the
 # consumer's no-regression argument rests on.
 #
-# NON-FATAL, and the consumer does not depend on this landing: max_age_hours
-# ages the signal out on its own, so a lost clear degrades to "expires late"
-# rather than "pinned at rank 1 forever".
+# It rides the SAME one write as the counters (), so a clear the
+# daemon could not confirm fails the close and is named like any other field.
+# The consumer does not depend on it landing: max_age_hours ages the signal out
+# on its own.
 if has_pull_signal:
-    upd_ps = subprocess.run(
-        [sys.executable, str(sd / "aspirations.py"),
-         "--source", src, "update-goal", gid, "pull_signal", "null"],
-        capture_output=True, text=True, encoding="utf-8",
-    )
-    if upd_ps.returncode != 0:
-        print(f"[recurring-close] clear pull_signal failed: {upd_ps.stderr}", file=sys.stderr)
-    else:
-        print(f"[recurring-close] {gid}: pull_signal CLEARED (null, not key removal)", file=sys.stderr)
+    fields["pull_signal"] = None
+
+unwritten, write_detail = _write_counter_fields(fields)
+if unwritten:
+    print(f"[recurring-close] COUNTER WRITE FAILED for {gid}: unwritten fields: "
+          f"{', '.join(unwritten)} — {write_detail}", file=sys.stderr)
+    # Hand the names and one exact repair command per field to the bash side, so
+    # the PHASE FAILURE banner names them. The values are the ones this close
+    # computed; each is absolute (not current+1), so a repair cannot double-count.
+    failure_file = os.environ.get("COUNTER_FAILURE_FILE", "")
+    if failure_file:
+        import shlex
+        retry = [
+            "bash core/scripts/aspirations-update-goal.sh --source %s %s %s %s" % (
+                src, gid, n, "null" if fields[n] is None else shlex.quote(str(fields[n])))
+            for n in unwritten if n in fields]
+        try:
+            with open(failure_file, "w", encoding="utf-8") as ff:
+                ff.write(",".join(unwritten) + "\n" + "\n".join(retry) + "\n")
+        except OSError as e:
+            print(f"[recurring-close] counter failure file unwritable ({e}); the "
+                  f"banner will not name the fields", file=sys.stderr)
+    sys.exit(1)
+if has_pull_signal:
+    print(f"[recurring-close] {gid}: pull_signal CLEARED (null, not key removal)", file=sys.stderr)
 
 # Surface the decision so the loop's stderr stream captures it. Mirrors the
 # Block A/C flip notification line above (line ~192).
-# : report the PERSISTED state, never the INTENDED one. The write
-# above is deliberately non-fatal, so when it failed this line still narrated
-# the transition ("consecutive_deep=2→3") while the record still read 2 — the
-# log and the store disagreed and nothing surfaced it. Same defect class as
-# guard-3826 (iteration-close renders the full success affordance even when it
-# closed nothing): a close's output is a CLAIM about the store, and a reader
-# trusting it is reading the claim, not the record.
+# : report the PERSISTED state, never the INTENDED one. A close's
+# output is a CLAIM about the store, and a reader trusting it is reading the
+# claim, not the record (guard-3826). The counter write above is all-or-fatal
+# and its reply was checked against every value, so reaching this line means
+# consecutive_deep read back as written; a failed write never gets here.
 if outcome == "deep":
-    if deep_write_landed:
-        deep_render = f"consecutive_deep={current_deep}→{new_deep}"
-    else:
-        deep_render = (
-            f"consecutive_deep={current_deep} "
-            f"(UNCHANGED — write FAILED, intended {new_deep})"
-        )
     print(
         f"[recurring-close] {gid}: outcome_origin={outcome_origin} "
-        f"{deep_render} "
+        f"consecutive_deep={current_deep}→{new_deep} "
         f"(genuine-deeps advance counter; forced-flips pin it; routine resets)",
         file=sys.stderr,
     )
 
-sys.path.insert(0, str(sd))
 import _paths
 with open(_paths.CONFIG_DIR / "aspirations.yaml", encoding="utf-8") as cf:
     cfg = yaml.safe_load(cf) or {}
@@ -906,17 +912,14 @@ if outcome == "routine" and new_val >= threshold:
         return False
 
     def _reset_counter():
-        r = subprocess.run(
-            [sys.executable, str(sd / "aspirations.py"),
-             "--source", src, "update-goal",
-             gid, "consecutive_routine", "0"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
-        if r.returncode != 0:
+        # A SECOND write by design: the batch audit below reads the streak this
+        # close just wrote, so the reset cannot be folded into that write.
+        unwritten, reset_detail = _write_counter_fields({"consecutive_routine": 0})
+        if unwritten:
             # Non-fatal: next cycle's dedupe (or audit) catches repeat firings.
-            # Surface stderr so the failure isn't invisible.
-            print(f"[recurring-close] consecutive_routine reset failed "
-                  f"(rc={r.returncode}): {r.stderr.strip()}", file=sys.stderr)
+            # Surface the failure so it isn't invisible.
+            print(f"[recurring-close] consecutive_routine reset failed: "
+                  f"{reset_detail}", file=sys.stderr)
 
     if batch_hours > 0 and _recent_batch_idea():
         # Recent batch Idea is still outstanding — do not re-file. Reset the
@@ -1055,6 +1058,17 @@ PY_RC=$?
 if [[ -n "$_irf" ]]; then
     INTERVAL_REVIEW="$(cat "$_irf")"
     rm -f "$_irf"
+fi
+if [[ -n "$_cff" ]]; then
+    if [[ -s "$_cff" ]]; then
+        # Not a phase, so it has no retry argv of its own: the heredoc wrote one
+        # exact repair command per unwritten field, and those join the list the
+        # banner prints under "Re-run ONLY the failed phase(s)".
+        FAILED_PHASES+="counters[$(head -n 1 "$_cff")] "
+        PHASE_RESULTS+="counters=fail(${PY_RC}) "
+        FAILED_RETRY_CMDS+="$(tail -n +2 "$_cff")"$'\n'
+    fi
+    rm -f "$_cff"
 fi
 }
 

@@ -40,6 +40,13 @@ Usage:
   bash core/scripts/shipped-claim-store-check.sh --goal <id> [--source world]
   # note on stdin, or --note "<text>"
 
+  # Mark a firing a reader has adjudicated (append-only: a later `kind:
+  # verdict` row, never an edit). rc 0 recorded, 2 refused (no reason, or the
+  # goal never fired):
+  bash core/scripts/shipped-claim-store-check.sh --goal <id> \
+      --verdict false_positive|confirmed --reason "<why>" [--basis "<where>"] \
+      [--row-ts <the firing's ts>]
+
 Output JSON (stdout): the gates/shipped_claim.evaluate() payload plus
 `resolved` (artifact -> store virtual path or null).
 
@@ -76,20 +83,31 @@ def _backend():
     return get_backend()
 
 
+# The env-var spelling of a store root ("$WORLD_PATH/scripts/x.sh" reads as the
+# token "WORLD_PATH/scripts/x.sh"): the same root under another name.
+_STORE_ALIASES = (("WORLD_PATH/", "world/"), ("META_PATH/", "meta/"))
+
+
 def _resolve_virtual(token: str) -> "list[str]":
     """Candidate store virtual paths for an artifact token, best first.
 
-    A token that already carries a `world/` or `meta/` prefix is taken
-    verbatim (one candidate). A bare basename is tried under each store root.
-    Anything else yields no candidates and is skipped — never guessed at.
+    A token that already carries a `world/` or `meta/` prefix (or the
+    WORLD_PATH/META_PATH spelling of one) is taken verbatim (one candidate). A
+    bare basename is tried under each store root. A relative fragment
+    ("scripts/foo.py") is a store root plus that fragment — never the
+    fragment's basename: reducing `core/config/aspirations.yaml` to
+    `aspirations.yaml` bound it to an unrelated 47-byte store file of the same
+    name and reported a zero about the wrong file (g-115-7429). Anything not
+    under a store root yields no candidates and is skipped — never guessed at.
     """
     tok = token.strip().lstrip("./")
+    for alias, real in _STORE_ALIASES:
+        if tok.startswith(alias):
+            tok = real + tok[len(alias):]
     if tok.startswith("world/") or tok.startswith("meta/"):
         return [tok]
     if "/" in tok:
-        # A relative path fragment ("scripts/foo.py"): only accept it under a
-        # store root, never as a bare project-relative path.
-        return [f"{root}/{tok.split('/')[-1]}" for root in _STORE_ROOTS]
+        return [f"{root}/{tok}" for root in ("world", "meta")]
     return [f"{root}/{tok}" for root in _STORE_ROOTS]
 
 
@@ -119,7 +137,17 @@ def _read_store_text(backend, virtual_path: str) -> "str | None":
         return None
 
 
-def _log_ledger(goal_id: str, agent: str, payload: dict) -> None:
+VERDICTS = ("false_positive", "confirmed")
+
+
+def _ledger_path() -> "Path | None":
+    from _paths import WORLD_DIR  # type: ignore
+    if WORLD_DIR is None:
+        return None
+    return Path(WORLD_DIR) / "shipped-claim-mismatches.jsonl"
+
+
+def _append_ledger(record: dict) -> bool:
     """Append one record to world/shipped-claim-mismatches.jsonl.
 
     Fail-open: a ledger write error is printed and swallowed. The durable
@@ -127,19 +155,79 @@ def _log_ledger(goal_id: str, agent: str, payload: dict) -> None:
     """
     try:
         from _fileops import locked_append_jsonl  # type: ignore
-        from _paths import WORLD_DIR  # type: ignore
-        if WORLD_DIR is None:
-            return
-        ledger = Path(WORLD_DIR) / "shipped-claim-mismatches.jsonl"
-        locked_append_jsonl(str(ledger), {
-            "ts": dt.datetime.now().isoformat(timespec="seconds"),
-            "agent": agent or "unknown",
-            "goal_id": goal_id,
-            "mismatches": payload.get("mismatches") or [],
-            "resolved": payload.get("resolved") or {},
-        })
+        ledger = _ledger_path()
+        if ledger is None:
+            return False
+        locked_append_jsonl(str(ledger), record)
+        return True
     except Exception as exc:  # pragma: no cover - ledger is best-effort
         print(f"[shipped-claim] ledger write failed: {exc}", file=sys.stderr)
+        return False
+
+
+def _log_ledger(goal_id: str, agent: str, payload: dict) -> None:
+    _append_ledger({
+        "ts": dt.datetime.now().isoformat(timespec="seconds"),
+        "agent": agent or "unknown",
+        "goal_id": goal_id,
+        "mismatches": payload.get("mismatches") or [],
+        "resolved": payload.get("resolved") or {},
+    })
+
+
+def _firing_ts(goal_id: str) -> "list[str]":
+    """`ts` of every FIRING row for a goal (verdict rows carry `kind`)."""
+    ledger = _ledger_path()
+    if ledger is None or not ledger.exists():
+        return []
+    out = []
+    for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("goal_id") == goal_id and not row.get("kind"):
+            out.append(str(row.get("ts")))
+    return out
+
+
+def _record_verdict(args) -> int:
+    """Append a disposition row for a firing a reader has adjudicated.
+
+    The ledger is append-only, so a verified false positive cannot be edited
+    out of it; it is MARKED by a later row (`kind: verdict`) naming the goal
+    and, optionally, the firing's `ts`. Rows keep an empty `mismatches` and
+    `resolved` so a reader that treats every row as a firing sees a row with
+    nothing in it, not a KeyError. Refuses a goal that never fired.
+    """
+    if not (args.reason or "").strip():
+        print("[shipped-claim] --verdict requires --reason", file=sys.stderr)
+        return 2
+    fired = _firing_ts(args.goal)
+    if not fired:
+        print(f"[shipped-claim] no firing recorded for {args.goal}", file=sys.stderr)
+        return 2
+    if args.row_ts and args.row_ts not in fired:
+        print(f"[shipped-claim] {args.goal} has no firing at ts {args.row_ts} "
+              f"(firings: {', '.join(fired)})", file=sys.stderr)
+        return 2
+    rec = {
+        "ts": dt.datetime.now().isoformat(timespec="seconds"),
+        "agent": os.environ.get("MIND_AGENT", "") or "unknown",
+        "kind": "verdict",
+        "goal_id": args.goal,
+        "row_ts": args.row_ts or None,
+        "verdict": args.verdict,
+        "reason": args.reason.strip(),
+        "basis": (args.basis or "").strip() or None,
+        "mismatches": [],
+        "resolved": {},
+    }
+    ok = _append_ledger(rec)
+    print(json.dumps({"verdict_recorded": ok, "goal_id": args.goal,
+                      "verdict": args.verdict, "row_ts": rec["row_ts"],
+                      "firings_for_goal": len(fired)}))
+    return 0 if ok else 2
 
 
 def main() -> int:
@@ -149,7 +237,17 @@ def main() -> int:
                     help="outcome_note text; read from stdin when omitted")
     ap.add_argument("--no-ledger", action="store_true")
     ap.add_argument("--output", default="json", choices=("json",))
+    ap.add_argument("--verdict", default=None, choices=VERDICTS,
+                    help="record a disposition for a firing already in the ledger")
+    ap.add_argument("--reason", default=None, help="why (required with --verdict)")
+    ap.add_argument("--basis", default=None,
+                    help="where the evidence is (a path, goal id or board post)")
+    ap.add_argument("--row-ts", default=None,
+                    help="the firing's ts; omit to mark every firing of the goal")
     args = ap.parse_args()
+
+    if args.verdict:
+        return _record_verdict(args)
 
     note = args.note
     if note is None:

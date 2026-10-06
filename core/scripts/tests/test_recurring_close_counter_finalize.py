@@ -331,20 +331,30 @@ def test_every_counter_write_site_lives_inside_the_guarded_function():
     normal path and be lost on the abort path: the worst of both."""
     lines = _lines()
     start, close = _function_span("finalize_counters")
-    outside = [
-        i + 1
-        for i, l in enumerate(lines)
-        if '"update-goal"' in l and not (start < i < close)
+    # : the counters land through ONE daemon write, so a per-field
+    # `update-goal` subprocess anywhere is the old shape coming back: one
+    # whole-store rewrite per field, up to eight a close.
+    per_field = [i + 1 for i, l in enumerate(lines) if '"update-goal"' in l]
+    assert not per_field, (
+        f"per-field aspirations.py update-goal call(s) at line(s) {per_field}: "
+        "the counter block writes through _write_counter_fields, one rewrite"
+    )
+    sites = [
+        i for i, l in enumerate(lines)
+        if "_write_counter_fields(" in l and "def _write_counter_fields" not in l
     ]
+    outside = [i + 1 for i in sites if not (start < i < close)]
     assert not outside, (
-        f"aspirations.py update-goal write site(s) outside finalize_counters at "
+        f"_write_counter_fields call site(s) outside finalize_counters at "
         f"line(s) {outside}. Every counter write must be inside the guard."
     )
-    inside = sum(1 for i, l in enumerate(lines) if '"update-goal"' in l and start < i < close)
-    assert inside >= 6, (
-        f"only {inside} update-goal write sites found inside finalize_counters; "
-        "the g-317-02 block writes consecutive_routine, consecutive_deep, "
-        "last_outcome_origin, substantive_runs, substantive_hits and pull_signal"
+    # Two sites, and the split is the point: the close's own batch (the full
+    # `fields` dict) and the cargo-cult reset, which has to FOLLOW that write
+    # because the detector reads the streak it just wrote.
+    batch = [i for i in sites if "_write_counter_fields(fields)" in lines[i]]
+    assert len(batch) == 1 and len(sites) == 2, (
+        f"expected one batch write plus the reset, found {len(batch)} batch and "
+        f"{len(sites)} total call sites"
     )
 
 

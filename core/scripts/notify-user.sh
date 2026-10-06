@@ -8,16 +8,19 @@
 #   notify-user.sh --category C --subject S (--message M | --message-file F)
 #                  [--goal-id G] [--allow-duplicate '<what is new>'] [--dry-run]
 #                  [--in-reply-to '<what he asked, and when>']
+#                  [--override-data-class '<why the text is not an owner address / credential>']
 #     --in-reply-to is REQUIRED for --category reply (rc 2 without it) and is
 #     appended to the body. `reply` is an ALWAYS_SEND category, so the citation
 #     is what keeps it from becoming a way to re-send a message the routing gate
 #     refused (, guard-4722).
 #   <builder payload> | notify-user.sh --payload-stdin   (already-built payload)
 #
-# Order: routing gate -> prior-outreach gate -> payload builder -> transport
+# Order: data-class gate (owner's personal address / credential -> refuse, )
+#        -> routing gate -> prior-outreach gate -> payload builder -> transport
 #        slot -> ledger record (+ peer mirror).
 # Exit: 0 sent | 2 usage/build | 3 suppressed by routing (re-routed to board)
 #       | 4 duplicate | 5 no transport configured | 6 transport failed
+#       | 7 refused by the data-class gate
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null

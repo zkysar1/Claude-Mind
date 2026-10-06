@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.93",
+    "previous_version": "2.12.92",
+    "date": "2026-10-05",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "v2.12.93: demand-pull cut for the member undo drain (g-335-1726 u7e, an undo is judged by when it was sent); framework_pull adopt verifies under a live daemon and rolls back added files (g-358-237); worker close-review queue hold and read-only carrier drain planner (g-306-558, g-306-506); retrieval trace segmentation flipped fleet-wide (g-374-161); knowledge projection keeps prose slashes whole (g-374-416); 133 framework commits since v2.12.92 (time-push due at 41h)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.92",
     "previous_version": "2.12.91",
     "date": "2026-10-03",

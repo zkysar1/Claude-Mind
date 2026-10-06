@@ -62,6 +62,11 @@ fi
 
 $PYLAUNCH "$SCRIPT_DIR/shipped-claim-store-check.py" "$@"
 rc=$?
+# --verdict is an operator action, not part of a close: its refusal (rc 2) must
+# reach the caller instead of reading as the clean no-op below.
+for _a in "$@"; do
+  if [ "$_a" = "--verdict" ]; then exit "$rc"; fi
+done
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 1 ]; then
   # Any unexpected rc (missing interpreter, import failure before the
   # script's own fail-open handler) is reported as a clean no-op rather

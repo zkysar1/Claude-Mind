@@ -1356,6 +1356,26 @@ gates:
     tuning_notes: "Instrumented 2026-09-06 (g-115-8163). Before that the gate was UNREGISTERED and emitted no firings at all: its only record was a best-effort scorer_override row in the per-agent execution diary, written on the SANCTIONED-DEVIATION branch alone. That is the guard-2293 shape — an escape-path-only ledger — so blocks that STOOD and every ordinary pass left no trace and the FP ratio count(override)/(block+override) was unmeasurable. All seven branches now emit a unique decision_path (guard-502), each mapped to a _gate_log decision by its observable control-flow effect at aspirations-claim.sh rather than by local intent (guard-1743). The second reason to move off the diary is CARRIER, not coverage: measured 2026-09-06, read_fleet_diaries returned alpha's diary at 57,198 B with ZERO of its 70 scorer_override rows while being FRESHER (08:44:16) than the local copy (08:37:00) — a cross-Body last-writer-wins clobber, not staleness — so 82% of the fleet's abstention signal was invisible to scorer-override-audit.py, its only fleet-wide reader. The gate-firings store aggregates via gate-firings-flush.sh and does not have that failure mode. Do NOT verify a firing by reading the shared store on an own-cloud box: _gate_log routes the hot path to a machine-local spool and the direct read yields a false 'telemetry is dead' (guard-4040)."
     retirement_eligible: false
 
+  - id: outbound-data-class-gate
+    script: core/scripts/outbound_data_class.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/board-post.sh", phase: "after the JSON-body guard, before the daemon POST (subprocess; rc 5 = refused, any other non-zero fails open + loud)" }
+      - { file: "core/scripts/peer_board_post.py", phase: "after the empty-text check, BEFORE the peer backend pin (subprocess, so its firing/ledger rows stay this world's; rc 5 -> EXIT_REFUSED)" }
+      - { file: "core/scripts/notify_dispatch.py", phase: "step 0b, before the routing gate and the outreach ledger (in-process; rc 7); email-send.sh re-enters it, so every dispatched send is covered" }
+    dominant_risk: FN
+    asymmetry_magnitude: high
+    keyword_bias: generous
+    override_flag: "--override-data-class"
+    fp_cost: low
+    fn_cost: high
+    fp_description: "A post or email quoting something shaped like a credential (an access-key id named in an incident thread, a fixture with a real prefix and a varied body) or carrying the owner's address in full is refused; the sender shapes it or re-sends with --override-data-class '<why>' (ledgered with the finding classes and a body hash). Seconds. Replay over 108,020 board posts: 142 messages (0.13%) would have been refused, 16 of them an access-key id."
+    fn_description: "The owner's personal address (guard-4061) or a credential (guard-4525) reaches a shared durable store — the board replicates to peers and git history keeps it. Blind spots, stated so a clean verdict is not over-read: an address spelled out or URL-encoded, a credential with no recognisable prefix, a board write that bypasses board-post.sh (the daemon endpoint, aspirations-store writes — where most historical address leaks occurred), world scripts that call the email service directly, and the EMAIL_SEND_ALLOW_DIRECT waiver. USER_EMAIL absent from both the environment and .env.local means the owner-email class is NOT checked there (loud WARN + a fail_open firing row)."
+    rb_evidence: ["guard-4061", "guard-4525", "guard-142", "guard-5287", "guard-3737", "guard-1790", "rb-8349", "guard-5593", "rb-9686", "guard-1851"]
+    tuning_notes: "Added 2026-10-05 (g-306-571), shapes validated by replaying the whole board history (32 files, 121 MB) and the outreach ledger (6,962 records) with a positive and a negative control per class before wiring. Credential shapes are prefix-and-length anchored; a single-repeated-character body or EXAMPLE is a placeholder, not a match. Security class: never count-retire."
+    retirement_eligible: false
+
 pending_audit:
   - audit-schema-gate.py
   - encode-stable-facts-gate.py

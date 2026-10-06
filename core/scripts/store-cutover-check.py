@@ -42,6 +42,22 @@ The hand-stamp path (--attest, team-state shard field) is kept ONLY as the
 fallback for a box with no commits since the seam. The gate-firings cutover
 starved 3 days on exactly that chore (g-115-6243, rb-8202).
 
+THE PER-BODY LANE (g-358-202 U23, opt-in per store through `per_body_carriers`).
+Every proof above is keyed by AGENT, and the local-box veto covers only the box
+running the check. An agent runs a Body on many boxes, so a store whose writer
+flip leaves a stale reader with a clean wrong answer (pre-seam code reads a
+composite head as an EMPTY queue) needs the answer per BOX: rb-8276, a box 357
+commits behind failed every governed-store write the moment a peer wrote gzip.
+Each Body publishes `main_base` in its heartbeat carrier, the newest origin/main
+commit its checkout contains, and this lane applies the SAME predicate as the
+roster lanes (`_prove_commit`: ancestry, consumer routing, recency) to the
+main_base of every live Body. All must prove. It fails closed: an incomplete or
+non-authoritative carrier read, no live Body enumerated, a carrier with no
+main_base (a Body whose tick predates the field) and an unreadable carrier are
+each UNSAFE with their own reason, and the report names the Bodies. It is a
+FLOOR, not a census: a Body whose carrier is stale or frozen in the store, and a
+box that runs a daemon with no Body, are invisible to it.
+
 FAIL-CLOSED BY CONSTRUCTION, same as the template: unreadable roster, missing
 proof AND missing stamp, unparseable timestamps, git errors — all report
 UNSAFE. The thing being gated is a silent false all-clear, so an error here
@@ -222,6 +238,13 @@ STORES = {
             "put_kwargs",
             {"name": "plain_md5", "kind": "name",
              "consumers": ["core/scripts/storage_backend.py"]},
+            #  U3: aspirations_write swapped its raw decode_response call for
+            # decode_whole, which calls the codec's decode_response first and then joins a
+            # composite head, so that file still routes through THIS seam. Scoped to it
+            # (): worker_stall.py made the same swap but keeps another
+            # decode_response call, and no other consumer needs the exemption.
+            {"name": "decode_whole", "kind": "call",
+             "consumers": ["mind_api/src/endpoints/aspirations_write.py"]},
         ],
         "consumers": [
             "core/scripts/_owncloud_codec.py",
@@ -230,6 +253,62 @@ STORES = {
             "core/scripts/storage_backend.py",
             "core/scripts/cold-snapshot-tick.py",
             "core/scripts/tree-body-presence-audit.py",
+            "core/scripts/worker_stall.py",
+            "mind_api/src/endpoints/aspirations_write.py",
+        ],
+    },
+    #  (U4a): the composite layout of world/aspirations.jsonl, the one allowlisted
+    # store (_owncloud_composite.ALLOWLIST). The writer flag OWNCLOUD_COMPOSITE_STORES names
+    # ENV-IDS exactly as the gzip flag does (should_composite) and stays unset until this
+    # reads SAFE; it is independent of OWNCLOUD_GZIP_STORES, because readers attested for one
+    # layout are not attested for the other. The hazard is the silent one this tool exists
+    # for: under the layout the object at the store key is a small HEAD that names segments
+    # and holds no goal, so a reader that predates the seam finds an empty queue and reports
+    # it as the whole one. Measured in U3 with head-blind control tests that reproduce the
+    # pre-seam readers: the persistence read-back answers no-verify for a goal that is
+    # there, and the stall readers return an empty claim map and an empty known-goal census,
+    # both at 'authoritative' provenance.
+    #
+    # Seam = 0913fcd2c5, the U3 commit and the LAST reader commit: U2c's backend read path
+    # (1f4c2674ad, 9ed1b75379) and the sync exclusion are its ancestors, and the U2e commits
+    # after it are the orphan collector and move no reader. Consumers = the reader inventory
+    # U3 took by reading every get_object site in core/ and mind_api/: the backend
+    # (_composite_whole, which every mirror-routed consumer reaches), the TWO raw readers of
+    # the queue key (worker_stall._read_queue_lines and
+    # aspirations_write._authoritative_goal_lookup), the sync layer's `.composite` exclusion,
+    # and the composite module itself.
+    #
+    # NOT a consumer, and recorded so that "excluded" and "never considered" differ
+    # (rb-6395): owncloud-store-enumerate.py. Its enumerate and copy loops list every object
+    # under a prefix and copy the bytes with no key excluded by name (read 2026-10-03), so
+    # it carries head and segments alike. Its limit is the prefix: one narrower than the
+    # environment root does not reach _composite-gc-archive/, which sits beside the governed
+    # roots, so a migration of a store whose orphans were collected must name the root.
+    #
+    # seam_symbols: read_whole is the join the backend calls and decode_whole is the join
+    # the two raw readers call. owncloud_sync.py carries its half of the seam as a LITERAL in
+    # _EXCLUDE_DIRS and has no call site, so it takes the weaker name-kind spec, scoped to
+    # that file () so it cannot soften another consumer. The literal occurs there
+    # once outside a comment, so removing the exclusion goes red (a test pins that).
+    #
+    # per_body_carriers: the flip of this writer leaves a pre-seam reader with an EMPTY queue,
+    # so the fleet answer is asked per Body, from each Body's own carrier (U23). The other
+    # entries do not opt in and keep their verdicts byte for byte.
+    "composite": {
+        "seam_commit": "0913fcd2c50bafc43a2b7ac2c48a9a9a29e01b7e",
+        "field": "owncloud_composite_seam",
+        "flag": "OWNCLOUD_COMPOSITE_STORES",
+        "per_body_carriers": True,
+        "seam_symbols": [
+            "read_whole",
+            "decode_whole",
+            {"name": ".composite", "kind": "name",
+             "consumers": ["core/scripts/owncloud_sync.py"]},
+        ],
+        "consumers": [
+            "core/scripts/_owncloud_composite.py",
+            "core/scripts/owncloud_backend.py",
+            "core/scripts/owncloud_sync.py",
             "core/scripts/worker_stall.py",
             "mind_api/src/endpoints/aspirations_write.py",
         ],
@@ -659,6 +738,134 @@ def evaluate_roster(roster: dict, proofs: dict, field: str,
     return out
 
 
+def _enumerate_body_carriers() -> tuple[list, dict, frozenset]:
+    """Heartbeat carriers from the store of record, with the enumeration's own
+    completeness and the closed-state set, for the per-Body lane.
+
+    Any failure returns an INCOMPLETE meta, which `evaluate_bodies` turns into a
+    refusal: an enumeration that could not run must never read as an empty fleet.
+    The closed set comes back empty on that path, so a failure can only make more
+    Bodies count as live.
+    """
+    try:
+        import worker_stall as ws
+        from _paths import agents_root
+        rows, meta = ws.enumerate_carriers(agents_root())
+        return rows, meta, frozenset(ws.CLOSED_BODY_STATES)
+    except Exception as exc:
+        return [], {"read_via": "none", "complete": False,
+                    "reason": f"{type(exc).__name__}: {exc}"}, frozenset()
+
+
+def _prove_main_base(base: str, seam_commit: str, consumers: list[str],
+                     now: datetime, seam_symbols=None) -> dict:
+    """The roster lanes' predicate, applied to ONE Body's published main_base.
+
+    `main_base` is a pushed origin/main commit, so every box can resolve it after
+    the fetch this gate already makes. A base that cannot be read here (pushed
+    after that fetch) is unproven, and re-running the check resolves it.
+    """
+    out = _git("log", "-1", "--format=%cI", base)
+    ciso = out.stdout.strip()
+    if out.returncode != 0 or not ciso:
+        return {"proven": False, "reason": "main_base_unreadable",
+                "commit": base[:9]}
+    return _prove_commit(base, ciso, seam_commit, consumers, now, seam_symbols)
+
+
+_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def evaluate_bodies(rows: list, meta: dict, now: datetime, prove,
+                    closed_states=frozenset(),
+                    window_hours: float = BODY_LIVENESS_MAX_AGE_HOURS) -> dict:
+    """Pure decision core of the per-Body lane: does EVERY live Body prove?
+
+    rows: worker_stall.enumerate_carriers() rows ({agent, sid, doc}). meta: that
+    call's completeness. prove(main_base) -> a _prove_commit-shaped dict, called
+    once per DISTINCT base (a box's Bodies share a checkout).
+
+    A Body is live when its carrier is within `window_hours` and its body_state is
+    not closed. Every uncertain case is counted as live and UNPROVEN, never
+    skipped: a carrier with no readable body, or no parseable ts, has unknown
+    freshness, and unknown is not absent (the discipline reducer_promotion's D3
+    scan keeps). A FUTURE ts passes as live, as in _live_body_sids: negative age
+    is clock skew, and skew is not staleness.
+    """
+    unproven: list[dict] = []
+    cache: dict[str, dict] = {}
+    live = proven = stale = closed = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        sid = str(row.get("sid") or "")
+        doc = row.get("doc")
+        who = {"agent": row.get("agent"), "sid": sid[:8]}
+        if not isinstance(doc, dict) or not doc:
+            live += 1
+            unproven.append({**who, "reason": "carrier_unreadable"})
+            continue
+        who["host"] = doc.get("host")
+        ts = _parse_ts(str(doc.get("ts") or ""))
+        if ts is None:
+            live += 1
+            unproven.append({**who, "reason": "unparseable_ts"})
+            continue
+        age_h = (now - ts).total_seconds() / 3600.0
+        if age_h > window_hours:
+            stale += 1
+            continue
+        if str(doc.get("body_state") or "") in closed_states:
+            closed += 1
+            continue
+        live += 1
+        who["age_min"] = round(max(age_h, 0.0) * 60)
+        base = doc.get("main_base")
+        if not isinstance(base, str) or not _SHA_RE.match(base):
+            unproven.append({**who, "reason": "no_main_base"})
+            continue
+        if base not in cache:
+            cache[base] = prove(base)
+        proof = cache[base]
+        if proof.get("proven"):
+            proven += 1
+        else:
+            unproven.append({**who, "main_base": base[:9],
+                             "reason": proof.get("reason")})
+
+    complete = bool(meta.get("complete")) and meta.get("read_via") == "authoritative"
+    if not complete:
+        reason = "carrier_enumeration_incomplete"
+    elif live == 0:
+        reason = "no_live_bodies"
+    elif unproven:
+        reason = "per_body_reader_unproven"
+    else:
+        reason = None
+    return {"lane": "per_body_main_base", "all_proven": reason is None,
+            "reason": reason, "read_via": meta.get("read_via"),
+            "enumeration_complete": bool(meta.get("complete")),
+            "enumeration_reason": meta.get("reason"),
+            "window_hours": window_hours, "carriers_scanned": len(rows),
+            "bodies_live": live, "bodies_proven": proven,
+            "stale_skipped": stale, "closed_skipped": closed,
+            "distinct_bases": len(cache), "unproven": unproven}
+
+
+def _per_body_report(cfg: dict, now: datetime) -> dict:
+    rows, meta, closed = _enumerate_body_carriers()
+
+    def prove(base: str) -> dict:
+        try:
+            return _prove_main_base(base, cfg["seam_commit"], cfg["consumers"],
+                                    now, cfg.get("seam_symbols"))
+        except Exception as exc:
+            return {"proven": False, "reason": f"git_error: {exc}",
+                    "commit": base[:9]}
+
+    return evaluate_bodies(rows, meta, now, prove, closed)
+
+
 def _read_team_state() -> tuple[dict, str | None]:
     try:
         out = subprocess.run(
@@ -1067,6 +1274,16 @@ def cmd_check(cfg: dict) -> int:
             result["verdict"] = "UNSAFE"
             result["reason"] = "origin_main_does_not_call_the_seam_symbols"
 
+    # PER-BODY LANE ( U23), opt-in. Like the symbol veto it overrides a
+    # SAFE and never rescues an UNSAFE, and it names itself as the reason only
+    # when nothing broader already failed.
+    if cfg.get("per_body_carriers"):
+        per_body = _per_body_report(cfg, datetime.now())
+        result["per_body"] = per_body
+        if not per_body["all_proven"] and result["verdict"] == "SAFE":
+            result["verdict"] = "UNSAFE"
+            result["reason"] = per_body["reason"]
+
     result.update({
         "flag": cfg.get("flag"),
         "seam_commit": cfg["seam_commit"][:9],
@@ -1082,7 +1299,10 @@ def cmd_check(cfg: dict) -> int:
             "because its proofs are agent-keyed and an agent has a Body on "
             "every box). Boxes listed unattested prove themselves by "
             "committing an iteration after pulling the seam (derived), or run: "
-            "bash core/scripts/store-cutover-check.sh --store <name> --attest"
+            "bash core/scripts/store-cutover-check.sh --store <name> --attest. "
+            "per_body (stores that opt in): every live Body's heartbeat carrier "
+            "must publish a main_base that proves; reason=per_body_reader_unproven "
+            "names the Bodies, and a Body proves itself by pulling and ticking once."
         ),
     })
     print(json.dumps(result, indent=2))

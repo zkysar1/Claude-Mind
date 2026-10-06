@@ -13,6 +13,9 @@ change are pinned here:
 - The state writes the replaced skill steps made are still made, with the same
   keys and diary text (guard-1867), and none lands on a checkpoint that anchors
   another goal.
+- An artifact last modified before the unit's claim is WARNED about and never
+  refused, and a claim time that cannot be read for this goal reads "currency not
+  checked", never current. Only the mtime is compared, so file names play no part.
 
 The harness runs the real gates and records the writes instead of making them,
 so no test touches a live checkpoint, diary or working memory.
@@ -25,6 +28,7 @@ import os
 import socket
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -50,16 +54,19 @@ CITED_UNRESOLVABLE = ("Acme Corporation reported revenue of 4.2 billion in 2024,
 from _paths import SESSIONS_DIRNAME  # noqa: E402
 SCRATCH = f"agents/charlie/{SESSIONS_DIRNAME}/57c55134e5b5429cbfa2dbd142b9574d/scratch/run.log"
 PROBE_OUT = f"agents/charlie/{SESSIONS_DIRNAME}/57c55134e5b5429cbfa2dbd142b9574d/scratch/probe.out"
+CLAIMED = "2026-10-05T00:44:08"  # a checkpoint's selected_at: naive UTC
 
 
 class Harness:
     """A pre-flight Runner. Gates run for real against tmp fixtures; the writes
     (checkpoint, diary, working memory) are recorded, never made."""
 
-    def __init__(self, tmp_path, note=GOOD_NOTE, checks=(), anchor="g-1-1", overrides=None):
+    def __init__(self, tmp_path, note=GOOD_NOTE, checks=(), anchor="g-1-1", overrides=None,
+                 selected_at=None):
         self.tmp = tmp_path
         self.checks = list(checks)
         self.anchor = anchor
+        self.selected_at = selected_at    # the checkpoint's claim time; absent when None
         self.overrides = overrides or {}  # script name -> (rc, stdout, stderr)
         self.calls = []                   # (script name, argv, stdin)
         world, meta = tmp_path / "world", tmp_path / "meta"
@@ -91,7 +98,8 @@ class Harness:
         if name in ("positive-state-gate.py", "q4-provenance-sample.sh"):
             return self._real(list(argv))
         if name == "loop-state-save.sh" and argv[2] == "read":
-            return (0, json.dumps({"goal_id": self.anchor}), "") if self.anchor else (1, "null", "")
+            cp = {"goal_id": self.anchor, **({"selected_at": self.selected_at} if self.selected_at else {})}
+            return (0, json.dumps(cp), "") if self.anchor else (1, "null", "")
         if name in ("loop-state-save.sh", "execution-diary.sh", "wm-append.sh"):
             return 0, "", ""
         raise AssertionError(f"unexpected script {name}: {argv}")
@@ -118,6 +126,13 @@ def art(tmp_path, name, text):
     p = tmp_path / name
     p.write_text(text, encoding="utf-8")
     return str(p)
+
+
+def stamp(path, iso):
+    """Set a file's modification time to a naive-UTC ISO time, as a checkpoint states one."""
+    t = datetime.fromisoformat(iso).replace(tzinfo=timezone.utc).timestamp()
+    os.utime(path, (t, t))
+    return str(path)
 
 
 # ─── each included check's refusal still refuses, with a passing control ────
@@ -286,6 +301,133 @@ def test_advisory_entries_this_cannot_read_are_one_warning_never_a_crash(tmp_pat
             "warning: the session-scratch advisory's entries could not be read ("), bad
 
 
+# ─── an artifact from before the claim is warned about (artifact currency) ──
+
+PLAIN = "Plain prose with no entity facts.\n"
+
+
+def test_an_artifact_that_predates_the_claim_is_warned_and_one_made_after_it_is_not(tmp_path):
+    """Q1's artifact is copied onto the goal verbatim, and a log left by an earlier run
+    passes the existence check. A found artifact last modified before the checkpoint's
+    claim time draws a warning, and a diary line because the copy is made either way.
+    Nothing else changes: the verdict, the rc and the stamped pair are what they were.
+    The control, on the same harness and claim, is a file modified after the claim: no
+    warning and no diary line."""
+    old = stamp(art(tmp_path, "cycle203.log", PLAIN), "2026-10-04T07:41:05")
+    h = Harness(tmp_path, selected_at=CLAIMED)
+    r = run(h, [old])
+    a = r["results"]["artifact"]
+    assert (a["state"], r["rc"], a["data"]["stale"]) == ("PASS", 0, [old])
+    assert len(a["findings"]) == 1 and a["findings"][0].startswith(
+        f"warning: {old} predates this unit's claim (modified 2026-10-04T07:41:05, "
+        f"claimed {CLAIMED}, 17 h 3 min earlier)"), a["findings"]
+    assert a["summary"].endswith("; 1 predate this unit's claim")
+    assert ["phase_progress.q1_passed=true", "--set", f"phase_progress.q1_artifact={old}"] in h.checkpoint_sets()
+    assert f"Q1 artifact predates this unit's claim: {old}" in h.diary()
+    new = stamp(art(tmp_path, "cycle220.log", PLAIN), "2026-10-05T00:50:00")
+    h = Harness(tmp_path, selected_at=CLAIMED)
+    r = run(h, [new])
+    a = r["results"]["artifact"]
+    assert (a["state"], r["rc"], a["findings"], a["data"]["stale"]) == ("PASS", 0, [], [])
+    assert a["summary"] == f"1 file(s) exist: {new}"
+    assert not any(d.startswith("Q1 artifact predates") for d in h.diary())
+
+
+def test_currency_follows_the_modification_time_never_the_file_name_or_its_order(tmp_path):
+    """The observed value was the EARLIER of two logs in one directory, and a first guess
+    was that the lexicographically first name wins. Both assignments of the older mtime
+    (to the lower name, then to the higher) are run with the files passed in both orders:
+    it is always the older file, and only it, that draws the warning."""
+    lo, hi = str(tmp_path / "cycle203.log"), str(tmp_path / "cycle220.log")
+    for older, newer in ((lo, hi), (hi, lo)):
+        stamp(art(tmp_path, Path(older).name, PLAIN), "2026-10-04T07:41:05")
+        stamp(art(tmp_path, Path(newer).name, PLAIN), "2026-10-05T00:50:00")
+        for passed in ([lo, hi], [hi, lo]):
+            a = run(Harness(tmp_path, selected_at=CLAIMED), passed)["results"]["artifact"]
+            assert a["data"]["stale"] == [older], (older, passed)
+            assert len(a["findings"]) == 1 and a["findings"][0].startswith(
+                f"warning: {older} predates this unit's claim"), (older, passed)
+
+
+def test_a_file_modified_at_the_claim_is_current_and_one_second_before_it_is_not(tmp_path):
+    """The boundary: an artifact is current from the second of the claim on."""
+    at = stamp(art(tmp_path, "at.log", PLAIN), CLAIMED)
+    before = stamp(art(tmp_path, "before.log", PLAIN), "2026-10-05T00:44:07")
+    a = run(Harness(tmp_path, selected_at=CLAIMED), [at])["results"]["artifact"]
+    assert (a["findings"], a["data"]["stale"]) == ([], [])
+    a = run(Harness(tmp_path, selected_at=CLAIMED), [before])["results"]["artifact"]
+    assert a["data"]["stale"] == [before]
+    assert "0 h 0 min earlier" in a["findings"][0]
+
+
+@pytest.mark.parametrize("anchor,selected_at,why", [
+    ("g-1-1", None, "the checkpoint's selected_at None is not a time"),
+    ("g-1-1", "yesterday", "the checkpoint's selected_at 'yesterday' is not a time"),
+    ("g-9-9", CLAIMED, "the checkpoint anchors g-9-9, not g-1-1"),
+    (None, CLAIMED, "no checkpoint anchors this goal"),
+])
+def test_a_claim_time_that_cannot_be_read_for_this_goal_is_said_and_never_read_as_current(
+        tmp_path, anchor, selected_at, why):
+    """The file is dated 2020, so a claim time would flag it. With none readable for THIS
+    goal the check says it did not run: it neither flags the file nor calls it current,
+    and it never refuses. Each case is paired with the readable-claim control in the
+    first test of this section."""
+    old = stamp(art(tmp_path, "cycle203.log", PLAIN), "2020-01-01T00:00:00")
+    h = Harness(tmp_path, anchor=anchor, selected_at=selected_at)
+    r = run(h, [old])
+    a = r["results"]["artifact"]
+    assert (a["state"], r["rc"], a["data"]["stale"]) == ("PASS", 0, [])
+    assert a["findings"] == [f"warning: currency not checked ({why}), so a file left by an "
+                             "earlier run would read the same as this unit's"]
+    assert not any(d.startswith("Q1 artifact predates") for d in h.diary())
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-10-05T00:44:08", datetime(2026, 10, 5, 0, 44, 8)),
+    ("2026-10-05T00:44:08Z", datetime(2026, 10, 5, 0, 44, 8)),
+    ("2026-10-05T02:44:08+02:00", datetime(2026, 10, 5, 0, 44, 8)),
+    ("2026-10-05T00:44:08.250000", datetime(2026, 10, 5, 0, 44, 8, 250000)),
+])
+def test_the_claim_time_is_read_as_naive_utc(raw, expected):
+    assert vp.claim_time({"goal_id": "g-1-1", "selected_at": raw}, "g-1-1") == (expected, "")
+
+
+def test_a_no_write_run_still_checks_currency_and_writes_nothing(tmp_path):
+    """--no-write is for a reader or a goal you are not closing; it still reads the
+    checkpoint, so one hand-picked artifact can be checked before it is stamped."""
+    old = stamp(art(tmp_path, "cycle203.log", PLAIN), "2026-10-04T07:41:05")
+    h = Harness(tmp_path, selected_at=CLAIMED)
+    r = run(h, [old], write=False)
+    assert r["results"]["artifact"]["data"]["stale"] == [old]
+    assert [h.writes(n) for n in ("loop-state-save.sh", "execution-diary.sh", "wm-append.sh")] == [[], [], []]
+
+
+def test_an_mtime_this_cannot_convert_is_one_warning_never_a_crash(tmp_path, monkeypatch):
+    """A crash here would cost every other check's verdict (guard-2298). The file reports a
+    modification time past the year 9999, which no datetime holds. It is planted through
+    stat and not os.utime, because a filesystem may clamp a far-future utime to a time it
+    can hold (ext4 stops at 2446) and then nothing fails there: this test was green on
+    tmpfs and red on ext4 until then. The control, on the same harness, is a file with an
+    ordinary mtime and no such warning."""
+    odd = art(tmp_path, "odd.log", PLAIN)
+    real_stat = Path.stat
+
+    def stat(self, *a, **k):
+        st = real_stat(self, *a, **k)
+        if str(self) != odd:
+            return st
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid, st.st_gid,
+                               st.st_size, int(st.st_atime), 2 ** 40, int(st.st_ctime)))
+    monkeypatch.setattr(Path, "stat", stat)
+    r = run(Harness(tmp_path, selected_at=CLAIMED), [odd])
+    a = r["results"]["artifact"]
+    assert (a["state"], r["rc"]) == ("PASS", 0)
+    assert len(a["findings"]) == 1 and a["findings"][0].startswith(
+        f"warning: currency not checked for {odd} ("), a["findings"]
+    ok = stamp(art(tmp_path, "ok.log", PLAIN), "2026-10-05T00:50:00")
+    assert run(Harness(tmp_path, selected_at=CLAIMED), [ok])["results"]["artifact"]["findings"] == []
+
+
 # ─── not-applied and could-not-run are never a pass ─────────────────────────
 
 def test_a_skipped_q4_is_not_a_pass_and_is_recorded_as_skipped(tmp_path):
@@ -364,8 +506,8 @@ def test_no_write_makes_no_write_at_all(tmp_path):
     h = Harness(tmp_path, checks=[GENUINE_FAIL])
     r = run(h, [art(tmp_path, "uncited.md", UNCITED)], claim="notes.md contains the plan", write=False)
     assert r["rc"] == 3
-    names = {n for n, _, _ in h.calls}
-    assert not names & {"loop-state-save.sh", "execution-diary.sh", "wm-append.sh"}
+    # The checkpoint is READ, since its claim time feeds the artifact's currency; a read is no write.
+    assert [h.writes(n) for n in ("loop-state-save.sh", "execution-diary.sh", "wm-append.sh")] == [[], [], []]
 
 
 # ─── the production call shapes, and the CLI ────────────────────────────────

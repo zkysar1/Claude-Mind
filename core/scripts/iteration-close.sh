@@ -4753,6 +4753,17 @@ do_productivity_check() {
     bash "$SCRIPT_DIR/aspirations-evict-tick.sh" \
         >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
 
+    # Composite goal-queue store orphan-collection tick (g-358-202 U15a). Starts
+    # composite_gc_runner.py in the background at most once per
+    # composite_gc_tick.interval_minutes on this box. It OBSERVES only: the
+    # wrapper never passes --apply and this call passes no argument at all. One
+    # caller is enough (the pass is fleet-single-flight), so the reducer-only
+    # productivity-check suffices. Same LOCAL-tick + fail-open (`|| true`) +
+    # stderr-sink contract as the ticks above. Config: aspirations.yaml §
+    # composite_gc_tick.
+    bash "$SCRIPT_DIR/composite-gc-tick.sh" \
+        >>"$CORE_ROOT/logs/iteration-close-stderr.log" 2>&1 || true
+
     # Orphan-root sweep (plan v1 D5, 2026-05-19) — periodic detector for
     # cruft directories at the wrong root (external-path-resolution drift).
     # Six scans: Mode A duplicates (world-parent), Mode B skeleton dirs
