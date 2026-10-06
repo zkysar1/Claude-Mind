@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -80,10 +81,24 @@ def _client_error(code, op):
 
 class _MemS3:
     """The few S3 calls the read and merge paths make, over a dict: quoted-md5 ETags, user
-    metadata, 404 / NoSuchKey for an absent key, and If-Match (412) on put_object."""
+    metadata, 404 / NoSuchKey for an absent key, If-Match (412) on put_object, and a paginated list
+    that carries each object's size, ETag and modification time (`page_cap` makes the server return
+    fewer keys per page than asked, which S3 is allowed to do).
 
-    def __init__(self):
+    `versioned=True` adds what a versioning-enabled bucket does (g-358-202 U8): every PUT is a new version, and
+    its response, HEAD and GET carry the VersionId; a delete without a VersionId adds a delete marker and one by
+    VersionId removes exactly that entry; the key is current only while its newest entry is a version, so a
+    marker hides it from GET, HEAD and the plain listing. `list_object_versions` answers in both modes (an
+    unversioned bucket lists each object once under the id 'null', as S3 does), and no VersionId appears anywhere
+    else on an unversioned double. The record `objects[key]` is the current version's, so a test that ages an
+    object by editing it ages that version."""
+
+    def __init__(self, versioned=False):
         self.objects = {}
+        self.page_cap = None
+        self.versioned = versioned
+        self.chains = {}  # versioned only: key -> every entry (versions and delete markers), newest first
+        self._serial = 0
 
     def put_object(self, *, Bucket, Key, Body, IfMatch=None, IfNoneMatch=None, Metadata=None,
                    ContentEncoding=None, **_kw):
@@ -92,33 +107,91 @@ class _MemS3:
         if IfNoneMatch == "*" and Key in self.objects:
             raise _client_error("PreconditionFailed", "PutObject")
         rec = {"Body": bytes(Body), "ETag": _etag(Body), "Metadata": dict(Metadata or {}),
-               "ContentEncoding": ContentEncoding}
+               "ContentEncoding": ContentEncoding, "LastModified": datetime.now(timezone.utc)}
+        out = {"ETag": rec["ETag"]}
+        if self.versioned:
+            rec["VersionId"] = out["VersionId"] = self._next_version_id()
+            self.chains.setdefault(Key, []).insert(0, rec)
         self.objects[Key] = rec
-        return {"ETag": rec["ETag"]}
+        return out
 
-    def _shape(self, Key, op, missing_code):
-        rec = self.objects.get(Key)
+    def _next_version_id(self):
+        self._serial += 1
+        return "v%06d" % self._serial
+
+    def _shape(self, Key, op, missing_code, VersionId=None):
+        if VersionId is None:
+            rec = self.objects.get(Key)
+        else:  # a named version, marker or not: only a real version can be read
+            rec = next((e for e in self.chains.get(Key, []) if e["VersionId"] == VersionId and not e.get("marker")),
+                       None)
+            missing_code = "NoSuchVersion"
         if rec is None:
             raise _client_error(missing_code, op)
-        out = {"ETag": rec["ETag"], "ContentLength": len(rec["Body"]), "Metadata": dict(rec["Metadata"])}
+        out = {"ETag": rec["ETag"], "ContentLength": len(rec["Body"]), "Metadata": dict(rec["Metadata"]),
+               "LastModified": rec["LastModified"]}
         if rec["ContentEncoding"]:
             out["ContentEncoding"] = rec["ContentEncoding"]
+        if self.versioned:
+            out["VersionId"] = rec["VersionId"]
         return rec, out
 
-    def head_object(self, *, Bucket, Key):
-        return self._shape(Key, "HeadObject", "404")[1]
+    def head_object(self, *, Bucket, Key, VersionId=None):
+        return self._shape(Key, "HeadObject", "404", VersionId)[1]
 
-    def get_object(self, *, Bucket, Key):
-        rec, out = self._shape(Key, "GetObject", "NoSuchKey")
+    def get_object(self, *, Bucket, Key, VersionId=None):
+        rec, out = self._shape(Key, "GetObject", "NoSuchKey", VersionId)
         out["Body"] = _Stream(rec["Body"])
         return out
 
-    def delete_object(self, *, Bucket, Key):
-        self.objects.pop(Key, None)
+    def delete_object(self, *, Bucket, Key, VersionId=None):
+        if not self.versioned:
+            self.objects.pop(Key, None)
+            return None
+        if VersionId is None:  # a delete marker: the key reads as absent, every version stays
+            marker = {"VersionId": self._next_version_id(), "marker": True, "LastModified": datetime.now(timezone.utc)}
+            self.chains.setdefault(Key, []).insert(0, marker)
+            self.objects.pop(Key, None)
+            return {"DeleteMarker": True, "VersionId": marker["VersionId"]}
+        chain = [e for e in self.chains.get(Key, []) if e["VersionId"] != VersionId]  # an absent id is a no-op, as in S3
+        self.chains[Key] = chain
+        if chain and not chain[0].get("marker"):
+            self.objects[Key] = chain[0]
+        else:
+            self.objects.pop(Key, None)
+        return {"VersionId": VersionId}
 
-    def list_objects_v2(self, *, Bucket, Prefix="", **_kw):
+    def list_object_versions(self, *, Bucket, Prefix="", KeyMarker=None, VersionIdMarker=None, MaxKeys=None, **_kw):
+        if self.versioned:
+            entries = [(k, e) for k in sorted(self.chains) if k.startswith(Prefix) for e in self.chains[k]]
+        else:
+            entries = [(k, {**self.objects[k], "VersionId": "null"}) for k in sorted(self.objects)
+                       if k.startswith(Prefix)]
+        start = int(KeyMarker) if KeyMarker else 0  # the double's key marker is the offset of the next entry
+        cap = min(self.page_cap or 1000, MaxKeys or 1000)
+        out = {"Versions": [], "DeleteMarkers": [], "IsTruncated": start + cap < len(entries)}
+        for k, e in entries[start:start + cap]:
+            row = {"Key": k, "VersionId": e["VersionId"], "LastModified": e["LastModified"],
+                   "IsLatest": (self.chains[k][0] if self.versioned else e) is e}
+            if e.get("marker"):
+                out["DeleteMarkers"].append(row)
+            else:
+                out["Versions"].append({**row, "ETag": e["ETag"], "Size": len(e["Body"])})
+        if out["IsTruncated"]:
+            out["NextKeyMarker"], out["NextVersionIdMarker"] = str(start + cap), "next"
+        return out
+
+    def list_objects_v2(self, *, Bucket, Prefix="", ContinuationToken=None, MaxKeys=None, **_kw):
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
-        return {"Contents": [{"Key": k} for k in keys], "KeyCount": len(keys), "IsTruncated": False}
+        start = int(ContinuationToken) if ContinuationToken else 0
+        cap = min(self.page_cap or 1000, MaxKeys or 1000)
+        page = keys[start:start + cap]
+        out = {"Contents": [{"Key": k, "Size": len(self.objects[k]["Body"]), "ETag": self.objects[k]["ETag"],
+                             "LastModified": self.objects[k]["LastModified"]} for k in page],
+               "KeyCount": len(page), "IsTruncated": start + cap < len(keys)}
+        if out["IsTruncated"]:
+            out["NextContinuationToken"] = str(start + cap)
+        return out
 
 
 class _Spy:

@@ -180,6 +180,17 @@ def _run(argv, **kw):
     return subprocess.CompletedProcess(res.args, res.returncode, _text(res.stdout), _text(res.stderr))
 
 
+def _signed_env():
+    """This process's environment plus MIND_NOTE_SIGNED=1, for every write this
+    script sends through aspirations-update-goal.sh. That wrapper signs a note value
+    a worker Body sends it (g-375-115) unless the caller says the value is already
+    signed. Here it always is, or deliberately is not: a worker's block carries its
+    line inside the block (main), and a description append and a rotation carry
+    none. Without the marker a worker's block would get a second line after its
+    sentinel."""
+    return {**os.environ, "MIND_NOTE_SIGNED": "1"}
+
+
 def _parse_json_tail(raw: str):
     """Parse the JSON body out of wrapper stdout that may carry a banner line.
 
@@ -247,6 +258,16 @@ SENTINEL_PREFIX = "[appended:"
 
 def sentinel_for(marker: str) -> str:
     return f"{SENTINEL_PREFIX}{marker}]"
+
+
+def is_block_boundary(line: str) -> bool:
+    """True for a line split_blocks ends a block on: the sentinel shape, unindented.
+
+    One predicate for both of its readers, split_blocks and the worker-text refusal
+    in main() (g-375-130), so the line the refusal names is exactly the line that
+    would cut a block in two.
+    """
+    return line.startswith(SENTINEL_PREFIX) and line.rstrip().endswith("]")
 
 
 def wrapped_marker_refusal(marker: str) -> "str | None":
@@ -357,7 +378,7 @@ def split_blocks(value: str) -> "list[str]":
     out, buf = [], []
     for line in value.split("\n"):
         buf.append(line)
-        if line.startswith(SENTINEL_PREFIX) and line.rstrip().endswith("]"):
+        if is_block_boundary(line):
             out.append("\n".join(buf).strip("\n"))
             buf = []
     tail = "\n".join(buf).strip("\n")
@@ -545,7 +566,7 @@ def rotate_oversize(goal_id: str, field: str, source: str, pre: str) -> str:
             "written and read-back-verified BEFORE this cut, and the newest blocks are kept",
             "--expect-sha256", expect,
             goal_id, field,
-        ), input=reduced)
+        ), input=reduced, env=_signed_env())
         if res.returncode != 0:
             # A refusal is not proof that nothing landed (guard-7050). rt_call
             # re-sends the identical request after a stale-daemon recycle or a
@@ -657,10 +678,40 @@ def main(argv=None) -> int:
     # above the sentinel, so it rotates with the text it signs. Only the two note
     # fields: a description is read as scope, where the line's sid would count as
     # a named entity (why: _body_stamp.py). Any other field, and anyone else's
-    # text, is stored exactly as passed.
+    # text, is stored exactly as passed. Text whose last line already is this
+    # Body's line is left as it is, the way aspirations-update-goal.sh leaves it
+    # (): a Body that ends its text with its own line got two.
+    #
+    # A WORKER'S TEXT IS CLEARED OF THE LINES THIS SCRIPT WRITES, FIRST ().
+    # Bodies imitate the stored format. Measured over 8 worker Bodies, 2026-09-27
+    # to 2026-10-05: 18 of 93 texts sent here carried a line shaped like a
+    # sentinel, 17 of them the sentinel of the very call that sent the text, and
+    # one carried this Body's line above its end. A line equal to this call's own
+    # sentinel, or to this Body's line anywhere but the end, is dropped: this
+    # script writes both, so nothing is lost. Any other boundary-shaped line is
+    # refused, because it would cut the block in two. An indented line, or a marker
+    # inside a sentence, is not a boundary and is stored, though its marker still
+    # meets the substring idempotency test below, a wider hazard ().
     signed = stamp_line() if args.field in ("progress_note", "outcome_note") else None
     if signed:
-        text = f"{text}\n{signed}"
+        lines = text.split("\n")
+        bad = next((n for n, ln in enumerate(lines, 1)
+                    if ln.strip() != sentinel and is_block_boundary(ln)), None)
+        if bad:
+            _die(RC_VALUE_SHAPE,
+                 f"line {bad} of the text reads as a block boundary: it starts with "
+                 f"'{SENTINEL_PREFIX}' and its last visible character is ']'. This script "
+                 "writes the block's sentinel itself, and a line of that shape inside the "
+                 "text would cut the block in two. Remove the line. Nothing was written.")
+        lines = [ln for ln in lines if ln.strip() != sentinel]
+        last = max((n for n, ln in enumerate(lines) if ln.strip()), default=-1)
+        text = "\n".join(ln for n, ln in enumerate(lines)
+                         if ln.strip() != signed or n == last).strip("\n")
+        if not text:
+            _die(RC_VALUE_SHAPE, "refusing to append empty text")
+        # rstrip: a blank line the dropped sentinel left below the line must not hide it.
+        if text.rstrip().rsplit("\n", 1)[-1].strip() != signed:
+            text = f"{text}\n{signed}"
 
     row = read_goal(args.goal_id, args.source)
     pre = row.get(args.field)
@@ -782,7 +833,7 @@ def main(argv=None) -> int:
         "--override-narrative-replace",
         "delegated append via goal-field-append.sh (CAS + marker idempotency applied)",
         args.goal_id, args.field,
-    ), input=new)
+    ), input=new, env=_signed_env())
     if res.returncode != 0:
         # The wrapper's rc is NOT the store of record (, rb-2648): its
         # OWN output handling can raise (e.g. a JSONDecodeError when the appended

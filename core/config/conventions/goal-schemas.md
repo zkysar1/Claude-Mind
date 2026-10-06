@@ -1183,6 +1183,25 @@ tree — same shape and same reason as `reducer_self_fence.py::decide`):
 The consumer goal id lives in `aspirations.yaml` `pull_boost.carrier_consumer_goal`
 (currently `g-306-284`), not hardcoded in either lane.
 
+**Held tips (CARRY).** The REDUCER lane keys its inputs on the outstanding TIP set, so a tip a
+reducer is deliberately holding (a placement hold whose owner waits on an external gate)
+re-raised the signal, and the STRANDED banner, on every run and on every box until the tip
+moved. A hold is recorded once with `worker-ref-consume.sh --carry <ref> --tip <sha>
+--owner-goal <g-id> --reason "<why>"` into `world/worker-ref-carries.jsonl`
+(`core/scripts/worker_ref_carries.py` owns the schema), and `--check` then prints the tip as
+CARRIED and leaves it out of `pull_tip_count` / `pull_first_ref` and out of the STRANDED
+thresholds for as long as the ref still points at the recorded SHA. Three properties carry
+the design. The key is the tip SHA, so a moved tip voids the hold with no action and a NEW tip
+is never masked by an old decision. Every hold expires (`--ttl-h`, default 72h), so a
+forgotten one cannot silence the detector for good; the reducer renews a hold it still means.
+Every failure direction (lapsed, voided, released, unreadable ledger) leaves the tip counted.
+`--carry` requires `--tip` and refuses when the ref has moved past it, so a hold attests to the
+commit that was audited. The WORKER lane is unaffected: it stamps on a Body's own push of its
+own commits. `--json` carries the producer's inputs (`pull_tip_count`, `pull_first_ref`,
+`carried`) so the exclusion can be measured without the side effect `--check` has. A box that
+predates this change ignores the ledger, so a held tip keeps re-raising there until it pulls
+the framework; nothing else about that box changes.
+
 ## Set via
 
 ```

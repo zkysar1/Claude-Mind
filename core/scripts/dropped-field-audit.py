@@ -63,6 +63,31 @@ def _enclosing_func(tree, node):
     return best.name if best else "<module>"
 
 
+def _set_parents(tree):
+    """Attach a `.parent` link to every node so a node's function ancestry is
+    exact (no line-range guessing). `_enclosing_func` above keeps its line-range
+    form: it names the function for reporting, and a mis-named function is a
+    cosmetic delta this audit's verdicts never rest on."""
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child.parent = node
+
+
+def _scope_chain(node):
+    """The functions enclosing `node`, innermost first, up to (excluding) the
+    module. Empty at module level. Reads of a receiver bound in function F are
+    dataflow-reachable only from F itself and from functions nested in F
+    (closures inherit the binding); a same-named variable in a SIBLING function
+    is a different name for dataflow's purposes (g-115-11975)."""
+    chain = []
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            chain.append(cur)
+        cur = getattr(cur, "parent", None)
+    return chain
+
+
 def audit_source(text, path_label):
     """Return (findings, rebuild_count, projection_dropped, parsed_ok).
 
@@ -79,6 +104,7 @@ def audit_source(text, path_label):
     except SyntaxError:
         return [], 0, 0, False
 
+    _set_parents(tree)
     all_dicts = [n for n in ast.walk(tree) if isinstance(n, ast.Dict)]
     # Every `X.get("k")` read anywhere in the file -> consumer evidence (part 3).
     # PART (3) IS THE WHOLE DISCRIMINATOR, so it is scoped, not file-wide.
@@ -94,6 +120,22 @@ def audit_source(text, path_label):
     # one place; the defect class is a record that TRAVELS to another consumer
     # and arrives missing a field. This is mechanical (confound gate (c)) --
     # no judgement about intent.
+    #
+    # SCOPE IS BY FUNCTION ANCESTRY, NOT BY NAME (). A data revision
+    # made the match name-keyed (rebound_in / reads_in below), and a bare
+    # `ast.walk` keyed by name matches a same-named variable in an UNRELATED
+    # function as if it were the receiver. Measured: close-review-queue main()
+    # binds `req = select_requests(...)` (the SOURCE) and reads `req["rows"]`,
+    # while _print_list() binds `req = result.get("requests") or {}` (the
+    # RECEIVER of a rebuild that deliberately omits `rows`); on the name alone
+    # the intersection is {req} and a standing false LIVE reads the audit's
+    # whole product -- a ZERO -- as a known non-zero. Two names in two
+    # functions are two names: a read is evidence about the receiver only when
+    # it is dataflow-reachable from that receiver's binding, i.e. inside the
+    # binding's function or a function nested in it (closures inherit). The
+    # canonical classify_stranded -> _file_investigate `draft` case is exactly
+    # such a same-function chain: `pr` is bound and read in _file_investigate,
+    # so it stays live under the scope rule.
     # container_key: id(dict-literal) -> the key it is stored under, e.g.
     #   entry["pull_request"] = {...}   ->  "pull_request"
     container_key = {}
@@ -104,9 +146,12 @@ def audit_source(text, path_label):
                         and isinstance(t.slice.value, str):
                     container_key[id(n.value)] = t.slice.value
 
-    # rebound_from: container key -> set(variable names bound from it), e.g.
-    #   pr = entry.get("pull_request") or {}   ->  "pull_request" -> {"pr"}
-    rebound_from = {}
+    # rebound_in: container key -> variable name -> [binding nodes], e.g.
+    #   pr = entry.get("pull_request") or {}   ->  "pull_request" -> {"pr": [n]}
+    # The NODE, not the name, is what part (3) matches on: the same name bound
+    # in two functions is two receivers (), and only a read
+    # dataflow-reachable from THIS binding is evidence about it.
+    rebound_in = {}
     for n in ast.walk(tree):
         if not isinstance(n, ast.Assign) or len(n.targets) != 1:
             continue
@@ -124,10 +169,10 @@ def audit_source(text, path_label):
                     and isinstance(sub.slice.value, str):
                 key = sub.slice.value
             if key:
-                rebound_from.setdefault(key, set()).add(t.id)
+                rebound_in.setdefault(key, {}).setdefault(t.id, []).append(n)
 
-    # reads_by_var: dropped-key -> set(variable names it is read off)
-    # BOTH ACCESS SHAPES, deliberately. An earlier revision counted only
+    # reads_in: dropped-key -> variable name -> [read nodes]. BOTH ACCESS
+    # SHAPES, deliberately. An earlier revision counted only
     # `var.get("k")`, which is a probe that assumes one path shape: it returns a
     # negative true for the shape it tested and false for the question it was
     # asked ("does anything read K off the rebuilt dict?"). A consumer written
@@ -138,18 +183,48 @@ def audit_source(text, path_label):
     # adding subscript reads across core/scripts contributes 5000 additional
     # read-edges and leaves live=0 unchanged, so the  zero survives a
     # materially weaker part-(3) predicate. (tree: probe-path-shape-assumption)
-    reads_by_var = {}
+    # The NODE, not the name, is what the match rests on (): the
+    # same name read in two functions is read off two different receivers, and
+    # only the read dataflow-reachable from THIS receiver's binding is
+    # evidence about the rebuilt dict.
+    reads_in = {}
     for n in ast.walk(tree):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) \
                 and n.func.attr == "get" and n.args \
                 and isinstance(n.func.value, ast.Name) \
                 and isinstance(n.args[0], ast.Constant) \
                 and isinstance(n.args[0].value, str):
-            reads_by_var.setdefault(n.args[0].value, set()).add(n.func.value.id)
+            reads_in.setdefault(n.args[0].value, {}).setdefault(
+                n.func.value.id, []).append(n)
         elif isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) \
                 and isinstance(n.slice, ast.Constant) \
                 and isinstance(n.slice.value, str):
-            reads_by_var.setdefault(n.slice.value, set()).add(n.value.id)
+            reads_in.setdefault(n.slice.value, {}).setdefault(
+                n.value.id, []).append(n)
+
+    def _reachable(bind, read):
+        """Is `read` dataflow-reachable from the receiver `bind`? A binding in
+        function F names a receiver live in F and in every function nested in F
+        (closures inherit the binding); a same-named variable in a SIBLING
+        function is a different receiver (g-115-11975). A module-level binding
+        is visible everywhere. This is the scope the part-(3) comment has
+        promised all along; the name-keyed maps lost it."""
+        b_chain = _scope_chain(bind)
+        if not b_chain:
+            return True        # module-level binding: visible anywhere
+        r_chain = _scope_chain(read)
+        return b_chain[0] in r_chain
+
+    def _key_reads_receiver(k, bindings):
+        """Is dropped key `k` read off any VARIABLE NAMED as a receiver of this
+        container key? True even when no such read is reachable from the
+        binding (that is precisely the same-named-local artifact, g-115-11975):
+        a `req["rows"]` in main() with the receiver `req` bound in _print_list()
+        names the receiver and cannot be attributed to the rebuilt dict."""
+        for var in bindings:
+            if var in reads_in.get(k, {}):
+                return True
+        return False
 
     consumer_reads = {}   # key -> set(function names reading it)  [diagnostic only]
     for n in ast.walk(tree):
@@ -214,17 +289,48 @@ def audit_source(text, path_label):
         #                       pr.get("draft")
         # So: take the CONTAINER KEY this literal is stored under, find every
         # variable bound from that same container key elsewhere, and require the
-        # dropped key to be read off one of THOSE variables.
+        # dropped key to be read off one of THOSE variables -- and that read
+        # must be dataflow-reachable from that binding (scoped, ),
+        # not merely same-named somewhere in the file.
         ckey = container_key.get(id(d))
         if not ckey:
             continue          # not stored under a named key -> cannot establish travel
-        receivers = rebound_from.get(ckey, set())
-        if not receivers:
+        bindings = rebound_in.get(ckey, {})
+        if not bindings:
             continue
-        live = sorted(k for k in missing
-                      if (reads_by_var.get(k, set()) & receivers))
+        live = []
+        # entangled: a dropped key is read off a VARIABLE NAMED as a receiver of
+        # this container key, in a scope the receiver's binding does not reach
+        # (). That read cannot be attributed to the rebuilt dict --
+        # it is the same-named-local artifact -- so the rebuild is NOT a live
+        # finding, but it is also NOT a countable deliberate projection: the
+        # evidence about which keys the record truly carries is ambiguous, and
+        # a projection is a claim, not a shrug. Measured: close-review-queue:873
+        # (rows read off main's own `req`, the source) drops out of BOTH
+        # counters, leaving the audit's zero -- and the cncs:920 merge_commit_sha
+        # projection, whose dropped key is never read off its receiver `pr` --
+        # counted.
+        entangled = []
+        for k in sorted(missing):
+            reachable = any(_reachable(b, r)
+                            for var, binds in bindings.items()
+                            for r in reads_in.get(k, {}).get(var, [])
+                            for b in binds)
+            if reachable:
+                live.append(k)
+            elif _key_reads_receiver(k, bindings):
+                entangled.append(k)
         if not live:
-            projections += len(missing)
+            if not entangled:
+                # DELIBERATE PROJECTION, counted PER LITERAL, not per key: the
+                # consumer test ran (a receiver exists) and established that
+                # none of the dropped keys is read off the rebuilt dict, so
+                # the whole rebuild is a projection. Counting per key would let
+                # one literal's several intentionally-omitted keys inflate the
+                # counter ( zero must stay a zero), and the confound
+                # gate (c) asks "is the rebuild a projection?" -- one answer per
+                # rebuild.
+                projections += 1
             continue
         findings.append({
             "file": path_label,

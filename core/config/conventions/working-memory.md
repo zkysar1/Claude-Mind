@@ -287,7 +287,7 @@ On THREE-WAY, in order:
 1. **Archive first. Copy, never move** (`archive-before-delete.md`).
    - Make `agents/<agent>/temp/wm-pre-adopt-<YYYY-MM-DD>-<hostname>/`.
    - Write `RECEIPT.md` in it BEFORE copying. It is the sentinel temp-drain-purge honours; without it the dir is deleted within ~120 min.
-   - `cp -p` the WM in. Verify the copy's md5 AND size equal the original's.
+   - `cp -p` the WM in under its original filename. Type the destination as ONE literal path: `cp -p agents/<agent>/session/working-memory.yaml agents/<agent>/temp/wm-pre-adopt-<YYYY-MM-DD>-<hostname>/working-memory.yaml` (agent, date and hostname written in; no shell variable, no `cd` followed by a bare filename). `bash-store-write-guard` judges the operand's text: a literal `agents/<agent>/temp/` path is admitted, while `"$DIR/working-memory.yaml"` carries no temp marker and is refused as a store write (g-306-576). Verify the copy's md5 AND size equal the original's.
    - Complete the receipt: both md5s, the size, the store version, `baseline_md5`, and restore steps. Record that it must never be restored into `session/` while a reducer is live.
 2. `bash core/scripts/owncloud-pull.sh --agent <agent> --only working-memory.yaml --adopt-store working-memory.yaml`. Expect `pulled=1`.
 3. Re-run the `backend-cat.sh head` call. It must read `[match]`; anything else HALTS. Then continue to CW1b.

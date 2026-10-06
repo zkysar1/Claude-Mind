@@ -290,3 +290,93 @@ def test_g5_negative_control_no_stamp_without_an_origin_env():
         assert k not in rec, (
             "%s present with no origin_env — the marker is unconditional, so "
             "the positive test above proves nothing" % k)
+
+
+# ── outbound data-class gate () ───────────────────────────────────
+# guard-4061 / guard-4525: the owner's personal address and credentials do not
+# cross into a peer's board. The checker runs as a SUBPROCESS and BEFORE the peer
+# backend is pinned, so its own gate-firings / override-ledger rows stay THIS
+# world's. Credential-shaped strings are assembled at run time: no key-shaped
+# literal sits in the repo.
+
+_OWNER = "operator@example.com"
+_SHAPED = "o***@e***.com"
+_AWS = "".join(["AKI", "AQWERTYUIOPASDFGH"])
+
+
+def _dc_env(tmp_path, peer_world=None):
+    """Caller env for a data-class test: tmp world/meta so the checker's own rows can
+    never reach a real store, and USER_EMAIL set to the owner."""
+    (tmp_path / "w").mkdir(exist_ok=True)
+    (tmp_path / "m").mkdir(exist_ok=True)
+    env = {"USER_EMAIL": _OWNER, "MIND_WORLD": str(tmp_path / "w"), "MIND_META": str(tmp_path / "m")}
+    if peer_world is not None:
+        env["PEER_WORLD_ZDS_MIND"] = str(peer_world)
+    return env
+
+
+@pytest.mark.parametrize("secret", [_OWNER, _AWS], ids=["owner-address", "credential"])
+def test_an_owner_address_or_a_credential_is_refused_and_nothing_reaches_the_peer(peer_world, tmp_path, secret):
+    r = run(["--peer", "zds-mind", "--channel", "coordination"], stdin=f"note: reached {secret} today",
+            env_extra=_dc_env(tmp_path, peer_world))
+    assert r.returncode == EXIT_REFUSED, r.stderr
+    assert "REFUSED by the outbound data-class gate" in r.stderr and secret not in r.stderr + r.stdout
+    assert not (peer_world / "board" / "coordination.jsonl").exists()
+
+
+def test_the_data_class_gate_runs_before_the_peer_is_resolved(tmp_path):
+    """No PEER_WORLD_* at all: an unreachable peer is EXIT_UNREACHABLE for clean text, so
+    EXIT_REFUSED here proves the check precedes the registry read and the backend pin."""
+    r = run(["--peer", "zds-mind", "--channel", "coordination"], stdin=f"note {_OWNER}",
+            env_extra=_dc_env(tmp_path))
+    assert r.returncode == EXIT_REFUSED, r.stderr
+
+
+def test_the_data_class_gate_is_called_before_the_backend_is_pinned():
+    """Structural pin of the guard-955 ordering: the checker's firing and ledger rows are THIS
+    world's, so it must run (as a subprocess, in the caller's env) before the peer pin."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    body = body[body.index("def main("):]
+    assert body.index("_data_class_gate(") < body.index("_force_peer_backend(")
+
+
+def test_the_shaped_remedy_and_clean_text_pass_and_land_on_the_peer_board(peer_world, tmp_path):
+    r = run(["--peer", "zds-mind", "--channel", "coordination"], stdin=f"note: reached {_SHAPED} today",
+            env_extra=_dc_env(tmp_path, peer_world))
+    assert r.returncode == EXIT_OK, r.stderr
+    [line] = [l for l in (peer_world / "board" / "coordination.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert _SHAPED in json.loads(line)["text"]
+
+
+def test_override_passes_the_gate_and_a_dry_run_still_refuses_without_it(peer_world, tmp_path):
+    args = ["--peer", "zds-mind", "--channel", "coordination", "--dry-run"]
+    env = _dc_env(tmp_path, peer_world)
+    r = run(args, stdin=f"note: example id {_AWS}", env_extra=env)
+    assert r.returncode == EXIT_REFUSED, r.stderr
+    r = run(args + ["--override-data-class", "documentation example"], stdin=f"note: example id {_AWS}", env_extra=env)
+    assert r.returncode == EXIT_OK, r.stderr
+    assert "would_write" in r.stdout
+    assert not list((tmp_path / "m").glob("gate-firings*")), "a dry run must leave no firing row"
+
+
+def test_a_checker_that_cannot_run_fails_open_and_loud(monkeypatch, capsys):
+    mod = _load_pbp()
+
+    class _Done:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    for rc in (1, 2, 127):
+        monkeypatch.setattr(mod.subprocess, "run", lambda *a, _rc=rc, **k: _Done(_rc))
+        mod._data_class_gate("text", "")  # returns: the post proceeds
+        assert "posting UNCHECKED" in capsys.readouterr().err, rc
+
+    def boom(*a, **k):
+        raise OSError("no interpreter")
+    monkeypatch.setattr(mod.subprocess, "run", boom)
+    mod._data_class_gate("text", "")
+    assert "posting UNCHECKED" in capsys.readouterr().err
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: _Done(mod.DATA_CLASS_REFUSAL_RC))
+    with pytest.raises(SystemExit) as exc:
+        mod._data_class_gate("text", "")
+    assert exc.value.code == mod.EXIT_REFUSED

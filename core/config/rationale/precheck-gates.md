@@ -372,6 +372,57 @@ agent-capable per `.claude/rules/capability-before-user.md`). User involvement
 happens at REVERT time and ONLY for Ring-1 candidates (`user-unblock`), where
 the user owns the file's intent — never at detection time.
 
+## Why the human-blocked defer join exists, and why a partial read is never "clean" (Phase 0.5b.15)
+
+A `human_blocked` defer has no script to run: what satisfies it is a human message
+arriving on a channel, so every clearing sweep falls through it and it stays
+effectively permanent until a person notices by hand. The two paragraphs below were
+moved here verbatim from the digest's Phase 0.5b.15 body (g-115-4265).
+
+Measured cost of that gap (2026-07-25, foxtrot): the user granted the exact
+authorization at 14:23 in a relayed board directive naming the commit by SHA.
+Nothing cleared the defer. ~8h later the approved work was still unshipped and the
+goal was ABSENT from goal-selector's entire candidate list — a deferred goal is not
+a candidate, so no amount of looping surfaces it. It also manufactured a spurious
+Investigate in a second agent's queue, correct about the mechanism and blind to the
+fact that the work was already authorized.
+
+Not redundant with 0.5b.9, and this was MEASURED rather than assumed — the
+credential sweep is the one phase that also matches on the `human_blocked:`
+prefix, so it is the obvious reason to delete this one. Live on 2026-07-31 it
+scanned 6 such defers and put **all 6** in `skipped_no_key`, whose own stated
+reason is "human-only defer, never cleared". It also scopes to
+`("pending","in-progress")` (`credential-defer-recheck.py:241`), so the 2
+`blocked`-status defers are outside it entirely. That is 100% of the population
+handed off by design: 0.5b.9 clears the credential subset, and this phase is the
+only thing that looks at the residue.
+
+Partial read (g-115-4265, 2026-10-04, zeta on cc-02). A `pq_missing` claim says the
+cited question exists in no agent's file. The fleet map it was checked against was
+built by a local glob with `except Exception: continue`, and the verdict hid `errors`
+whenever any defer existed. So an unreadable peer file, or a peer mirror weeks old,
+produced a SMALLER map that the lane treated as COMPLETE, and every id the missing rows
+held was reported as a broken citation: a claim about the owner's records manufactured
+by the reader.
+
+The reader now returns `(map, err)`, and `err` is None only when the map is complete. A
+cited id absent from an incomplete map reads `pq_unverifiable` (confidence none), never
+`pq_missing`. The roster is the store listing union the local agent dirs (a glob cannot
+tell an unreadable file from an agent with none). Each agent is read from the local
+mirror AND from the store of record (`read_authoritative_bytes`, absolute path); the
+store wins on a shared id and a local-only row stays known, so an owner's unpushed row is
+not "missing". `errors` is payload key 2, so a hit list cannot bury a failed read.
+
+`records` lists only the defers that carry at least one signal, so
+`records < human_blocked_defers` is the normal case (16 defers, 14 records on
+2026-10-04) and not a lost row: the goal's "20 vs 14" was this, not a read failure. The
+stale-mirror cause did not reproduce on cc-02 (all five peer mirrors were md5-equal to
+the store); the goal's notes carry it from other boxes (alpha: a sweep counted 33 of 40
+entries from a mirror dated 2026-09-16; foxtrot: mirrors 19 and 37 days old).
+`mirror_age` was not added: once the store is the source of truth the mirror's age
+decides nothing. The same stale-peer-mirror read in `pending-questions-sweep.py
+--all-agents` is filed as g-115-12001.
+
 ## Cross-references
 
 - `core/scripts/precheck-eval.py` — SSOT for precheck evaluation logic; DO NOT modify via goals in ZDS-Mind

@@ -273,6 +273,7 @@ READER = "#!/usr/bin/env bash\nrt_call GET /store\n"
 _PROSE = "\n".join("Plain prose line %d." % i for i in range(8))   # no exit-code evidence
 _CHECK = "IF that call exits non-zero, stop here."                 # matches the non-zero pattern
 SKILL = ".claude/skills/demo/SKILL.md"
+NO_TREE = {"head": None, "dirty": None}                            # a baseline row that recorded no tree
 
 
 def _site(name):
@@ -572,7 +573,18 @@ def test_delta_baseline_reading_is_the_newest_row_at_the_baseline(uwa, tmp_path)
     # Not in chronological order, and the last row is a higher reading: newest AT the baseline.
     p = history(("2026-01-03T00:00:00", 444), ("2026-01-01T00:00:00", 444),
                 ("2026-01-04T00:00:00", 446), ("2026-01-02T00:00:00", 446))
-    assert uwa.baseline_reading(p) == (444, "2026-01-03T00:00:00")
+    assert uwa.baseline_reading(p) == (444, "2026-01-03T00:00:00", NO_TREE)
+
+    # A row that recorded the tree it read hands it back, and an older row at the baseline
+    # does not leak its own tree into the newest one's.
+    sha = "ab" * 20
+    p = tmp_path / "audit-baselines.yaml"
+    p.write_text(yaml.safe_dump({"unchecked_writes": {"baseline": 444, "history": [
+        {"recorded_at": "2026-01-01T00:00:00", "drift_total": 444, "verdict": "x",
+         "breakdown": {"head": "cd" * 20, "dirty": 9}},
+        {"recorded_at": "2026-01-02T00:00:00", "drift_total": 444, "verdict": "x",
+         "breakdown": {"unverified": 444, "head": sha, "dirty": 2}}]}}), encoding="utf-8")
+    assert uwa.baseline_reading(p) == (444, "2026-01-02T00:00:00", {"head": sha, "dirty": 2})
 
     gone = history(("2026-01-04T00:00:00", 446), ("2026-01-05T00:00:00", 446))
     with pytest.raises(RuntimeError, match="left the window"):
@@ -593,14 +605,14 @@ def test_delta_baseline_mode_resolves_the_commit_at_or_before_the_reading(uwa, d
     # A zone east of UTC: a stamp handed to git WITHOUT an explicit UTC offset would be read
     # in local time, 13 hours early, and land on c1 instead of c2.
     monkeypatch.setenv("TZ", "Pacific/Auckland")
-    monkeypatch.setattr(uwa, "baseline_reading", lambda: (444, "2026-01-02T12:00:00"))
+    monkeypatch.setattr(uwa, "baseline_reading", lambda: (444, "2026-01-02T12:00:00", NO_TREE))
 
     ref = uwa.resolve_since("baseline", None)
     assert ref["sha"] == c2 and ref["baseline"] == 444
     assert uwa.resolve_since("baseline", c1)["sha"] == c1          # the walk starts at --until
     assert uwa.resolve_since(c3, None) == {"sha": c3, "how": "named", "baseline": None}
 
-    monkeypatch.setattr(uwa, "baseline_reading", lambda: (444, "2025-12-31T00:00:00"))
+    monkeypatch.setattr(uwa, "baseline_reading", lambda: (444, "2025-12-31T00:00:00", NO_TREE))
     with pytest.raises(RuntimeError, match="no commit at or before"):
         uwa.resolve_since("baseline", None)
 
@@ -623,3 +635,110 @@ def test_delta_until_without_new_since_is_a_usage_error(uwa, monkeypatch):
     with pytest.raises(SystemExit) as exc:
         uwa.main()
     assert exc.value.code == 2
+
+
+# --- provenance: which tree a reading was taken over () -------------------
+#
+# The ratchet's floor is a count, and a count from another box's tree reads like drift. Each
+# reading now carries the HEAD it was taken at and how many audited inputs differed from it,
+# and `--new-since baseline` rebuilds that head instead of guessing a commit from the clock.
+
+def test_provenance_names_head_and_counts_the_audited_inputs_that_differ_from_it(uwa, delta_repo):
+    """The census walks the filesystem, so an untracked wrapper moves the count exactly as an
+    edited one does: `dirty` counts both, plus staged and deleted inputs."""
+    _seed(delta_repo, _site("slot_a"))
+    head = _commit(delta_repo, "base")
+    assert uwa.provenance() == {"head": head, "dirty": 0}
+
+    _write(delta_repo, SKILL, _skill(_site("slot_a"), _site("slot_b")))          # edited input
+    assert uwa.provenance()["dirty"] == 1
+    _git(delta_repo, "add", SKILL)                                               # staged still differs
+    assert uwa.provenance()["dirty"] == 1
+    _write(delta_repo, "core/scripts/new-set.sh", WRITER)                        # untracked input
+    _write(delta_repo, ".claude/skills/fresh/SKILL.md", _skill(_site("slot_z")))  # untracked, new directory
+    (delta_repo / "core/scripts/wm-read.sh").unlink()                            # deleted input
+    assert uwa.provenance() == {"head": head, "dirty": 4}
+
+    # What neither the live walk nor the archive filter selects is not counted.
+    _write(delta_repo, "core/scripts/tests/nested-set.sh", WRITER)
+    _write(delta_repo, ".claude/skills/demo/extra/SKILL.md", _skill(_site("slot_y")))
+    _write(delta_repo, "NOTES", "not an input\n")
+    assert uwa.provenance() == {"head": head, "dirty": 4}
+
+
+def test_provenance_counts_an_untracked_input_even_when_the_checkout_hides_untracked_files(uwa, delta_repo):
+    """`--untracked-files=all` looks redundant under git's defaults and is not: a checkout
+    configured with status.showUntrackedFiles=no lists nothing untracked without it."""
+    _seed(delta_repo, _site("slot_a"))
+    head = _commit(delta_repo, "base")
+    _git(delta_repo, "config", "status.showUntrackedFiles", "no")
+    _write(delta_repo, "core/scripts/new-set.sh", WRITER)
+    assert _git(delta_repo, "status", "--porcelain", "--", "core/scripts/*.sh") == ""   # the hazard
+    assert uwa.provenance() == {"head": head, "dirty": 1}
+
+
+def test_provenance_is_none_when_git_cannot_answer(uwa, delta_repo, monkeypatch):
+    """A reading is never lost to a checkout git cannot read: both fields come back None."""
+    assert uwa.provenance() == {"head": None, "dirty": None}      # no commit yet, so HEAD names nothing
+
+    def no_git(*args):
+        raise OSError("git is not installed")
+    monkeypatch.setattr(uwa, "_git", no_git)
+    assert uwa.provenance() == {"head": None, "dirty": None}
+
+
+def test_census_json_carries_the_tree_it_read(uwa, delta_repo, monkeypatch, capsys):
+    _seed(delta_repo, _site("slot_a"))
+    head = _commit(delta_repo, "base")
+    monkeypatch.setattr(sys, "argv", ["uwa"])
+    assert uwa.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["provenance"] == {"head": head, "dirty": 0}
+    assert out["unverified"] == 1          # the new key moves no count
+
+
+def _three_commits(repo):
+    _seed(repo, _site("slot_a"))
+    c1 = _commit(repo, "c1", "2026-01-01T10:00:00+0000")
+    _write(repo, "NOTES", "two\n")
+    c2 = _commit(repo, "c2", "2026-01-02T10:00:00+0000")
+    _write(repo, "NOTES", "three\n")
+    c3 = _commit(repo, "c3", "2026-01-03T10:00:00+0000")
+    return c1, c2, c3
+
+
+def test_delta_baseline_mode_uses_the_head_recorded_on_the_row(uwa, delta_repo, monkeypatch, capsys):
+    """The row names the tree it read, so the clock is not consulted: the stamp alone lands on c2."""
+    c1, _c2, c3 = _three_commits(delta_repo)
+    monkeypatch.setattr(uwa, "baseline_reading",
+                        lambda: (444, "2026-01-02T12:00:00", {"head": c1, "dirty": 0}))
+    ref = uwa.resolve_since("baseline", None)
+    assert (ref["sha"], ref["baseline"]) == (c1, 444)
+    assert "head recorded" in ref["how"] and "approximate" not in ref["how"]
+    assert uwa.resolve_since("baseline", c3)["sha"] == c1       # `until` bounds the date walk only
+
+    monkeypatch.setattr(uwa, "baseline_reading",
+                        lambda: (444, "2026-01-02T12:00:00", {"head": c1, "dirty": 2}))
+    assert "2 audited file(s) differed" in uwa.resolve_since("baseline", None)["how"]
+
+    # and the operator sees which way the revision was found
+    _write(delta_repo, SKILL, _skill(_site("slot_a"), _site("slot_b")))
+    assert uwa.delta_main("baseline", None, False) == 0
+    assert "head recorded with the baseline reading of 2026-01-02T12:00:00" in capsys.readouterr().out
+
+
+def test_delta_baseline_mode_falls_back_to_the_clock_when_the_row_has_no_usable_head(uwa, delta_repo, monkeypatch):
+    c1, c2, c3 = _three_commits(delta_repo)
+    cases = (
+        (None, False),           # a row written before the field existed
+        ("ef" * 20, True),       # a full sha this checkout does not hold
+        ("main", True),          # symbolic names move, so they are not heads: this one would
+        ("HEAD", True),          # resolve to c3 if it reached git
+        ("--output=x", True),    # and nothing read from the file may reach git as an option
+    )
+    for head, says_so in cases:
+        monkeypatch.setattr(uwa, "baseline_reading",
+                            lambda head=head: (444, "2026-01-02T12:00:00", {"head": head, "dirty": 0}))
+        ref = uwa.resolve_since("baseline", None)
+        assert ref["sha"] == c2, head
+        assert ("not a commit in this checkout" in ref["how"]) is says_so, (head, ref["how"])

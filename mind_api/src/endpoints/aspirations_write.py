@@ -71,7 +71,7 @@ from .. import file_locks, history, changelog
 # package gives us the pure evaluate() functions extracted in PR 7a.
 from _fileops import _atomic_write_with_fallback  # noqa: E402
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
-from _owncloud_codec import decode_response as _codec_decode_response  # noqa: E402  #  transport seam
+from _owncloud_composite import decode_whole as _decode_whole  # noqa: E402  #  transport seam +  U3 composite join
 from ..agent_paths import (  # noqa: E402
     assert_not_cruft, SESSIONS_DIRNAME, SESSION_DIRNAME,
 )
@@ -538,7 +538,9 @@ def _authoritative_goal_lookup(live_path: Path, asp_id: str, goal_id: str):
         obj = be.s3.get_object(Bucket=be.bucket, Key=key)
         # : decode through the one transport seam — the store may be
         # gzip on the wire (magic-byte authoritative; plain passes through).
-        raw = _codec_decode_response(obj, key=key).decode("utf-8", errors="replace")
+        #  U3: a composite head is joined to the whole file first; the head
+        # alone holds no goal, so reading it raw would answer no-verify.
+        raw = _decode_whole(be, key, obj).decode("utf-8", errors="replace")
     except Exception as e:  # noqa: BLE001 — raw S3 read failed -> fail-open
         print(f"[daemon] persistence read-back unavailable "
               f"({type(e).__name__}); assuming persisted (fail-open, g-115-2208)",
@@ -10100,9 +10102,171 @@ def evolution_append(ctx) -> "Response":  # type: ignore[name-defined]
     return Response.json({"ok": True, "event": evt})
 
 
+# ---------------------------------------------------------------------------
+# POST /v1/aspirations/update-goal-fields  ()
+# ---------------------------------------------------------------------------
+#
+# Several flat fields of ONE goal in ONE locked rewrite of the store. The
+# recurring-close counter block wrote its seven fields as up to eight separate
+# `aspirations.py update-goal` calls, and on a whole-object-PUT store each call
+# is a full-object PUT of aspirations.jsonl (: 23-97 such rewrites a
+# day on a ~34 MB object; one close made eight to one goal in 37 s).
+#
+# NARROW ON PURPOSE. update_goal runs a per-field gate and cascade pipeline;
+# this route applies its fields BENEATH all of it, and a bulk write is blind to
+# the refusals the per-field path would have produced (rb-7387). So it admits
+# only fields that carry neither a gate nor a cascade and refuses every other
+# name by name. Widening the allowlist means proving the new field carries none.
+_BATCH_INT_FIELDS = frozenset({
+    "consecutive_routine", "consecutive_deep", "substantive_runs", "substantive_hits"})
+_BATCH_STR_FIELDS = frozenset({"last_outcome_origin", "last_substantive_at"})
+# pull_signal is CLEAR-ONLY here: its producer sets it through update_goal, and a
+# close only nulls it (null, never key removal -- ).
+_BATCH_CLEAR_ONLY_FIELDS = frozenset({"pull_signal"})
+_BATCH_ALLOWED_FIELDS = _BATCH_INT_FIELDS | _BATCH_STR_FIELDS | _BATCH_CLEAR_ONLY_FIELDS
+
+
+def _batch_field_problem(name: str, value: Any) -> Optional[str]:
+    """Why `name=value` may not go through update-goal-fields, or None."""
+    if name not in _BATCH_ALLOWED_FIELDS:
+        return (f"{name!r} is not writable through update-goal-fields "
+                f"(allowed: {', '.join(sorted(_BATCH_ALLOWED_FIELDS))}); "
+                f"use update-goal for any other field")
+    if name in _BATCH_INT_FIELDS:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return f"{name!r} must be a non-negative integer, got {value!r}"
+    elif name in _BATCH_STR_FIELDS:
+        if not isinstance(value, str) or not value:
+            return f"{name!r} must be a non-empty string, got {value!r}"
+    elif value is not None:
+        return f"{name!r} can only be cleared (null) here, got {value!r}"
+    return None
+
+
+def _normalize_terminal_goals_cli_parity(items: List[Dict[str, Any]]) -> None:
+    """aspirations.py `_normalize_terminal_goals_in`, over the whole store.
+
+    The counter writes this route replaces went through the CLI writer, which
+    runs that normalizer at every disk write; it is what backfills completed_at
+    and clears stale defer state as a side effect of those writes (g-115-10145).
+    A batch write must keep running it, so this is the CLI's semantics and NOT
+    `_normalize_terminal_goals_in` above: that twin nulls blocked_by, which the
+    CLI preserves as dependency lineage, and stamps completed_at only when the
+    key is missing, not when it is null. Parity is pinned against the CLI
+    function itself in test_update_goal_fields.py.
+    """
+    for asp in items:
+        for g in asp.get("goals", []) or []:
+            if g.get("status") not in _TERMINAL_GOAL_STATUSES:
+                continue
+            for key in ("defer_reason", "defer_reason_set_at"):
+                if g.get(key) is not None:
+                    g[key] = None
+            for key in ("deferred_until", "blocker_ref", "blocked_since"):
+                if key in g:
+                    g[key] = None
+            if g.get("completed_at") is None:
+                cd = g.get("completed_date")
+                if isinstance(cd, str) and cd:
+                    g["completed_at"] = cd if "T" in cd else f"{cd}T00:00:00"
+                else:
+                    g["completed_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def update_goal_fields(ctx) -> "Response":  # type: ignore[name-defined]
+    """POST /v1/aspirations/update-goal-fields?id=<goal>[&source=world|agent]
+    body {"fields": {"<name>": <value>, ...}}
+
+    Applies every field in ONE locked rewrite (one history snapshot, one store
+    write, one changelog row), then reads each one back from the authoritative
+    store. A refusal (bad name, bad value, unknown goal) writes nothing and
+    lists every field in `unwritten`. A field the read-back does not find as
+    written fails the call with 500 `update_not_persisted` and names exactly
+    those fields in `unwritten`; it never answers 200 over a field it could not
+    confirm (the partial-apply-while-printing-success shape, ZDS guard-920).
+    """
+    from ..server import Response
+
+    goal_id = (ctx.query.get("id") or "").strip()
+    if not goal_id:
+        return Response.error(400, "missing_param", "query parameter 'id' required")
+    if not _GOAL_ID_RE.match(goal_id):
+        return Response.error(400, "invalid_goal_id",
+                              f"expected g-NNN-NN[N[N[N]]], got {goal_id!r}")
+    source = (ctx.query.get("source") or "world").lower()
+    if source not in ("world", "agent"):
+        return Response.error(400, "invalid_source", "source must be world or agent")
+    agent_guard = _require_explicit_agent(ctx, source)
+    if agent_guard is not None:
+        return agent_guard
+    try:
+        body = _parse_body_json(ctx.body)
+    except (ValueError, json.JSONDecodeError) as e:
+        return Response.error(400, "invalid_body", f"body must be JSON: {e}")
+    fields = body.get("fields") if isinstance(body, dict) else None
+    if not isinstance(fields, dict) or not fields:
+        return Response.error(
+            400, "invalid_body",
+            "body must be a JSON object with a non-empty 'fields' object")
+    problems = [p for p in (_batch_field_problem(n, v) for n, v in fields.items()) if p]
+    if problems:
+        return Response.json({"error": "invalid_fields", "detail": "; ".join(problems),
+                              "unwritten": list(fields)}, status=400)
+
+    live_path, base_dir = _resolve_paths(ctx, source)
+    agent = _agent_name(ctx)
+    try:
+        with file_locks.locked(live_path):
+            items = _read_jsonl(live_path)
+            found = _find_goal(items, goal_id)
+            if found is None:
+                return Response.json({
+                    "error": "goal_not_found",
+                    "detail": f"goal {goal_id} not found in the {source} queue",
+                    "unwritten": list(fields)}, status=404)
+            asp_idx, goal_idx, asp = found
+            goal = asp["goals"][goal_idx]
+            for name, value in fields.items():
+                goal[name] = value
+            goal["last_modified"] = datetime.now().isoformat(timespec="seconds")
+            _recompute_progress(asp)
+            _normalize_terminal_goals_cli_parity(items)
+            summary = f"update-goal-fields {goal_id} {','.join(fields)}"
+            history.snapshot(live_path, base_dir, agent, summary=summary)
+            _atomic_write_jsonl(live_path, items)
+            changelog.append(base_dir, agent, live_path, "edit",
+                             summary=summary, lines_changed=len(items))
+            _jsonl_cache().invalidate(live_path)
+    except OSError as e:
+        return Response.json({"error": "write_failed", "detail": str(e),
+                              "unwritten": list(fields)}, status=500)
+
+    ok, mismatches = _verify_transition_persisted(
+        live_path, asp["id"], goal_id, {n: goal.get(n) for n in fields})
+    if not ok:
+        import sys
+        # A goal absent from the authoritative store means NO field persisted.
+        absent = any(m["field"] == "<goal>" for m in mismatches)
+        unwritten = list(fields) if absent else [
+            m["field"] for m in mismatches if m["field"] in fields]
+        detail = _format_transition_mismatches(mismatches)
+        print(f"[daemon update_goal_fields] WRITE-LOSS DETECTED on {goal_id}: "
+              f"{', '.join(unwritten)} did not persist -- {detail}", file=sys.stderr)
+        return Response.json({
+            "error": "update_not_persisted",
+            "detail": (f"update-goal-fields {goal_id}: {', '.join(unwritten)} did "
+                       f"not read back as written from the authoritative store "
+                       f"[{detail}]; retry the update"),
+            "unwritten": unwritten}, status=500)
+
+    return Response.json({"ok": True, "goal_id": goal_id, "aspiration_id": asp["id"],
+                          "source": source, "fields": list(fields), "goal": goal})
+
+
 def register(routes) -> None:
     routes[("POST", "/v1/aspirations/add-goal")] = add_goal
     routes[("POST", "/v1/aspirations/update-goal")] = update_goal
+    routes[("POST", "/v1/aspirations/update-goal-fields")] = update_goal_fields
     routes[("POST", "/v1/aspirations/complete")] = complete
     routes[("POST", "/v1/aspirations/complete-intent")] = complete_intent
     routes[("POST", "/v1/aspirations/complete-by")] = complete_by

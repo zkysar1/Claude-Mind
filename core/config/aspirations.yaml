@@ -499,8 +499,13 @@ close_review_gate:
   # (guard-3699). Relaxing never drops a role to zero coverage (): a sampled role
   # keeps a deterministic review_sample_rate share of its closures in the queue, so its
   # pass rate stays measured after relaxing. A rate outside (0, 1] reads as 0.2, loudly.
-  review_closer_roles: [worker]
-  review_sampled_roles: []
+  # RELAXED 2026-10-04 (): worker moved to review_sampled_roles on `stats`
+  # reviewed=159 approve_rate=0.943, no REJECT in the last 5. Its last full-review coverage
+  # was 159/246=0.646; from here coverage counts only the sample, past closures included.
+  # Why: about 23 worker closures a day met 20-30 verdicts a day with review requests
+  # ranked first (34 open from alpha alone), so worker closures drew 1 verdict on 10-03.
+  review_closer_roles: []
+  review_sampled_roles: [worker]
   review_sample_rate: 0.2
 
 planning:
@@ -3128,6 +3133,22 @@ aspirations_eviction:
   interval_hours: 24
   age_days: 3
   apply: true
+
+# Composite goal-queue store: scheduled orphan-collection pass ( U15a).
+# core/scripts/composite-gc-tick.sh, called from iteration-close.sh
+# productivity-check beside the eviction tick above, starts
+# core/scripts/composite_gc_runner.py in the background at most once per
+# `interval_minutes` on this box. The tick OBSERVES: it never passes --apply, and
+# this block has no key that could. Deleting needs a reviewed edit to the tick
+# plus the environment's delete flag (design record and flip checklist:
+# core/config/rationale/aspirations-store-segmentation.md). While the composite
+# flags are unset the runner makes no store call, so `enabled: true` is the
+# shipped state and `enabled: false` is the kill switch. Only a literal boolean
+# true enables; any other value, a missing block or an unreadable file reads as
+# disabled.
+composite_gc_tick:
+  enabled: true
+  interval_minutes: 30
 
 # Candidate tier (world/conventions/goal-intake-management.md §8; B2, ).
 # core/scripts/gates/intake_route.py reads `enabled` and the two origin lists:

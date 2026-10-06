@@ -270,6 +270,31 @@ if [[ -z "$SUMMARY" ]]; then
     exit 0
 fi
 
+# A WORKER BODY'S OWN LINE, COPIED INTO ITS TEXT, IS DROPPED HERE ():
+# every exact copy of the line the signing block below adds, except one that
+# already ends the text. Bodies imitate the stored format, and a copy above the
+# end left the note with the line twice (measured 2026-10-05: one text in 44 h,
+# sent once to each writer).
+# HERE, before the idempotency compare, and not in the signing block: that
+# compare looks for this SUMMARY inside the stored note, so the note must be
+# written from the same normalized text a retry produces. A text without the
+# line is not touched and stays byte-exact. awk rather than a read loop keeps an
+# unterminated final line (guard-3915); the line rides ENVIRON because awk -v
+# would rewrite backslashes; an empty or failed result is not taken. A helper
+# failure is quiet HERE only because the signing block below calls the same
+# helper and says that failure aloud.
+if [[ "${BODY_ROLE:-}" == "worker" ]] \
+   && _ce_own="$($PYLAUNCH "$SCRIPT_DIR/_body_stamp.py" line 2>/dev/null)" \
+   && [[ -n "$_ce_own" && "$SUMMARY" == *"$_ce_own"* ]]; then
+    if _ce_norm="$(printf '%s\n' "$SUMMARY" | CE_OWN="$_ce_own" awk '
+            { line[NR] = $0; t = $0; sub(/^[ \t\r]+/, "", t); sub(/[ \t\r]+$/, "", t)
+              trim[NR] = t; if (t != "") last = NR }
+            END { for (i = 1; i <= NR; i++) if (trim[i] != ENVIRON["CE_OWN"] || i == last) print line[i] }')" \
+       && [[ -n "$_ce_norm" ]]; then
+        SUMMARY="$_ce_norm"
+    fi
+fi
+
 # PROVENANCE MARKER (). The recurring supersede branch below needs to
 # tell a PRIOR-occurrence note (safe to replace) from one an agent hand-wrote for
 # THIS occurrence (must never be replaced), and the goal record carries NO signal
@@ -603,10 +628,19 @@ fi
 # signs, and the idempotency compare above still finds the bare summary. Not on
 # the deferral path, for the reason just given: SUMMARY is then the caller's
 # preserved note, which this Body did not write. The line is ASCII, as above. A
-# failure to sign is said aloud and the note is written unsigned.
+# failure to sign is said aloud and the note is written unsigned. A narrative
+# whose last line already is this Body's line is left as it is, the way
+# aspirations-update-goal.sh leaves one (). Measured 2026-10-04: 2 of 26
+# notes worker Bodies wrote through this script and goal-field-append.py carried
+# the line twice, each because the text the Body sent already ended with it.
 if [[ "${BODY_ROLE:-}" == "worker" && "${_CE_DEFER_STAMPED:-0}" -eq 0 ]]; then
     if _ce_signed="$($PYLAUNCH "$SCRIPT_DIR/_body_stamp.py" line)"; then
-        [[ -n "$_ce_signed" ]] && SUMMARY="$SUMMARY
+        # The last non-blank line, trimmed, by expansion. A read loop would drop
+        # an unterminated final line (guard-3915).
+        _ce_last="${SUMMARY%"${SUMMARY##*[![:space:]]}"}"
+        _ce_last="${_ce_last##*$'\n'}"
+        _ce_last="${_ce_last#"${_ce_last%%[![:space:]]*}"}"
+        [[ -n "$_ce_signed" && "$_ce_last" != "$_ce_signed" ]] && SUMMARY="$SUMMARY
 
 $_ce_signed"
     else
@@ -625,7 +659,10 @@ fi
 # no evidence for. Merged 2>&1 because the CLI path prints its refusal on stderr
 # and the daemon path on stdout; dropping either would re-bury the one line that
 # explains the exit code (guard-3662).
-_upd_out="$(bash "$SCRIPT_DIR/aspirations-update-goal.sh" ${SOURCE:+--source "$SOURCE"} \
+# MIND_NOTE_SIGNED=1: SUMMARY is already signed above, or deliberately not (the
+# deferral path's preserved note), so the wrapper must not add the line it adds
+# to a note a worker Body sends it directly ().
+_upd_out="$(MIND_NOTE_SIGNED=1 bash "$SCRIPT_DIR/aspirations-update-goal.sh" ${SOURCE:+--source "$SOURCE"} \
         "$GOAL_ID" outcome_note "$SUMMARY" 2>&1)"
 _upd_rc=$?
 

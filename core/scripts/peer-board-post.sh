@@ -3,12 +3,14 @@
 #
 # Usage: echo "message" | bash core/scripts/peer-board-post.sh \
 #          --peer <environment-id> --channel <name> \
-#          [--type <t>] [--tags <t1,t2>] [--reply-to <id>] [--author <a>] [--dry-run]
+#          [--type <t>] [--tags <t1,t2>] [--reply-to <id>] [--author <a>] [--dry-run] \
+#          [--override-data-class "<why the body is not an owner address / credential>"]
 #
 # Message comes via STDIN (guard-1036 -- same contract as board-post.sh).
 #
 # Exit codes: 0 ok | 2 usage/registry error | 3 peer unreachable from this box
-#             | 4 refused (peer == self)
+#             | 4 refused (peer == self, or the body carries the owner's personal address /
+#             a credential -- the outbound data-class gate, )
 #
 # See core/config/conventions/cross-deployment-channel.md. The engine pins the
 # PEER's storage backend before importing _fileops -- see peer_board_post.py.

@@ -46,17 +46,31 @@ false positive costs trust in the whole detector, and detectors nobody trusts
 get ignored rather than fixed. The incident is caught twice over on the two
 forms that ARE extracted.
 
-KNOWN LIMITATION — QUOTATION READS AS CLAIM. The shipped-verb test is
-note-GLOBAL, so a note that QUOTES someone else's false claim ("g-326-585
-said it added --direct to zakpod1-pp-aging-probe.py; it did not") fires the
-same as a note that MAKES it. The detector's output is still literally true
-in that case — the note does name a symbol that is absent from the artifact —
-but the defect belongs to the quoted goal, not the quoting one. Narrowing the
-verb test to the artifact's own clause was rejected: quoted claims carry the
-verb next to the filename too, so it would cost recall on real claims without
-buying precision here. Read a fire as "some goal's claim about this artifact
-is false", then check WHICH goal. This is a report, never a block, precisely
-because of cases like this.
+BINDING IS SENTENCE-SCOPED (g-115-7429). The first version bound each symbol
+to the nearest preceding filename anywhere in the note and tested the shipped
+verb note-globally. Replayed over 887 live closing notes (2.9 MB, one store
+snapshot) it fired on 61 goals (117 artifact/symbol pairs), and every one was
+read: none was a genuine shipped claim. 93 pairs crossed a sentence boundary,
+20 shared a sentence that had no shipped verb, and 3 of the last 4 were a
+path-resolution defect (`core/config/aspirations.yaml` read as an unrelated
+47-byte store file with the same basename). A claim now needs the verb, the
+symbol and the artifact in ONE sentence, and four kinds of token are not
+claims (see `extract_claims`); over the same notes and snapshot the fired set
+went 61 goals -> 1. The cost is recall, taken on purpose: a claim spread over
+several sentences, or a header line plus bullets, no longer binds (pinned by a
+test, so widening it is a deliberate, measured act). The one remaining firing
+is a flag and a filename joined by a 488-character run-on sentence.
+
+KNOWN LIMITATION — QUOTATION READS AS CLAIM. Within a single sentence, a note
+that QUOTES someone else's false claim ("g-326-585 said it added --direct to
+zakpod1-pp-aging-probe.py; it did not") fires the same as a note that MAKES
+it. The detector's output is still literally true in that case — the note does
+name a symbol that is absent from the artifact — but the defect belongs to the
+quoted goal, not the quoting one. Read a fire as "some goal's claim about this
+artifact is false", then check WHICH goal. This is a report, never a block,
+precisely because of cases like this. A firing a reader has adjudicated is
+marked with `shipped-claim-store-check.sh --verdict`, not left to stand as an
+unexplained closure defect.
 
 Public API (PURE — no I/O, no subprocess, no env reads):
     extract_claims(outcome_note) -> [{"artifact": str, "symbols": [str, ...]}]
@@ -138,6 +152,48 @@ SYMBOL_RES = (
 )
 
 
+# A claim is made in ONE sentence: the shipped verb, the symbol and the artifact
+# all sit inside the same unit. Only the two boundaries that are reliable in
+# these notes are used — a newline, and a terminator (. ! ?) followed by
+# whitespace. A dot inside a filename or a version is never followed by
+# whitespace, so it cannot split. Semicolons, pipes and dashes are deliberately
+# NOT boundaries: a claim joined by one still binds.
+_SENTENCE_BREAK_RE = re.compile(r"\n+|(?<=[.!?])\s+")
+
+# A backtick span that is a whole COMMAND LINE (`tool sub --flag arg`), as
+# opposed to a span that is just the symbol (`--flag`, `--flag <arg>`).
+_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
+
+# Artifacts that hold records or declarative config, never a CLI surface: a
+# `--flag` cannot be "shipped into" one, so a flag bound to one is a command
+# the note quoted, not a claim about the file.
+_DATA_EXTS = frozenset({"json", "jsonl", "yaml", "yml"})
+
+
+def _sentence_spans(text: str) -> List[tuple]:
+    spans, pos = [], 0
+    for m in _SENTENCE_BREAK_RE.finditer(text):
+        spans.append((pos, m.start()))
+        pos = m.end()
+    spans.append((pos, len(text)))
+    return spans
+
+
+def _in_command_span(segment: str, pos: int) -> bool:
+    """True when `pos` sits inside a backtick span that is a command line.
+
+    `git diff --no-renames` and `tool.sh sub --flag arg` are transcripts of
+    something that was RUN; `--direct` and `--direct <url>` are the symbol
+    itself. The discriminator is the first word: a command line starts with a
+    command, a symbol span starts with the symbol.
+    """
+    for m in _CODE_SPAN_RE.finditer(segment):
+        if m.start() < pos < m.end():
+            words = m.group(1).split()
+            return len(words) > 1 and not words[0].startswith("-")
+    return False
+
+
 def _symbol_needle(symbol: str) -> str:
     """The literal that must appear in the artifact for the claim to hold.
 
@@ -154,13 +210,19 @@ def _symbol_needle(symbol: str) -> str:
 def extract_claims(outcome_note: str) -> List[Dict[str, object]]:
     """Parse shipped-symbol claims out of a closing note.
 
-    Symbols bind to the NEAREST PRECEDING artifact token, falling back to the
-    first artifact in the note when a symbol appears before any filename. That
-    rule reads a multi-file note correctly ("Added a() to x.py and --b to
-    y.sh") and reads the far more common single-file note correctly by
-    construction, without needing sentence segmentation — prose sentence
-    boundaries in these notes are unreliable (semicolons, pipes from flattened
-    newlines, bare dashes).
+    A claim lives in ONE sentence: a shipped verb, a symbol and an artifact
+    token all inside the same sentence unit (`_SENTENCE_BREAK_RE`). Inside that
+    sentence a symbol binds to the NEAREST PRECEDING artifact, falling back to
+    the first artifact of the SAME sentence when the symbol comes first ("wrote
+    a --b and c() into y.sh"). Nothing binds across a sentence boundary, so a
+    flag, function or identifier mentioned in one sentence is never charged to
+    a file named in another.
+
+    Four kinds of token are not claims and are dropped here: a filename used as
+    a symbol (a note that names another file is citing it), a `--flag` bound to
+    a data or config artifact (no CLI surface to ship into), a `--flag` inside
+    a backticked command line (a transcript of something that was run), and
+    the artifact's own name.
 
     Returns [] when the note makes no shipped claim, names no artifact, or
     names no extractable symbol. Never raises.
@@ -175,35 +237,45 @@ def extract_claims(outcome_note: str) -> List[Dict[str, object]]:
     if not artifacts:
         return []
 
-    # Preserve first-appearance order of artifacts; dedupe symbols per artifact.
+    # First-claim order of artifacts; dedupe symbols per artifact.
     bucket: Dict[str, List[str]] = {}
     order: List[str] = []
-    for _, name in artifacts:
-        if name not in bucket:
-            bucket[name] = []
-            order.append(name)
+    for start, end in _sentence_spans(text):
+        segment = text[start:end]
+        if not SHIPPED_VERB_RE.search(segment):
+            continue
+        here = [(p - start, n) for p, n in artifacts if start <= p < end]
+        if not here:
+            continue
+        for rx in SYMBOL_RES:
+            for m in rx.finditer(segment):
+                symbol = m.group(1)
+                if rx.pattern.endswith(r"\(\)"):
+                    symbol += "()"
+                pos = m.start()
+                # Nearest preceding artifact; else the first one in the sentence.
+                owner = here[0][1]
+                for a_pos, a_name in here:
+                    if a_pos < pos:
+                        owner = a_name
+                    else:
+                        break
+                needle = _symbol_needle(symbol)
+                # A filename is not a symbol claim about itself or about another file.
+                if needle == owner or ARTIFACT_TOKEN_RE.fullmatch(needle):
+                    continue
+                if symbol.startswith("--"):
+                    if owner.rsplit(".", 1)[-1].lower() in _DATA_EXTS:
+                        continue
+                    if _in_command_span(segment, pos):
+                        continue
+                if owner not in bucket:
+                    bucket[owner] = []
+                    order.append(owner)
+                if symbol not in bucket[owner]:
+                    bucket[owner].append(symbol)
 
-    for rx in SYMBOL_RES:
-        for m in rx.finditer(text):
-            symbol = m.group(1)
-            if rx.pattern.endswith(r"\(\)"):
-                symbol += "()"
-            pos = m.start()
-            # Nearest preceding artifact; else the first artifact in the note.
-            owner = artifacts[0][1]
-            for a_pos, a_name in artifacts:
-                if a_pos < pos:
-                    owner = a_name
-                else:
-                    break
-            # A filename is not a symbol claim about itself.
-            if _symbol_needle(symbol) == owner:
-                continue
-            if symbol not in bucket[owner]:
-                bucket[owner].append(symbol)
-
-    return [{"artifact": name, "symbols": bucket[name]}
-            for name in order if bucket[name]]
+    return [{"artifact": name, "symbols": bucket[name]} for name in order]
 
 
 def missing_symbols(symbols: List[str], content: str) -> List[str]:
@@ -243,11 +315,11 @@ def evaluate(*, goal_id: str, outcome_note: str,
                 "claims_checked": 0,
                 "reason": "no shipped-symbol claim in outcome_note"}
 
-    # Cross-artifact acquittal. `extract_claims` binds each symbol to the
-    # nearest PRECEDING filename, which reads "Added to x.py: a(), --b"
-    # correctly and mis-reads the equally common "wrote a() and --b into x.py"
-    # — the symbols precede the file they went into, so they bind to whatever
-    # filename came earlier. On a single-artifact note (the common case, and
+    # Cross-artifact acquittal. `extract_claims` binds each symbol, within its
+    # sentence, to the nearest PRECEDING filename, which reads "Added to x.py:
+    # a(), --b" correctly and mis-reads a sentence that names two files
+    # ("added a() to x.py, then wrote --b into y.sh"): --b follows x.py, so it
+    # binds to x.py though it went into y.sh. On a single-artifact note (the common case, and
     # the  case) the binding is irrelevant because there is only one
     # target. On a MULTI-artifact note a mis-bind manufactures a false
     # positive, which is the one failure this detector cannot afford.

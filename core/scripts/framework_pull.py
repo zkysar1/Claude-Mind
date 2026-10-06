@@ -51,8 +51,10 @@ import datetime
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -536,6 +538,34 @@ def failing_node_ids_from_dir(out_dir) -> set:
     return ids
 
 
+_INVISIBLE_FAIL_LINE = re.compile(r"^FAIL\(rc=-?\d+\) (\S+)(?: \(shell\))?\s*$")
+
+
+def failing_invisible_files(text: str) -> set:
+    """File names the invisible half reported FAIL, read from the run's stdout.
+
+    halves.jsonl keeps the half's rc and ONE summary line, and run-full-suite.sh
+    deletes the half's own log right after recording it, so the names exist in
+    exactly one place: the runner's stdout, which run_suite() already captures
+    for both the adopt-commit run and the baseline run. The runner prints one
+    `FAIL(rc=N) <file>` line per red file (`<file> (shell)` for the shell half).
+    Anchored at the line start, so a failing test's OWN output -- the runner
+    indents the last eight lines of it under `    | ` -- cannot enter the set.
+    """
+    out = set()
+    for line in (text or "").splitlines():
+        m = _INVISIBLE_FAIL_LINE.match(line)
+        if m:
+            out.add(m.group(1))
+    return out
+
+
+def _half_red(halves, name) -> bool:
+    """True when halves.jsonl has a row for `name` and its rc is nonzero."""
+    row = {h.get("half"): h for h in halves or [] if isinstance(h, dict)}.get(name)
+    return row is not None and row.get("rc") not in (0, None)
+
+
 def _verdict_trustworthy(verdict) -> bool:
     """The run concluded and its numbers mean something: CLEAN or GENUINE.
 
@@ -544,24 +574,6 @@ def _verdict_trustworthy(verdict) -> bool:
     """
     return bool(verdict) and "INVALID" not in verdict \
         and ("CLEAN" in verdict or "GENUINE" in verdict)
-
-
-def _framework_halves_clean(halves) -> bool:
-    """True when halves.jsonl was read and no framework-owned half is red.
-
-    The rule suite_is_green applies when it excuses a red rc, minus its "a
-    deployment half must explain the rc" clause (here the chunked half's own
-    pre-existing reds explain it). A half with no row reads as not red, as it
-    does in suite_is_green. Absent or unreadable halves are unprovable.
-    """
-    if not halves:
-        return False
-    by_half = {h.get("half"): h for h in halves if isinstance(h, dict)}
-    for name in FRAMEWORK_HALVES:
-        row = by_half.get(name)
-        if row is not None and row.get("rc") not in (0, None):
-            return False
-    return True
 
 
 # --------------------------------------------------- C4 in a pinned worktree
@@ -650,9 +662,96 @@ def bridge_runtime_state(project_root: Path, wt: Path, agent: str | None) -> lis
     return rows
 
 
+# ------------------------------------------------ the daemon, around the verify
+#
+# run-full-suite.py REFUSES a run from a linked worktree while a daemon is
+# listening for the main checkout (rc 3; guard-5866, guard-6394), and the pinned
+# verify below is always a linked worktree. Every deployment has a live daemon,
+# so the first real --adopt on one (g-358-237) hit that refusal and rolled back.
+# The executor makes the refusal's PRECONDITION true -- no live daemon -- and
+# leaves the refusal itself in place as the independent check. It does not
+# forward --override-worktree-daemon: that overrides the safety gate on every
+# adoption (guard-4817: a gate that refuses correctly and is overridden every
+# time reads as noise to the telemetry that decides retirement) and runs the
+# configuration guard-6394 measured as worse than the contention it avoids.
+
+def daemon_listening_port(project_root: Path):
+    """The port a daemon is ACTUALLY listening on for project_root, else None.
+
+    Connecting is the signal, not the port file: a stale file outlives its
+    daemon. This is the question run-full-suite.py's _live_daemon_port asks the
+    same way (its refusal is what this module has to get past), and a test pins
+    the two probes to each other so they cannot drift.
+    """
+    try:
+        port = int((Path(project_root) / "mind_api" / "state" / "daemon.port")
+                   .read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+    if not 0 < port < 65536:
+        return None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+            return port
+    except Exception:
+        return None
+
+
+def _default_daemon_stop(project_root: Path) -> bool:
+    """Stop the daemon with the runtime helper's own primitive, rt_daemon_kill.
+
+    SIGTERM, a bounded health-probe wait, then a kill by the KNOWN pids in
+    daemon.pid / daemon.parent.pid (the Windows tree-kill lives there). Sourced
+    from the target's own _runtime.sh, never re-implemented here. The runtime
+    dir is the helper's to resolve: RT_DIR if exported, else mind_api/state.
+    """
+    try:
+        p = subprocess.run(
+            [BASH, "-c", 'source "$1" && rt_daemon_kill', "stop-daemon",
+             (Path(project_root) / "core/scripts/_runtime.sh").as_posix()],
+            cwd=str(project_root), capture_output=True, text=True, timeout=120)
+        return p.returncode == 0
+    except Exception:  # pragma: no cover
+        return False
+
+
+def quiesce_daemon(project_root: Path, stopper=None, prober=None,
+                   wait_s: float = 30.0, sleeper=time.sleep, clock=time.monotonic) -> dict:
+    """Bring the main checkout's daemon down, and say whether it is.
+
+    Returns {was_up, port, stopped, quiesced[, detail]}. A box with no daemon is
+    already quiesced and nothing is stopped. When the daemon is up it is stopped
+    ONCE and then watched, with the same connect probe the runner uses, until it
+    stops answering or `wait_s` passes -- a kill loop would race the daemon's own
+    shutdown. `quiesced` False means it is still listening: the caller must not
+    launch the suite, which the runner would refuse anyway.
+
+    "Keeps it down" is best-effort and the record says so: another live session's
+    wrapper can respawn the daemon (rt_ensure_running), and nothing here can stop
+    that without disabling the box's auto-spawn for everyone.
+    """
+    stopper = stopper or _default_daemon_stop
+    prober = prober or daemon_listening_port
+    port = prober(project_root)
+    rec = {"was_up": port is not None, "port": port, "stopped": False, "quiesced": True}
+    if port is None:
+        return rec
+    stopper(project_root)
+    deadline = clock() + wait_s
+    while prober(project_root) is not None:
+        if clock() >= deadline:
+            rec["quiesced"] = False
+            rec["detail"] = (f"a daemon is still listening on port {port} "
+                             f"{wait_s:.0f}s after the stop")
+            return rec
+        sleeper(0.5)
+    rec["stopped"] = True
+    return rec
+
+
 def verify_in_worktree(project_root: Path, sha: str, log_path: Path,
                        agent: str | None = None, runner=None, bridger=None,
-                       collect_failures: bool = False):
+                       collect_failures: bool = False, quiescer=None):
     """C4 verify, pinned at `sha` in a detached worktree off project_root.
 
     WHY THE LIVE TREE CANNOT BE THE VERIFY TREE: run-full-suite's tree-moved
@@ -674,13 +773,18 @@ def verify_in_worktree(project_root: Path, sha: str, log_path: Path,
 
     With collect_failures=True, meta["failed"] is the sorted list of FAILED and
     ERROR node ids read from the runner's chunk logs (the stdout log does not
-    carry them; see failing_node_ids_from_dir). Off by default: strict C4 never
-    reads it.
+    carry them; see failing_node_ids_from_dir) and meta["failed_files"] the
+    invisible half's red files, which exist only in the stdout (see
+    failing_invisible_files). Off by default: strict C4 never reads either.
+
+    The daemon is quiesced right before the run (see quiesce_daemon); meta["daemon"]
+    records what that did and whether a daemon was listening again afterwards.
     """
     import shutil as _sh
     import tempfile as _tf
     runner = runner or run_suite
     bridger = bridger or bridge_runtime_state
+    quiescer = quiescer or quiesce_daemon
     meta = {"worktree": None, "sha": sha, "bridge": [], "out_dir": None}
 
     wt = Path(_tf.mkdtemp(prefix="framework-pull-verify-wt-"))
@@ -693,15 +797,24 @@ def verify_in_worktree(project_root: Path, sha: str, log_path: Path,
     meta["worktree"] = str(wt)
     try:
         meta["bridge"] = bridger(project_root, wt, agent)
+        # After the checkout and the bridge, immediately before the run: the
+        # shortest gap in which anything can bring the daemon back. Once per
+        # run, so the baseline run gets its own.
+        meta["daemon"] = quiescer(project_root)
+        if not meta["daemon"].get("quiesced"):
+            return None, ("VERDICT: INVALID (daemon-not-quiesced) "
+                          + meta["daemon"].get("detail", "")).rstrip(), meta
         # The log lives OUTSIDE the worktree by construction (caller passes a
         # project_root path): a log written INSIDE it makes the teardown below
         # fail "handle still busy" (guard-5842).
-        rc, verdict, _ = runner(wt, log_path)
+        rc, verdict, text = runner(wt, log_path)
+        meta["daemon"]["listening_after_run"] = daemon_listening_port(project_root) is not None
         out_dir = suite_out_dir(wt)
         meta["out_dir"] = str(out_dir) if out_dir else None
         meta["halves"] = read_halves(out_dir)
         if collect_failures:
             meta["failed"] = sorted(failing_node_ids_from_dir(out_dir))
+            meta["failed_files"] = sorted(failing_invisible_files(text))
         return rc, verdict, meta
     finally:
         git(project_root, "worktree", "remove", "--force", str(wt), timeout=300)
@@ -714,12 +827,14 @@ def verify_with_baseline(project_root: Path, adopt_sha: str, pre_sha: str,
 
     Strict first. Only when the strict verdict is red does it spend a SECOND
     suite run, on `pre_sha` (this box's tree before the adoption). Green then
-    means all three hold: the adopt-commit run concluded with real failures
-    (GENUINE), every failing node id on it also failed on the pre-adopt tree,
-    and no framework-owned half is red. Everything else is red, with the reason
-    in meta["baseline_refused"] -- including each case where the evidence
-    cannot prove "no new reds" (an INVALID run, a GENUINE verdict beside an
-    empty failing set, unreadable halves). The cheap refusals run BEFORE the
+    means all three hold: the adopt-commit run concluded (CLEAN or GENUINE),
+    every failing node id on it also failed on the pre-adopt tree, and every
+    red file of the invisible half also failed there. The deferred half names
+    no files, so it is not compared and any red in it is red. Everything else
+    is red, with the reason in meta["baseline_refused"] -- including each case
+    where the evidence cannot prove "no new reds" (an INVALID run, a GENUINE
+    verdict beside an empty failing set, unreadable halves, a red invisible half
+    whose files were not read on either run). The cheap refusals run BEFORE the
     second suite run is paid for.
 
     Returns (green, verdict, meta): the 3-tuple adopt()'s pinned default verify
@@ -730,6 +845,7 @@ def verify_with_baseline(project_root: Path, adopt_sha: str, pre_sha: str,
                                  agent=agent, collect_failures=True)
     meta = dict(meta or {})
     post_failed = set(meta.pop("failed", None) or [])
+    post_files = set(meta.pop("failed_files", None) or [])
     if suite_is_green(rc, verdict, meta.get("halves")):
         meta["c4_mode"] = "strict"
         return True, verdict, meta
@@ -739,36 +855,66 @@ def verify_with_baseline(project_root: Path, adopt_sha: str, pre_sha: str,
         meta["baseline_refused"] = why
         return False, verdict, meta
 
+    # The differential covers the chunked half (by node id) and the invisible
+    # half (by file). The deferred half names nothing a baseline could compare,
+    # so it stays strict; a red domain half never reached here (suite_is_green
+    # reports it without gating).
+    halves = meta.get("halves")
+    inv_red = _half_red(halves, "invisible")
     if not _verdict_trustworthy(verdict):
         return refuse("the adopt-commit run did not conclude (INVALID or no "
                       "verdict); its failures are not evidence")
-    if "CLEAN" in verdict:
-        return refuse("the chunked half is clean, so the red is in another half; "
-                      "no baseline excuses a framework-owned half")
-    if not post_failed:
+    if "CLEAN" in verdict and not inv_red:
+        return refuse("the chunked half is clean, so the red is in another half "
+                      "that no baseline covers (deferred, or halves.jsonl unreadable)")
+    if "GENUINE" in verdict and not post_failed:
         return refuse("GENUINE verdict but no FAILED/ERROR node id was read from "
                       "the chunk logs; cannot prove the reds are not new")
-    if not _framework_halves_clean(meta.get("halves")):
+    if not halves or _half_red(halves, "deferred"):
         return refuse("a framework-owned half is red, or halves.jsonl is unreadable")
+    if inv_red and not post_files:
+        return refuse("a framework-owned half (invisible) is red and its failing "
+                      "files could not be read from the run log; cannot prove "
+                      "they are not new")
 
     base_log = log_path.with_name(log_path.stem + "-baseline" + log_path.suffix)
     b_rc, b_verdict, b_meta = verifier(project_root, pre_sha, base_log,
                                        agent=agent, collect_failures=True)
+    b_meta = b_meta or {}
     meta["baseline_verdict"] = b_verdict
+    if b_meta.get("daemon") is not None:
+        meta["baseline_daemon"] = b_meta["daemon"]
     if not _verdict_trustworthy(b_verdict):
         return refuse("the pre-adopt baseline run did not conclude; there is "
                       "nothing to compare against")
-    base_failed = set((b_meta or {}).get("failed") or [])
+    base_failed = set(b_meta.get("failed") or [])
     if "GENUINE" in b_verdict and not base_failed:
         return refuse("baseline GENUINE but no node id was read from its chunk "
                       "logs; cannot compare")
+    base_files = set(b_meta.get("failed_files") or [])
+    if inv_red:
+        # "Green at baseline" and "unread" both leave base_files empty, so the
+        # baseline's own halves must say which it was before an empty set counts.
+        if not b_meta.get("halves"):
+            return refuse("baseline halves.jsonl is unreadable; cannot tell "
+                          "whether its invisible half was red")
+        if _half_red(b_meta["halves"], "invisible") and not base_files:
+            return refuse("baseline invisible half is red but no failing file was "
+                          "read from its run log; cannot compare")
     new = sorted(post_failed - base_failed)
+    new_files = sorted(post_files - base_files)
     meta["post_reds"] = len(post_failed)
     meta["baseline_reds"] = len(base_failed)
     meta["new_reds"] = new[:50]
     note = (f"baseline differential: {len(post_failed)} red after adopt, "
             f"{len(base_failed)} red before, {len(new)} new")
-    return (not new), f"{verdict} -- {note}", meta
+    if post_files or base_files:
+        meta["post_red_files"] = len(post_files)
+        meta["baseline_red_files"] = len(base_files)
+        meta["new_red_files"] = new_files[:50]
+        note += (f"; invisible half: {len(post_files)} red file(s) after, "
+                 f"{len(base_files)} before, {len(new_files)} new")
+    return (not new and not new_files), f"{verdict} -- {note}", meta
 
 
 # ------------------------------------------------------------ orchestration
@@ -1006,6 +1152,7 @@ def rollback(project_root: Path, source_sha: str, restart=None,
     # --soft: HEAD moves, index and working tree do NOT. A caller asserting
     # HEAD == pre_sha still sees what it expects; a store write made during the
     # suite is still on disk.
+    _, head_before, _ = git(project_root, "rev-parse", "HEAD")
     rc, _, err = git(project_root, "reset", "--soft", source_sha)
     out["reset_rc"] = rc
     if err:
@@ -1028,8 +1175,42 @@ def rollback(project_root: Path, source_sha: str, restart=None,
         if rc_r != 0:
             out["restore_error"] = f"checkout rc={rc_r}: {err_r[:200]}"
             return out
+
+    # `git checkout <sha> -- <root>` restores what the sha HAD and never deletes
+    # what it did not (guard-1340), so a file the adoption added INSIDE a root
+    # that existed here survives the restore above as a staged add. g-358-237:
+    # 904 of them after the first real rollback. The set is read from the
+    # COMMITS (source_sha..head_before, tree to tree), never from the index: a
+    # `diff --cached` would also name a new framework file somebody else has
+    # staged in this shared checkout, and removing that is not an undo of this
+    # adoption. Batched because 900 pathspecs overflow the Windows command line.
+    rc_s, added_raw, err_s = git(project_root, "diff", "--name-only",
+                                 "--diff-filter=A", "-z", source_sha, head_before,
+                                 "--", *wanted)
+    if rc_s != 0:
+        out["restore_error"] = f"added-file scan rc={rc_s}: {err_s[:200]}"
+        return out
+    added_files = [f for f in added_raw.split("\0") if f]
+    i = 0
+    while i < len(added_files):
+        batch, size = [], 0
+        while i < len(added_files) and len(batch) < 500 and size < 12000:
+            batch.append(added_files[i])
+            size += len(added_files[i]) + 1
+            i += 1
+        rc_f, _, err_f = git(project_root, "rm", "-f", "--quiet", "--ignore-unmatch",
+                             "--", *batch)
+        if rc_f != 0:
+            out["restore_error"] = f"rm of added files rc={rc_f}: {err_f[:200]}"
+            return out
+    out["framework_added_files_removed"] = len(added_files)
+
     if added:
-        rc_d, _, err_d = git(project_root, "rm", "-rf", "--quiet", "--", *added)
+        # --ignore-unmatch: the file pass above has usually removed every tracked
+        # file under a root the adoption created, and `git rm` then reports the
+        # root as matching nothing (rc 128).
+        rc_d, _, err_d = git(project_root, "rm", "-rf", "--quiet", "--ignore-unmatch",
+                             "--", *added)
         if rc_d != 0:
             out["restore_error"] = f"rm rc={rc_d}: {err_d[:200]}"
             return out
@@ -1052,6 +1233,14 @@ def _default_restart(project_root: Path) -> bool:
         return p.returncode == 0
     except Exception:  # pragma: no cover
         return False
+
+
+# `--no-verify` skips pre-commit and commit-msg and NOT post-commit, which is the
+# hook that restarts the daemon after a daemon-code commit. g-358-237: the adopt
+# commit (120 daemon-code files) fired it and the restart landed 4-17 s later,
+# under the verify's refusal check. The executor owns the recycle for its own
+# commits (adopt() below), so they fire no hook at all.
+_NO_HOOKS = ("-c", f"core.hooksPath={os.devnull}")
 
 
 def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
@@ -1139,7 +1328,7 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
             if rc_k == 0 and git(project_root, "diff", "--cached",
                                  "--name-only")[1].strip():
                 rc_k, _, err_k = git(
-                    project_root, "commit", "-m",
+                    project_root, *_NO_HOOKS, "commit", "-m",
                     f"chore(pull): checkpoint {len(dirty)} dirty file(s) "
                     f"before adopting {newest}", "--no-verify")
             if rc_k != 0:
@@ -1163,7 +1352,7 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
                 failure = f"re-graft add failed rc={rc_g}: {err_g[:200]}"
             elif git(project_root, "diff", "--cached", "--name-only")[1].strip():
                 rc_g, _, err_g = git(
-                    project_root, "commit", "-m",
+                    project_root, *_NO_HOOKS, "commit", "-m",
                     f"chore(pull): re-graft {len(graft_blobs)} keep-prod-ahead "
                     f"file(s) before adopting {newest}", "--no-verify")
                 if rc_g != 0:
@@ -1208,7 +1397,7 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
                          staged_paths=len(stage), skipped_absent=absent)
                 else:
                     rc_c, _, err_c = git(
-                        project_root, "commit", "-m",
+                        project_root, *_NO_HOOKS, "commit", "-m",
                         f"chore: adopt framework {newest}", "--no-verify")
                     if rc_c != 0:
                         failure = f"adopt commit failed rc={rc_c}: {err_c[:200]}"
@@ -1250,6 +1439,10 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
                 return verify_with_baseline(root, _sha, _pre, _log, agent=_agent)
             rc, verdict, meta = verify_in_worktree(root, _sha, _log, agent=_agent)
             return (suite_is_green(rc, verdict, meta.get("halves")), verdict, meta)
+    # The daemon is stopped INSIDE the verify (quiesce_daemon) and the commits
+    # above fired no post-commit recycle, so putting it back on the adopted (or
+    # restored) tree is the executor's job: note whether there was one to put back.
+    daemon_up = daemon_listening_port(project_root) is not None
     outcome = verify()
     # Injected verifies (the RED-path tests) return the 2-tuple this signature
     # has always had; the pinned default adds a third element. Accept both so a
@@ -1262,7 +1455,9 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
     step("verify", green, verdict=verdict, sha=adopt_sha,
          worktree=vmeta.get("worktree"), halves=vmeta.get("halves"),
          **{k: vmeta[k] for k in ("c4_mode", "post_reds", "baseline_reds",
-                                  "new_reds", "baseline_refused") if k in vmeta})
+                                  "new_reds", "post_red_files", "baseline_red_files",
+                                  "new_red_files", "baseline_refused", "daemon",
+                                  "baseline_daemon") if k in vmeta})
 
     if not green:
         result["rollback"] = rollback(project_root, pre_sha, restart=restart,
@@ -1284,6 +1479,8 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
         # "C4 baseline differential"): `verified` alone cannot tell them apart.
         doc["c4_mode"] = "baseline-differential"
         doc["baseline_reds"] = vmeta.get("baseline_reds")
+        if "baseline_red_files" in vmeta:
+            doc["baseline_red_files"] = vmeta["baseline_red_files"]
     world_dir.mkdir(parents=True, exist_ok=True)
     (world_dir / "installed-release.yaml").write_text(render_installed_release(doc),
                                                       encoding="utf-8")
@@ -1296,7 +1493,7 @@ def adopt(*, project_root: Path, source_repo: Path, newest: str, plan: dict,
     result["pushed"] = bool(pusher())
     step("push", result["pushed"])
 
-    if plan.get("daemon_recycle_required"):
+    if plan.get("daemon_recycle_required") or daemon_up:
         r = restart or _default_restart
         result["restarted"] = bool(r(project_root))
         step("daemon-recycle", result["restarted"])
@@ -1392,7 +1589,8 @@ def main(argv=None) -> int:
                     help="with --adopt: C4 also passes when the post-adopt suite has no "
                          "failing test that the PRE-adopt tree on this box did not also "
                          "fail. Runs the suite a second time, on the pre-adopt commit, "
-                         "only when the first run is red. Default off (strict C4). "
+                         "only when the first run is red, and compares the invisible "
+                         "half by file. Default off (strict C4). "
                          "See pull-promotion.md, 'C4 baseline differential'")
     ap.add_argument("--record-installed", metavar="TAG", default=None,
                     help="git-fed shape only (pull-promotion.md addendum h): record TAG "

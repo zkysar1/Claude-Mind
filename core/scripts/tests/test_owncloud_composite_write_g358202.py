@@ -14,10 +14,13 @@ Coverage:
   4. an existing segment is not an error and is not rewritten; a cache miss attempts every name
      but stores each once
   5. the plain whole-object PUT is unchanged: flag off, flag naming another env, a store off the
-     allowlist, a store under the size floor, a store the layout refuses (warned once)
+     allowlist, a store under the size floor, a store the layout refuses (warned once); a goal list
+     appended out of string order is NOT refused (U10): it goes out as a composite with a tail in the head
   6. the next refresh downloads nothing (the head's md5 metadata); a cached head is not trusted
      once the fence has moved
   7. the merge-reconcile and mirror_put sites reach the same seam
+  8. the whole-body gzip encode is lazy (U12): a composite write gzips only its segments; a write that goes
+     whole gzips the store once, at either PUT site
 
 File basename starts with ``test_`` so domain-leak-check.sh skips it.
 """
@@ -292,6 +295,34 @@ def test_a_store_the_layout_refuses_goes_whole_and_is_warned_once_per_reason(s3,
     assert len([r for r in caplog.records if "goes whole" in r.getMessage()]) == 2
 
 
+def test_a_store_with_a_goal_appended_out_of_string_order_still_goes_out_as_a_composite(s3, tmp_path, gz):
+    """U10 (found by U9 on the live key): a writer appends and only a merge sorts, so about half of the live PUT
+    stream had a list that is not in string order. split refused it and _store_put sent the whole object, so a
+    flag-on writer would have saved about 2x, not 24x. A tail now rides in the head."""
+    be, p, key = _prepare(s3, tmp_path)
+    recs = _mutated()
+    # g-3-241 sorts BEFORE g-3-99, the string-last id of asp-3's 240 goals: an append out of string order
+    recs[3]["goals"].append({"id": "g-3-241", "title": "appended", "status": "pending", "priority": "MEDIUM", "description": "x" * 240})
+    new = _legacy(recs)
+    mark = len(s3.puts)
+    be.write_bytes(p, new)
+    stored, _obj = _stored(s3, key)
+    assert comp.is_head(stored), "an out-of-order list went whole"
+    assert json.loads(stored)["tails"] == {"asp-3": ["g-3-241"]}
+    assert [x["Key"] for x in s3.puts[mark:]][-1] == key and len(s3.puts[mark:]) > 2
+    assert be.read_authoritative_bytes(p) == new
+    # steady state with the tail still in the file: one segment and the head, not the whole store
+    recs[5]["goals"][5]["status"] = "completed"
+    third = _legacy(recs)
+    mark = len(s3.puts)
+    be.write_bytes(p, third)
+    seg, head = s3.puts[mark:]
+    assert _is_segment_key(seg["Key"]) and "/asp-5/0." in seg["Key"] and head["Key"] == key
+    assert seg["bytes"] * 10 < len(third)
+    assert json.loads(_stored(s3, key)[0])["tails"] == {"asp-3": ["g-3-241"]}
+    assert be.read_authoritative_bytes(p) == third
+
+
 def test_a_short_head_is_padded_to_the_floor_and_a_long_one_is_stored_as_it_is(s3, tmp_path, monkeypatch):
     be, p, key = _prepare(s3, tmp_path)
     new = _legacy(_mutated())
@@ -374,3 +405,85 @@ def test_mirror_put_reaches_the_same_seam_and_leaves_the_mirror_alone(s3, tmp_pa
     assert puts[-1]["Key"] == key and puts[-1]["IfMatch"] == fence
     assert len(puts) > 1 and all(_is_segment_key(x["Key"]) for x in puts[:-1])
     assert comp.is_head(_stored(s3, key)[0]) and be.read_authoritative_bytes(p) == new
+
+
+# --- 8. the whole-body gzip encode is lazy (U12) ---------------------------------------------------------------
+@pytest.fixture
+def encodes(monkeypatch):
+    """The byte length of every body the writer hands the gzip codec (_owncloud_codec.put_kwargs, through the
+    alias owncloud_backend calls). The call goes through, so the codec's own contract still runs. A segment is
+    never as long as the store it came from, so the length of the whole store names the whole-body encode."""
+    import owncloud_backend as ob  # noqa: PLC0415
+    real, seen = ob._codec_put_kwargs, []
+
+    def spy(body):
+        seen.append(len(body))
+        return real(body)
+
+    monkeypatch.setattr(ob, "_codec_put_kwargs", spy)
+    return seen
+
+
+def test_a_composite_write_never_gzips_the_whole_store(s3, tmp_path, monkeypatch, encodes):
+    """U11 measured it on the live key: _put gzipped the whole 32.6 MB body (0.95 s of a 1.51 s write) before
+    _store_put chose a plan, and the composite plan threw that encoding away. Only the segments it PUTs are
+    gzipped now."""
+    monkeypatch.setenv("OWNCLOUD_GZIP_STORES", ENV_ID)
+    be, p, key = _prepare(s3, tmp_path)
+    new = _legacy(_mutated())
+    be.write_bytes(p, new)  # the migration write: every segment, then the head
+    assert comp.is_head(_stored(s3, key)[0])  # the control: this write went out as a composite
+    assert sorted(encodes) == sorted(len(b) for b in comp.plan_write(None, new).segments.values())  # one per segment
+    assert len(new) not in encodes
+    del encodes[:]
+    third = _another_mutation(_mutated, 3, 5)
+    be.write_bytes(p, third)  # steady state: the one changed segment
+    assert comp.is_head(_stored(s3, key)[0])
+    assert len(encodes) == 1 and encodes[0] * 10 < len(third)
+    assert be.read_authoritative_bytes(p) == third
+
+
+@pytest.mark.parametrize("why", ["flag-unset", "flag-another-env", "under-size-floor", "layout-refused"])
+def test_a_whole_object_put_gzips_the_store_exactly_once(s3, tmp_path, monkeypatch, encodes, why):
+    """The four ways a write goes whole, each with the gzip codec on: the encode moved into the whole-object
+    branch, so it must still run there, once, and the object must carry the codec's wire shape."""
+    monkeypatch.setenv("OWNCLOUD_GZIP_STORES", ENV_ID)
+    new = _legacy(_mutated())
+    if why == "flag-unset":
+        monkeypatch.delenv("OWNCLOUD_COMPOSITE_STORES")
+    elif why == "flag-another-env":
+        monkeypatch.setenv("OWNCLOUD_COMPOSITE_STORES", "some-other-env")
+    elif why == "under-size-floor":
+        monkeypatch.setattr(comp, "MIN_RAW_BYTES", REAL_MIN_RAW_BYTES)
+        assert len(new) < REAL_MIN_RAW_BYTES  # the control: this fixture is under the real floor
+    else:
+        new += _legacy([{"id": "asp-3", "goals": []}])  # a duplicate aspiration id: split refuses the store
+    be, p, key = _prepare(s3, tmp_path)
+    mark = len(s3.puts)
+    be.write_bytes(p, new)
+    assert [x["Key"] for x in s3.puts[mark:]] == [key]  # one object: it went whole
+    assert encodes == [len(new)]  # and that one PUT gzipped the whole store, once
+    stored, obj = _stored(s3, key)
+    assert obj.get("ContentEncoding") == "gzip" and stored[:2] == GZIP_MAGIC and not comp.is_head(stored)
+    assert obj["Metadata"][codec.META_PLAIN_MD5] == hashlib.md5(new).hexdigest()
+    assert be.read_authoritative_bytes(p) == new
+
+
+@pytest.mark.parametrize("composite", [True, False], ids=["composite", "whole"])
+def test_the_merge_reconcile_site_gzips_the_whole_store_only_when_it_goes_whole(
+        s3, tmp_path, monkeypatch, encodes, composite):
+    monkeypatch.setenv("OWNCLOUD_GZIP_STORES", ENV_ID)
+    if not composite:
+        monkeypatch.delenv("OWNCLOUD_COMPOSITE_STORES")
+    be, p, key = _setup(tmp_path, s3)
+    _publish(s3, key, _legacy(_records()))  # a peer left a composite
+    local = _legacy(_mutated())
+    be._merge_reconcile_put(p, key, be._local(p), local, lambda outgoing, remote_bytes: outgoing)
+    stored, obj = _stored(s3, key)
+    if composite:
+        assert comp.is_head(stored)
+        assert len(encodes) == 1 and encodes[0] * 10 < len(local)  # the one changed segment, never the store
+    else:
+        assert not comp.is_head(stored) and obj.get("ContentEncoding") == "gzip"
+        assert encodes == [len(local)]
+    assert be.read_authoritative_bytes(p) == local

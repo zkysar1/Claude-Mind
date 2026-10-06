@@ -117,6 +117,16 @@ os.environ.pop("GATE_FIRINGS_SEGMENTED", None)
 # test observes.
 os.environ.pop("TREE_RETRIEVAL_SPOOLED", None)
 
+# The retrieval-trace segmented writer is a PER-BOX deployment flag too:
+# settings.json env sets it fleet-wide since , and
+# `_retrieval_trace.store_name()` (reached from `retrieve._log_retrieval_trace`)
+# branches on it. Pin it OFF for the session so a hermetic retrieve test appends
+# to the legacy `retrieval-trace.jsonl` its assertions were written against; the
+# segment tests opt in with monkeypatch.setenv(rt.SEGMENTED_ENV, "1")
+# (test_retrieval_trace_segments). Same shape as the pins above: the box's live
+# setting must not decide what a hermetic test observes.
+os.environ.pop("RETRIEVAL_TRACE_SEGMENTED", None)
+
 # Hermetic embedding index (). Sibling of the STORAGE_BACKEND pin
 # above and for the same reason: a test can redirect the STORE to a tmp path,
 # but retrieve.py's `_embedding_blend` calls `cosine_scores(query)` with no

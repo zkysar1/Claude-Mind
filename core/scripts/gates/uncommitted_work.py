@@ -195,6 +195,32 @@ def get_undelivered_framework_files(repo_path: Path) -> List[str]:
     return sorted(set(undelivered))
 
 
+# GitHub account that owns a remote URL: https, ssh://, or scp-style
+# (git@github.com:owner/repo), with or without userinfo or a port. No match
+# means the host is not GitHub or the shape is unfamiliar -- see _origin_owner.
+_GITHUB_OWNER_RE = re.compile(
+    r"^(?:[a-z][a-z0-9+.-]*://)?(?:[^/@\s]*@)?github\.com(?::\d+)?[:/]+"
+    r"([^/\s]+)/[^/\s]+", re.IGNORECASE)
+
+
+def _origin_owner(repo: Path) -> Optional[str]:
+    """Lower-cased GitHub account that owns `repo`'s `origin`, or None.
+
+    None covers every case where the owner cannot be NAMED: no origin, an
+    unreadable config, a non-GitHub host, an unfamiliar URL shape. The caller
+    keeps such a repo, so a probe that cannot tell never drops a repo from the
+    gate. The URL itself is never returned or printed: it can embed a token.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+            capture_output=True, text=True, errors="replace", timeout=10)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    m = _GITHUB_OWNER_RE.match(r.stdout.strip()) if r.returncode == 0 else None
+    return m.group(1).lower() if m else None
+
+
 def _delivery_repo_roots(world_dir: Optional[Path]) -> List[Path]:
     """Repos (beyond the framework repo) whose work must REACH THE DEFAULT
     BRANCH before a goal may close — the cross-repo half of the 2026-05-07
@@ -206,10 +232,20 @@ def _delivery_repo_roots(world_dir: Optional[Path]) -> List[Path]:
     world_dir, means no cross-repo scanning — the gate stays exactly as
     portable as before for domains that never declare delivery repos.
 
-    Parsed with a deliberately narrow hand parser (a `roots:` list of quoted
-    scalars) rather than importing yaml: this module is imported by daemon
-    endpoints, and a parse failure of an OPTIONAL enrichment file must degrade
-    to "feature off", never to an ImportError in the write path.
+    OPTIONAL `owners: ["account", ...]` (g-115-6841) narrows the scan to repos
+    the fleet delivers. A glob over a checkout directory also matches clones of
+    someone else's repo (reference checkouts, forks kept for reading), and
+    their unmerged branches are not stranded work this fleet owes, yet each one
+    blocked every close. With `owners:` set, a root is dropped only when its
+    `origin` is a GitHub URL under a DIFFERENT account (case-insensitive). A
+    root whose origin cannot be named (no origin, another host, an unfamiliar
+    shape) is KEPT, so an unreadable probe never narrows the gate. Dropped
+    roots are named on stderr every run, never silently.
+
+    Parsed with a deliberately narrow hand parser (`roots:` and `owners:` lists
+    of quoted scalars) rather than importing yaml: this module is imported by
+    daemon endpoints, and a parse failure of an OPTIONAL enrichment file must
+    degrade to "feature off", never to an ImportError in the write path.
     """
     if world_dir is None:
         return []
@@ -221,26 +257,41 @@ def _delivery_repo_roots(world_dir: Optional[Path]) -> List[Path]:
     except OSError:
         return []
     entries: List[str] = []
-    in_roots = False
+    owners: List[str] = []
+    section: Optional[List[str]] = None
     for line in raw.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
         if stripped.startswith("roots:"):
-            in_roots = True
+            section = entries
             continue
-        if in_roots:
+        if stripped.startswith("owners:"):
+            section = owners
+            continue
+        if section is not None:
             if stripped.startswith("- "):
-                entries.append(stripped[2:].strip().strip('"').strip("'"))
+                section.append(stripped[2:].strip().strip('"').strip("'"))
             else:
-                in_roots = False
+                section = None
+    allowed = {o.lower() for o in owners if o}
     roots: List[Path] = []
+    foreign: List[str] = []
     import glob as _glob
     for e in entries:
         for hit in sorted(_glob.glob(e)):
             hp = Path(hit)
             if hp.is_dir() and (hp / ".git").exists():
+                owner = _origin_owner(hp) if allowed else None
+                if owner is not None and owner not in allowed:
+                    foreign.append(f"{hp.name} ({owner})")
+                    continue
                 roots.append(hp)
+    if foreign:
+        print(f"[uncommitted-gate] NOTE: skipped {len(foreign)} delivery "
+              f"repo(s) whose origin owner is not in delivery-repos.yaml "
+              f"owners [{', '.join(sorted(allowed))}]: {', '.join(foreign)}",
+              file=sys.stderr)
     return roots
 
 
@@ -344,10 +395,16 @@ def _refspec_covers_all_heads(repo: Path) -> bool:
     return any("refs/heads/*" in ln for ln in r.stdout.splitlines())
 
 
-# Bound on patch walks, and separately on content probes, per repo per run.
-# Each costs a few cheap git calls; the bound only bites on a pathological
-# branch, and an unprobed commit simply keeps blocking -- the safe direction.
+# Bound on patch walks, and separately on content probes, per repo per run
+# (tests 2 and 3 of _landed_by_content share the second). Each costs a few cheap
+# git calls; the bound only bites on a pathological branch, and an unprobed
+# commit simply keeps blocking -- the safe direction.
 _LANDED_PROBE_CAP = 40
+# Test 3 reads the ref's own commit patches since the merge-base, restricted to
+# the branch's paths: at most this many commits (newest first), and it declines
+# a branch touching more paths than fit safely on a command line.
+_RANGE_PATCH_COMMIT_CAP = 300
+_RANGE_PATCH_PATH_CAP = 100
 
 
 def _landed_by_content(repo: Path, ref: str,
@@ -363,9 +420,11 @@ def _landed_by_content(repo: Path, ref: str,
     refused closes were pushed through --override-uncommitted, which teaches
     the override reflex.
 
-    TWO DISCRIMINATORS, in this order (guard-4009 ordering rule 1: a
-    single-commit squash satisfies both, so the patch test must run first or
-    its cases are re-bucketed under the content test):
+    THREE DISCRIMINATORS, in this order (guard-4009 ordering rule 1: a
+    single-commit squash satisfies both of the first two, so the patch test must
+    run first or its cases are re-bucketed under the content test; the third
+    runs last and only on what the first two left, so it cannot move a
+    classification they pin):
 
     1. `patch-equivalent` -- `git log --cherry-mark` finds a commit on `ref`
        with the same patch-id. This is git-native and binary-safe. It catches
@@ -378,22 +437,39 @@ def _landed_by_content(repo: Path, ref: str,
        squash, and it releases X's whole off-ref ancestry at once. It is
        scoped to the branch's own paths because `ref` keeps moving with
        other work, so a whole-tree comparison would never match.
+    3. `range-patch-equivalent` -- the patch-id of the branch's COMBINED diff
+       (merge-base(ref, X)..X) equals the patch-id of ONE commit on `ref` since
+       that merge-base: an N>1 squash, read the way test 1 reads a one-commit
+       squash (guard-4009: the combined patch matches none of the N originals,
+       but it does match the squash). It survives `ref` changing the same paths
+       AFTERWARDS, which test 2 cannot. Git's own cherry walk cannot be aimed at
+       a combined range, so both sides go through `git patch-id --stable`,
+       limited to the branch's own paths and to _RANGE_PATCH_COMMIT_CAP commits.
+       Declined, so the commit keeps blocking, for a branch past
+       _RANGE_PATCH_PATH_CAP paths and for a binary change. git 2.43 hashes a
+       binary file's blob ids (the `index` line), but that is the git version's
+       doing, not patch-id's contract: an id built from the `Binary files ...
+       differ` marker alone would equate two different edits of one path. Not
+       verified on older gits, so a binary change is declined, not trusted.
+       As exact as `git patch-id`: blind to whitespace.
 
     FALSE POSITIVES. A released commit carries no content that `ref` lacks, so
     no WORK can be lost by releasing it. Only history is lost -- the same
     trade the tree-identity release above already makes. Released commits are
     REPORTED, never dropped (guard-1760).
 
-    FALSE NEGATIVES, in the safe direction. An N>1 squash whose paths also
-    carry OTHER work on `ref` (landed before or after it -- a branch cut from a
-    stale base is enough), or a squash that folded in review fixups, still
-    blocks. So does anything past _LANDED_PROBE_CAP.
+    FALSE NEGATIVES, in the safe direction. A squash that folded review fixups
+    into the branch's own files still blocks, since its patch is no longer the
+    branch's. So does a squash whose hunks sit within diff-context of other work
+    that reached `ref` while the branch was open (the patch-id covers the
+    context lines), and anything past _LANDED_PROBE_CAP or a cap above.
 
     TRI-STATE, fail-closed (guard-4009 rule 2): any git error, timeout, missing
-    merge-base or empty branch diff leaves the commit OUT of the result, so it
-    keeps blocking. An error never proves a commit landed.
+    merge-base, empty branch diff or failed patch-id leaves the commit OUT of
+    the result, so it keeps blocking. An error never proves a commit landed.
 
-    Returns {sha: "patch-equivalent" | "content-on-ref"}.
+    Returns {sha: label}, label one of "patch-equivalent", "content-on-ref" or
+    "range-patch-equivalent".
     """
     def _git(*args: str) -> Optional[str]:
         try:
@@ -402,6 +478,23 @@ def _landed_by_content(repo: Path, ref: str,
         except (subprocess.TimeoutExpired, OSError):
             return None
         return r.stdout if r.returncode == 0 else None
+
+    def _git_raw(*args: str, feed: Optional[bytes] = None) -> Optional[bytes]:
+        # Bytes, not text: a diff is not guaranteed to decode under the locale
+        # codec, and a UnicodeDecodeError would escape the fail-closed handling.
+        try:
+            r = subprocess.run(["git", "-C", str(repo), *args], input=feed,
+                               capture_output=True, timeout=15)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    def _patch_ids(patch: bytes) -> Optional[List[str]]:
+        out = _git_raw("patch-id", "--stable", feed=patch)
+        if out is None:
+            return None
+        return [ln.split()[0].decode("ascii", "replace")
+                for ln in out.splitlines() if ln.split()]
 
     wanted = set(candidates)
     landed: Dict[str, str] = {}
@@ -429,6 +522,10 @@ def _landed_by_content(repo: Path, ref: str,
             if mark == "=" and c in wanted:
                 landed[c] = "patch-equivalent"
 
+    # Test 3's git output must not depend on this box's config: pinned context,
+    # no rename detection, no external or textconv drivers, no colour.
+    diff_flags = ("-U3", "--no-renames", "--no-ext-diff", "--no-textconv",
+                  "--no-color")
     probes = 0
     for sha in candidates:
         if sha in landed:
@@ -445,14 +542,36 @@ def _landed_by_content(repo: Path, ref: str,
         if changed is None or differ is None:
             continue
         changed_paths = set(changed.splitlines())
-        if not changed_paths or changed_paths & set(differ.splitlines()):
+        if not changed_paths:
+            continue
+        label = None
+        if not changed_paths & set(differ.splitlines()):
+            label = "content-on-ref"
+        elif len(changed_paths) <= _RANGE_PATCH_PATH_CAP:
+            # Test 3. The branch's paths moved on after the squash, so test 2
+            # cannot match; look for the squash itself in `ref`'s history.
+            span = _git_raw("diff", *diff_flags, base.strip(), sha, "--")
+            # A binary change is declined (see the docstring).
+            binary = span is not None and any(
+                ln.startswith((b"Binary files ", b"GIT binary patch"))
+                for ln in span.splitlines())
+            if span and not binary:
+                mine = _patch_ids(span)
+                since = _git_raw("log", "-p", "--pretty=medium", "--no-merges",
+                                 f"--max-count={_RANGE_PATCH_COMMIT_CAP}",
+                                 *diff_flags, f"{base.strip()}..{ref}", "--",
+                                 *sorted(changed_paths))
+                theirs = _patch_ids(since) if since else None
+                if mine and len(mine) == 1 and theirs and mine[0] in theirs:
+                    label = "range-patch-equivalent"
+        if label is None:
             continue
         covered = _git("rev-list", sha, "--not", ref)
         if covered is None:
             continue
         for c in covered.split():
             if c in wanted and c not in landed:
-                landed[c] = "content-on-ref"
+                landed[c] = label
     return landed
 
 

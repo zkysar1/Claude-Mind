@@ -50,6 +50,7 @@
     "OWNCLOUD_GZIP_STORES": "ayoai-mind",
     "UTILIZATION_COUNTERS_SPOOLED": "1",
     "TREE_RETRIEVAL_SPOOLED": "1",
+    "RETRIEVAL_TRACE_SEGMENTED": "1",
     "BOARD_SEGMENTED_CHANNELS": "coordination"
   },
   "skillListingBudgetFraction": 0.05,

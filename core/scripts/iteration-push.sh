@@ -25,9 +25,11 @@
 #     IT LANDS. git checks only at that moment: a plain `git merge` silently
 #     overwrote a write made while its merge drivers ran, so the merge is
 #     computed off the tree first (_ip_merge_upstream, ). The
-#     fast-forward's own checkout is still unguarded, and a path left in
-#     info/exclude (_ip_exclude_locally) is expendable to git, so a merge that
-#     re-tracks it replaces the local copy.
+#     fast-forward's own checkout is still unguarded: git treats an IGNORED
+#     local file (a committed rule or an info/exclude line alike, measured on
+#     2.43.0) as expendable, so a merge that tracks such a path replaces the
+#     local copy (). The info/exclude lines _ip_exclude_locally writes
+#     are a bridge, pruned once HEAD's own rules cover the path ().
 #     Any merge failure (dirty tree, staged entries, true conflict) is aborted
 #     cleanly (merge --abort if MERGE_HEAD exists) and logged LOUDLY. Dirty-tree
 #     refusals self-heal in-run (agents/<self>/* churn is COMMITTED pathspec-
@@ -1911,14 +1913,16 @@ _ip_defer_exit() {
 #     rule until the merge lands it, and the churn self-heal commits every
 #     UNTRACKED self-namespace file it lists (ls-files --others
 #     --exclude-standard). Without the exclude, the self-heal re-tracks the file
-#     in this same run and the conflict returns.
+#     in this same run and the conflict returns. The line is a BRIDGE to the
+#     merge that lands that rule, not a standing one: _ip_prune_redundant_excludes
+#     drops it once HEAD's own .gitignore covers the path ().
 #   - The commit is a plain `git commit`, over an index verified to hold ONLY
 #     these deletions (guard-741). A pathspec commit is wrong here: its --only
 #     mode re-reads the working tree, so `git rm --cached f && git commit -- f`
 #     re-adds f instead of deleting it (measured on a scratch repo, 2026-09-28).
 # Fail-soft: every refusal logs and returns 0, and the merge then runs exactly
 # as it did before this helper existed.
-_ip_upstream_ignored_subset() {  # NUL-separated paths in -> the subset UPSTREAM's .gitignore files ignore, NUL-separated out
+_ip_upstream_ignored_subset() {  # NUL-separated paths in -> the subset UPSTREAM's .gitignore files ignore, NUL-separated out; $1 = judge by another ref (HEAD, )
   local _tmp _up _p _rest _dir
   local -A _seen=()
   local -a _paths=()
@@ -1932,7 +1936,7 @@ _ip_upstream_ignored_subset() {  # NUL-separated paths in -> the subset UPSTREAM
   #  - under MSYS_NO_PATHCONV=1, which _platform.sh exports for the loop's call,
   #    mktemp's /tmp/... reaches git.exe unconverted and names C:\tmp\..., not
   #    the directory bash writes to. cygpath -m is one path both read alike.
-  _up="$(git -C "$REPO" rev-parse -q --verify "$UPSTREAM" 2>/dev/null)" || return 0
+  _up="$(git -C "$REPO" rev-parse -q --verify "${1:-$UPSTREAM}" 2>/dev/null)" || return 0
   _tmp="$(mktemp -d 2>/dev/null)" || return 0
   command -v cygpath >/dev/null 2>&1 && _tmp="$(cygpath -m "$_tmp")"
   if git init -q "$_tmp" >/dev/null 2>&1; then
@@ -1965,6 +1969,68 @@ _ip_exclude_locally() {  # paths as args -> one anchored, glob-escaped line each
     _p="/$(printf '%s' "$_p" | sed 's/[][*?\\]/\\&/g')"
     grep -qxF -- "$_p" "$_excl" 2>/dev/null || printf '%s\n' "$_p" >> "$_excl"
   done
+  return 0
+}
+
+# The line above bridges ONE window: the untrack until UPSTREAM's own ignore rule
+# is in HEAD (). From then on the committed rule decides, and the line
+# only does harm, because it never expires: when upstream later drops the rule and
+# re-tracks the path, the line still hides the local copy and the merge replaces it
+# without a word. Measured on git 2.43.0 in a scratch repo, through both merge shapes
+# this script uses (a plain fast-forward, and merge-tree + commit-tree + --ff-only):
+#   path ignored by nothing ................ the merge REFUSES (untracked file would be overwritten)
+#   path in info/exclude ................... the merge overwrites it silently
+#   path ignored by a committed rule ....... the merge overwrites it silently
+# So a line is dropped the moment HEAD's rules cover its path, which leaves ONE source
+# of truth for "this path is machine-local": upstream's .gitignore. HEAD's own rules
+# already make the same ignore decision for a path they cover, so pruning needs no
+# record of which run wrote a line, and it also clears the lines boxes wrote before
+# it existed. WHAT THIS DOES NOT FIX: while HEAD's rule still covers the path the
+# merge replaces the local copy all the same (the third row above), so a re-track
+# that lands before the rule is dropped is not stopped here ().
+#   - Candidates are only lines in the exact shape _ip_exclude_locally writes: `/`
+#     plus a literal path whose glob characters are backslash-escaped. A comment, a
+#     glob, or a negation is somebody else's and is never touched.
+#   - A candidate goes only when the COMMITTED files alone ignore it: the scratch
+#     repo has neither info/exclude nor global excludes, so the line cannot vouch
+#     for itself. While the merge has not landed the rule (a defer, a conflict
+#     abort) HEAD does not cover the path, the line stays, and the bridge holds.
+# Fail-soft: every refusal returns 0 and leaves the file as it was. It is a
+# read-modify-write, so a line another run appends within the same few
+# milliseconds is lost, and that run re-derives it at its next integrate.
+_ip_prune_redundant_excludes() {
+  local _excl _line _body _p _pat _tmp _rc
+  local -A _line_of=()
+  local -a _paths=() _drop=() _gone=()
+  _excl="$(git -C "$REPO" rev-parse --git-path info/exclude 2>/dev/null)"
+  case "$_excl" in /*|[A-Za-z]:*|'') ;; *) _excl="$REPO/$_excl";; esac
+  { [ -n "$_excl" ] && [ -f "$_excl" ]; } || return 0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    case "$_line" in /?*) ;; *) continue;; esac
+    _body="${_line#/}"
+    case "$(printf '%s' "$_body" | sed 's/\\[][*?\\]//g')" in *[][*?\\]*) continue;; esac
+    _p="$(printf '%s' "$_body" | sed 's/\\\([][*?\\]\)/\1/g')"
+    _line_of[$_p]="$_line"
+    _paths+=("$_p")
+  done < "$_excl"
+  [ "${#_paths[@]}" -eq 0 ] && return 0
+  while IFS= read -r -d '' _p; do
+    _drop+=("${_line_of[$_p]}")
+    _gone+=("$_p")
+  done < <(printf '%s\0' "${_paths[@]}" | _ip_upstream_ignored_subset HEAD)
+  [ "${#_drop[@]}" -eq 0 ] && return 0
+  _pat="$(mktemp 2>/dev/null)" || return 0
+  _tmp="$(mktemp 2>/dev/null)" || { rm -f "$_pat"; return 0; }
+  printf '%s\n' "${_drop[@]}" > "$_pat"
+  grep -vxFf "$_pat" "$_excl" > "$_tmp" 2>/dev/null
+  _rc=$?
+  # rc 1 = every line was dropped (empty output), which is a result; rc 2 is not.
+  if [ "$_rc" -le 1 ] && cat "$_tmp" > "$_excl" 2>/dev/null; then
+    for _p in "${_gone[@]}"; do
+      log "untrack-ahead: pruned from info/exclude (HEAD's .gitignore now ignores it): $_p (g-306-540)"
+    done
+  fi
+  rm -f "$_pat" "$_tmp"
   return 0
 }
 
@@ -2133,6 +2199,10 @@ fi
 # was needed) — clear the consecutive-failure streak (). Skipped in
 # dry-run: nothing was proven, so a real streak must survive it.
 [ "$DRY_RUN" = 1 ] || _ip_defer_streak_reset
+# : the same point is where a merge that landed upstream's ignore rule
+# (this run's, or any other path's) has made untrack-ahead's info/exclude lines
+# redundant. Pruned here, before the push decision, so --no-push runs do it too.
+[ "$DRY_RUN" = 1 ] || _ip_prune_redundant_excludes
 
 # --no-push: the fetch+integrate above IS the whole job. Exit before the push
 # decision (). This is the session-start continuity pull for
@@ -2296,6 +2366,7 @@ if [ "$NO_FETCH" -eq 0 ] && printf '%s' "$PUSH_OUT" | grep -qiE 'non-fast-forwar
       fi
       soft_exit 1
     fi
+    _ip_prune_redundant_excludes
   fi
   RPUSH_OUT="$(GIT_TERMINAL_PROMPT=0 $IP_TMO git -C "$REPO" push origin "$BRANCH" 2>&1)"
   RPUSH_RC=$?

@@ -54,6 +54,7 @@ RECURRING_CLOSE_SH = CORE_SCRIPTS / "recurring-close.sh"
 
 sys.path.insert(0, str(CORE_SCRIPTS))
 from _runtime_bash import BASH  # noqa: E402  (guard-580: never a bare "bash")
+from _daemon_fixture import DaemonFixture  # noqa: E402  (: counters land via the daemon)
 
 SRC = RECURRING_CLOSE_SH.read_text(encoding="utf-8")
 
@@ -163,23 +164,28 @@ def _run_heredoc(tmp: Path, world: Path, *, outcome: str):
     meta.mkdir()
     agent = tmp / "agent"
     (agent / "session").mkdir(parents=True)
-    env = dict(os.environ)
-    for key in ("BODY_ROLE", "MIND_SID"):
-        env.pop(key, None)
-    env.update({
-        "GID": "g-100-01", "SF": str(world / "aspirations.jsonl"),
-        "OUTCOME": outcome, "OUTCOME_ORIGIN": "genuine", "SRC_FLAG": "world",
-        "SD": str(CORE_SCRIPTS), "NOW": "2026-09-25T00:00:00",
-        "INTERVAL_REVIEW_FILE": str(review_file),
-        "MIND_WORLD": str(world), "MIND_META": str(meta),
-        "MIND_AGENT": "alpha", "MIND_AGENT_DIR": str(agent),
-        # guard-3375 / guard-862: a worker box injects the LIVE Body WM path into
-        # every process; point it at a throwaway file so nothing here can reach it.
-        "BODY_WM_PATH": str(tmp / "wm.yaml"),
-        "STORAGE_BACKEND": "local",  # guard-955
-    })
-    r = subprocess.run([sys.executable, "-"], input=HEREDOC, capture_output=True,
-                       text=True, env=env, cwd=str(PROJECT_ROOT), timeout=120)
+    # : the counter fields land through the DAEMON now, so the heredoc
+    # needs one that serves THIS world. Without it `_rt` reads the box's real
+    # mind_api/state/daemon.port and the test writes to (or is refused by) the
+    # live daemon. The fixture pins RT_DIR / MIND_WORLD for the child process.
+    with DaemonFixture(world):
+        env = dict(os.environ)
+        for key in ("BODY_ROLE", "MIND_SID"):
+            env.pop(key, None)
+        env.update({
+            "GID": "g-100-01", "SF": str(world / "aspirations.jsonl"),
+            "OUTCOME": outcome, "OUTCOME_ORIGIN": "genuine", "SRC_FLAG": "world",
+            "SD": str(CORE_SCRIPTS), "NOW": "2026-09-25T00:00:00",
+            "INTERVAL_REVIEW_FILE": str(review_file),
+            "MIND_WORLD": str(world), "MIND_META": str(meta),
+            "MIND_AGENT": "alpha", "MIND_AGENT_DIR": str(agent),
+            # guard-3375 / guard-862: a worker box injects the LIVE Body WM path into
+            # every process; point it at a throwaway file so nothing here can reach it.
+            "BODY_WM_PATH": str(tmp / "wm.yaml"),
+            "STORAGE_BACKEND": "local",  # guard-955
+        })
+        r = subprocess.run([sys.executable, "-"], input=HEREDOC, capture_output=True,
+                           text=True, env=env, cwd=str(PROJECT_ROOT), timeout=120)
     return r, review_file.read_text(encoding="utf-8")
 
 

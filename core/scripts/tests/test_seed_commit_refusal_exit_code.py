@@ -43,6 +43,7 @@ Chosen above the pre-existing 2-8 range and clear of the --plan verdict codes
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -247,8 +248,17 @@ def test_clean_plant_still_succeeds(tmp_path):
     assert "chore: sync framework" in _dest_log(dest), (
         "the plant exited 0 but committed nothing — exactly the state this "
         "whole fix exists to make impossible:\n" + _dest_log(dest))
-    assert "Status: PASS" in out, (
-        "post-plant verify did not pass on a clean plant:\n" + out[-3000:])
+    # `Status: PASS` was only reachable while run_check could not count a WARN
+    # (). This fixture plants two files, so check 5's five sample files
+    # are all MISSING at the destination and it WARNs, truthfully, and a WARN
+    # never fails a plant. What this control owns: no check FAILED the honest
+    # plant, and the fixture really is bootable (check 6), so a later FAIL here
+    # means the fix broke the plant and not that the fixture was unbootable.
+    assert "FAILS: 0" in out and "Status: FAIL" not in out, (
+        "post-plant verify failed a clean plant:\n" + out[-3000:])
+    assert re.search(r"\[6\] Framework bootability[^\n]*\n\s+PASS", out), (
+        "check 6 did not PASS, so the fixture is not bootable and this control "
+        "proves nothing:\n" + out[-3000:])
 
 
 # ── Layer 3: seed-verify must be ABLE to call a dirty post-plant tree a FAIL ──

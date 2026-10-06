@@ -7,6 +7,7 @@
 # The endpoint returns JSON {"ok":true,"id":"msg-...","record":{...}};
 # the OLD CLI printed only the message ID, so _extract_id reproduces that.
 # Usage: echo "message" | bash core/scripts/board-post.sh --channel <name> [--author <a>] [--type <t>] [--reply-to <id>] [--tags <t1,t2>]
+#   [--override-data-class "<why the body is not an owner address / credential>"]  (; a ledgered false-positive override)
 set -euo pipefail
 
 # --- Skinny PROJECT_ROOT resolve ------------------------------------------
@@ -15,7 +16,7 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
-CHANNEL=""; AUTHOR=""; MSG_TYPE=""; REPLY_TO=""; TAGS=""; ALLOW_JSON_BODY=0
+CHANNEL=""; AUTHOR=""; MSG_TYPE=""; REPLY_TO=""; TAGS=""; ALLOW_JSON_BODY=0; OVERRIDE_DATA_CLASS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --channel)  CHANNEL="${2-}";  shift $(( $# >= 2 ? 2 : 1 ));;
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
         --type)     MSG_TYPE="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --reply-to) REPLY_TO="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --tags)     TAGS="${2-}";     shift $(( $# >= 2 ? 2 : 1 ));;
+        --override-data-class) OVERRIDE_DATA_CLASS="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         # Escape hatch for the rare caller that genuinely means to post a JSON
         # document AS the message body. Deliberately not a silent default: see
         # the json-body guard below.
@@ -173,6 +175,26 @@ sys.exit(1)
     # rc captured on the LAST pipeline element, which IS the python (guard-1150).
     if [ "$_jb_rc" -ne 0 ]; then exit 1; fi
 fi
+
+# --- Refuse an owner address / credential in the body () ---------
+# guard-4061 (the owner's personal address is written ONLY in shape) and
+# guard-4525 (no credential reaches a log or a message) were honor-system: nothing
+# inspected a post's text. One shared checker, the one peer-board-post.sh and the
+# notification dispatcher also call. It prints the refusal itself (class, line, the
+# fix); rc 5 = refused. ANY other non-zero rc means the checker could not run, and
+# that fails OPEN and LOUD (guard-142, guard-3737): a gate that blocks posts must not
+# take the board down with it.
+# Not a daemon fallback: a content filter in FRONT of the daemon call with no
+# endpoint behind it (.claude/rules/no-python-cli-fallback.md governs fallbacks).
+# --override-data-class "<why>" is for a FALSE POSITIVE only; its use is ledgered.
+_dc_rc=0
+printf '%s' "$BODY" | $(rt_python_launcher) "$CORE_ROOT/scripts/outbound_data_class.py" \
+    --surface board-post --override "$OVERRIDE_DATA_CLASS" || _dc_rc=$?
+case $_dc_rc in
+    0) ;;
+    5) exit 1;;
+    *) echo "[board-post] WARN: outbound data-class gate could not run (rc=$_dc_rc) -- posting UNCHECKED." >&2;;
+esac
 
 # Build query string -------------------------------------------------------
 QUERY="channel=$(rt_url_encode "$CHANNEL")"

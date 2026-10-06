@@ -71,6 +71,7 @@ from storage_backend import (
 # shared with every raw-boto3 caller; see _owncloud_codec's module docstring.
 from _owncloud_codec import (
     CodecError as _CodecError,
+    decode as _codec_decode,
     decode_response as _codec_decode_response,
     head_plain_md5 as _codec_head_plain_md5,
     content_matches as _codec_content_matches,
@@ -376,6 +377,12 @@ def _reraise_access_denied(e: ClientError, op: str) -> None:
             f"sessions/lock table, or s3:ListBucket/GetObject on the governed "
             f"prefix)."
         ) from e
+
+
+def _last_modified_epoch(resp) -> Optional[float]:
+    """The last_modified of a HeadObject response as epoch seconds, or None when it carries none."""
+    stamp = resp.get("LastModified")
+    return stamp.timestamp() if hasattr(stamp, "timestamp") else None
 
 
 def runner_token_fingerprint(token: Optional[str]) -> Optional[str]:
@@ -1091,10 +1098,11 @@ class OwnCloudBackend:
 
     def _composite_whole(self, key: str, body: bytes, etag, local: Optional[Path] = None):
         """g-358-202 (U2c): the READ half of the composite layout, one adapter for the three read
-        paths below. If `body` (the decoded object at `key`) is a composite HEAD of an allowlisted
-        store, return (the whole legacy file joined from its segment objects, the ETag of the head it
-        was joined from). Anything else comes back as (body, etag) untouched, so every other object
-        is byte-identical to the pre-composite backend.
+        paths below (and, through `join_composite`, for the raw-S3 readers). If `body` (the decoded
+        object at `key`) is a composite HEAD of an allowlisted store, return (the whole legacy file
+        joined from its segment objects, the ETag of the head it was joined from). Anything else
+        comes back as (body, etag) untouched, so every other object is byte-identical to the
+        pre-composite backend.
 
         The join, the bounded retry and the fence rule live in `_owncloud_composite.read_whole`,
         shared with the raw-S3 readers; this supplies only its two I/O steps. `local` (passed by
@@ -1133,6 +1141,725 @@ class OwnCloudBackend:
         if joined_etag == head_etag and _composite.is_head(head):
             self._composite_heads[key] = (head_etag, head)  # the old head _store_put plans a write against
         return raw, joined_etag
+
+    def join_composite(self, key: str, body: bytes, etag) -> bytes:
+        """g-358-202 (U3): the whole legacy bytes for a raw-S3 reader that already holds the DECODED
+        `body` of the object at `key` and its `etag` (`_owncloud_composite.decode_whole` calls this for
+        a composite head only). Such a reader bypasses the mirror, so no local file is offered for
+        segment reuse. Raises what `_composite_whole` raises (IntegrityError once the bounded re-reads
+        are spent); those readers treat any exception as 'the authoritative read is unavailable'."""
+        return self._composite_whole(key, body, etag)[0]
+
+    def composite_gc_enumerate(self, path: PathLike, ledger, now: float, *,
+                               grace_s: float = _composite.GC_GRACE_S,
+                               max_delete: int = _composite.GC_MAX_DELETE) -> _composite.GcEnumeration:
+        """g-358-202 (U2e): the READ-ONLY half of orphan collection for the composite store at `path`: what
+        a later delete pass may remove, and the evidence for it. It GETs the head, lists the segment
+        directory to the END of its pagination, then HEADs the head again, and hands the three to
+        `_owncloud_composite.plan_gc`. It never PUTs, deletes or copies, never touches the local mirror, and
+        does not consult the writer flag (a box whose flag is unset can still enumerate what a flagged box
+        wrote).
+
+        An orphan is only defined against the head the listing was taken under, so a head that moved (or
+        vanished) between the first read and the last abandons the pass: refused
+        `head-moved-during-enumeration`, nothing planned. The other refusals are `store-not-allowlisted` (no
+        S3 call is made), `head-missing`, and the planner's own (a head that is not a composite head is
+        refused without listing anything). An S3 error propagates: a pass that failed has no plan.
+
+        Returns a GcEnumeration: the plan, the head ETag it was computed against, and for each name the plan
+        would delete its size, last_modified (epoch), ETag and first_seen, which is the enumeration
+        archive-before-delete step 1 asks for (names and sizes, not a bare count, guard-6063)."""
+        key = self._s3_key(path)
+
+        def refused(why: str) -> _composite.GcEnumeration:
+            return _composite.GcEnumeration(_composite.GcPlan([], dict(ledger), [why], [], {}), None, {})
+
+        if not _composite.reads_composite(self._rel_of_key(key)):
+            return refused("store-not-allowlisted")
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return refused("head-missing")
+            _reraise_access_denied(e, "composite GC head GetObject")
+            raise
+        head, etag = _codec_decode_response(obj, key=key), obj["ETag"]
+        if not _composite.is_head(head):
+            plan = _composite.plan_gc([], head, ledger, now, grace_s=grace_s, max_delete=max_delete)
+            return _composite.GcEnumeration(plan, etag, {})
+        found = self._composite_segment_listing(key)
+        try:
+            after = self.s3.head_object(Bucket=self.bucket, Key=key)["ETag"]
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in _NOT_FOUND:
+                _reraise_access_denied(e, "composite GC head HeadObject")
+                raise
+            after = None
+        if after != etag:
+            return refused("head-moved-during-enumeration")
+        plan = _composite.plan_gc([(n, m["last_modified"], m["size"]) for n, m in found.items()], head, ledger,
+                                  now, grace_s=grace_s, max_delete=max_delete)
+        items = {n: {**found[n], "first_seen": plan.ledger[n]} for n in plan.delete}
+        return _composite.GcEnumeration(plan, etag, items)
+
+    def _composite_segment_listing(self, key: str) -> dict:
+        """name -> {size, last_modified (epoch seconds), etag} for every object under the segment directory
+        of the store whose head is at `key`, names relative to that directory, read to the END of the
+        listing. A listing that says it is truncated and gives no token to continue is an error, never
+        a short answer or a loop."""
+        prefix = _composite.segment_s3_key(key, "")
+        expected = self._customer_prefix() + self.env_id + "/"
+        assert prefix.startswith(expected), (
+            f"composite GC prefix {prefix!r} escapes customer/env scope {expected!r} "
+            "— IAM ListBucket is prefix-conditioned on it")
+        found: dict = {}
+        token = None
+        while True:
+            kw = dict(Bucket=self.bucket, Prefix=prefix)
+            if token:
+                kw["ContinuationToken"] = token
+            try:
+                resp = self.s3.list_objects_v2(**kw)
+            except ClientError as e:
+                _reraise_access_denied(e, "composite GC ListObjectsV2")
+                raise
+            for c in resp.get("Contents", []):
+                name = c["Key"][len(prefix):]
+                if name:
+                    found[name] = {"size": int(c["Size"]), "last_modified": c["LastModified"].timestamp(),
+                                   "etag": c["ETag"]}
+            if not resp.get("IsTruncated"):
+                return found
+            token = resp.get("NextContinuationToken")
+            if not token:
+                raise _composite.CompositeError("segment listing truncated without a continuation token")
+
+    def _composite_object_versions(self, obj_key: str) -> list:
+        """Every version and delete marker of exactly `obj_key`, newest first, read to the END of the listing:
+        dicts of `version_id`, `is_latest`, `marker`, `etag` (None on a marker), `size` and `last_modified`
+        (epoch seconds). The delete pass lists the chain of each orphan it archives, so it can remove exactly
+        those versions (`_owncloud_composite.plan_version_delete`). Needs ListBucketVersions, which a principal
+        that can list objects may still lack: that is an OwnCloudPermissionError, never a short answer. A
+        listing that says it is truncated and gives no key marker to continue is an error, never a loop. An
+        unversioned store lists each object once with the version id 'null'."""
+        expected = self._customer_prefix() + self.env_id + "/"
+        assert obj_key.startswith(expected), (
+            f"composite GC version prefix {obj_key!r} escapes customer/env scope {expected!r} "
+            "— IAM ListBucketVersions is prefix-conditioned on it")
+        chain: list = []
+        kw = dict(Bucket=self.bucket, Prefix=obj_key)
+        while True:
+            try:
+                resp = self.s3.list_object_versions(**kw)
+            except ClientError as e:
+                _reraise_access_denied(e, "composite GC ListObjectVersions")
+                raise
+            for entry, marker in ([(v, False) for v in resp.get("Versions", [])]
+                                  + [(m, True) for m in resp.get("DeleteMarkers", [])]):
+                if entry["Key"] == obj_key:  # the prefix also matches longer keys
+                    chain.append({"version_id": entry["VersionId"], "is_latest": bool(entry.get("IsLatest")),
+                                  "marker": marker, "etag": None if marker else entry.get("ETag"),
+                                  "size": 0 if marker else int(entry.get("Size", 0)),
+                                  "last_modified": entry["LastModified"].timestamp()})
+            if not resp.get("IsTruncated"):
+                return sorted(chain, key=lambda v: -v["last_modified"])
+            if not resp.get("NextKeyMarker"):
+                raise _composite.CompositeError("version listing truncated without a key marker")
+            kw["KeyMarker"] = resp["NextKeyMarker"]
+            if resp.get("NextVersionIdMarker"):
+                kw["VersionIdMarker"] = resp["NextVersionIdMarker"]
+            else:
+                kw.pop("VersionIdMarker", None)
+
+    def _gc_read_head(self, key: str) -> Optional[bytes]:
+        """The decoded head object at `key`, or None when it is absent (composite GC)."""
+        try:
+            return _codec_decode_response(self.s3.get_object(Bucket=self.bucket, Key=key), key=key)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return None
+            _reraise_access_denied(e, "composite GC head GetObject")
+            raise
+
+    def _gc_head(self, key: str) -> Optional[dict]:
+        """The HeadObject response of the current object at `key`, or None when there is none. A delete marker
+        reads as absent (composite GC)."""
+        try:
+            return self.s3.head_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return None
+            _reraise_access_denied(e, "composite GC HeadObject")
+            raise
+
+    def _gc_present(self, key: str) -> bool:
+        """Is there a current object at `key`? A delete marker reads as absent (composite GC)."""
+        return self._gc_head(key) is not None
+
+    def _gc_delete(self, key: str, version_id: Optional[str] = None) -> None:
+        """One DeleteObject for an orphan (composite GC): the key itself, or exactly the version `version_id`.
+        A version that is already gone is the state asked for, not an error (S3 answers 204; a store that says
+        NoSuchVersion is read the same way): the read-back after the deletes is what judges the outcome."""
+        kw = dict(Bucket=self.bucket, Key=key)
+        if version_id is not None:
+            kw["VersionId"] = version_id
+        try:
+            self.s3.delete_object(**kw)
+        except ClientError as e:
+            if version_id is not None and e.response["Error"]["Code"] in (_NOT_FOUND | {"NoSuchVersion"}):
+                return
+            _reraise_access_denied(e, "composite GC DeleteObject")
+            raise
+
+    def _gc_put_receipt(self, receipt_key: str, receipt: dict) -> None:
+        try:
+            self.s3.put_object(Bucket=self.bucket, Key=receipt_key,
+                               Body=json.dumps(receipt, indent=1, sort_keys=True).encode("utf-8"))
+        except ClientError as e:
+            _reraise_access_denied(e, "composite GC receipt PutObject")
+            raise
+
+    def _composite_archive_names(self) -> set:
+        """g-358-202 (U30): every directory name directly under `<env root>_composite-gc-archive/`: run ids, `_state`, `_pruned`
+        and any stray name alike, read to the END of the listing. `composite_gc_runs` keeps the run ids; the prune pass hands the
+        whole set to its planner, which reports what is neither. A listing that says it is truncated and gives no continuation
+        token is an error, never a loop."""
+        prefix = self._customer_prefix() + self.env_id + "/" + _composite.GC_ARCHIVE_DIR + "/"
+        names = set()
+        token = None
+        while True:
+            kw = dict(Bucket=self.bucket, Prefix=prefix, Delimiter="/")
+            if token:
+                kw["ContinuationToken"] = token
+            try:
+                resp = self.s3.list_objects_v2(**kw)
+            except ClientError as e:
+                _reraise_access_denied(e, "composite GC archive ListObjectsV2")
+                raise
+            for cp in resp.get("CommonPrefixes", []):
+                names.add(cp["Prefix"][len(prefix):].rstrip("/"))
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+            if not token:
+                raise _composite.CompositeError("archive listing truncated without a continuation token")
+        return names
+
+    def composite_gc_runs(self) -> List[str]:
+        """g-358-202 (U14): the run ids of this environment's composite GC archives, oldest first: the directories directly under
+        `<env root>_composite-gc-archive/` whose name is a run id (the `_state` directory and any stray name are not). Listing the
+        archive is how a late restore finds the runs it owes a look, so a pass that died before it could record its own run
+        still gets one. A listing that says it is truncated and gives no continuation token is an error, never a loop."""
+        return sorted(n for n in self._composite_archive_names() if _composite.gc_run_time(n) is not None)
+
+    def composite_gc_state_get(self, path: PathLike, doc: str) -> Optional[dict]:
+        """g-358-202 (U14): one of the scheduled pass's two documents (`_composite.GC_STATE_DOCS`) for the composite store
+        at `path`, parsed, or None when it has never been written. ONLY an object that is not there is None: every other
+        failure raises (an access denial, a transport error, a body that is not JSON), because an unreadable ledger is
+        not an empty one and a caller that took it for empty would overwrite the real one with a fresh start."""
+        key = self._s3_key(path)
+        rel = self._rel_of_key(key)
+        if not _composite.reads_composite(rel):
+            raise _composite.CompositeError("%r is not a composite store" % rel)
+        skey = _composite.gc_state_key(self._customer_prefix() + self.env_id + "/", rel, doc)
+        try:
+            body = self.s3.get_object(Bucket=self.bucket, Key=skey)["Body"].read()
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return None
+            _reraise_access_denied(e, "composite GC state GetObject")
+            raise
+        return json.loads(body.decode("utf-8"))
+
+    def composite_gc_state_put(self, path: PathLike, doc: str, obj: dict) -> None:
+        """g-358-202 (U14): write one scheduled-pass document (see `composite_gc_state_get`): one PutObject of compact JSON
+        beside the archive, outside the governed roots, so the sync layer never mirrors it."""
+        key = self._s3_key(path)
+        rel = self._rel_of_key(key)
+        if not _composite.reads_composite(rel):
+            raise _composite.CompositeError("%r is not a composite store" % rel)
+        skey = _composite.gc_state_key(self._customer_prefix() + self.env_id + "/", rel, doc)
+        try:
+            self.s3.put_object(Bucket=self.bucket, Key=skey,
+                               Body=json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        except ClientError as e:
+            _reraise_access_denied(e, "composite GC state PutObject")
+            raise
+
+    def composite_gc_apply(self, path: PathLike, ledger, now: float, *,
+                           grace_s: float = _composite.GC_GRACE_S,
+                           max_delete: int = _composite.GC_MAX_DELETE,
+                           batch: int = _composite.GC_DELETE_BATCH) -> _composite.GcApplied:
+        """g-358-202 (U2e): the DESTRUCTIVE half of orphan collection for the composite store at `path`.
+
+        Inert unless OWNCLOUD_COMPOSITE_GC names this environment (`_composite.should_gc`): with the flag unset it
+        returns `stopped='gc-not-enabled'` having made no S3 call, and a grace window under `GC_GRACE_S` is
+        refused the same way (`grace-below-floor`). The writer's path never calls it.
+
+        The pass: enumerate (`composite_gc_enumerate`, read-only: any refusal there stops the pass with nothing
+        done); ARCHIVE every object the plan names to `_composite.gc_archive_key` and read the copy back, keeping
+        an object whose bytes do not hash to the md5 its name carries or whose copy reads back different; write
+        the run's RECEIPT.json; only then delete, by single `delete_object` calls in batches of `batch`, reading
+        the head before each batch and keeping any name it now lists, HEADing each object just before its delete
+        and keeping one re-written since the listing (a writer's re-PUT of an old segment it found present,
+        `moved_since_listing`), and reading each delete back; finally
+        `composite_gc_restore`, which puts back from the archive any deleted name the head names after all (the
+        writer treats a 412 on a segment PUT as 'already there' and re-PUTs only an old one, so a head can still
+        commit over an object this pass deletes in the gap between that HEAD and the delete). What is deleted is
+        the archive's manifest, never the plan: an object the archive does not
+        verifiably hold is never deleted.
+
+        On a VERSIONED store (the archive's GET returns a VersionId) the pass lists each archived object's chain
+        of versions and delete markers (`_composite_object_versions`, recorded in the receipt before any delete)
+        and deletes exactly those versions BY ID, the latest last, instead of the key
+        (`_owncloud_composite.plan_version_delete`). The re-check before the delete is by VersionId: the HEAD's
+        must be the listed latest, else the name is kept as rewritten-since-listing, so a writer's re-PUT of an
+        old segment (a version the listing never saw) survives even when it lands between that HEAD and the
+        delete. A listed version whose ETag differs from the archived bytes keeps the whole name
+        (version-bytes-not-archived: the archive holds the current version only). No delete marker and no
+        noncurrent version is left, so the archive is the only copy of a collected segment. An unversioned store
+        (no VersionId in the responses) keeps the key delete and the last_modified re-check.
+
+        A permission failure raises OwnCloudPermissionError and any other S3 error propagates. Before the first
+        delete nothing is lost (an archive object is harmless); after it the receipt written first still names
+        every object and where its copy is, and the restore step still runs. The caller persists the returned
+        ledger; `restored` is never expected to be non-empty, and when it is the pass has met the 412 window."""
+        key = self._s3_key(path)
+        rel = self._rel_of_key(key)
+
+        def result(stopped, plan=None, led=None, run_id=None, deleted=(), restored=(), skipped=None):
+            return _composite.GcApplied(stopped, plan, dict(ledger if led is None else led), run_id,
+                                        list(deleted), list(restored), dict(skipped or {}))
+
+        if not _composite.should_gc(rel, self.env_id):
+            return result("gc-not-enabled")
+        if not _composite.gc_grace_ok(grace_s):
+            return result("grace-below-floor")
+        enum = self.composite_gc_enumerate(path, ledger, now, grace_s=grace_s, max_delete=max_delete)
+        plan = enum.plan
+        if plan.refused:
+            return result(plan.refused[0], plan, plan.ledger)
+        env_root = self._customer_prefix() + self.env_id + "/"
+        run_id = _composite.gc_run_id(now, plan.delete)
+        archived: dict = {}
+        skipped: dict = {}
+        for name in plan.delete:
+            src = _composite.segment_s3_key(key, name)
+            dst = _composite.gc_archive_key(env_root, run_id, rel, name)
+            try:
+                obj = self.s3.get_object(Bucket=self.bucket, Key=src)
+            except ClientError as e:
+                if e.response["Error"]["Code"] in _NOT_FOUND:
+                    skipped[name] = "gone-since-listing"
+                    continue
+                _reraise_access_denied(e, "composite GC segment GetObject")
+                raise
+            raw = obj["Body"].read()
+            enc, meta = obj.get("ContentEncoding"), dict(obj.get("Metadata") or {})
+            try:
+                plain = _codec_decode(raw, content_encoding=enc, metadata=meta, key=src)
+            except _CodecError:
+                skipped[name] = "undecodable"
+                continue
+            plain_md5 = name.rsplit(".", 2)[1]  # the md5 in '<asp>/<token>.<md5>.jsonl'
+            if hashlib.md5(plain).hexdigest() != plain_md5:
+                skipped[name] = "content-does-not-match-its-name"
+                continue
+            kw = dict(Bucket=self.bucket, Key=dst, Body=raw)
+            if enc:
+                kw["ContentEncoding"] = enc
+            if meta:
+                kw["Metadata"] = meta
+            try:
+                self.s3.put_object(**kw)
+            except ClientError as e:
+                _reraise_access_denied(e, "composite GC archive PutObject")
+                raise
+            if self.s3.get_object(Bucket=self.bucket, Key=dst)["Body"].read() != raw:
+                skipped[name] = "archive-readback-mismatch"
+                continue
+            version_id = obj.get("VersionId")  # absent on an unversioned store; 'null' on a suspended one
+            versions = self._composite_object_versions(src) if version_id not in (None, "null") else []
+            archived[name] = {"source_key": src, "archive_key": dst, "size": len(raw),
+                              "md5": hashlib.md5(raw).hexdigest(), "plain_md5": plain_md5,
+                              "content_encoding": enc, "metadata": meta, "etag": obj.get("ETag"),
+                              "version_id": version_id, "versions": versions,
+                              "last_modified": enum.items[name]["last_modified"],
+                              "first_seen": enum.items[name]["first_seen"]}
+        if not archived:
+            return result(None, plan, plan.ledger, skipped=skipped)
+        receipt_key = _composite.gc_receipt_key(env_root, run_id)
+        receipt = {"kind": "composite-gc-archive", "format": 1, "run_id": run_id, "store": rel, "head_key": key,
+                   "head_etag": enum.head_etag, "grace_s": grace_s,
+                   "started": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)), "status": "archived",
+                   "objects": archived, "deleted": [], "restored": [], "skipped": skipped,
+                   "restore": ("An object's copy is at its archive_key. To put one back: GET it, check its md5 equals "
+                               "`md5`, and PUT it at `source_key` on this same endpoint with the recorded "
+                               "content_encoding and metadata. OwnCloudBackend.composite_gc_restore does that for "
+                               "every object here that the current head names and the store lacks. Never restore "
+                               "into a local mirror: the sync layer would push it as a file. On a versioned store "
+                               "the pass deletes by version id: `versions` names what was removed, and no "
+                               "noncurrent copy remains, so the archive object is the only copy.")}
+        self._gc_put_receipt(receipt_key, receipt)
+        deleted: list = []
+        restored: list = []
+        stopped = None
+        status = "done"
+        step = max(1, int(batch))
+        names = [n for n in plan.delete if n in archived]
+        try:
+            for i in range(0, len(names), step):
+                head = self._gc_read_head(key)
+                if head is None or not _composite.is_head(head):
+                    stopped = "head-changed-layout"
+                    status = "stopped: " + stopped
+                    break
+                named = _composite.head_object_names(head)
+                for name in names[i:i + step]:
+                    if name in named:
+                        skipped[name] = "re-referenced"
+                        continue
+                    rec = archived[name]
+                    current = self._gc_head(rec["source_key"])
+                    if current is None:
+                        skipped[name] = "gone-since-archive"
+                        continue
+                    if rec["version_id"] not in (None, "null"):  # a versioned store: remove exactly the versions listed
+                        verdict = _composite.plan_version_delete(rec["versions"], rec["last_modified"],
+                                                                 current.get("VersionId"), rec["etag"])
+                        if verdict.keep:
+                            skipped[name] = verdict.keep
+                            continue
+                        for vid in verdict.order:
+                            self._gc_delete(rec["source_key"], vid)
+                        after = self._gc_head(rec["source_key"])
+                        if after is None:
+                            deleted.append(name)
+                        elif after.get("VersionId") in {v["version_id"] for v in rec["versions"]}:
+                            skipped[name] = "delete-not-effective"
+                        else:  # present, but as a version the listing never saw: a writer's re-PUT, which survives
+                            skipped[name] = "rewritten-since-listing"
+                        continue
+                    if _composite.moved_since_listing(rec["last_modified"], _last_modified_epoch(current)):
+                        skipped[name] = "rewritten-since-listing"
+                        continue
+                    self._gc_delete(rec["source_key"])
+                    if self._gc_present(rec["source_key"]):
+                        skipped[name] = "delete-not-effective"
+                    else:
+                        deleted.append(name)
+        except Exception as exc:
+            status = "stopped: " + type(exc).__name__
+            raise
+        finally:
+            try:
+                restored = self.composite_gc_restore(path, run_id)
+            finally:
+                receipt.update(status=status, deleted=deleted, restored=restored, skipped=skipped)
+                self._gc_put_receipt(receipt_key, receipt)
+        return result(stopped, plan, {n: t for n, t in plan.ledger.items() if n not in deleted}, run_id,
+                      deleted, restored, skipped)
+
+    def composite_gc_restore(self, path: PathLike, run_id: str) -> List[str]:
+        """g-358-202 (U2e): put back from the archive of delete pass `run_id` every object that the CURRENT head
+        names and the store lacks; returns their names. It reads the live head and the live store, never the
+        receipt's own list of what was deleted, so it is right after a pass that died half way and right for a
+        late sweep; a name the head does not list, or that is present, is left alone, which also makes it
+        idempotent. The copy is checked against the md5 in the receipt before it is PUT (a mismatch raises
+        CompositeError and puts nothing back). It needs no GC flag: recovery must not depend on the switch that
+        enables deletion."""
+        key = self._s3_key(path)
+        rel = self._rel_of_key(key)
+        if not _composite.reads_composite(rel):
+            raise _composite.CompositeError("%r is not a composite store" % rel)
+        env_root = self._customer_prefix() + self.env_id + "/"
+        try:
+            body = self.s3.get_object(Bucket=self.bucket, Key=_composite.gc_receipt_key(env_root, run_id))["Body"].read()
+        except ClientError as e:
+            _reraise_access_denied(e, "composite GC receipt GetObject")
+            raise
+        objects = json.loads(body.decode("utf-8"))["objects"]
+        head = self._gc_read_head(key)
+        if head is None or not _composite.is_head(head):
+            return []
+        named = _composite.head_object_names(head)
+        restored: List[str] = []
+        for name in sorted(objects):
+            rec = objects[name]
+            if rec["source_key"] != _composite.segment_s3_key(key, name):
+                raise _composite.CompositeError("receipt %s describes another store" % run_id)
+            if name not in named or self._gc_present(rec["source_key"]):
+                continue
+            raw = self.s3.get_object(Bucket=self.bucket, Key=rec["archive_key"])["Body"].read()
+            if hashlib.md5(raw).hexdigest() != rec["md5"]:
+                raise _composite.CompositeError("archive object %s no longer matches its receipt" % rec["archive_key"])
+            kw = dict(Bucket=self.bucket, Key=rec["source_key"], Body=raw)
+            if rec.get("content_encoding"):
+                kw["ContentEncoding"] = rec["content_encoding"]
+            if rec.get("metadata"):
+                kw["Metadata"] = rec["metadata"]
+            self.s3.put_object(**kw)
+            restored.append(name)
+        return restored
+
+    def _composite_run_listing(self, run_id: str) -> dict:
+        """g-358-202 (U30): key -> size for every object under one archive run's prefix, read to the END of the listing. The run id
+        is checked by `gc_run_prefix`, so the listing cannot leave the run's directory. A listing that says it is truncated and
+        gives no continuation token is an error, never a short answer."""
+        prefix = _composite.gc_run_prefix(self._customer_prefix() + self.env_id + "/", run_id)
+        found: dict = {}
+        token = None
+        while True:
+            kw = dict(Bucket=self.bucket, Prefix=prefix)
+            if token:
+                kw["ContinuationToken"] = token
+            try:
+                resp = self.s3.list_objects_v2(**kw)
+            except ClientError as e:
+                _reraise_access_denied(e, "composite GC archive run ListObjectsV2")
+                raise
+            for c in resp.get("Contents", []):
+                found[c["Key"]] = int(c["Size"])
+            if not resp.get("IsTruncated"):
+                return found
+            token = resp.get("NextContinuationToken")
+            if not token:
+                raise _composite.CompositeError("archive run listing truncated without a continuation token")
+
+    def _composite_json_object(self, key: str, what: str) -> Optional[dict]:
+        """g-358-202 (U30): the JSON object stored at `key` (an archive run's receipt or its tombstone, named by `what`), or None when
+        there is none or the body is not a JSON object (the planner keeps a run with no receipt as `no-receipt`). ONLY an object that
+        is not there, or a body that is not a JSON object, reads as None: every other failure raises, because a record that could
+        not be read is not a record that is not there."""
+        try:
+            body = self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return None
+            _reraise_access_denied(e, "composite GC archive %s GetObject" % what)
+            raise
+        try:
+            obj = json.loads(body.decode("utf-8"))
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    def _composite_run_receipt(self, run_id: str) -> Optional[dict]:
+        """g-358-202 (U30): the parsed RECEIPT.json of an archive run, or None (`_composite_json_object`)."""
+        return self._composite_json_object(_composite.gc_receipt_key(self._customer_prefix() + self.env_id + "/", run_id), "receipt")
+
+    def _gc_needed_names(self, key: str):
+        """g-358-202 (U30): `(needed, why)` for the store whose head is at `key`: the segment names the head names and the store
+        lacks, which are the only archive objects `composite_gc_restore` could still take, or `(None, reason)` when that cannot be
+        said ('head-missing', 'head-not-composite', 'head-moved-during-read'). The head is read, the segment directory listed to
+        its end, and the head HEADed again: a head that moved in between is not an answer."""
+        try:
+            obj = self.s3.get_object(Bucket=self.bucket, Key=key)
+        except ClientError as e:
+            if e.response["Error"]["Code"] in _NOT_FOUND:
+                return None, "head-missing"
+            _reraise_access_denied(e, "composite GC head GetObject")
+            raise
+        head, etag = _codec_decode_response(obj, key=key), obj["ETag"]
+        if not _composite.is_head(head):
+            return None, "head-not-composite"
+        listed = self._composite_segment_listing(key)
+        after = self._gc_head(key)
+        if after is None or after["ETag"] != etag:
+            return None, "head-moved-during-read"
+        return frozenset(_composite.head_object_names(head)) - frozenset(listed), None
+
+    def composite_gc_prune_enumerate(self, path: PathLike, now: float, *,
+                                     prune_after_s: float = _composite.GC_PRUNE_AFTER_S,
+                                     max_runs: int = _composite.GC_PRUNE_MAX_RUNS) -> _composite.PruneEnumeration:
+        """g-358-202 (U30): the READ-ONLY half of archive pruning for the composite store at `path`: which archive runs a prune pass
+        may remove (`plan_archive_prune`) and, for each, the keys it may remove or why that run stays (`plan_run_removal`). It lists
+        the archive's top-level names, GETs the receipt of each run at least `prune_after_s` old (a younger run needs none),
+        reads the head and the segment directory for `needed`, and lists each planned run's prefix. It never PUTs, deletes or
+        copies and does not consult any flag: a box that has not been armed can still say what a pass would do. `store-not-allowlisted`
+        is answered before any S3 call. An S3 error propagates: a pass that failed has no plan."""
+        key = self._s3_key(path)
+        rel = self._rel_of_key(key)
+        if not _composite.reads_composite(rel):
+            return _composite.PruneEnumeration(_composite.PrunePlan([], {}, ["store-not-allowlisted"], [], {}, {}), {}, None)
+        env_root = self._customer_prefix() + self.env_id + "/"
+        names = sorted(self._composite_archive_names())
+        receipts: dict = {}
+        for name in names:
+            when = _composite.gc_run_time(name)
+            try:
+                old_enough = when is not None and now - when >= prune_after_s
+            except TypeError:  # a clock or window that is not a number: the planner refuses on it below, and no receipt is read for it
+                old_enough = False
+            if old_enough:
+                receipts[name] = self._composite_run_receipt(name)
+        needed, why = self._gc_needed_names(key)
+        plan = _composite.plan_archive_prune(names, receipts, needed, now, rel, prune_after_s, max_runs)
+        runs = {run_id: _composite.plan_run_removal(run_id, receipts[run_id], self._composite_run_listing(run_id), env_root)
+                for run_id in plan.prune}
+        return _composite.PruneEnumeration(plan, runs, why)
+
+    def composite_gc_prune_control(self, now: float, *, token: Optional[str] = None) -> _composite.PruneControl:
+        """g-358-202 (U30): the control a prune pass runs before its first removal, and the one to run BEFORE the prune flag is
+        set (guard-1301). It needs no flag: it touches one throwaway sentinel under `_state/_prune-control/` that it made itself,
+        and removes every version of it before it returns.
+
+        It does to the sentinel what the pass does to a run's object. PUT it (the response must carry a VersionId that is not
+        'null': the store is versioned), delete it by the same plain single call, and read its versions back: exactly one delete
+        marker, newest, and exactly one noncurrent version, the PUT's, at the sentinel's size. Restore from that noncurrent
+        version, compare its md5 with the original's, and put the restored bytes back as the current object. Any miss stops the
+        pass (`failed` names it) and the pass removes nothing. A sentinel key that already has ANY entry is refused
+        ('control-key-not-fresh') before the PUT, so the cleanup only ever removes versions this call made. The control proves the
+        delete is undoable on this store NOW; that the undo window is long enough is a reading of the bucket's lifecycle
+        configuration, taken by the storage host at arming (design record, U30). It needs ListBucketVersions, like the delete pass."""
+        env_root = self._customer_prefix() + self.env_id + "/"
+        token = os.urandom(16).hex() if token is None else token
+        key = _composite.gc_prune_control_key(env_root, token)
+        body = ("composite gc prune control %s %s\n" % (token, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)))).encode("utf-8")
+        md5 = hashlib.md5(body).hexdigest()
+        evidence: dict = {"key": key, "size": len(body), "md5": md5}
+        if self._composite_object_versions(key):
+            return _composite.PruneControl(False, "control-key-not-fresh", evidence)
+        failed = None
+        try:
+            vid = self.s3.put_object(Bucket=self.bucket, Key=key, Body=body).get("VersionId")
+            if vid in (None, "null"):
+                failed = "control-store-not-versioned"
+            elif self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read() != body:
+                failed = "control-readback-mismatch"
+            else:
+                evidence["version_id"] = vid
+                self._gc_delete(key)
+                if self._gc_present(key):
+                    failed = "control-delete-not-effective"
+                else:
+                    chain = self._composite_object_versions(key)
+                    markers = [v for v in chain if v["marker"]]
+                    noncurrent = [v for v in chain if not v["marker"]]
+                    if not (len(markers) == 1 and markers[0]["is_latest"] and len(noncurrent) == 1
+                            and noncurrent[0]["version_id"] == vid and noncurrent[0]["size"] == len(body)):
+                        failed = "control-delete-left-no-recoverable-version"
+                    else:
+                        evidence["marker_version_id"] = markers[0]["version_id"]
+                        back = self.s3.get_object(Bucket=self.bucket, Key=key, VersionId=vid)["Body"].read()
+                        if hashlib.md5(back).hexdigest() != md5:
+                            failed = "control-restore-mismatch"
+                        else:
+                            self.s3.put_object(Bucket=self.bucket, Key=key, Body=back)
+                            if self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read() != body:
+                                failed = "control-restored-copy-mismatch"
+        finally:
+            for entry in self._composite_object_versions(key):
+                self._gc_delete(key, entry["version_id"])
+            clean = not self._composite_object_versions(key)
+        evidence["cleanup"] = "clean" if clean else "left"
+        if failed is None and not clean:
+            failed = "control-cleanup-failed"
+        return _composite.PruneControl(failed is None, failed, evidence)
+
+    def _composite_prune_run(self, run_id: str, receipt: dict, removal, control, now: float, prune_after_s: float,
+                             rel: str, env_root: str) -> Optional[str]:
+        """g-358-202 (U30): remove one planned run. Returns why it stopped, or None when the run is gone.
+
+        The ORDER is the protocol. Each object the run's receipt names and its listing holds goes by a plain single
+        `delete_object` (never by version id, so a versioned store keeps it as a noncurrent version for the bucket's undo window)
+        after a HEAD shows it still has the receipt's size, and is read back absent. Only then is the tombstone written to
+        `_pruned/<run id>/RECEIPT.json` and read back equal, and only after that is the run's own RECEIPT.json deleted and read back
+        absent. The receipt therefore stays until the tombstone is stored, so the record of what was removed never has a gap, and
+        a pass that dies anywhere leaves a run whose receipt still reads `done`: the next pass finishes it (guard-4747). A tombstone
+        rewritten by that next pass keeps the version ids an earlier tombstone of the run recorded, so the way back is never lost."""
+        sizes = {r["archive_key"]: r["size"] for r in receipt["objects"].values()}
+        tkey = _composite.gc_pruned_key(env_root, run_id)
+        earlier = (self._composite_json_object(tkey, "tombstone") or {}).get("removed")  # read first: a read that fails stops the run before it deletes
+        removed: dict = {}
+        for akey in removal.delete:
+            head = self._gc_head(akey)
+            if head is None:
+                continue  # gone since the listing, which is the state asked for
+            if int(head["ContentLength"]) != sizes[akey]:
+                return "changed-since-listing"
+            self._gc_delete(akey)
+            if self._gc_present(akey):
+                return "delete-not-effective"
+            removed[akey] = head.get("VersionId")
+        if isinstance(earlier, dict):  # a pass that died after writing this tombstone and before the receipt went: the rewrite keeps its version ids
+            removed = {**earlier, **removed}
+        gone = [k for k in removal.gone if k not in removed]
+        tombstone = {"kind": "composite-gc-archive-pruned", "format": 1, "run_id": run_id, "store": rel, "status": "pruned",
+                     "pruned_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)), "window_s": prune_after_s,
+                     "objects": {n: {k: r.get(k) for k in ("archive_key", "source_key", "size", "md5", "plain_md5", "etag")}
+                                 for n, r in receipt["objects"].items()},
+                     "removed": removed, "gone": gone, "control": control.evidence,
+                     "restore": ("Each removed object went by a plain delete, so on a versioned store it is a noncurrent version "
+                                 "(`removed` maps its archive_key to that version id) until the bucket's noncurrent-version window "
+                                 "ends: GET it with that VersionId and PUT the bytes back at its archive_key. After the window the "
+                                 "run is gone, which is what pruning is for. Never restore into a local mirror.")}
+        self._gc_put_receipt(tkey, tombstone)
+        if json.loads(self.s3.get_object(Bucket=self.bucket, Key=tkey)["Body"].read().decode("utf-8")) != tombstone:
+            return "tombstone-readback-mismatch"
+        rkey = _composite.gc_receipt_key(env_root, run_id)
+        self._gc_delete(rkey)
+        if self._gc_present(rkey):
+            return "receipt-delete-not-effective"
+        return None
+
+    def composite_gc_prune_apply(self, path: PathLike, now: float, *,
+                                 prune_after_s: float = _composite.GC_PRUNE_AFTER_S,
+                                 max_runs: int = _composite.GC_PRUNE_MAX_RUNS) -> _composite.PruneApplied:
+        """g-358-202 (U30): the DESTRUCTIVE half of archive pruning for the composite store at `path`. Nothing calls it yet: it lands
+        dark (guard-1301) and is armed by its own flag.
+
+        Inert unless OWNCLOUD_COMPOSITE_GC_PRUNE names this environment (`_composite.should_prune_archive`): with the flag unset it
+        returns `stopped='prune-not-enabled'` having made no S3 call. The pass: enumerate (`composite_gc_prune_enumerate`: any
+        refusal stops it with nothing done; a plan with no removable run returns without a write); run the control
+        (`composite_gc_prune_control`: a miss removes nothing); then, run by run, oldest first, re-read what the plan was computed
+        from INSIDE the removal (guard-5952): the head's needed set, the run's receipt and its listing, and re-plan that run
+        (`plan_archive_prune` for the one run, `plan_run_removal`), so a head that began naming an archived object after the
+        enumeration keeps its run. A run that stays for a reason is skipped and the pass goes on; a run that cannot be finished
+        (an object changed, a delete not effective, a tombstone that does not read back) stops the pass. The removal itself is
+        `_composite_prune_run`. An S3 error propagates, and a permission failure raises OwnCloudPermissionError; after a death at
+        any point the receipt of every unfinished run still reads `done` and the next pass finishes it."""
+        key = self._s3_key(path)
+        rel = self._rel_of_key(key)
+
+        def result(stopped, plan=None, control=None, pruned=(), skipped=None):
+            return _composite.PruneApplied(stopped, plan, control, list(pruned), dict(skipped or {}))
+
+        if not _composite.should_prune_archive(rel, self.env_id):
+            return result("prune-not-enabled")
+        enum = self.composite_gc_prune_enumerate(path, now, prune_after_s=prune_after_s, max_runs=max_runs)
+        plan = enum.plan
+        if plan.refused:
+            why = plan.refused[0]
+            return result("%s: %s" % (why, enum.needed_why) if why == "needed-unknown" and enum.needed_why else why, plan)
+        skipped = {r: enum.runs[r].keep for r in plan.prune if enum.runs[r].keep is not None}
+        todo = [r for r in plan.prune if enum.runs[r].keep is None]
+        if not todo:
+            return result(None, plan, None, [], skipped)
+        control = self.composite_gc_prune_control(now)
+        if not control.ok:
+            return result("control-failed: %s" % control.failed, plan, control, [], skipped)
+        env_root = self._customer_prefix() + self.env_id + "/"
+        pruned: list = []
+        for run_id in todo:
+            needed, why = self._gc_needed_names(key)
+            if needed is None:
+                return result("needed-unknown: %s" % why, plan, control, pruned, skipped)
+            receipt = self._composite_run_receipt(run_id)
+            fresh = _composite.plan_archive_prune([run_id], {run_id: receipt}, needed, now, rel, prune_after_s, 1)
+            if fresh.prune != [run_id]:
+                skipped[run_id] = fresh.kept.get(run_id) or "refused: %s" % ",".join(fresh.refused)
+                continue
+            removal = _composite.plan_run_removal(run_id, receipt, self._composite_run_listing(run_id), env_root)
+            if removal.keep:
+                skipped[run_id] = removal.keep
+                continue
+            stopped = self._composite_prune_run(run_id, receipt, removal, control, now, prune_after_s, rel, env_root)
+            if stopped:
+                skipped[run_id] = stopped
+                return result("run-stopped: %s" % stopped, plan, control, pruned, skipped)
+            pruned.append(run_id)
+        return result(None, plan, control, pruned, skipped)
 
     def _refresh(self, path: PathLike, force_fresh: bool) -> Path:
         """Ensure the local cache file is current vs S3, returning its path. On a
@@ -1862,9 +2589,10 @@ class OwnCloudBackend:
         deployment is listed) AND the path's env-scoped logical path
         (``_rel``, e.g. ``world/aspirations.jsonl``) is on the hot-store
         allowlist; otherwise ``{"Body": body}`` — byte-for-byte the pre-codec
-        PUT. Both PUT sites (``_put`` and ``_merge_reconcile_put``) call this,
-        and every write path funnels through those two, so the flag governs
-        all writes at one seam.
+        PUT. Its one caller is ``_store_put`` (g-358-202 U12: a composite write
+        never calls it), the seam both PUT sites (``_put`` and
+        ``_merge_reconcile_put``) go through, and every write path funnels
+        through those two, so the flag governs all whole-object writes at one seam.
 
         Everything around the PUT keeps working on PLAINTEXT: the local mirror
         write, the manifest baseline stamp (md5 of ``body``), and the merge
@@ -1880,14 +2608,15 @@ class OwnCloudBackend:
 
     def _store_put(self, path: PathLike, key: str, body: bytes, kw: dict):
         """The ONE PUT seam of the two write sites (_put, _merge_reconcile_put). `kw` is the
-        whole-object PUT they built (Bucket, Key, the codec's body kwargs, IfMatch or IfNoneMatch)
-        and `body` the PLAINTEXT store bytes; returns the response of the PUT that commits the write.
+        PUT they began (Bucket, Key, IfMatch or IfNoneMatch: no Body, the codec has not run) and
+        `body` the PLAINTEXT store bytes; returns the response of the PUT that commits the write.
 
         g-358-202 U2d. Unless the composite writer is on for this store (_composite.should_composite:
         the OWNCLOUD_COMPOSITE_STORES flag names this env and the path is allowlisted) this is the
         pre-U2d PUT, untouched. When it is on, the write is: each segment object the old head does not
         already name, created if absent (immutable and content-addressed, so a 412 means the same bytes
-        are already there), THEN the head under the caller's fence. The head PUT is the only commit
+        are already there, and `_freshen_segment` makes sure an old one stays), THEN the head under the
+        caller's fence. The head PUT is the only commit
         point: a failure or a 412 before it leaves orphan segments and the old head exactly as it was.
 
         The head is stored PLAIN and padded to HEAD_MIN_BYTES (a gzipped or small head would be inlined
@@ -1895,10 +2624,15 @@ class OwnCloudBackend:
         and its plain-md5 metadata is the md5 of the JOINED bytes, which content_matches compares with
         the local file. A segment is gzipped exactly when the store itself would be. A store under
         MIN_RAW_BYTES, or one `split` refuses, goes whole; that PUT also reverts the layout, which every
-        reader tolerates (read_whole returns a whole object unchanged)."""
+        reader tolerates (read_whole returns a whole object unchanged).
+
+        g-358-202 U12. The body is encoded HERE, by `_body_kwargs`, and only for a whole-object PUT (the flag off, a
+        store under MIN_RAW_BYTES, a store `split` refuses). `_put` used to encode first, so a composite write gzipped
+        the whole 32.6 MB body (0.95 s of a 1.51 s write, U11) and dropped it: the composite plan sends only its
+        segments, each through the codec on its own."""
         rel = self._rel(path)
         if not _composite.should_composite(rel, self.env_id):
-            return self.s3.put_object(**kw)
+            return self.s3.put_object(**{**kw, **self._body_kwargs(path, body)})
         plan = None
         if len(body) >= _composite.MIN_RAW_BYTES:
             held = self._composite_heads.get(key)
@@ -1910,7 +2644,7 @@ class OwnCloudBackend:
                     self._composite_warned.add((key, str(exc)))
                     _LOG.warning("owncloud composite: %s goes whole, the layout refused it: %s", key, exc)
         if plan is None:
-            return self.s3.put_object(**kw)
+            return self.s3.put_object(**{**kw, **self._body_kwargs(path, body)})
         encode = _codec_should_encode(rel, self.env_id)
         for name, seg in plan.segments.items():
             skw = dict(Bucket=self.bucket, Key=_composite.segment_s3_key(key, name), IfNoneMatch="*")
@@ -1921,6 +2655,7 @@ class OwnCloudBackend:
                 if e.response["Error"]["Code"] not in _PRECONDITION:
                     _reraise_access_denied(e, "composite segment PutObject")
                     raise
+                self._freshen_segment(skw)
         head = _composite.pad_head(plan.head)
         hkw = {k: v for k, v in kw.items() if k not in ("Body", "ContentEncoding", "Metadata")}
         hkw["Body"] = head
@@ -1928,6 +2663,31 @@ class OwnCloudBackend:
         r = self.s3.put_object(**hkw)
         self._composite_heads[key] = (r["ETag"], head)
         return r
+
+    def _freshen_segment(self, skw: dict) -> None:
+        """g-358-202 (e): a segment PUT answered 412, so the object is already there, and the head this write is
+        about to commit will name it. Make sure it is still there when the head lands: HEAD it, and when it is
+        missing (a sweep took it since) or within `FRESHEN_MARGIN_S` of collectable (`_composite.needs_freshen`),
+        PUT the same bytes again, unconditionally. The name carries the md5 of the content, so the overwrite
+        changes nothing but the object's last_modified, which restarts the delete pass's grace clock (git's
+        'freshen' of a loose object) and which that pass re-checks before each delete. A young object is left
+        alone, so a segment is re-PUT at most once per GC_GRACE_S - FRESHEN_MARGIN_S however many writes find it.
+        Not closed here: a delete that lands between the pass's last check and its delete call, which
+        `composite_gc_restore` repairs."""
+        try:
+            present = self.s3.head_object(Bucket=skw["Bucket"], Key=skw["Key"])
+        except ClientError as e:
+            if e.response["Error"]["Code"] not in _NOT_FOUND:
+                _reraise_access_denied(e, "composite segment HeadObject")
+                raise
+            present = None
+        if present is not None and not _composite.needs_freshen(_last_modified_epoch(present), time.time()):
+            return
+        try:
+            self.s3.put_object(**{k: v for k, v in skw.items() if k != "IfNoneMatch"})
+        except ClientError as e:
+            _reraise_access_denied(e, "composite segment PutObject")
+            raise
 
     def _put(self, path: PathLike, body: bytes, *,
              local_is_source: bool = False) -> WriteResult:
@@ -2053,7 +2813,7 @@ class OwnCloudBackend:
             if handler is not None:
                 return self._merge_reconcile_put(path, key, local, body, handler)
         kw = dict(Bucket=self.bucket, Key=key)
-        kw.update(self._body_kwargs(path, body))  # g-358-11 transport encode
+        # no body kwargs yet: _store_put encodes the body only when a whole-object PUT goes out (g-358-202 U12)
         fence = self._etags.get(key)
         if fence is None:
             # W1 fix (g-115-2370, from the g-115-2360 RCA of the 2026-07-16
@@ -2294,7 +3054,7 @@ class OwnCloudBackend:
                         key, self._merge_noop_identical)
                 return WriteResult(version=remote_etag, fallback_used=False)
             kw = dict(Bucket=self.bucket, Key=key)
-            kw.update(self._body_kwargs(path, merged))  # g-358-11 transport encode
+            # no body kwargs yet: _store_put encodes only a whole-object PUT (g-358-202 U12)
             if remote_etag is not None:
                 kw["IfMatch"] = remote_etag  # CAS on the version we merged against
             self._cas_writes += 1  # g-328-21: each merge attempt is a fenced write

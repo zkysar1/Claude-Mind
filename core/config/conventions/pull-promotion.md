@@ -190,6 +190,48 @@ than as a config error.
 OUTSIDE the worktree — a log written inside it wedges the teardown with
 `handle still busy`.
 
+### The executor quiesces the daemon around the verify (normative, g-358-237)
+
+The pinned verify is a linked worktree, and `run-full-suite.py` refuses a linked
+worktree while a daemon is listening for the main checkout (rc 3, `LINKED
+WORKTREE ... a LIVE mind_api daemon`; guard-6394). Every deployment has a live
+daemon, so the first real `--adopt` on one rolled back on that refusal.
+
+**The decision:** the executor makes the refusal's precondition true instead of
+overriding it. `verify_in_worktree` calls `quiesce_daemon()` after the checkout
+and the bridge, immediately before each suite run (the baseline run gets its
+own): a connect probe on the port in `mind_api/state/daemon.port` (the runner's
+own signal; the port FILE is not the signal), ONE stop through the runtime
+helper's `rt_daemon_kill` (never a re-implementation), then a bounded wait for
+the port to close. A daemon that will not go down yields `VERDICT: INVALID
+(daemon-not-quiesced)` and the suite is never launched.
+
+Two further rules keep it down, and the first is why quiescing by hand did not
+hold:
+
+1. **The executor's own commits fire no hook.** The checkpoint, re-graft and
+   adopt commits run with `core.hooksPath` at no hooks. `--no-verify` skips
+   pre-commit and commit-msg and NOT post-commit, which restarts the daemon after
+   a daemon-code commit, and that restart lands seconds later, under the runner's
+   check.
+2. **Putting it back is the executor's job.** `adopt()` notes whether a daemon
+   was listening, then restarts it ONCE: after a green verify (onto the adopted
+   tree) or inside `rollback()` (onto the restored tree). The plan's
+   `daemon_recycle_required` still triggers the same single restart.
+
+What it does NOT do: hold the daemon down against another live session. The
+daemon is box-wide, so adopt inside your own idle window (C5); a wrapper's
+auto-spawn can bring it back mid-run, so the verify step records
+`daemon` (`was_up`, `stopped`, `quiesced`, `listening_after_run`) and the
+baseline run `baseline_daemon`; a red verdict beside `listening_after_run: true`
+is suspect.
+
+**Rejected: forwarding `--override-worktree-daemon`.** It overrides the safety
+gate on every adoption (a gate that refuses correctly and is overridden every
+time reads as noise to the telemetry that decides its retirement, guard-4817) and
+runs the configuration guard-6394 measured as worse than the contention it
+avoids. The runner's refusal stays as the independent check.
+
 ### The domain half does not gate adoption (normative, decided g-360-19)
 
 **The question:** does a red DOMAIN half flip `run-full-suite.sh`'s rc and
@@ -259,14 +301,22 @@ the pre-adopt commit, on the same box, in a pinned worktree. Green requires ALL 
    the pre-adopt run. Ids are FULL (`[param]` included) and are read from
    `<log-dir>/chunk-*.log`, never from the runner's stdout, which lists failing
    files and no node ids.
-3. **No framework-owned half is red.** `halves.jsonl` was read and neither
-   `invisible` nor `deferred` recorded a failing rc. A red `domain` half is
-   reported, not gating, as under strict C4.
+3. **No framework-owned half is red, except where the baseline excuses it.**
+   `halves.jsonl` was read and `deferred` recorded no failing rc (it names no
+   files, so no baseline can compare it). A red `invisible` half is compared BY
+   FILE: every file that failed on the adopt-commit run also failed on the
+   pre-adopt run. The names come from the runner's captured stdout (one
+   `FAIL(rc=N) <file>` line per red file), because `halves.jsonl` keeps only the
+   half's rc and one summary line. A red `domain` half is reported, not gating,
+   as under strict C4. (g-358-237: this clause used to refuse on ANY red
+   framework half, so a deployment whose invisible half was red before the
+   adoption could never pass.)
 
 Fail-safe direction, same as the domain-half decision: any case where the evidence
 cannot prove "no new reds" is RED, with the reason in the verify step's
 `baseline_refused` (a `GENUINE` verdict beside an empty failing set, unreadable
-`halves.jsonl`, a baseline run that did not conclude). Cheap refusals run before the
+`halves.jsonl`, a red invisible half with no file name read on either run, a
+baseline run that did not conclude). Cheap refusals run before the
 second suite run is paid for.
 
 What it does NOT do: it does not run unless asked (the default stays strict); it does
@@ -275,9 +325,11 @@ that exists only in the new release counts as new (nothing can baseline it); a t
 that flakes red only on the adopt run blocks until a re-run.
 
 An adoption verified this way is marked: the verify step carries `c4_mode`,
-`post_reds`, `baseline_reds` and `new_reds` (first 50), and `installed-release.yaml`
-gains `c4_mode: baseline-differential` and `baseline_reds`, because `verified: true`
-alone cannot tell it from a strict pass. Measurement and the alternatives rejected:
+`post_reds`, `baseline_reds` and `new_reds` (first 50) and, when the invisible half
+was red, `post_red_files`, `baseline_red_files` and `new_red_files`; and
+`installed-release.yaml` gains `c4_mode: baseline-differential`, `baseline_reds`
+and `baseline_red_files`, because `verified: true` alone cannot tell it from a
+strict pass. Measurement and the alternatives rejected:
 `core/config/rationale/c4-baseline-differential.md`.
 
 ### Rollback is framework-SCOPED, and adopt checkpoints first (normative, g-360-17)
@@ -307,8 +359,13 @@ independently:
    gates AUTHORING; an adoption installs already-gated content).
 2. **`rollback()` is scoped** — `git reset --soft <source_sha>` (HEAD moves;
    index and working tree do not), then `git checkout <source_sha> -- <the
-   framework paths that existed there>` and `git rm -rf` for the ones the
-   adoption ADDED. The path set is read from `promotion-preflight.py` via
+   framework paths that existed there>`, `git rm -rf` for the roots the adoption
+   ADDED, and `git rm -f` for every FILE it added inside a root that already
+   existed (read tree to tree from the commits, `source_sha..HEAD-before-reset`,
+   never from the index, and batched so 900 paths do not overflow a Windows
+   command line). `git checkout <sha> -- <root>` restores what the sha had and
+   never deletes what it did not (guard-1340): the first real downstream
+   rollback left 904 staged adds that way. The path set is read from `promotion-preflight.py` via
    `framework_paths()`, never re-declared. When that set cannot be resolved,
    rollback REFUSES rather than widening back to the tree.
 

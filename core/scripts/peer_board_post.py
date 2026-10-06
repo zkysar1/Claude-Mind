@@ -38,6 +38,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 ENV_REGISTRY = PROJECT_ROOT / "core" / "config" / "environments"
 
 # Exit codes -- distinct so callers can branch. 3 is the common, expected one.
+# 4 also covers a body the outbound data-class gate refused ().
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_PEER_UNREACHABLE = 3
@@ -144,6 +146,9 @@ def _force_peer_backend(env_id: str, registry: dict) -> str:
 # whole module is built around. Its own directory is sys.path[0] when this
 # script runs directly.
 import _grants  # noqa: E402
+# The outbound data-class checker's refusal rc. The module is stdlib-only at import
+# (its storage imports are lazy), so this cannot bind a backend either.
+from outbound_data_class import REFUSAL_RC as DATA_CLASS_REFUSAL_RC  # noqa: E402
 
 
 def build_record(*, author: str, channel: str, msg_type: str, text: str,
@@ -175,6 +180,34 @@ def build_record(*, author: str, channel: str, msg_type: str, text: str,
     return rec
 
 
+def _data_class_gate(text: str, override: str, record: bool = True) -> None:
+    """Refuse a body carrying the owner's personal address or a credential ().
+
+    A SUBPROCESS, run BEFORE ``_force_peer_backend``, and both are load-bearing: the
+    checker's gate-firings row and override-ledger row are THIS deployment's records,
+    and the storage layer binds its backend from process env at import time -- a check
+    that imported ``_fileops`` after the pin would write them to the PEER's store (the
+    guard-955 / rb-2983 hazard this module exists to prevent). Its stderr is the
+    refusal text, so it is inherited, not captured. rc DATA_CLASS_REFUSAL_RC = refused;
+    any other non-zero rc means the checker could not run, which fails OPEN and LOUD
+    (guard-142, guard-3737): a gate that blocks posts must not take the channel down.
+    """
+    script = PROJECT_ROOT / "core" / "scripts" / "outbound_data_class.py"
+    try:
+        rc = subprocess.run([sys.executable, str(script), "--surface", "peer-board-post",
+                             "--override", override] + ([] if record else ["--no-record"]),
+                            input=text.encode("utf-8"), timeout=60).returncode
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[peer-board-post] WARN: outbound data-class gate could not run "
+              f"({type(e).__name__}) -- posting UNCHECKED.", file=sys.stderr)
+        return
+    if rc == DATA_CLASS_REFUSAL_RC:
+        sys.exit(EXIT_REFUSED)
+    if rc != 0:
+        print(f"[peer-board-post] WARN: outbound data-class gate could not run (rc={rc}) "
+              f"-- posting UNCHECKED.", file=sys.stderr)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="peer-board-post",
@@ -188,6 +221,9 @@ def main(argv=None) -> int:
     ap.add_argument("--author", default="", help="override; default <agent>@<this-env-id>")
     ap.add_argument("--dry-run", action="store_true",
                     help="resolve + validate + print the record, write nothing")
+    ap.add_argument("--override-data-class", dest="override_data_class", default="",
+                    help="justification that a match is a FALSE POSITIVE (not the owner's "
+                         "address / a credential); ledgered")
     args = ap.parse_args(argv)
 
     if not CHANNEL_RE.match(args.channel or ""):
@@ -227,6 +263,8 @@ def main(argv=None) -> int:
     text = sys.stdin.read().strip()
     if not text:
         _die(EXIT_USAGE, "empty message on stdin. Usage: echo \"msg\" | peer-board-post.sh --peer <id> --channel <ch>")
+
+    _data_class_gate(text, args.override_data_class, record=not args.dry_run)
 
     registry = read_registry(args.peer)
     world = peer_world_path(args.peer, registry)

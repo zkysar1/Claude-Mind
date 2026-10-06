@@ -17,6 +17,7 @@ import json
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,22 @@ def _forget(retention: Path, key: str, *, apply: bool = True, report: dict | Non
 def _undo(retention: Path, key: str, *, report: dict | None = None) -> int:
     return apply_mod.main(["--handle", _handle(key), "--op", "undo",
                            f"--retention-dir={retention}", "--apply"], report)
+
+
+def _undo_sent_at(retention: Path, key: str, sent_at: str, *, report: dict | None = None) -> int:
+    """An undo the drain hands the applier with the time the member sent it."""
+    return apply_mod.main(["--handle", _handle(key), "--op", "undo", f"--retention-dir={retention}",
+                           f"--queued-at={sent_at}", "--apply"], report)
+
+
+def _window_ended(retention: Path, key: str, ago: datetime.timedelta) -> datetime.datetime:
+    """Move a retained record's ``undo_until`` to ``ago`` before now, and return that instant."""
+    path = knowledge_retention.record_path(retention, "node", key)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    until = (datetime.datetime.now(datetime.timezone.utc) - ago).replace(microsecond=0)
+    record["undo_until"] = until.isoformat()
+    path.write_text(json.dumps(record, sort_keys=True), encoding="utf-8")
+    return until
 
 
 def _keys(world: Path) -> set:
@@ -426,6 +443,99 @@ def test_undo_after_the_window_is_refused_and_changes_nothing(world, retention, 
 
     assert (rc, report) == (3, {"refused": "undo_expired"})
     assert _files(world, retention) == stores
+
+
+# --- an undo is judged by when the member sent it ( u7e) ----------------------------
+#
+# A stopped home applies nothing. The window the member saw ("undo until X") can close while
+# their undo waits in the queue, and judging it at apply time would refuse an undo that was sent
+# in time. Each case below moves the window's end to a day ago, so apply time is outside it, and
+# varies only what the member sent.
+
+
+def test_an_undo_sent_inside_the_window_is_restored_even_when_it_is_applied_after_it(
+        world, retention):
+    original = _page(world, "acme/acme-widgets.md").read_bytes()
+    _forget(retention, "acme-widgets")
+    until = _window_ended(retention, "acme-widgets", datetime.timedelta(days=1))
+    sent = (until - datetime.timedelta(hours=1)).isoformat()
+    report = {}
+
+    rc = _undo_sent_at(retention, "acme-widgets", sent, report=report)
+
+    assert rc == 0 and "refused" not in report, report
+    assert _page(world, "acme/acme-widgets.md").read_bytes() == original
+    assert "acme-widgets" in _index(world)["nodes"]
+    (_path, record), = list(knowledge_retention.list_records(retention))
+    assert not knowledge_retention.is_live(record), "the retained record now holds a marker, not the text"
+
+
+def test_an_undo_sent_a_second_after_the_window_is_refused_and_changes_nothing(world, retention):
+    _forget(retention, "acme-widgets")
+    until = _window_ended(retention, "acme-widgets", datetime.timedelta(days=1))
+    stores = _files(world, retention)
+    report = {}
+
+    rc = _undo_sent_at(retention, "acme-widgets", (until + datetime.timedelta(seconds=1)).isoformat(),
+                       report=report)
+
+    assert (rc, report) == (3, {"refused": "undo_expired"})
+    assert _files(world, retention) == stores, "a refusal writes nothing"
+
+
+def test_an_undo_sent_in_the_last_instant_of_the_window_is_inside_it(world, retention):
+    """The same edge ``in_window`` has: the window includes its own last instant."""
+    _forget(retention, "acme-widgets")
+    until = _window_ended(retention, "acme-widgets", datetime.timedelta(days=1))
+
+    assert _undo_sent_at(retention, "acme-widgets", until.isoformat()) == 0
+
+
+def test_a_send_time_after_now_is_never_stricter_than_the_apply_time(world, retention):
+    """A stamp from a clock that runs ahead cannot refuse an undo that applying it now would
+    accept: the judgment moment is the earlier of the send time and now."""
+    _forget(retention, "acme-widgets")  # a fresh forget: its window is open for 30 days
+    ahead = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=60)).isoformat()
+
+    assert _undo_sent_at(retention, "acme-widgets", ahead) == 0
+
+
+@pytest.mark.parametrize("sent", ["", "yesterday", "2026-13-45T00:00:00", "   "])
+def test_a_send_time_that_cannot_be_read_is_judged_by_the_apply_time(world, retention, sent):
+    _forget(retention, "acme-widgets")
+    # the window is open: an unreadable stamp does not break an undo that applying it now accepts
+    assert _undo_sent_at(retention, "acme-widgets", sent) == 0
+    # the window is over: an unreadable stamp does not rescue one
+    _forget(retention, "acme-widgets")
+    _window_ended(retention, "acme-widgets", datetime.timedelta(days=1))
+    report = {}
+
+    rc = _undo_sent_at(retention, "acme-widgets", sent, report=report)
+
+    assert (rc, report) == (3, {"refused": "undo_expired"})
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="the box clock zone cannot be changed here")
+@pytest.mark.parametrize("zone", ["Pacific/Auckland", "America/Los_Angeles"])
+def test_a_send_time_without_an_offset_is_read_as_utc_whatever_zone_the_box_is_in(
+        world, retention, zone):
+    """The intake's stamp has no offset. A reader that took it as the box's local time would move
+    the judgment by hours, and on one side of the window's edge that is the difference."""
+    _forget(retention, "acme-widgets")
+    until = _window_ended(retention, "acme-widgets", datetime.timedelta(days=1))
+    inside = (until - datetime.timedelta(minutes=30)).replace(tzinfo=None).isoformat()
+    outside = (until + datetime.timedelta(minutes=30)).replace(tzinfo=None).isoformat()
+    with pytest.MonkeyPatch.context() as in_zone:
+        in_zone.setenv("TZ", zone)
+        time.tzset()
+        try:
+            refused = {}
+            assert _undo_sent_at(retention, "acme-widgets", outside, report=refused) == 3
+            assert refused == {"refused": "undo_expired"}
+            assert _undo_sent_at(retention, "acme-widgets", inside) == 0
+        finally:
+            in_zone.undo()
+            time.tzset()
 
 
 def test_undo_is_refused_when_the_key_is_back_in_the_index(world, retention):

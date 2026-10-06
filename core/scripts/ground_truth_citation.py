@@ -120,10 +120,13 @@ _RULE_ID = re.compile(r"\b(?:guard|rb)-\d{2,6}\b")
 # The surviving discriminator is structural, not lexical: a genuine node key
 # in this store is kebab-case (the naming rule), so the run must contain a
 # kebab segment; a genuine FILE citation is anchored by its extension. Census
-# over the live tree (2026-10-03): every multi-segment node key of the 3,264
-# live keys contains a kebab segment (0 of 3,260 without), and the corpus
-# census below shows the dropped set is the phantom class while every pinned
-# test token and every live key still matches.
+# over the live tree (2026-10-03, 3,270 keys): 0 of the 3,266 multi-segment
+# keys lacks a kebab segment; 3,261 keys extract whole under BOTH grammars,
+# 0 extract whole under the old but not the new (zero regressions), and 9
+# (single-segment roots, dot-prefixed ".archive/" and uppercase "RECEIPT"
+# shapes) extract non-whole under both -- so every genuine live key still
+# matches, and the corpus census below shows the dropped set is the phantom
+# class.
 #
 # THREE ALTERNATIVES (ordered; the file form first so the extension binds the
 # WHOLE run -- "core/scripts/wm-read.sh" must not split into a truncated key
@@ -144,17 +147,19 @@ _RULE_ID = re.compile(r"\b(?:guard|rb)-\d{2,6}\b")
 # than a regex swap: that comment rejected "require a hyphen or a known root"
 # as guard-1901 alarm suppression because it would drop genuine
 # unhyphenated node keys. Census over the full goal-corpus exports (10,938
-# fields / 24.5M chars, 2026-10-03): the old extractor yielded 7,155 distinct
-# node-key tokens (23,188 total); this grammar yields 3,970 (11,503) and GAINS
-# 1,562 distinct extension-terminated citations (5,310 total) the old grammar
-# truncated or missed. The 4,747 distinct dropped tokens (16,776 total) are the
-# phantom class: at retrieved=False (the worst case for suppression) 13,466
-# previously-reported cluster spans are still flagged and 1,885 are not -- and
-# by construction every one of those 1,885 carried ONLY node-key tokens (no
-# url: a url would still be extracted and still flagged), so each returns to
-# the pre-existing corpus-wide `if not checkable: continue` policy rather than
-# to a hidden pass -- the same shape as the 18 ratio notes the _RATIO_RUN note
-# measured, where the lost alarm was never real.
+# fields / 24.5M chars, 2026-10-03, old baseline pinned at the pre-rewrite
+# module): the old extractor yielded 7,155 distinct node-key tokens (23,188
+# total); this grammar yields 4,972 (14,294) and GAINS 2,878 distinct tokens
+# (9,170 total) the old grammar truncated or missed (extension-terminated and
+# underscore-bearing forms). The 5,061 distinct dropped tokens (17,633 total)
+# are the phantom class: at retrieved=False (the worst case for suppression)
+# 13,789 previously-reported cluster spans are still flagged and 1,562 are
+# not -- and MEASURED, every one of those 1,562 carries only goal-id /
+# board-msg / rule-id tokens under the new extractor (1,202 goal-id, 135
+# board-msg, 778 rule-id occurrences; none url or node-key), so each returns
+# to the pre-existing corpus-wide `if not checkable: continue` policy rather
+# than to a hidden pass -- the same shape as the 18 ratio notes the
+# _RATIO_RUN note measured, where the lost alarm was never real.
 #
 # THE ONE PINNED TOKEN THIS DROPS, documented rather than left for a future
 # reader to find: "runs/32023260302" (all-digit segments, no kebab) no longer

@@ -218,8 +218,87 @@ def test_intrinsic_reasons_without_a_clock_stay_no_clock():
     """The residue the name is FOR: blocked for a reason true for everyone, age unknown."""
     g = _goal("g-i")
     for reason in ("explicit_status", "infrastructure", "dependency", "deferred",
-                   "hypothesis_gate", "precondition_unmet"):
+                   "precondition_unmet"):
         assert sgr.classify(g, {"g-i": reason}, NOW) == "no_clock", reason
+
+
+# ═════════════ a wait with a KNOWN END is `scheduled`, not an unknown age ═════════════
+# . A goal blocked only by a future-dated gate has no block event to stamp,
+# and its end is already on the record. Measured 2026-10-03: 26 of the 54 unclocked.
+
+def _later(days):
+    return (NOW + dt.timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def test_an_unclocked_hypothesis_gate_goal_is_scheduled():
+    """goal-selector.py emits hypothesis_gate only while now < resolves_no_earlier_than,
+    so the reason alone proves the end is ahead. Measured 2026-10-03: 21 of 21 had it."""
+    g = _goal("g-h", resolves_no_earlier_than=_later(9))
+    assert sgr.classify(g, {"g-h": "hypothesis_gate"}, NOW) == "scheduled"
+
+
+def test_a_deferred_goal_is_scheduled_only_while_its_own_date_is_ahead():
+    """`deferred` has several doors (a defer_reason, a handoff, a never-expiring prefix,
+    a dated deferred_until) and only the last is dated, so the goal's own field decides
+    (guard-6861): a door that leaves no date must stay no_clock."""
+    reasons = {"g-d": "deferred"}
+    assert sgr.classify(_goal("g-d", deferred_until=_later(3)), reasons, NOW) == "scheduled"
+    assert sgr.classify(_goal("g-d", deferred_until=_iso(3)), reasons, NOW) == "no_clock"   # passed
+    assert sgr.classify(_goal("g-d"), reasons, NOW) == "no_clock"                           # no date
+    assert sgr.classify(_goal("g-d", deferred_until="soon"), reasons, NOW) == "no_clock"    # unparseable
+    assert sgr.classify(_goal("g-d", defer_reason="handoff: x"), reasons, NOW) == "no_clock"
+
+
+def test_a_future_date_does_not_make_another_reason_scheduled():
+    """The date is read for `deferred` alone: a goal blocked for another reason that happens
+    to carry a future deferred_until is not scheduled by it."""
+    g = _goal("g-p", deferred_until=_later(3))
+    for reason in ("precondition_unmet", "explicit_status", "dependency", "infrastructure"):
+        assert sgr.classify(g, {"g-p": reason}, NOW) == "no_clock", reason
+
+
+def test_a_clocked_goal_is_aged_even_when_a_date_is_ahead():
+    """ANTI-LAUNDERING again: the clock is tested first, so a future date cannot lift a
+    stall out of stalled_goals."""
+    dated = _goal("g-o", blocked_since=_iso(30), deferred_until=_later(3))
+    assert sgr.classify(dated, {"g-o": "deferred"}, NOW) == "stalled"
+    gated = _goal("g-o2", blocked_since=_iso(30))
+    assert sgr.classify(gated, {"g-o2": "hypothesis_gate"}, NOW) == "stalled"
+
+
+def test_scheduled_moves_no_baseline_key():
+    """Differential on one corpus: a plain id set (the old call shape) and the reason
+    mapping give the same drift_total, human_blocked_total and stalled rows. Only
+    unclocked rows leave no_clock, and the buckets still partition the population."""
+    goals = [
+        _goal("s1", blocked_since=_iso(30)),                      # stalled
+        _goal("h1", defer_reason="human_blocked: x"),             # human_blocked
+        _goal("a1", resolves_no_earlier_than=_later(9)),          # scheduled (hypothesis)
+        _goal("a2", deferred_until=_later(2)),                    # scheduled (deferred)
+        _goal("n1"),                                              # no clock, a probe
+        _goal("n2", deferred_until=_iso(1)),                      # no clock, the date has passed
+    ]
+    reasons = {"s1": "deferred", "h1": "deferred", "a1": "hypothesis_gate",
+               "a2": "deferred", "n1": "precondition_unmet", "n2": "deferred"}
+    old = sgr.census(goals, set(reasons), NOW)
+    new = sgr.census(goals, reasons, NOW)
+    assert new["drift_total"] == old["drift_total"] == 1
+    assert new["human_blocked_total"] == old["human_blocked_total"] == 1
+    assert new["rows"]["stalled"] == old["rows"]["stalled"]
+    assert old["breakdown"]["no_clock"] == 4
+    assert new["breakdown"] == dict(old["breakdown"], no_clock=2, scheduled=2)
+    assert sum(new["breakdown"].values()) == new["scanned"] == len(goals)
+
+
+def test_scheduled_reasons_are_pinned_and_match_what_the_selector_emits():
+    """Stated literally so shrinking the constant fails here. Drift guard: the reason is
+    matched by string and the date fields by name, so a rename in goal-selector.py would
+    send every scheduled goal back into no_clock."""
+    assert set(sgr.SCHEDULED_REASONS) == {"hypothesis_gate"}
+    src = (SCRIPTS / "goal-selector.py").read_text(encoding="utf-8")
+    assert 'entry["block_reason"] = "hypothesis_gate"' in src
+    assert 'rne = goal.get("resolves_no_earlier_than")' in src
+    assert 'deferred = goal.get("deferred_until")' in src
 
 
 def test_an_unknown_or_absent_reason_falls_back_to_no_clock():
@@ -315,8 +394,28 @@ def test_summary_names_the_split_and_keeps_it_out_of_the_denominator(monkeypatch
     assert sgr.main(["--dry-run"]) == 0
     out = capsys.readouterr().out
     assert "stalled_goals=1 (blocked >14d, of 3 blocked)" in out
-    assert "[not counted: no_clock=1, young=1, runner_relative=2, candidate=1]" in out
+    assert "[not counted: no_clock=1, young=1, runner_relative=2, candidate=1, scheduled=0]" in out
     assert "scanned=6" in out
+
+
+def test_summary_names_scheduled_in_the_bracket_and_keeps_it_out_of_the_denominator(
+        monkeypatch, capsys):
+    """: a goal waiting on a known date is not stuck work either, so "of N
+    blocked" must not count it, and the bracket must name it."""
+    def real(days_ago):
+        return (dt.datetime.now() - dt.timedelta(days=days_ago)).isoformat(timespec="seconds")
+    ahead = (dt.datetime.now() + dt.timedelta(days=3)).isoformat(timespec="seconds")
+    goals = [_goal("s1", blocked_since=real(30)), _goal("n1"), _goal("h1"),
+             _goal("d1", deferred_until=ahead)]
+    reasons = {"s1": "deferred", "n1": "precondition_unmet", "h1": "hypothesis_gate",
+               "d1": "deferred"}
+    monkeypatch.setattr(sgr, "_load_population", lambda: goals)
+    monkeypatch.setattr(sgr, "_blocked_ids", lambda: reasons)
+    assert sgr.main(["--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "stalled_goals=1 (blocked >14d, of 2 blocked)" in out
+    assert "[not counted: no_clock=1, young=0, runner_relative=0, candidate=0, scheduled=2]" in out
+    assert "scanned=4" in out
 
 
 def test_unparseable_timestamp_is_no_clock_not_a_crash():
@@ -462,7 +561,7 @@ def test_real_corpus_mix_reproduces_the_measured_shape():
     blocked = _ids(*goals) - {"g-live"}
     c = sgr.census(goals, blocked, NOW)
     assert c["breakdown"] == {"terminal": 0, "executable": 1, "human_blocked": 1,
-                              "runner_relative": 0, "candidate": 0,
+                              "runner_relative": 0, "candidate": 0, "scheduled": 0,
                               "no_clock": 2, "stalled": 3, "young": 1}
     assert c["drift_total"] == 3            # stalled only
     assert c["human_blocked_total"] == 1    # its own ratchet

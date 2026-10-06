@@ -105,9 +105,13 @@ def read_invocations(agent_name, since_dt=None):
 #   - journal 'Outcome: deep|routine|durable' line              -> success
 #   - execution-diary reaching 'phase-12-productivity' phase_end -> success (closed)
 #   - a goal with a diary window that NEVER reached close and is
-#     not the in-flight (last, open) goal                        -> failure
+#     not the in-flight (last, open) goal                        -> failure, unless the
+#     goal store says the goal is completed/decomposed             -> success ()
 #   - journal 'Outcome: deferred'                                -> failure
 #   - no attributable window / no signal                         -> unknown
+# The never-closed failure is scored from the ABSENCE of a success signal on THIS box
+# (diary and journal are per-box read-through caches), so it is the one branch the
+# store may overrule; an explicit 'deferred' is evidence and stays a failure.
 #
 # Join key: agent + time-window. The invocation's sid scopes to the agent's
 # ledger; the execution-diary is that agent's single append-only timeline, so
@@ -118,6 +122,15 @@ def read_invocations(agent_name, since_dt=None):
 
 SUCCESS_OUTCOMES = {'deep', 'routine', 'durable'}
 CLOSE_PHASE = 'phase-12-productivity'
+# Terminal store statuses that are NOT a failure (): a goal the store says
+# completed, or split into sub-goals, did not fail, whatever this box's diary shows.
+COMPLETED_STATUSES = {'completed', 'decomposed'}
+# Diary rows that may OPEN a goal window. Only these say "this agent is executing
+# <goal_id>"; a finding/observation/decision row carries the id of the goal it is ABOUT,
+# so letting it open a window splits the executing goal's window and mints a never-closed
+# phantom window for the other goal ().
+WINDOW_OPENING_ENTRY_TYPES = {'phase_start', 'phase_end', 'scorer_override'}
+_GOAL_ID_RE = re.compile(r'^g-[0-9]+-[0-9]+$')
 _GOAL_LINE_RE = re.compile(r'Goal:\s*\(?(g-[0-9]+-[0-9]+)\)?')
 _OUTCOME_LINE_RE = re.compile(r'Outcome:\s*(\w+)')
 
@@ -210,9 +223,13 @@ def build_goal_windows(diary_rows):
 
     Contiguous same-goal entries collapse into one run; a window ends where the
     NEXT distinct goal begins (the last window's end is None = open/in-flight).
+    Only WINDOW_OPENING_ENTRY_TYPES rows keyed by a real goal id count: a row ABOUT
+    another goal must not split the executing goal's window or open a phantom one, and
+    a non-goal token ('precheck', 'none') is no goal to score (g-115-4215).
     """
     seq = [(r['goal_id'], r['timestamp']) for r in diary_rows
-           if r.get('goal_id') and r.get('timestamp')]
+           if r.get('timestamp') and r.get('entry_type') in WINDOW_OPENING_ENTRY_TYPES
+           and _GOAL_ID_RE.match(str(r.get('goal_id') or ''))]
     runs = []  # [goal_id, first_ts, last_ts]
     for gid, ts in seq:
         if runs and runs[-1][0] == gid:
@@ -226,8 +243,10 @@ def build_goal_windows(diary_rows):
     return windows
 
 
-def _resolve_window_outcome(gid, start, end, is_last, journal_out, close_ts):
-    """success | failure | unknown for one goal window (see module join docstring)."""
+def _resolve_window_outcome(gid, start, end, is_last, journal_out, close_ts, goal_status=None):
+    """success | failure | unknown for one goal window (see module join docstring).
+
+    `goal_status` is the store's {goal_id: status} oracle (goal_status_map), or None."""
     jo = journal_out.get(gid)
     if jo in SUCCESS_OUTCOMES:
         return 'success'
@@ -239,6 +258,11 @@ def _resolve_window_outcome(gid, start, end, is_last, journal_out, close_ts):
             return 'success'
     if is_last and end is None:
         return 'unknown'  # most-recent, open window — in-flight, not yet closed
+    # No success signal on THIS box, and the store is the authority on whether the goal
+    # completed: a goal a peer closed leaves no local evidence ( read-through
+    # cache), so absence here is not a failure ().
+    if goal_status and goal_status.get(gid) in COMPLETED_STATUSES:
+        return 'success'
     return 'failure'      # window exists, no success signal, not in-flight
 
 
@@ -250,15 +274,73 @@ def _locate_invocation(ts, win_outcomes):
     return 'unknown', None
 
 
-def compute_join(agents, since_dt=None):
+def read_goals():
+    """Read every goal the store holds -> (goals, errors).
+
+    Both queues (world, agent), live AND archive, plus the census of EVICTED ids: a
+    terminal goal leaves its aspiration after aspirations_eviction.age_days and survives
+    only as a bare id under archived_census.evicted_ids (keyed by status), and a goal in
+    a completed aspiration is absent from every live read (guard-1555) -- so a live-only
+    lookup reports "not found" for goals that provably completed (g-353-108). Records are
+    slimmed to what the join and the reconsolidation dedup consume.
+
+    A failed read is RETURNED in `errors`, never swallowed: an empty oracle renders
+    identically to a healthy one that had nothing to clear (guard-3992), so the caller
+    must be able to tell them apart. An undecodable body still aborts (guard-383).
+    """
+    import _rt  # noqa: E402 -- lazy: only the outcome/reconsolidation paths need the daemon
+    import _goal_census  # noqa: E402
+    goals, errors = [], []
+    for source in ('world', 'agent'):
+        for archive in (False, True):
+            label = '%s/%s' % (source, 'archive' if archive else 'live')
+            try:
+                raw = _rt.aspirations_read(source=source, active=not archive, archive=archive)
+            except Exception as e:  # noqa: BLE001 -- recorded in errors, not raised
+                errors.append('%s: %s' % (label, e))
+                continue
+            data = _rt.tolerant_decode_aggregate('skill-attribution goals: %s' % label, raw)
+            for asp in (data.get('aspirations') if isinstance(data, dict) else data) or []:
+                for g in asp.get('goals') or []:
+                    gid = g.get('id') or g.get('goal_id')
+                    if gid:
+                        goals.append({
+                            'id': gid, 'status': g.get('status'), 'source': source,
+                            'origin_signal': g.get('origin_signal'),
+                            'completed_at': g.get('completed_at') or g.get('completed_date'),
+                        })
+                for status, ids in _goal_census.census_evicted_ids(asp).items():
+                    goals.extend({'id': gid, 'status': status, 'source': source,
+                                  'evicted': True} for gid in ids)
+    return goals, errors
+
+
+def goal_status_map(goals):
+    """{goal_id: status} from read_goals() records. An id held with two different
+    statuses (a cross-queue id collision; 7 of 7131 ids measured 2026-10-04) is dropped:
+    ambiguous is not evidence, and the join leaves that window as it was."""
+    seen = defaultdict(set)
+    for g in goals:
+        if g.get('status'):
+            seen[g['id']].add(g['status'])
+    return {gid: next(iter(st)) for gid, st in seen.items() if len(st) == 1}
+
+
+def compute_join(agents, since_dt=None, goal_status=None):
     """Join invocations to enclosing-goal outcomes across `agents`.
 
+    `goal_status` is the goal store's {goal_id: status} oracle (read_goals +
+    goal_status_map); None means no oracle, so a window's outcome rests on this box's
+    diary and journal alone.
+
     Returns {'per_skill': {skill: {success, failure, unknown, classified,
-    success_rate}}, 'failing': [{skill, goal_id, ts, agent}]}.
+    success_rate}}, 'failing': [{skill, goal_id, ts, agent}], 'diary_coverage': {...},
+    'goal_status_check': {...}}.
     """
     per_skill = defaultdict(lambda: {'success': 0, 'failure': 0, 'unknown': 0})
     failing = []
     coverage = {}
+    windows_cleared = failure_windows = failure_windows_unknown = 0
     for ag in agents:
         invs = read_invocations(ag, since_dt=since_dt)
         if not invs:
@@ -273,7 +355,16 @@ def compute_join(agents, since_dt=None):
         for idx, (gid, start, end) in enumerate(windows):
             is_last = idx == len(windows) - 1
             outcome = _resolve_window_outcome(gid, start, end, is_last,
-                                              journal_out, close_ts)
+                                              journal_out, close_ts, goal_status)
+            if goal_status is not None:
+                # Carry the control (guard-3992): how many windows the store cleared, and
+                # how many failures it could NOT check, so a blind oracle is visible.
+                if outcome == 'failure':
+                    failure_windows += 1
+                    failure_windows_unknown += gid not in goal_status
+                elif _resolve_window_outcome(gid, start, end, is_last,
+                                             journal_out, close_ts) == 'failure':
+                    windows_cleared += 1
             win_outcomes.append((gid, start, end, outcome))
         # Diary coverage ( part 2): the two ledgers have ASYMMETRIC
         # retention — skill-invocations.jsonl is append-only across months, while
@@ -316,6 +407,12 @@ def compute_join(agents, since_dt=None):
     failing.sort(key=lambda f: f['ts'])
     tot_inv = sum(c['invocations'] for c in coverage.values())
     tot_span = sum(c['invocations_in_diary_span'] for c in coverage.values())
+    # classified_invocations is the COUNT the join actually classified (success +
+    # failure). classifiable_ceiling counts span membership while classification
+    # counts WINDOW membership, so once one agent's span decouples from its windows
+    # the ceiling stops being an upper bound (, zeta 2026-08-20: 6574
+    # classified against a stated ceiling of 2023). Emit both so a reader compares them.
+    tot_classified = sum(v['classified'] for v in out.values())
     return {
         'per_skill': out,
         'failing': failing,
@@ -324,6 +421,13 @@ def compute_join(agents, since_dt=None):
             'invocations': tot_inv,
             'classifiable_ceiling': tot_span,
             'ceiling_ratio': round(tot_span / tot_inv, 4) if tot_inv else None,
+            'classified_invocations': tot_classified,
+        },
+        'goal_status_check': {
+            'oracle_goals': len(goal_status) if goal_status is not None else None,
+            'windows_cleared': windows_cleared,
+            'failure_windows': failure_windows,
+            'failure_windows_status_unknown': failure_windows_unknown,
         },
     }
 
@@ -461,7 +565,10 @@ def main():
     # Invocation -> outcome join (opt-in; heavier — reads diaries + journals)
     join = None
     if args.with_outcomes or args.failing_invocations:
-        join = compute_join(agents, since_dt=since_dt)
+        goals, goal_errors = read_goals()
+        for err in goal_errors:
+            print('[skill-attribution] goal store read failed: %s' % err, file=sys.stderr)
+        join = compute_join(agents, since_dt=since_dt, goal_status=goal_status_map(goals))
         # Fold per-skill outcome counts into stats for the report paths
         for sk, oc in join['per_skill'].items():
             if sk in stats:
@@ -496,6 +603,7 @@ def main():
                 # emitted (guard-2046: a step naming both a command and a
                 # capture list is an unverified pairing).
                 'diary_coverage': join['diary_coverage'],
+                'goal_status_check': join['goal_status_check'],
             }, indent=2, default=str))
         else:
             print(f"=== failing invocations ({len(failing)}) ===")

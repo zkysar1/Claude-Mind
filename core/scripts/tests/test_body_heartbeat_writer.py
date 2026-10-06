@@ -413,6 +413,87 @@ def test_carrier_is_valid_json_with_an_absent_manifest():
         assert doc["sid"] == SID
 
 
+# --- 6b. main_base: the per-Body reader proof ( U23) ---------------
+def _git_root_with_origin_main(root: Path) -> tuple[str, str]:
+    """git-init `root` with origin/main at commit A and HEAD one local commit
+    past it (B). That is the WORKER shape: HEAD is a local merge no other box
+    can resolve, so a carrier that published HEAD would be unreadable fleet-wide.
+    """
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t",
+             "-c", "commit.gpgsign=false", *args],
+            capture_output=True, text=True, check=True).stdout.strip()
+
+    git("init", "-q")
+    git("commit", "-q", "--allow-empty", "-m", "a")
+    base = git("rev-parse", "HEAD")
+    git("update-ref", "refs/remotes/origin/main", base)
+    git("commit", "-q", "--allow-empty", "-m", "b")
+    return base, git("rev-parse", "HEAD")
+
+
+def test_carrier_publishes_the_newest_origin_main_commit_its_checkout_contains():
+    """`main_base` is what the store-cutover gate reads to ask whether THIS
+    Body's checkout carries a seam commit. It is the origin/main ANCESTOR of
+    HEAD, never HEAD: a worker's HEAD is a local merge. The last assertions feed
+    the real writer's output through the real reader, so a rename on either side
+    fails here rather than silently producing `no_main_base` fleet-wide."""
+    import importlib.util
+    import json
+    from datetime import datetime
+
+    if shutil.which("git") is None:
+        import pytest
+        pytest.skip("git unavailable")
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True, state="IDLE")
+        base, head = _git_root_with_origin_main(root)
+        assert base != head
+        r = _tick(root, adir, sid=SID)
+        c = _carrier(adir)
+        assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
+        doc = json.loads(c.read_text(encoding="utf-8"))
+        assert doc["main_base"] == base, (
+            f"the carrier must carry the newest origin/main commit the checkout "
+            f"contains ({base}), not HEAD ({head}). doc={doc} stderr={r.stderr[-400:]}")
+        # The fields every other reader keys on survive the added one.
+        assert doc["sid"] == SID and doc["ts"] and doc["body_state"] == ""
+
+        spec = importlib.util.spec_from_file_location(
+            "scc_for_carrier_pin", REPO / "core" / "scripts" / "store-cutover-check.py")
+        scc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scc)
+        proved = []
+        out = scc.evaluate_bodies(
+            [{"agent": AGENT, "sid": SID, "doc": doc}],
+            {"complete": True, "read_via": "authoritative"}, datetime.now(),
+            lambda b: proved.append(b) or {"proven": True}, frozenset())
+        assert proved == [base] and out["all_proven"] is True, out
+
+
+def test_carrier_without_an_origin_main_ref_is_written_with_an_empty_main_base():
+    """FAIL-OPEN and LOUD. A checkout that cannot name its origin/main base still
+    publishes a well-formed carrier (liveness must never depend on git), with the
+    field EMPTY, which the gate reads as `no_main_base` and refuses. The refusal
+    is not silent: the tick says why on stderr (rb-400)."""
+    import json
+
+    if shutil.which("git") is None:
+        import pytest
+        pytest.skip("git unavailable")
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True, state="IDLE")
+        subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)  # no origin/main
+        r = _tick(root, adir, sid=SID)
+        c = _carrier(adir)
+        assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
+        doc = json.loads(c.read_text(encoding="utf-8"))  # must still parse
+        assert doc["main_base"] == ""
+        assert doc["sid"] == SID and doc["ts"]
+        assert "main_base not published" in r.stderr, r.stderr[-400:]
+
+
 # --- 7. the IDLE refusal is NOT stop-scoped () -------------------
 def test_idle_refusal_is_not_stop_scoped():
     """A stop in progress must NOT buy an exemption from the IDLE gate.

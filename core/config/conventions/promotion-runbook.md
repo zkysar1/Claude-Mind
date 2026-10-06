@@ -178,6 +178,19 @@ bash core/scripts/promote-to-upstream.sh --target <dest-clone> \
      --branch "promote/vX.Y.Z" --pr
 ```
 
+**Daemon-survival capture (g-374-89 outcome 4; the mechanism is NOT established).**
+The plant commit fires the dest's post-commit hook, which restarts the daemon
+rooted at the throwaway plant worktree. Whether that ever reaches THIS box's live
+daemon is unknown: on v2.12.80 the live daemon died with no `stopped` event
+within a minute of the plant commit. Observe it; do not infer it. Before the run,
+record `cat mind_api/state/daemon.pid` and `wc -l mind_api/state/daemon.log`, and
+start a process sampler (`while :; do date +%T; ps -eo pid,ppid,etime,args --forest;
+sleep 1; done > <scratch>/ps-during-plant.log 2>&1 &`, killed after the run).
+After the plant, read the pid again and the new `daemon.log` lines (`stopped` /
+`started` events). Put the readings in the Phase 6 handoff post. If the pid
+changed, keep the sampler window around that moment and encode it in guard-6394's
+lineage, still without naming a cause.
+
 Merge the PR yourself once mergeable (guard-680 grant); sync the dest clone.
 
 **Then TAG the dest merge commit and push the tag** — this is the step nothing
@@ -343,7 +356,13 @@ Run every item; each is a one-liner and each has caught a real defect:
     g-360-16 the plant carries the bit at the GIT level after its `git add -A`
     (`_seed_engine.py carry-exec-bits`, fail-closed rc=11) and seed-verify
     Check 8 compares source index vs destination index (`verify-exec-bits`,
-    FAIL). This item stays as the independent read: `py -3
+    FAIL). That FAIL was printed but never counted until g-374-89 (`run_check`
+    read the negated status, so FAILS stayed 0 for checks 1/2/3/5/8): now a
+    failing check 1, 2 or 8 makes seed-verify exit 1 and the hop stop at
+    `post-promotion verify FAILED`, and a failing 3 or 5 raises WARNS. Checks 2
+    and 3 ask git whether a path can ship: runtime state the plant's own commit
+    hook creates at the dest (gitignored, untracked) prints as INFO, not a leak.
+    This item stays as the independent read: `py -3
     core/scripts/_seed_engine.py verify-exec-bits --source <worktree> --dest
     <dest>` prints `stripped: []` on a clean hop.
 11. Transform-only diffs — files that changed at the dest although their SOURCE

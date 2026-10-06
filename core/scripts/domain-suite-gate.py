@@ -546,6 +546,22 @@ def run_suite(scripts_dir: Path, timeout: int,
     rt_dir = tempfile.mkdtemp(prefix="domain-suite-rt-")
     env["RUNTIME_DIR"] = rt_dir
     env["RT_DIR"] = rt_dir
+    # : the isolation above leaves a unit that reaches a daemon-backed
+    # wrapper with NO daemon, and since b599f12f86 (, 2026-09-21) it cannot
+    # get one: an empty runtime dir may not spawn while ANY live daemon exists
+    # (daemon.log `start-refused`, reason `unreferenced-daemon-alive`). The wrapper
+    # still retries and then waits out the readiness window, so each such call burned
+    # ~15.5 s and failed anyway. Measured on cc-03: 17 calls in one unit = 277 s, with
+    # that unit's own timeout at 300 s and the gate's budget at 900 s. RT_NO_AUTOSPAWN
+    # (the flag _runtime.sh keeps for "daemon-down test suite, CI gates") makes the
+    # same call fail in ~0.02 s with the same rc and the same "daemon is unreachable"
+    # block, so a unit's own daemon-absent self-skip () still matches. The
+    # isolation itself is untouched; this only stops paying for a spawn that cannot
+    # succeed (guard-7037: never speed the gate up by deleting the isolation). Set
+    # unconditionally because the gate runs from a close, which itself needs the live
+    # daemon, so the refusal is the case in every close. A hand run on a box with no
+    # live daemon gets fast failures here where it used to get a private spawned one.
+    env["RT_NO_AUTOSPAWN"] = "1"
     # guard-4375: `timeout` is DECORATIVE against a Git-Bash child whenever
     # stdout or stderr is a PIPE. The kill fires on schedule; what blocks is the
     # post-kill communicate() reap inside subprocess.run — it takes no timeout,

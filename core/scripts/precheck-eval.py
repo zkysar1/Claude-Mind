@@ -280,6 +280,9 @@ def cmd_zombies(args, config, compact):
     aspiration's `motivation`; without one it cannot discharge the flag at all,
     so a single flag made that class re-fire forever. The orchestrator invokes
     the handler named by the flag, per entry.
+
+    An aspiration flagged `triage_inbox: true` is exempt from every kind: it is
+    a queue that never completes by design (g-353-183).
     """
     intent = config.get("intent_satisfaction") or {}
     zombie_ratio = intent.get("zombie_completion_ratio")
@@ -306,6 +309,14 @@ def cmd_zombies(args, config, compact):
     zombies = []
 
     for asp in active:
+        # The Triage Inbox is a queue, not a deliverable: it never completes by
+        # design, and groom.py resolves it as the live aspiration whose flag is
+        # literally True, so an agent routed to close it would defer every
+        # move-on-touch re-home (). Key on the flag, never the id, and
+        # on groom's own predicate (`is True`), or the two disagree on which
+        # aspiration is the inbox.
+        if asp.get("triage_inbox") is True:
+            continue
         goals = asp.get("goals", [])
         has_recurring = any(g.get("recurring") for g in goals)
         non_recurring = [g for g in goals if not g.get("recurring")]
@@ -1496,7 +1507,7 @@ def cmd_temp_pressure(args, config, compact):
     # default exists), while this one only gates ESCALATION of an
     # already-filed goal — a lagging config on a promoted box must degrade to
     # the pre-escalation behavior, not brick the whole temp-pressure check
-    # (guard-4653 promotion-coupling class).
+    # (guard-4654 promotion-coupling class).
     drain_goal_max_age_h = tp.get("drain_goal_max_age_hours") or 48
 
     # temp/ holds THREE file classes (core/config/conventions/temp-store.md).

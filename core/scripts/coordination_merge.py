@@ -5047,6 +5047,13 @@ _HANDLERS: Dict[str, Callable[[bytes, bytes], bytes]] = {
     "retrieval-trace.jsonl": merge_append_only_jsonl,
     "loop-death-detections.jsonl": merge_append_only_jsonl,
     "description-length-telemetry.jsonl": merge_append_only_jsonl,
+    # worker-ref-consume CARRY dispositions (worker_ref_carries.py): one line per
+    # hold/release, keyed on (ref, tip SHA). Strictly append-only BY DESIGN: a
+    # release is a record, never a deletion, and the reader takes the latest
+    # record per ref by `ts` (not file position, which a line-union interleaves),
+    # so resurrecting a line on a both-diverged merge is harmless here. Writer
+    # (_fileops.locked_append_jsonl) read and verified: no rewrite/prune path.
+    "worker-ref-carries.jsonl": merge_append_only_jsonl,
     # changelog.jsonl + its rotation target changelog-archive.jsonl (,
     # ports cc-02 7b6801e1; SUPERSEDES the  "pruned -> exclude" call).
     # changelog.jsonl IS rotated by store-hygiene.yaml, but the rotation MOVES

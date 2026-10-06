@@ -334,14 +334,21 @@ class _Handler(BaseHTTPRequestHandler):
                     return
                 _cust_token = set_customer(ctx.tenant)
 
-            _sid_token = None
+            _sid_token = _agent_token = _meta_token = None
             try:
-                # Name the calling session for gate telemetry. Gates run in-process under
-                # handlers, and without this every firing is stamped with the session that
-                # spawned this daemon, whose env we inherited (guard-2480, ).
-                # Inside the try, so a failure here still resets the customer.
-                from _gate_log import set_request_session, reset_request_session
+                # Name the calling session and agent for what the daemon does in-process:
+                # gate firings, and changelog and history attribution. Without this each
+                # carries the session and agent that spawned this daemon, whose env we
+                # inherited (guard-2480; the session , the agent ). The meta
+                # dir is named as a callable because ctx.paths resolves lazily, and a route
+                # that needs no paths must not resolve them. Inside the try, so a failure
+                # here still resets the customer.
+                from _gate_log import (set_request_session, reset_request_session,
+                                       set_request_meta_dir, reset_request_meta_dir)
+                from _fileops import set_request_agent, reset_request_agent
                 _sid_token = set_request_session(ctx.headers.get("x-mind-sid"))
+                _agent_token = set_request_agent(ctx.headers.get("x-mind-agent"))
+                _meta_token = set_request_meta_dir(lambda: ctx.paths.meta)
                 handler = self.routes.get((method, path))
                 if handler is None:
                     resp = Response.error(404, "not_found", f"no route for {method} {path}")
@@ -351,7 +358,11 @@ class _Handler(BaseHTTPRequestHandler):
                 # Reset within the request so the customer never leaks to the next
                 # request on a reused thread (defensive — ThreadingHTTPServer
                 # spawns per-request threads today, but a future pool must be safe).
-                # The session resets for the same reason.
+                # The session, agent and meta dir reset for the same reason.
+                if _meta_token is not None:
+                    reset_request_meta_dir(_meta_token)
+                if _agent_token is not None:
+                    reset_request_agent(_agent_token)
                 if _sid_token is not None:
                     reset_request_session(_sid_token)
                 if _cust_token is not None:

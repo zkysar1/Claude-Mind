@@ -25,6 +25,8 @@ present, not on some unconditional deny.
 guard-1165: no module-level os.environ mutation and no sys.modules stubs.
 """
 
+import json
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,6 +34,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 
+import unit_claim  # noqa: E402
 from unit_claim import (  # noqa: E402
     DEFAULT_LEASE_HOURS,
     decide,
@@ -279,3 +282,128 @@ def test_a_well_formed_claim_wins_the_holder_slot_over_a_malformed_peer():
     ]
     holder = live_claims(board, now=NOW, lease_hours=LEASE)[(GOAL, UNIT)]
     assert holder["session_id"] == BODY_A
+
+
+# ---------------------------------------------------------------------------
+# The same unit spelled two ways ()
+# ---------------------------------------------------------------------------
+# Measured 2026-08-22: one Body held `unknown-flag-aspirations-read`, another
+# acquired `unknown-flag-aspirations-read.sh` for the IDENTICAL wrapper, and both
+# acquires returned rc=0. A trailing `.sh` (or a different case) is the whole
+# difference, so those spellings are one unit; a genuinely different unit is not.
+
+def test_the_same_unit_spelled_with_a_trailing_sh_is_refused():
+    board = [rec("CLAIM", GOAL, "unknown-flag-aspirations-read", BODY_A, NOW - timedelta(minutes=20))]
+    assert verdict(board, sid=BODY_B, unit="unknown-flag-aspirations-read.sh") == "held"
+
+
+def test_the_same_unit_spelled_the_other_way_round_is_refused():
+    board = [rec("CLAIM", GOAL, "unknown-flag-aspirations-read.sh", BODY_A, NOW - timedelta(minutes=20))]
+    assert verdict(board, sid=BODY_B, unit="unknown-flag-aspirations-read") == "held"
+
+
+def test_the_same_unit_in_a_different_case_is_refused():
+    board = [rec("CLAIM", GOAL, "Reflection_Focal_Points.j2", BODY_A, NOW - timedelta(minutes=20))]
+    assert verdict(board, sid=BODY_B, unit="reflection_focal_points.j2") == "held"
+
+
+def test_a_distinct_near_neighbour_unit_is_still_free():
+    """The fix must not block real work: units that merely look alike stay claimable."""
+    board = [rec("CLAIM", GOAL, "unknown-flag-aspirations-read", BODY_A, NOW - timedelta(minutes=20))]
+    for near in ("unknown-flag-aspirations-write", "unknown-flag-aspirations-read.j2",
+                 "unknown-flag-aspirations-reader", "unknown-flag-aspirations-read.sh.bak"):
+        assert verdict(board, sid=BODY_B, unit=near) == "free", near
+
+
+def test_the_holder_re_entering_under_the_other_spelling_is_already_mine():
+    board = [rec("CLAIM", GOAL, "unknown-flag-aspirations-read", BODY_A, NOW - timedelta(minutes=20))]
+    assert verdict(board, sid=BODY_A, unit="unknown-flag-aspirations-read.sh") == "already-mine"
+
+
+def test_the_other_spelling_is_free_once_the_holder_releases():
+    board = [
+        rec("CLAIM", GOAL, "unknown-flag-aspirations-read", BODY_A, NOW - timedelta(minutes=20)),
+        rec("RELEASE", GOAL, "unknown-flag-aspirations-read", BODY_A, NOW - timedelta(minutes=5)),
+    ]
+    assert verdict(board, sid=BODY_B, unit="unknown-flag-aspirations-read.sh") == "free"
+
+
+def test_a_release_under_the_other_spelling_frees_the_unit():
+    """`acquire` answers already-mine for the other spelling, so the holder may release by it."""
+    board = [
+        rec("CLAIM", GOAL, "unknown-flag-aspirations-read", BODY_A, NOW - timedelta(minutes=20)),
+        rec("RELEASE", GOAL, "unknown-flag-aspirations-read.sh", BODY_A, NOW - timedelta(minutes=5)),
+    ]
+    for spelling in ("unknown-flag-aspirations-read", "unknown-flag-aspirations-read.sh"):
+        assert verdict(board, sid=BODY_B, unit=spelling) == "free", spelling
+
+
+def test_a_peers_release_under_the_other_spelling_frees_nothing():
+    """Control: normalising the release must keep it scoped to the releasing session."""
+    board = [
+        rec("CLAIM", GOAL, "unknown-flag-aspirations-read", BODY_A, NOW - timedelta(minutes=20)),
+        rec("RELEASE", GOAL, "unknown-flag-aspirations-read.sh", BODY_B, NOW - timedelta(minutes=5)),
+    ]
+    assert verdict(board, sid=BODY_B, unit="unknown-flag-aspirations-read") == "held"
+
+
+def _cli_on_a_memory_board(monkeypatch):
+    """`main()` against an in-memory board. Returns ``(board, run)``; ``run(sid, *argv)`` -> rc."""
+    board = []
+
+    def fake_post(verb, goal_id, unit, note):
+        msg_id = f"msg-{len(board)}"
+        board.append(rec(verb, goal_id, unit, os.environ["MIND_SID"], datetime.now(),
+                         msg_id=msg_id))
+        return msg_id
+
+    monkeypatch.setattr(unit_claim, "_read_board", lambda since_hours, *, fresh=True: list(board))
+    monkeypatch.setattr(unit_claim, "_post", fake_post)
+    monkeypatch.setattr(unit_claim, "load_lease_hours", lambda *a, **k: LEASE)
+
+    def run(sid, *argv):
+        monkeypatch.setenv("MIND_SID", sid)
+        return unit_claim.main(list(argv))
+
+    return board, run
+
+
+def test_status_flags_two_live_rows_that_are_one_unit(monkeypatch, capsys):
+    """A forced duplicate (or claims posted before the spellings were unified) must not read as two units.
+
+    The goal's aggravating factor: `live_units` showed two plausible, distinct rows
+    and gave a human no way to notice the collision.
+    """
+    board, run = _cli_on_a_memory_board(monkeypatch)
+    assert run(BODY_A, "acquire", GOAL, "build-x") == 0
+    assert run(BODY_B, "acquire", GOAL, "build-x.sh", "--force", "holder provably dead") == 0
+    assert run(BODY_B, "acquire", GOAL, "build-y") == 0
+    capsys.readouterr()                                      # drop the acquire chatter
+
+    assert run(BODY_B, "status", GOAL, "--json") == 0
+    rows = {r["unit"]: r for r in json.loads(capsys.readouterr().out)["live_units"]}
+    assert rows["build-x"]["same_unit_as"] == ["build-x.sh"]
+    assert rows["build-x.sh"]["same_unit_as"] == ["build-x"]
+    assert "same_unit_as" not in rows["build-y"]             # a distinct unit is not flagged
+
+    assert run(BODY_B, "status", GOAL) == 0
+    flagged = [ln for ln in capsys.readouterr().out.splitlines() if "SAME UNIT AS" in ln]
+    assert len(flagged) == 2                                 # the plain-text rows say it too
+
+
+def test_the_two_spellings_through_the_cli(monkeypatch):
+    """The incident at the level it was observed: two `acquire` calls, both rc=0.
+
+    Drives `main()` against an in-memory board, so the wiring (acquire -> decide,
+    release -> the marker it posts) is pinned along with the pure logic.
+    """
+    board, run = _cli_on_a_memory_board(monkeypatch)
+
+    assert run(BODY_A, "acquire", GOAL, "build-x") == 0
+    assert run(BODY_B, "acquire", GOAL, "build-x.sh") == 1   # was rc 0: the incident
+    assert len(board) == 1                                   # a refusal posts nothing
+    assert run(BODY_B, "acquire", GOAL, "build-x.j2") == 0   # a distinct unit stays claimable
+    assert run(BODY_A, "acquire", GOAL, "build-x.sh") == 0   # already mine, either spelling
+    assert len(board) == 2                                   # re-entry posts nothing
+    assert run(BODY_A, "release", GOAL, "build-x.sh") == 0   # release by the spelling it was told
+    assert run(BODY_B, "acquire", GOAL, "build-x") == 0      # so the unit is free again

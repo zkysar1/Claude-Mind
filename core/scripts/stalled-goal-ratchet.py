@@ -101,6 +101,46 @@ routing a stalled goal to a peer cannot lift it out of `stalled_goals`.
 construction. Only the unmeasured remainder is named, and the printed
 "of N blocked" no longer counts the first two buckets.
 
+═══ `scheduled` — a wait with a KNOWN END is not an unknown age (g-115-9259) ═══
+
+What stamps a clock: `cmd_update_goal` writes `blocked_since` on a status→blocked write and
+`defer_reason_set_at` on a defer_reason write, so a block that goes through a write carries one. Measured
+2026-10-03 over the selector's 722 blocked rows (the ratchet's own loaders, one snapshot): explicit_status
+10 of 10 clocked, dependency 24 of 24, deferred 67 of 72. Every other unclocked goal is blocked by a pure
+function of its own fields at read time, so there is no block EVENT to recover: caller routing (449),
+candidate tier (105), a future `deferred_until` (5), a future `resolves_no_earlier_than` (21), and
+`verification.preconditions` (28 goals, 36 predicates: command_succeeds 18, after_time 7,
+goal_completed_after 5, pr_merged 4, metric_threshold 1, file_check 1).
+
+No stored field carries a blocked-since for them either. A complete key survey of the 54 goals that were
+unclocked then found `created_at` (all), `last_modified` (36), `deferred_until` (the 5 dated waits) and
+bookkeeping stamps that record the LAST claim, shelve, abstention or rehome, never when a wait began.
+The per-write `.history` is a partial stand-in at best. Measured the same day over this box's 14721
+goal-queue manifests (58 days): 7 of the 54 are named at all (6 of them first by a `claim`), and a
+gate-related write is named for at most 4 (one add-goal, and `verification` or `status` updates whose
+values the summary does not carry). That history is machine-local (the store backend calls it so, and the
+shared store holds 0 keys under `.history/`), so another box's writes are out of reach from here.
+
+Backfilling a `blocked_since` onto them was considered and REJECTED, for three reasons that do not depend
+on each other. It would invent a moment (the creation date is not when the goal became blocked, and
+`blocked_since` is set once, by a status write). It would turn waits that end by themselves into
+`stalled_goals` debt the fleet cannot clear before the date, the permanent-regression shape the
+human_blocked key was split out to avoid. And the history cannot supply it evenly: it reaches at most 4 of
+the 54, and only where this box wrote the gate, so a clock built from it would age a goal or not by where
+its gate happened to be written. The remedy therefore stays reporting, and the 26 goals whose end
+is dated are named `scheduled`: "blocked too long" has no answer until the date passes, and the selector
+stops blocking them by itself when it does. `hypothesis_gate` is emitted only while the date is ahead
+(goal-selector.py, the resolves_no_earlier_than branch), so that reason alone proves it. `deferred` has
+several doors (a defer_reason, a handoff, a never-expiring prefix, a dated `deferred_until`), so it counts
+only when the goal's own `deferred_until` is still ahead (the deferred_until branch). A CLOCKED goal is
+aged first, whatever its date, so a date cannot lift a stall out of `stalled_goals`.
+
+What stays in `no_clock` is the precondition-gated 28: a probe or an event, except that 7 of them carry an
+`after_time` predicate, a window whose end is kept inside the precondition object, which this module does
+not parse. Some are gates on the caller's own machine (7 of the 28 have a predicate id naming a platform,
+host, box or desktop), which the selector evaluates where it runs. They are the real unmeasured
+remainder: their wait has no recorded start.
+
 ═══ `human_blocked:` gets its OWN ratchet — the second anti-laundering move ═══
 
 A `human_blocked:` defer is by design un-clearable by any agent
@@ -144,6 +184,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _dt import parse_naive_iso  # noqa: E402  (shared tzinfo-stripping naive-ISO parse, )
+from _ratchet_delta import box_name, describe, since_last_reading  # noqa: E402
 
 METRIC_KEY = "stalled_goals"
 # Second key, same file, same lock — see the human_blocked section of the module
@@ -170,6 +211,11 @@ _HUMAN_BLOCKED_PREFIX = "human_blocked:"
 # docstring). Exact names: an unknown or absent reason stays `no_clock`.
 RUNNER_RELATIVE_REASONS = ("routed_to_agent", "not_my_lane", "fresh_session_only")
 NOT_ACTIVE_REASONS = ("candidate_tier",)
+# An UNCLOCKED goal waiting on a future-dated gate has a known end, so it is not an
+# unknown age (). The selector emits `hypothesis_gate` only while
+# `now < resolves_no_earlier_than`, so the reason alone proves the date is ahead.
+# `deferred` has several doors and only one is dated: see `_waits_for_future_date`.
+SCHEDULED_REASONS = ("hypothesis_gate",)
 
 
 # ─────────────────────────────── pure core ────────────────────────────────
@@ -210,6 +256,14 @@ def is_human_blocked(goal):
         _HUMAN_BLOCKED_PREFIX)
 
 
+def _waits_for_future_date(goal, now):
+    """Is this goal's own `deferred_until` still ahead? The selector's dated door for the
+    `deferred` reason; a defer_reason, a handoff or a never-expiring prefix reach the same
+    reason with no date, and those stay `no_clock`."""
+    until = _parse_ts(goal.get("deferred_until"))
+    return until is not None and until > now
+
+
 def classify(goal, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
     """One goal -> one bucket. Order of the checks is the semantics.
 
@@ -223,6 +277,9 @@ def classify(goal, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
     runner_relative — no clock, and blocked only for THIS caller (routed to a peer,
                     lane pin, fresh-session gate); reported, not counted
     candidate     — no clock, and not an active goal yet; reported, not counted
+    scheduled     — no clock, and waiting on a gate with a known FUTURE end (a
+                    hypothesis not resolvable before its date, or a future
+                    `deferred_until`); reported, not counted
     no_clock      — blocked for a reason true for everyone, stall duration UNKNOWN
                     (also any reason this module does not know); reported, not counted
     stalled       — blocked, measurably, for longer than the threshold
@@ -248,6 +305,9 @@ def classify(goal, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
             return "runner_relative"
         if reason in NOT_ACTIVE_REASONS:
             return "candidate"
+        if reason in SCHEDULED_REASONS or (
+                reason == "deferred" and _waits_for_future_date(goal, now)):
+            return "scheduled"
         return "no_clock"
     return "stalled" if age > threshold_days else "young"
 
@@ -258,9 +318,9 @@ def census(goals, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
     `drift_total = stalled` — ONLY the measured, agent-clearable bucket.
     `no_clock` is unmeasurable (357 of 499 blocked goals; folding it in would
     swamp the signal 16:1) and rides in `breakdown` as a coverage figure.
-    `runner_relative` and `candidate` name the unclocked goals that are not a
-    coverage gap at all (see the module docstring); they are counts only, with no
-    `rows`, since nothing consumes them.
+    `runner_relative`, `candidate` and `scheduled` name the unclocked goals that are
+    not a coverage gap at all (see the module docstring); they are counts only, with
+    no `rows`, since nothing consumes them.
     `human_blocked_total` is returned SEPARATELY and ratchets under its own
     baseline key, so relabeling a stall as `human_blocked:` moves debt between
     two visible counters instead of deleting it.
@@ -272,7 +332,7 @@ def census(goals, blocked_ids, now, threshold_days=DEFAULT_THRESHOLD_DAYS):
     """
     buckets = {k: [] for k in
                ("terminal", "executable", "human_blocked", "runner_relative",
-                "candidate", "no_clock", "stalled", "young")}
+                "candidate", "scheduled", "no_clock", "stalled", "young")}
     for g in goals:
         if not isinstance(g, dict):
             continue
@@ -395,13 +455,29 @@ def main(argv=None):
         print(json.dumps(result, indent=2))
 
     verdicts = {METRIC_KEY: "dry-run", HUMAN_METRIC_KEY: "dry-run"}
+    stamp = now.isoformat(timespec="seconds")
+    counts = {METRIC_KEY: result["drift_total"],
+              HUMAN_METRIC_KEY: result["human_blocked_total"]}
+    host = box_name()
+    since = {}
+    if args.dry_run:
+        # A dry run records nothing, but its reading can still be set against this
+        # box's last recorded one, so --dry-run answers "did it move" as well.
+        try:
+            import yaml  # noqa: WPS433
+            from _paths import META_DIR  # noqa: WPS433
+            stored = yaml.safe_load(
+                (Path(META_DIR) / "audit-baselines.yaml").read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — no readable baseline file means no comparison
+            stored = None
+        stored = stored if isinstance(stored, dict) else {}
+        for key, current in counts.items():
+            since[key] = since_last_reading(
+                (stored.get(key) or {}).get("history"), current, host, stamp)
     if not args.dry_run:
         from _fileops import locked_modify_yaml  # noqa: WPS433
         from _paths import META_DIR  # noqa: WPS433
         baselines_path = Path(META_DIR) / "audit-baselines.yaml"
-        stamp = now.isoformat(timespec="seconds")
-        counts = {METRIC_KEY: result["drift_total"],
-                  HUMAN_METRIC_KEY: result["human_blocked_total"]}
         box = {}
 
         def _ratchet_one(baselines, key, current):
@@ -422,8 +498,11 @@ def main(argv=None):
             entry["last_recorded"] = stamp
             entry["last_verdict"] = v
             history = list(entry.get("history") or [])
+            # This box's previous reading, read BEFORE the new row is appended.
+            since[key] = since_last_reading(history, current, host, stamp)
             history.append({"recorded_at": stamp, "drift_total": current,
-                            "verdict": v, "breakdown": result["breakdown"]})
+                            "verdict": v, "hostname": host,
+                            "breakdown": result["breakdown"]})
             entry["history"] = history[-50:]     # bounded, per the convention
             baselines[key] = entry
             box[key] = v
@@ -448,23 +527,29 @@ def main(argv=None):
     # without knowing how many goals were even eligible, and `no_clock` is the
     # instrument's blind spot — a reader who cannot see it cannot tell a real
     # improvement from a coverage collapse. The denominator leaves out the
-    # unclocked runner_relative and candidate goals (guard-6445): they are blocked
-    # for the caller or not active yet, and counting them made "of N blocked" read
-    # as stuck work. They are named in the bracket instead.
+    # unclocked runner_relative, candidate and scheduled goals (guard-6445,
+    # ): they are blocked for the caller, not active yet, or waiting on a
+    # known date, and counting them made "of N blocked" read as stuck work. They
+    # are named in the bracket instead.
     b = result["breakdown"]
     blocked_pop = (b["stalled"] + b["young"] + b["no_clock"] + b["human_blocked"])
     # Under --json the summary goes to STDERR: stdout must stay parseable JSON
     # or the flag is a trap for every caller that pipes it.
     print("%s: %s=%d (blocked >%.0fd, of %d blocked) | %s: %s=%d "
           "[not counted: no_clock=%d, young=%d, runner_relative=%d, "
-          "candidate=%d] scanned=%d"
+          "candidate=%d, scheduled=%d] scanned=%d"
           % (str(verdicts[METRIC_KEY]).upper(), METRIC_KEY,
              result["drift_total"], result["threshold_days"], blocked_pop,
              str(verdicts[HUMAN_METRIC_KEY]).upper(), HUMAN_METRIC_KEY,
              result["human_blocked_total"],
              b["no_clock"], b["young"], b["runner_relative"], b["candidate"],
-             result["scanned"]),
+             b["scheduled"], result["scanned"]),
           file=sys.stderr if args.json else sys.stdout)
+    if since:
+        # One line, both metrics: a reader asks "did it move" of each count in turn.
+        print("since last reading: " + "; ".join(
+                  "%s %s" % (key, describe(line)) for key, line in since.items()),
+              file=sys.stderr if args.json else sys.stdout)
     if hard_gate and "regressed" in verdicts.values():
         return 1
     return 0

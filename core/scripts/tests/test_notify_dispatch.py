@@ -409,3 +409,86 @@ def test_conversation_ref_is_drawn_per_call_from_a_vowel_free_alphabet():
     assert all(re.fullmatch(REF_RE, r) for r in refs), refs
     assert len(refs) > 1, "the ref is constant -- every send would share one subject again"
     assert not set("AEIOUY") & set(nd.CONVERSATION_REF_ALPHABET), "a vowel lets a ref spell a classifier keyword"
+
+
+# --- outbound data-class gate () -----------------------------------------------------
+# guard-4061 / guard-4525: the owner's personal address and credentials do not leave in a
+# notification. _env() sets USER_EMAIL=operator@example.com, which is "the owner" here.
+# Credential-shaped strings are assembled at run time so no key-shaped literal sits in the repo.
+
+_OWNER = "operator@example.com"
+_SHAPED = "o***@e***.com"
+_AWS = "".join(["AKI", "AQWERTYUIOPASDFGH"])
+_SUBJ = "Retire the legacy PK? (g-115-6222)"
+
+
+def _rows(world, name):
+    p = world / name
+    return [json.loads(l) for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+
+def test_the_owner_address_in_the_body_is_refused_before_anything_is_sent_or_recorded(world):
+    p = _run(world, "--category", "decision-needed", "--subject", _SUBJ, "--message", f"{BODY} Reach me at {_OWNER}.")
+    assert p.returncode == nd.RC_DATA_CLASS == 7, p.stderr
+    assert "owner-email" in p.stderr and _SHAPED in p.stderr and _OWNER not in p.stderr + p.stdout
+    assert _sent(world) == [], "the transport must not be called"
+    assert _ledger(world) == [], "the outreach ledger keeps a body fingerprint: a refused text must never reach it"
+    assert list((world / "board").iterdir()) == [], "nothing may be re-routed to the board either"
+    # the remedy: the same text with the address in shape
+    p = _run(world, "--category", "decision-needed", "--subject", _SUBJ, "--message", f"{BODY} Reach me at {_SHAPED}.")
+    assert p.returncode == nd.RC_SENT, p.stderr
+    assert len(_sent(world)) == 1
+
+
+@pytest.mark.parametrize("where", ["subject", "message"])
+def test_a_credential_in_the_subject_or_the_body_is_refused(world, where):
+    subject = f"Rotated {_AWS}" if where == "subject" else _SUBJ
+    message = f"{BODY} key {_AWS}" if where == "message" else BODY
+    p = _run(world, "--category", "decision-needed", "--subject", subject, "--message", message)
+    assert p.returncode == nd.RC_DATA_CLASS, p.stderr
+    assert "credential" in p.stderr and _AWS not in p.stderr + p.stdout
+    assert _sent(world) == [] and _ledger(world) == []
+
+
+def test_every_string_in_a_prebuilt_payload_is_scanned_but_the_recipient_envelope_is_not(world):
+    envelope = {"InfoType": "Decision Needed", "Title": _SUBJ, "Body": BODY, "RecipientEmail": _OWNER,
+                "FromEmail": _OWNER, "XPayloadProvenance": "test/v1"}
+    p = _run(world, "--payload-stdin", "--category", "decision-needed", stdin=json.dumps(envelope))
+    assert p.returncode == nd.RC_SENT, p.stderr  # the owner IS the recipient: the envelope is not content
+    leaky = {"InfoType": "Decision Needed", "Title": "Pause asp-9 for a week?",
+             "Body": "I decided to pause asp-9 for a week; override if you disagree.",
+             "Footer": f"key {_AWS}", "RecipientEmail": _OWNER, "XPayloadProvenance": "test/v1"}
+    p = _run(world, "--payload-stdin", "--category", "decision-needed", stdin=json.dumps(leaky))
+    assert p.returncode == nd.RC_DATA_CLASS, p.stderr  # a field the dispatcher does not read by name is still content
+    assert len(_sent(world)) == 1 and _AWS not in p.stderr
+
+
+def test_override_sends_and_ledgers_the_justification_without_the_value(world):
+    p = _run(world, "--category", "decision-needed", "--subject", _SUBJ, "--message", f"{BODY} Example id {_AWS}.",
+             "--override-data-class", f"documentation example {_AWS}")
+    assert p.returncode == nd.RC_SENT, p.stderr
+    assert len(_sent(world)) == 1
+    [row] = _rows(world, "override-bypass-ledger.jsonl")
+    assert row["gate"] == "outbound-data-class-gate" and row["context"]["surface"] == "notify-user"
+    assert row["context"]["kinds"] == ["AWS access key id"]
+    assert row["justification"] == "documentation example <redacted:len=20>"
+    assert _AWS not in (world / "override-bypass-ledger.jsonl").read_text()
+
+
+def test_dry_run_gives_the_verdict_and_records_nothing(world):
+    args = ("--category", "decision-needed", "--subject", _SUBJ, "--dry-run")
+    p = _run(world, *args, "--message", f"{BODY} Reach me at {_OWNER}.")
+    assert p.returncode == nd.RC_DATA_CLASS, p.stderr
+    p = _run(world, *args, "--message", f"{BODY} Example id {_AWS}.", "--override-data-class", "documentation example")
+    assert p.returncode == nd.RC_SENT, p.stderr
+    assert _rows(world, "override-bypass-ledger.jsonl") == [] and _sent(world) == [] and _ledger(world) == []
+
+
+def test_a_crash_in_the_checker_fails_open_and_loud(world, monkeypatch, capsys):
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(nd.data_class, "check", boom)
+    rc = nd.dispatch(agent="alpha", category="decision-needed", subject=_SUBJ, message=f"{BODY} Reach me at {_OWNER}.",
+                     world=world, mirror_peers=False, dry_run=True)
+    assert rc != nd.RC_DATA_CLASS, "a checker crash must never read as a refusal"
+    assert "could not run" in capsys.readouterr().err

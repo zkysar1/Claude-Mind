@@ -55,9 +55,10 @@ run_check() {
     local check_id="$1"; shift
     echo "[$check_id] $label"
     local rc=0
-    if ! $PYLAUNCH "$SCRIPT_DIR/_seed_verify_format.py" "$check_id" "$@" 2>&1; then
-        rc=$?
-    fi
+    # `|| rc=$?`, NOT `if ! cmd; then rc=$?`: inside that `then`, $? is the status of the
+    # NEGATED command and is always 0, so a failing check never reached the counters
+    # below -- checks 1/2/3/5/8 printed FAIL while the summary read FAILS: 0 ().
+    $PYLAUNCH "$SCRIPT_DIR/_seed_verify_format.py" "$check_id" "$@" 2>&1 || rc=$?
     if [ $rc -ne 0 ]; then
         if [ "$exit_kind" = "fail" ]; then
             FAILS=$((FAILS+1))

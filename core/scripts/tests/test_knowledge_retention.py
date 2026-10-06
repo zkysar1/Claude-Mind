@@ -199,3 +199,58 @@ def test_a_naive_prior_is_read_as_utc_whatever_the_local_zone_is() -> None:
         else:
             os.environ["TZ"] = before
         time.tzset()
+
+
+# --- an undo is judged when the member sent it ( u7e) ------------------------------
+
+
+def _at(hours: int) -> str:
+    return (NOW + datetime.timedelta(hours=hours)).isoformat()
+
+
+def test_an_undo_is_judged_at_the_moment_it_was_sent_when_that_is_before_now() -> None:
+    assert kr.judged_at(_at(-5), NOW) == NOW - datetime.timedelta(hours=5)
+    assert kr.judged_at(NOW.replace(tzinfo=None).isoformat(), NOW) == NOW, "a stamp with no zone is UTC"
+
+
+def test_a_send_time_after_now_is_judged_at_now_so_it_is_never_stricter_than_applying() -> None:
+    assert kr.judged_at(_at(3), NOW) == NOW
+    assert kr.judged_at("9999-12-31T23:59:59+00:00", NOW) == NOW
+
+
+@pytest.mark.parametrize("sent", [None, "", "  ", "soon", "2026-13-45T00:00:00", 7, {"at": _at(-5)}, [_at(-5)]])
+def test_a_send_time_that_is_missing_or_does_not_read_is_judged_at_now(sent) -> None:
+    assert kr.judged_at(sent, NOW) == NOW
+
+
+def test_a_send_time_at_the_edge_of_the_calendar_never_raises() -> None:
+    """The judgment parses text the intake wrote. An offset on the last or first day of the calendar
+    overflows a conversion to UTC, so the judgment must not make one."""
+    assert kr.judged_at("9999-12-31T23:59:59-05:00", NOW) == NOW
+    assert kr.judged_at("0001-01-01T00:00:00+05:00", NOW).year == 1
+
+
+def test_an_undo_sent_in_the_last_instant_of_the_window_is_inside_it_however_late_it_is_applied() -> None:
+    record = _record()
+    until = datetime.datetime(2026, 11, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    applied = until + datetime.timedelta(days=40)
+
+    assert kr.in_window(record, kr.judged_at(until.isoformat(), applied))
+    assert not kr.in_window(record, kr.judged_at((until + datetime.timedelta(seconds=1)).isoformat(), applied))
+    assert not kr.in_window(record, kr.judged_at("", applied)), "no stamp: judged when applied"
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="no tzset on this platform")
+def test_a_naive_send_time_is_read_as_utc_whatever_the_local_zone_is() -> None:
+    before = os.environ.get("TZ")
+    os.environ["TZ"] = "Pacific/Auckland"
+    time.tzset()
+    try:
+        assert kr.judged_at("2026-10-02T06:00:00", NOW) == datetime.datetime(
+            2026, 10, 2, 6, 0, 0, tzinfo=datetime.timezone.utc)
+    finally:
+        if before is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = before
+        time.tzset()

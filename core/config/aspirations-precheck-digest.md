@@ -21,7 +21,7 @@ Rationale (WHY pending-questions sentinel sweep): `core/config/rationale/prechec
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check pending-questions-sweep)
-Bash: bash core/scripts/pending-questions-sweep.sh sweep --apply
+Bash: bash core/scripts/pending-questions-sweep.sh sweep --all-agents --apply
 # Reads world+agent aspiration queues to build the completed/superseded
 # goal-id set, evaluates the heuristic chain, and (when --apply) atomically
 # marks verdict=auto_resolve entries as status=resolved with timestamp.
@@ -398,23 +398,7 @@ a structured precondition. A `human_blocked` defer has no script to run — what
 satisfies it is a HUMAN MESSAGE arriving on a channel — so it falls through every
 one of them and is effectively permanent until a person notices by hand.
 
-Measured cost of that gap (2026-07-25, foxtrot): the user granted the exact
-authorization at 14:23 in a relayed board directive naming the commit by SHA.
-Nothing cleared the defer. ~8h later the approved work was still unshipped and the
-goal was ABSENT from goal-selector's entire candidate list — a deferred goal is not
-a candidate, so no amount of looping surfaces it. It also manufactured a spurious
-Investigate in a second agent's queue, correct about the mechanism and blind to the
-fact that the work was already authorized.
-
-Not redundant with 0.5b.9, and this was MEASURED rather than assumed — the
-credential sweep is the one phase that also matches on the `human_blocked:`
-prefix, so it is the obvious reason to delete this one. Live on 2026-07-31 it
-scanned 6 such defers and put **all 6** in `skipped_no_key`, whose own stated
-reason is "human-only defer, never cleared". It also scopes to
-`("pending","in-progress")` (`credential-defer-recheck.py:241`), so the 2
-`blocked`-status defers are outside it entirely. That is 100% of the population
-handed off by design: 0.5b.9 clears the credential subset, and this phase is the
-only thing that looks at the residue.
+Rationale (WHY the lane exists, why 0.5b.9 does not cover it, why a partial read is never "clean"): `core/config/rationale/precheck-gates.md` (g-115-4265)
 
 DETECTIVE ONLY — no `--apply`, and that is a design decision rather than an
 unfinished half. guard-1249: "match the probe to the DEFER'S PREMISE, not to the
@@ -423,7 +407,7 @@ resource on a single probe." A keyword join proves a message MENTIONS a goal; it
 cannot prove the message GRANTS that goal's specific blocking condition. The live
 population shows the hazard is real: of 8 such defers, THREE named one Studio host.
 
-Read `confidence`, never mere presence. The four signals demand DIFFERENT actions,
+Read `confidence`, never mere presence. The five signals demand DIFFERENT actions,
 and the two deterministic ones demand OPPOSITE ones:
 
 | signal | confidence | what it means | action |
@@ -431,18 +415,23 @@ and the two deterministic ones demand OPPOSITE ones:
 | `pq_answered` | deterministic | the cited pending-question now reads answered/resolved | re-derive — but the tier is per-CITATION, not per-LEG: a defer naming several legs is NOT discharged by one answered pq (g-326-191). Count the legs first |
 | `pq_retired` | deterministic | the cited question was WITHDRAWN | the OPPOSITE — the clearing path is dead, so the defer cannot be satisfied as written. Re-premise or re-file; never read as granted |
 | `board_directive` | heuristic | a board post newer than the defer names this goal | evidence a human SPOKE about it. Open the post; never act on this alone |
-| `pq_missing` | none | the cited `pq-` id exists in no agent's file | nothing arrived — the citation itself is broken. Confirm the block is really filed (guard-1197) |
+| `pq_missing` | none | the cited `pq-` id exists in no agent's file, read from a COMPLETE map | nothing arrived — the citation itself is broken. Confirm the block is really filed (guard-1197) |
+| `pq_unverifiable` | none | the cited `pq-` id is absent from what was read, and the pending-question map is INCOMPLETE (`errors` names the file or listing that failed) | NOT a finding about the defer, and never a broken citation: the sweep could not look. Re-run once the source is back (g-115-4265) |
 
 ```
 # Budget meter — Magic Wand 2 (g-115-509). Skip when zone==tight.
 Bash: decision=$(bash core/scripts/aspirations-precheck-budget-meter.sh check human-blocked-defer-join)
 Bash: bash core/scripts/human-blocked-defer-join.sh --output json
-Parse verdict + records[] + shared_premise_clusters + errors[].
+Parse verdict + errors[] + records[] + shared_premise_clusters.
+# `errors` is read on EVERY branch: verdict "partial" = a source failed, so what it held is unknown, never absent.
+# `records` < `human_blocked_defers` is NORMAL (a defer with no signal has no record), not a lost row.
 IF verdict == "unreadable":
     Output: "▸ ⚠ HUMAN-BLOCKED JOIN UNREADABLE: {errors} — this is NOT a clean sweep (rb-245)"
 ELIF verdict == "clean":
     continue silently to Phase 0.5b.16   # the common case
-ELSE:
+ELSE:   # "hits" or "partial"
+    IF verdict == "partial":
+        Output: "▸ ⚠ HUMAN-BLOCKED JOIN PARTIAL: {errors} — the records below are what the readable sources showed; the failed source is NOT reported as empty"
     FOR EACH k, v in shared_premise_clusters.items():
         Output: "▸ SHARED PREMISE: {v} defers name '{k}' — guard-1249: probe each premise separately, never batch-clear the cluster"
     FOR EACH r in records where best_confidence == "deterministic" (max 5):
@@ -450,7 +439,10 @@ ELSE:
     FOR EACH r in records where best_confidence == "heuristic" (max 3):
         Output: "▸ defer mentioned on the board: {r.goal_id} — open the post before concluding anything: {r.title}"
     FOR EACH r in records where best_confidence == "none" (max 3):
-        Output: "▸ BROKEN CITATION: {r.goal_id} — its defer cites a pq that exists in no agent's file; nothing arrived. Confirm the block is really filed (guard-1197)"
+        IF "pq_missing" in the signal names:
+            Output: "▸ BROKEN CITATION: {r.goal_id} — its defer cites a pq that exists in no agent's file; nothing arrived. Confirm the block is really filed (guard-1197)"
+        ELSE:   # pq_unverifiable only
+            Output: "▸ citation unverified: {r.goal_id} — its defer cites a pq the sweep could not look for (see errors); NOT a broken citation"
     # Say what each bucket IS. Rendering a `none` record with the heuristic line
     # would announce a board post that was never found — the sweep asserting
     # evidence it never saw, which is the failure class it exists to catch.
@@ -1085,7 +1077,7 @@ unclaimed**:
    it at one line per agent per day):
 
    ```
-   Bash: goal-field-append.sh --source <src> <owner-goal-id> progress_note recheck-<agent>-<YYYYMMDD> "[recheck:<agent> <YYYY-MM-DD>] <lane> re-fired: <one clause>"
+   Bash: goal-field-append.sh --source <src> <owner-goal-id> progress_note recheck-<agent>-<YYYYMMDD> "<lane> re-fired [recheck:<agent> <YYYY-MM-DD>]: <one clause>"
    ```
 
 3. The `[recheck:<agent> <YYYY-MM-DD>]` marker line is the **selection

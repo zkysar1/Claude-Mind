@@ -182,6 +182,18 @@ _N3_ALLOWED_EXACT = frozenset({
     # above (guard-3485: a reader missing from this list never receives the value).
     # Non-secret boolean.
     "TREE_RETRIEVAL_SPOOLED",
+    # : the retrieval-trace segmented-writer flag, read at CALL TIME by
+    # `_retrieval_trace.segmented_enabled()` (through `store_name()`) in
+    # `retrieve._log_retrieval_trace`, which the daemon runs in-request for every
+    # retrieve (`endpoints/retrieve.py` calls it). The flip itself reaches the
+    # daemon through the settings overlay at spawn (`daemon_overlay_settings_env`,
+    # ). THIS entry is the `.env.local` channel, kept so a declaration
+    # there is honoured like the keys above (guard-3485), AND it is the
+    # in-boundary change that arms the daemon recycle: `mind-api-code-changed.sh`
+    # watches only mind_api/src and core/scripts/_*.py, so a settings-only flip
+    # arms nothing and a running daemon keeps appending to the legacy file
+    # (rb-8458). Non-secret boolean.
+    "RETRIEVAL_TRACE_SEGMENTED",
 })
 
 

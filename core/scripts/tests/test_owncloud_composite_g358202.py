@@ -6,18 +6,24 @@ Pure-Python: no backend, no daemon, no network.
 Coverage:
   1. split -> join is byte-identical on a fixture whose goal ids straddle a range edge
      and whose STRING order differs from NUMERIC order (so the check can fail)
-  2. controls that can fail: a file in numeric order is refused; swapped goals are refused
+  2. controls that can fail: a file in numeric order and a swapped pair now round-trip through the head's
+     tails (U10, they were refused before); serialization split cannot reproduce is refused (test 5)
   3. one goal mutation -> the head plus exactly one segment, at least 10x fewer bytes
   4. integrity: a missing segment, a stale segment, a tampered head and a non-head all raise
   5. refusals (duplicate goal id, null goals, no trailing newline, blank line, ...) raise
      NotSplittable, so the caller PUTs the whole object
   6. the merge handler registered for the legacy path runs on JOINED bytes and its output
      satisfies the split invariant, including for a goal on a range edge
+  7. an order exception rides in the head (U10, found by U9 on the live key): a list not in string order (an
+     appended tail, numeric order, a swapped pair, reversed, shuffled) splits and round-trips byte for byte; the
+     head of a sorted file is unchanged; segments do not depend on order; a tail costs the head and no segment;
+     a tampered tail is an IntegrityError; a reader's local file with a tail still reuses its segments
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import random
 import sys
 from pathlib import Path
 
@@ -82,19 +88,23 @@ def test_empty_input_round_trips():
     assert s.segments == {} and c.join(s.head, s.segments) == b""
 
 
-def test_a_file_in_numeric_order_is_refused():
+def test_a_file_in_numeric_order_round_trips_through_the_head_tail():
     recs = _fixture()
-    recs[0]["goals"].sort(key=lambda g: int(g["id"].rsplit("-", 1)[1]))
-    with pytest.raises(c.NotSplittable):
-        c.split(_legacy(recs))
+    recs[0]["goals"].sort(key=lambda g: int(g["id"].rsplit("-", 1)[1]))  # refused before U10
+    raw = _legacy(recs)
+    s = c.split(raw)
+    assert c.join(s.head, s.segments) == raw
+    assert json.loads(s.head)["tails"]["asp-1"]
 
 
-def test_swapped_goals_are_refused():
+def test_swapped_goals_round_trip_through_the_head_tail():
     recs = _fixture()
     g = recs[0]["goals"]
-    g[3], g[4] = g[4], g[3]
-    with pytest.raises(c.NotSplittable):
-        c.split(_legacy(recs))
+    g[3], g[4] = g[4], g[3]  # refused before U10
+    raw = _legacy(recs)
+    s = c.split(raw)
+    assert c.join(s.head, s.segments) == raw
+    assert json.loads(s.head)["tails"]["asp-1"] == [x["id"] for x in g[4:]]  # the tail starts at the first descent
 
 
 def _big_fixture():
@@ -215,6 +225,14 @@ def _goal_without_id():
     return _legacy(recs)
 
 
+def _compact():
+    return "".join(json.dumps(r, separators=(",", ":"), ensure_ascii=True) + "\n" for r in _fixture()).encode("ascii")
+
+
+def _unescaped():
+    return "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in _fixture()).encode("utf-8")
+
+
 @pytest.mark.parametrize("raw", [
     _legacy(_fixture())[:-1],                                   # no trailing newline
     _legacy(_fixture()) + b"\n",                                # blank line
@@ -225,8 +243,10 @@ def _goal_without_id():
     _goal_without_id(),
     _legacy([{"id": "asp/1", "goals": []}]),                    # id unusable as a segment key
     _legacy([{"id": "asp-1", "goals": []}, {"id": "asp-1", "goals": []}]),
+    _compact(),                                                 # parses, but is not the writer's serialization
+    _unescaped(),                                               # same: raw non-ASCII where the writer escapes
 ], ids=["no-newline", "blank-line", "not-json", "not-object", "dup-goal", "null-goals",
-        "goal-without-id", "unsafe-aspiration-id", "dup-aspiration"])
+        "goal-without-id", "unsafe-aspiration-id", "dup-aspiration", "compact-json", "unescaped-non-ascii"])
 def test_unreproducible_input_is_refused(raw):
     with pytest.raises(c.NotSplittable):
         c.split(raw)
@@ -235,6 +255,150 @@ def test_unreproducible_input_is_refused(raw):
 def test_a_head_is_not_splittable_again():
     with pytest.raises(c.NotSplittable):
         c.split(c.split(_legacy(_fixture())).head)
+
+
+# --- 7. an order exception rides in the head (U10) ------------------------------------------------------------
+def _sorted_copy(records):
+    out = []
+    for r in records:
+        r = dict(r)
+        if "goals" in r:
+            r["goals"] = sorted(r["goals"], key=lambda g: g["id"])
+        out.append(r)
+    return out
+
+
+def _tailed(tail_numbers=(11939, 11940)):
+    """The live asp-115 shape (U9): a string-sorted body whose last id is , then goals appended since the
+    last merge. Five-digit ids sort BEFORE 9xxx, so each append is out of string order."""
+    first = _aspiration("115", [1, 2, 9, 10, 99, 100, 9998])
+    first["goals"] += [_goal("115", n) for n in tail_numbers]
+    return [first, _aspiration("2", [1, 2, 3]), {"id": "asp-3", "title": "no goals key"}]
+
+
+def _prefix(ids):
+    for k in range(1, len(ids)):
+        if ids[k - 1] > ids[k]:
+            return k
+    return len(ids)
+
+
+def _with_doc(head, edit):
+    doc = json.loads(head)
+    edit(doc)
+    return (_dump(doc) + "\n").encode("ascii")
+
+
+def test_an_appended_tail_round_trips_and_the_head_names_it():
+    raw = _legacy(_tailed())
+    assert _ids(json.loads(raw.split(b"\n")[0]))[-2:] == ["g-115-11939", "g-115-11940"]  # control: they ARE last
+    s = c.split(raw)
+    assert c.join(s.head, s.segments) == raw
+    assert json.loads(s.head)["tails"] == {"asp-115": ["g-115-11939", "g-115-11940"]}
+
+
+def test_the_head_of_a_sorted_file_is_what_it_was_before_tails_existed():
+    recs = _fixture()
+    raw = _legacy(recs)
+    s = c.split(raw)
+    doc = {"composite": c.FORMAT, "span": c.SEGMENT_SPAN, "joined_md5": hashlib.md5(raw).hexdigest(), "joined_bytes": len(raw),
+           "aspirations": [dict(r, goals=[]) if "goals" in r else r for r in recs], "segments": s.manifest}
+    assert s.head == (_dump(doc) + "\n").encode("ascii")
+    assert "tails" not in json.loads(s.head)
+
+
+def test_the_segments_do_not_depend_on_the_order_the_goals_are_listed_in():
+    tailed = c.split(_legacy(_tailed()))
+    canonical = c.split(_legacy(_sorted_copy(_tailed())))
+    assert tailed.segments == canonical.segments and tailed.manifest == canonical.manifest
+    assert "tails" in json.loads(tailed.head) and "tails" not in json.loads(canonical.head)
+
+
+def test_appending_a_goal_and_then_sorting_it_in_puts_one_segment_then_none():
+    first = c.plan_write(None, _legacy(_tailed(())))
+    appended = _tailed((11939,))
+    plan = c.plan_write(first.head, _legacy(appended))
+    assert len(plan.segments) == 1 and next(iter(plan.segments)).startswith("asp-115/47.")  # the goal's own range
+    again = c.plan_write(plan.head, _legacy(_sorted_copy(appended)))  # a merge sorted it in
+    assert again.segments == {} and "tails" not in json.loads(again.head)
+
+
+@pytest.mark.parametrize("how", ["reversed", "numeric", "rotated", "shuffled-1", "shuffled-2", "shuffled-3"])
+def test_any_order_of_a_goal_list_is_reproduced_byte_for_byte(how):
+    recs = _fixture()
+    goals = recs[0]["goals"]
+    if how == "reversed":
+        goals.reverse()
+    elif how == "numeric":
+        goals.sort(key=lambda g: int(g["id"].rsplit("-", 1)[1]))
+    elif how == "rotated":
+        goals[:] = goals[97:] + goals[:97]
+    else:
+        random.Random(how).shuffle(goals)
+    ids = [g["id"] for g in goals]
+    assert ids != sorted(ids)  # control: the order is not the sorted one
+    raw = _legacy(recs)
+    s = c.split(raw)
+    assert c.join(s.head, s.segments) == raw
+    tails = json.loads(s.head)["tails"]
+    assert tails == {"asp-1": ids[_prefix(ids):]}
+
+
+def test_the_tail_keeps_the_order_the_head_records_even_when_it_is_not_ascending():
+    recs = _tailed(())
+    recs[0]["goals"] += [_goal("115", n) for n in (11941, 11939, 11940)]
+    raw = _legacy(recs)
+    s = c.split(raw)
+    assert json.loads(s.head)["tails"]["asp-115"] == ["g-115-11941", "g-115-11939", "g-115-11940"]
+    assert c.join(s.head, s.segments) == raw
+
+
+def test_the_untampered_tailed_head_joins_so_the_failures_below_are_the_tampering():
+    raw = _legacy(_tailed())
+    s = c.split(raw)
+    assert c.join(s.head, s.segments) == raw
+
+
+_MD5 = "do not match the head's md5"
+
+
+@pytest.mark.parametrize("edit,why", [
+    pytest.param(lambda d: d["tails"]["asp-115"].append("g-115-77777"), "which no segment holds", id="goal-no-segment-holds"),
+    pytest.param(lambda d: d["tails"]["asp-115"].append(d["tails"]["asp-115"][0]), "not a list of distinct ids", id="id-twice"),
+    pytest.param(lambda d: d.update(tails=["g-115-11939"]), "tails is not an object", id="tails-not-object"),
+    pytest.param(lambda d: d["tails"].update({"asp-115": [1, 2]}), "not a list of distinct ids", id="not-ids"),
+    pytest.param(lambda d: d["tails"].update({"asp-115": dict.fromkeys(d["tails"]["asp-115"], 1)}),
+                 "not a list of distinct ids", id="not-a-list"),  # valid ids in an object: only the check refuses it
+    pytest.param(lambda d: d["tails"].update({"asp-99": ["g-99-1"]}), "an aspiration it does not hold", id="unknown-aspiration"),
+    pytest.param(lambda d: d["tails"].update({"asp-3": ["g-3-1"]}), "an aspiration it does not hold", id="aspiration-without-goals"),
+    pytest.param(lambda d: d.pop("tails"), _MD5, id="tails-dropped"),            # the order lost: the md5 refuses
+    pytest.param(lambda d: d["tails"]["asp-115"].reverse(), _MD5, id="tail-reversed"),  # the order changed: the md5 refuses
+])
+def test_a_tampered_tail_is_an_integrity_error(edit, why):
+    """Each refusal is pinned by its own message: the md5 would catch every one of these too, so the exception type
+    alone cannot tell a check that fires from a check that was deleted (the md5 then fires late, with another cause)."""
+    raw = _legacy(_tailed())
+    s = c.split(raw)
+    with pytest.raises(c.IntegrityError, match=why):
+        c.join(_with_doc(s.head, edit), s.segments)
+
+
+def test_a_reader_whose_local_file_has_a_tail_still_reuses_its_segments():
+    local = _legacy(_tailed())
+    total = len(c.split(local).segments)
+    r = c.plan_refresh(local, c.split(local).head)  # the remote describes the same file
+    assert r.fetch == {} and len(r.reuse) == total
+    recs = _tailed()
+    recs[1]["goals"][0]["status"] = "completed"  # the remote moved one segment
+    r = c.plan_refresh(local, c.split(_legacy(recs)).head)
+    assert list(r.fetch) == ["asp-2/0"] and len(r.reuse) == total - 1
+
+
+def test_read_whole_rebuilds_a_file_whose_lists_carry_a_tail():
+    raw = _legacy(_tailed())
+    plan = c.plan_write(None, raw)
+    got, etag = c.read_whole(plan.head, "e1", lambda name: plan.segments[name], lambda: (plan.head, "e1"))
+    assert got == raw and etag == "e1"
 
 
 def test_the_merge_handler_for_the_legacy_path_runs_on_joined_bytes():
@@ -249,6 +413,62 @@ def test_the_merge_handler_for_the_legacy_path_runs_on_joined_bytes():
     s = c.split(merged)  # the handler's own output satisfies the invariant
     assert c.join(s.head, s.segments) == merged
     assert {"asp-1/0", "asp-1/1"} <= set(s.segments)
+
+
+def test_a_displaced_goal_is_placed_past_every_range_the_merge_can_see():
+    """H1 under the seam ( outcome 3): the handler gets JOINED bytes, so it sees every range.
+
+    Two distinct goals race for g-1-249, the last id of range 0, while range 1 already holds g-1-250.
+    Joined, the loser is displaced to max(all ids)+1 = g-1-251 and split files it in range 1 beside
+    g-1-250. A handler that saw only range 0 (the per-segment merge H1 rejects) hands it g-1-250,
+    an id range 1 already owns."""
+    import coordination_merge as cm
+
+    def side(title, nonce, numbers):
+        rec = _aspiration("1", numbers)
+        for g in rec["goals"]:
+            if g["id"] == "g-1-249":
+                g.update(title=title, alloc_nonce=nonce)
+        return rec
+
+    def merged(numbers):
+        raw = cm.merge_aspirations(_legacy([side("mine", "n-mine", numbers)]),
+                                   _legacy([side("peer", "n-peer", numbers)]))
+        return raw, json.loads(raw.split(b"\n")[0])["goals"]
+
+    raw, goals = merged([1, 248, 249, 250])
+    ids = [g["id"] for g in goals]
+    assert {g["title"] for g in goals} >= {"mine", "peer"}  # both writers' goals survive
+    assert len(set(ids)) == len(ids)
+    assert [(g["id"], g["displaced_from"]) for g in goals if g.get("displaced_from")] == [("g-1-251", "g-1-249")]
+    s = c.split(raw)
+    home = {k: [json.loads(line)["id"] for line in v.splitlines()] for k, v in s.segments.items()}
+    assert [k for k, v in home.items() if "g-1-251" in v] == ["asp-1/1"]  # the segment its id names
+    assert "g-1-250" in home["asp-1/1"]
+    assert c.join(s.head, s.segments) == raw
+
+    # the contrast that gives the assertions above their meaning: range 0 alone collides with range 1
+    _, narrow = merged([1, 248, 249])
+    assert [g["id"] for g in narrow if g.get("displaced_from")] == ["g-1-250"]
+    # control: identical sides displace nothing, so the displacement above is what the race caused
+    same = _legacy([side("mine", "n-mine", [1, 248, 249, 250])])
+    assert not any(g.get("displaced_from")
+                   for g in json.loads(cm.merge_aspirations(same, same).split(b"\n")[0])["goals"])
+
+
+def test_no_merge_handler_resolves_for_a_composite_segment():
+    """The literal 'merge handler registered for the segment set' is moot under design (b): the registered
+    handler belongs to the legacy key and receives joined bytes, and no segment name resolves to one.
+    Registering one is a design change (design (a), per-segment merges): it must first satisfy the
+    registration test H1 in core/config/rationale/aspirations-store-segmentation.md requires.
+
+    None is not guard-6907's class-(b) wedge here: the sync layer never carries these objects and their
+    PUT is create-only (design record, "Outcome 3 under design (b)")."""
+    import coordination_merge as cm
+    name = c.segment_object_name("asp-1/0", "0" * 32)
+    assert cm.merge_handler_for("world/" + c.segment_s3_key("aspirations.jsonl", name)) is None
+    assert cm.merge_handler_for(name.rsplit("/", 1)[-1]) is None
+    assert cm.merge_handler_for("world/aspirations.jsonl") is cm.merge_aspirations  # control: the legacy key keeps its own
 
 
 def test_should_composite_is_off_by_default_and_env_scoped():

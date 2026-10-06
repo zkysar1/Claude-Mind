@@ -183,6 +183,70 @@ def test_redact_paths_posix_and_windows() -> None:
     assert "/srv/tricks-ws" not in out
 
 
+#: Slashes that are prose, not paths (). The loose path pattern turned each of these
+#: into "word[path]", and a row so altered could not be corrected by its member.
+_PROSE_WITH_SLASHES = (
+    "Use and/or here.",
+    "Due 9/30/2026 on dev/main.",
+    "TCP/IP, 24/7 and 3/4 of the reef.",
+    "Either (and/or) yes/no, his/her, 2026/10/05.",
+)
+
+#: Slash runs that say where something lives, each with a fragment that must NOT survive.
+#: They must stay redacted whatever the prose rule keeps whole: redaction is a privacy
+#: control, and narrowing a matcher that forbids shrinks what it forbids (guard-1901).
+_PATHS_THAT_STAY_REDACTED = {
+    "rooted posix": ("see /etc/hosts now", "etc/hosts"),
+    "rooted and prose-shaped": ("see /and/or now", "and/or"),
+    "windows drive, backslash": (r"open C:\Users\me\x now", "Users"),
+    "windows drive, slash": ("open C:/Users/me/x now", "Users"),
+    "home tilde": ("see ~/projects/x now", "projects"),
+    "home of a named user, two words": ("cd ~deploy/projects now", "deploy/projects"),
+    "home of a named user, hidden dir": ("InaccessiblePaths=-~deploy/.cache", ".cache"),
+    "user at host, two words": ("scp admin@box/data now", "box/data"),
+    "variable-rooted, two words": ("cd $HOME/projects now", "HOME/projects"),
+    "variable-rooted, three segments": ("run $HOME/.local/bin/uv now", ".local/bin/uv"),
+    "relative, three segments": ("see world/knowledge/tree now", "knowledge/tree"),
+    "relative, with an extension": ("see notes/summary.txt now", "summary.txt"),
+    "relative, hidden segment": ("see dir/.hidden now", ".hidden"),
+    "three words": ("read/write/execute", "write/execute"),
+    "hyphenated name": ("arn user/fleet-agent now", "fleet-agent"),
+    "underscored name": ("role assumed-role/Test_role now", "Test_role"),
+    "name with a digit": ("moved node/web-02 now", "web-02"),
+    "dotted host and one segment": ("see www.example.com/page now", "/page"),
+    "url path": ("see https://example.com/a/b now", "/a/b"),
+    "url port path": ("curl http://localhost:8080/api/v1/logs", "api/v1/logs"),
+    "port and one segment": ("curl localhost:3000/health now", "/health"),
+}
+
+
+def test_redact_keeps_prose_slashes_whole() -> None:
+    for text in _PROSE_WITH_SLASHES:
+        assert redact(text) == text, text
+    # The sentence the loose pattern mangled into "Use and[path] here. Due 9[path] on
+    # dev[path] Real path [path]": now only the path goes.
+    assert redact("Use and/or here. Due 9/30/2026 on dev/main. Real path /etc/hosts.") == (
+        "Use and/or here. Due 9/30/2026 on dev/main. Real path [path]"
+    )
+
+
+def test_redact_still_redacts_every_slash_run_that_is_a_path() -> None:
+    for why, (text, gone) in _PATHS_THAT_STAY_REDACTED.items():
+        out = redact(text)
+        assert "[path]" in out, why
+        assert gone not in out, why
+
+
+def test_redact_never_raises_on_slash_heavy_text() -> None:
+    """The prose rule reads back from the match, so it must hold for every edge of a string."""
+    from itertools import product
+
+    for n in range(1, 5):
+        for chars in product("a1 /.\\$~@", repeat=n):
+            text = "".join(chars)
+            assert isinstance(redact(text), str), repr(text)
+
+
 def test_redact_agent_names_case_insensitive_word_boundary() -> None:
     out = redact("Alpha handed off to bravo", agent_names=["alpha", "bravo"])
     assert "the agent" in out
@@ -1208,7 +1272,7 @@ def test_project_publishes_an_id_less_record_without_a_handle() -> None:
 #: text the redactor never touches.
 _ALTERED_BY_THE_VIEW = {
     "absolute path": "Survey notes live in /srv/survey/reefs.md for now.",
-    "slash inside a word": "Count the fish and/or the coral.",
+    "relative path": "Count the fish in survey/reefs/north.",
     "agent name": "Nova counted the fish twice.",
     "framework id": "The count follows guard-12 closely.",
     "secret value": "Log in with s3cr3t-value-for-tests, then count.",
@@ -1230,6 +1294,25 @@ def test_is_unredacted_is_true_when_only_the_ends_are_trimmed() -> None:
     for text in ("Coral reefs bleach in warm water.", "", "Line one.\n\nLine two.\n",
                  "\n\nA body read after its front matter.\n"):
         assert kp.is_unredacted(text, _VIEW_REDACTOR), repr(text)
+
+
+def test_is_unredacted_is_true_for_prose_slashes() -> None:
+    """A slash inside prose is not an alteration, so a row carrying one can be corrected ()."""
+    for text in _PROSE_WITH_SLASHES:
+        assert kp.is_unredacted(text, _VIEW_REDACTOR), text
+
+
+def test_project_publishes_prose_slashes_whole_and_flags_the_row() -> None:
+    body = "Count and/or weigh the fish. Due 9/30/2026 on dev/main."
+    nodes = [{"key": "reefs", "category": "marine-biology/reefs", "body": body},
+             {"key": "vents", "category": "marine-biology/vents", "body": body + " Logs: /srv/vents/log.md"}]
+    bundle = project(tree_nodes=nodes, reasoning=[], hypotheses=[], guardrails=[],
+                     redactor=_VIEW_REDACTOR, item_handle_secret=_HANDLE_SECRET, environment_id=_ENV)
+    assert bundle.tree[0]["body"] == body and bundle.tree[0].get("unredacted") is True
+    # The same prose beside a real path: the prose survives, the path goes, and the row is not
+    # offered for correction because the member would be correcting text that hides a path.
+    assert bundle.tree[1]["body"] == body + " Logs: [path]"
+    assert "unredacted" not in bundle.tree[1]
 
 
 def test_project_marks_unredacted_only_on_addressable_rows_whose_text_shows_whole() -> None:

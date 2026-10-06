@@ -63,6 +63,18 @@ tries again), and the last two make the drain exit 2. The sweep shows the lock i
 before each record and each write, so a pass that outlasts ``LOCK_STALE_SECONDS`` is not
 taken for a dead one; a dry run holds no lock and shows nothing.
 
+THE SWEEP WAITS FOR EVERY QUEUED UNDO, AND AN UNDO IS JUDGED BY WHEN IT WAS SENT (g-335-1726 u7e)
+--------------------------------------------------------------------------------------------
+A stopped home applies nothing, so the window a member saw ("undo until X") can close while their
+undo waits in ``inbound/``. The applier judges an undo against the time its queued record carries
+(``queued_at``, forwarded as ``--queued-at``), never later than now, so an undo sent in time is
+restored when the home next runs; and the sweep runs only after the queued records, so it then finds
+a marker and not text. A pass that leaves queued records behind (past its ``--max`` cap, or unclaimed
+because this box cannot resolve handles) does not sweep, since an undo among them would find its
+retained copy erased: an erase entry ``deferred`` says so, and the next pass that leaves nothing
+behind sweeps. A record that FAILED stays in ``processing/`` and is not retried (an operator
+requeues it), so it holds nothing. The fleet's wrapper passes no ``--max``; the cap is an operator's.
+
 THE CLAIM STEP IS LOAD-BEARING, NOT CEREMONY
 --------------------------------------------
 Each record is moved into ``processing/`` BEFORE it is applied. That rename is
@@ -436,8 +448,9 @@ def _apply_knowledge(record: dict, *, spool_root: Path, retention_dir: Path | No
     is missing or no longer matches the item's view (rc=3, terminal), and a second
     copy of that rule here would drift from it. A forget or an undo is also handed
     ``retention_dir`` (see ``_retention_refusal``); an edit is not, so its argv is what
-    it was before forgets were applied. ``report`` receives the applier's own account
-    of the op, for ``_knowledge_outcome``.
+    it was before forgets were applied. An undo is also handed the record's ``queued_at`` as
+    ``--queued-at``: it is judged by when the member sent it. ``report`` receives the
+    applier's own account of the op, for ``_knowledge_outcome``.
     """
     fence = _destination_fence(spool_root)
     if fence is not None:
@@ -466,6 +479,11 @@ def _apply_knowledge(record: dict, *, spool_root: Path, retention_dir: Path | No
             # FAILED, never REJECTED: the record is legitimate and the gap is on this side.
             return FAILED, why
         argv.append(f"--retention-dir={retention_dir}")
+    if op == "undo":
+        # Judged by when the member sent it, not when this pass reaches it (u7e). A record that
+        # carries no usable stamp is judged at apply time, which the applier decides.
+        sent = record.get("queued_at")
+        argv.append(f"--queued-at={sent if isinstance(sent, str) else ''}")
     argv.append("--apply")
     mod = _load_knowledge_applier()
     return _run_applier(mod, argv, "unresolved handle, a missing or stale view base, or "
@@ -736,13 +754,16 @@ def _keep_lock_fresh(env_dir: Path) -> None:
         pass
 
 
-def _sweep_erasures(env_dir: Path, res: dict, *, apply: bool, spool_root: Path) -> None:
+def _sweep_erasures(env_dir: Path, res: dict, *, apply: bool, spool_root: Path,
+                    waiting: int = 0) -> None:
     """Erase what a member forgot once its undo window has closed ( u4), and add what
     happened to ``res``. See THE 30-DAY ERASE in the module docstring.
 
     Skipped where ``retention/`` does not exist, since a box that never handled a forget has no
     obligation and checking the fences there would only make an idle misconfigured box report a
-    failure it never had. Past that it takes both fences a forget takes, FAILED and loud when one
+    failure it never had. ``waiting`` is how many queued records this pass left behind; any means
+    an undo among them could find its retained copy erased, so the sweep does not run and says so
+    (u7e). Past that it takes both fences a forget takes, FAILED and loud when one
     refuses. The sweep is a boundary like an applier: it must not take the drain down with it, so
     an exception or a SystemExit is a failed erase, and its lines go to stderr, which keeps this
     process's stdout one JSON document under ``--json``. An exception is reported by its type
@@ -752,6 +773,11 @@ def _sweep_erasures(env_dir: Path, res: dict, *, apply: bool, spool_root: Path) 
     """
     retention_dir = env_dir / RETENTION
     if not retention_dir.is_dir():
+        return
+    if waiting:
+        res["erasures"].append({"kind": "-", "record": "-", "action": "deferred",
+                                "detail": f"{waiting} queued record(s) were left unapplied by this pass; "
+                                          "an undo among them is applied before anything is erased"})
         return
     why = _destination_fence(spool_root) or _retention_refusal(retention_dir)
     if why is None:
@@ -825,7 +851,9 @@ def _drain_records(env_dir: Path, *, apply: bool, source: str, asp_id: str,
             _move(stale, _lane(env_dir, QUARANTINE))
 
     files = _record_files(inbound)
+    past_cap = 0
     if max_records > 0:
+        past_cap = max(0, len(files) - max_records)
         files = files[:max_records]
 
     for src in files:
@@ -936,7 +964,8 @@ def _drain_records(env_dir: Path, *, apply: bool, source: str, asp_id: str,
         _move(claimed, _lane(env_dir, disposition))
 
     _sweep_erasures(env_dir, res, apply=apply,
-                    spool_root=spool_root if spool_root is not None else env_dir.parent)
+                    spool_root=spool_root if spool_root is not None else env_dir.parent,
+                    waiting=past_cap + res["unprovisioned"])
     return res
 
 

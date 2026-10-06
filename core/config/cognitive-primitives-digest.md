@@ -117,6 +117,16 @@ goal = {
 echo '<goal-json>' | bash core/scripts/aspirations-add-goal.sh --source {source} <aspiration_id>
 ```
 
+**Commit the edit in the same turn.** A `completed` Maintain filing carries no
+commit, and `iteration-commit.sh` no-ops on a routine close (guard-1275), so an
+inline edit made outside a deep goal stays dirty. The push self-heal commits
+only `agents/*` churn, so a dirty `core/` or `.claude/` file DEFERS every merge
+while upstream also touches it (one box, 2026-08-01 to 2026-10-04: 17 of 19
+deferred merges named a `core/` file). Right after filing, from the project root:
+`bash core/scripts/iteration-commit.sh --goal-id <maintain-goal-id> --title "<its title>" --outcome deep --repo . --session-sid "$MIND_SID"`.
+Add `--message "size-budget-override: <why>"` when a budgeted hot-path file grew
+(`hot-path-size-budget.md`).
+
 Place in `asp-001` (agent self-maintenance) or whichever aspiration houses
 framework-maintenance work in your domain. The next iteration's state-update
 will fire experience archival, spark, and tree encoding as if the goal had

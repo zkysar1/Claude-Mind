@@ -275,6 +275,29 @@ def reset_request_session(token):
     _request_session.reset(token)
 
 
+#: The meta dir of the agent the request this thread is serving belongs to, as a
+#: zero-argument callable the mind_api dispatcher names once per request (). A
+#: callable rather than a path, because the daemon resolves an agent's paths lazily:
+#: resolving them on every request, health checks included, raises for an agent with no
+#: local-paths.conf. log() calls it only when it writes a firing with no meta_dir of its
+#: own. Unset outside a request.
+_request_meta_dir = _contextvars.ContextVar("ayoai_gate_log_request_meta_dir", default=None)
+
+
+def set_request_meta_dir(resolve):
+    """Name, as a zero-argument callable, the current request's agent's meta dir.
+
+    Returns a token the caller MUST pass to reset_request_meta_dir() in a ``finally``,
+    so the destination never outlives its request on a reused thread.
+    """
+    return _request_meta_dir.set(resolve)
+
+
+def reset_request_meta_dir(token):
+    """Restore what the context held before the matching set_request_meta_dir()."""
+    _request_meta_dir.reset(token)
+
+
 def log(
     gate_id,
     decision,
@@ -298,19 +321,19 @@ def log(
                 "fail_open" with a marker in `extra._invalid_decision_received`
                 so the bad call surfaces in the log itself rather than crashing
                 the caller.
-      meta_dir: optional override for the META_DIR destination. Required by the
-                daemon (`mind_api/src/endpoints/`) — the daemon process imports
-                this module once at startup, so the module-level META_DIR is
-                frozen to whichever agent's local-paths.conf the daemon process
-                was launched under. Multi-tenant daemon requests pass
-                `ctx.paths.meta` explicitly so the firing record lands in the
-                CALLING agent's gate-firings.jsonl, not the daemon-launch
-                agent's. Omit in legacy CLI / subprocess callers — the
-                module-level META_DIR is correct for those (the CLI process
-                has its own MIND_AGENT env).
-      agent_name: optional override for the `agent` field on the record. Same
-                  motivation as meta_dir — env-derived value is wrong in the
-                  daemon. Omit elsewhere.
+      meta_dir: optional override for the META_DIR destination. The daemon
+                process imports this module once at startup, so the module-level
+                META_DIR is frozen to whichever agent's local-paths.conf the
+                daemon was launched under. When omitted, a firing written under a
+                mind_api request goes to the meta dir of the agent the dispatcher
+                named for it (set_request_meta_dir, g-375-46), and anywhere else
+                to META_DIR, which is right for a CLI or subprocess caller (its
+                process has its own MIND_AGENT env). A daemon handler may still
+                pass `ctx.paths.meta`, the same dir.
+      agent_name: optional override for the `agent` field on the record. When
+                  omitted it is the agent the dispatcher named for this request
+                  (_fileops.set_request_agent), else MIND_AGENT. The daemon's
+                  MIND_AGENT is its spawner's (guard-2480, g-375-46).
       session_id: the record's `session_id`. When omitted it is the session
                   set_request_session() named for this request, else MIND_SID.
                   The daemon's MIND_SID is whichever session SPAWNED it, so a
@@ -338,12 +361,17 @@ def log(
 
         if session_id is _ENV_SID:
             session_id = _request_session.get()
+        # Looked up per call, not at import: the dispatcher names the agent on the _fileops
+        # in sys.modules at request time, and an import-time binding would keep an older
+        # copy's var once _fileops is deleted from sys.modules and imported again, as some
+        # test suites do ().
+        from _fileops import request_agent
         record = {
             "schema_version": _SCHEMA_VERSION,
             "ts": _dt.datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
             "gate_id": gate_id,
             "decision": decision,
-            "agent": agent_name or _os.environ.get("MIND_AGENT", "") or None,
+            "agent": agent_name or request_agent() or _os.environ.get("MIND_AGENT", "") or None,
             "session_id": ((_os.environ.get("MIND_SID", "") or None)
                            if session_id is _ENV_SID else (session_id or None)),
         }
@@ -360,7 +388,16 @@ def log(
         if extra is not None:
             record["extra"] = extra
 
-        dest = (meta_dir if meta_dir is not None else META_DIR)
+        dest = meta_dir
+        if dest is None:
+            resolve = _request_meta_dir.get()
+            try:
+                dest = resolve() if resolve is not None else None
+            except Exception:
+                # An agent the daemon cannot resolve keeps the old destination.
+                dest = None
+        if dest is None:
+            dest = META_DIR
         if _spool_active():
             # O(1) hot path: one lockless local append; the flush tick
             # batches records into the shared store (see _SPOOL_NAME note).

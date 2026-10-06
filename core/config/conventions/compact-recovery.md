@@ -274,7 +274,12 @@ All keys are optional. Older readers that ignore `phase_progress` still function
 ### Writer
 
 `aspirations-verify` writes each key in-place via `jq` as the corresponding check passes:
-- After Q1 EVIDENCE passes: `q1_passed` + `q1_artifact`
+- After Q1 EVIDENCE passes: `q1_passed` + `q1_artifact`, the artifact THIS execution
+  produced. `iteration-close.sh --phase verify` copies `phase_progress` onto the goal
+  verbatim as `verify_verdict`, so a path left by an earlier run is stamped as this
+  close's evidence. `verify-preflight.sh` warns when a passed `--artifact` was last
+  modified before the unit's claim (`selected_at`); it answers age, not correctness,
+  and a pair written by hand is checked only through the same file passed as `--artifact`.
 - After Q2 NEGATIVE CHECK passes: `q2_passed` + `q2_failure_mode_checked`
 - After Q3 INTEGRATION SCOPE assessed: `q3_scope`
 - After standard checks evaluated: `standard_checks_passed`

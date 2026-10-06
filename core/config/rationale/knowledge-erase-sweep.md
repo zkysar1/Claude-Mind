@@ -192,14 +192,36 @@ after an hour. Only a file named the way the retention writer names its own is p
 left alone, and a record of a newer schema is kept, since deleting what this code cannot evaluate would be the
 opposite of a careful erase.
 
+## Why an undo is judged by when it was sent
+
+The window a member sees is "undo until X", and X is 30 days after the home APPLIED the forget. A stopped home applies
+nothing, so an undo sent on day 29 can wait in `inbound/` past day 30. Judged when it is applied, it is refused
+`undo_expired` and the same pass erases the retained copy: the member did what the page allowed and lost the item
+(the g-335-1726 u5b1 review, finding F-2).
+
+The applier therefore judges an undo at the earlier of the time its queued record carries (`queued_at`, handed to the
+applier as `--queued-at`) and now (`knowledge_retention.judged_at`, the one place that rule lives). The clamp keeps the
+change one-directional: a stamp can make the judgment more lenient than applying now and never stricter, so no undo that
+is accepted today is refused by it. A stamp that is absent, not text, or does not parse is judged at now, which is the
+behaviour before this change, and a stamp with no offset is read as UTC whatever zone the box is in (a test sets the
+zone to settle it).
+
+The sweep runs after the queued records, so an undo sent in time has restored the item and left a marker before the sweep
+looks, and the sweep passes over a marker. A pass that leaves queued records behind does not sweep: records past an
+operator's `--max` cap (the fleet's wrapper passes none), or records left unclaimed because the box cannot resolve
+handles. Either could hold an undo whose retained copy the sweep would erase first, so the pass reports one `deferred`
+entry in `erasures` (a count; no text, no id), changes no counter and does not fail, and the next pass that leaves
+nothing behind sweeps. Erasing a pass late keeps a retained copy one pass longer; erasing early cannot be taken back.
+
 ## Why it runs inside the drain
 
 The drain already owns the three things an erase needs: the environment's lock (a sweep that runs beside a member's
 undo could delete the record the undo is reading, or blank text the undo has just put back), the two fences a forget
 takes (a box that is not the environment must not touch its retention or its world), and the exit code and finding
-channel that reach an operator. The sweep runs after the queued records so a late undo is refused as expired before
-the record it would have used is deleted, and it is skipped where no retention directory exists, so an environment
-that never handled a forget is untouched and an idle box with a wrong fence reports nothing it never had.
+channel that reach an operator. The sweep runs after the queued records so an undo among them is applied, or refused
+as expired, before the record it would have used is deleted (the next section says how that judgment is made), and
+it is skipped where no retention directory exists, so an environment that never handled a forget is untouched and an
+idle box with a wrong fence reports nothing it never had.
 
 The lock is only as good as its staleness bound. `LOCK_STALE_SECONDS` is 600, and the sweep's longest steps are
 daemon writes: one blanked hypothesis took five `update-field` calls in a probe, and the transport's default
@@ -212,6 +234,22 @@ passes one that refreshes the lock's mtime. A dry run holds no lock and passes n
 
 Each of these is counted or pinned, never reported as erased:
 
+- **The stamp is the intake's, and a member's request cannot set it.** An undo is judged by `queued_at` as the queued
+  record carries it. Measured 2026-10-04 from the intake's source, read on its development and its production branch
+  (they differ only in the `undo` op): the intake stamps `queued_at` itself, from its own UTC clock to the second
+  (`%Y-%m-%dT%H:%M:%S`, no offset, the form the fixtures use and the box reads as UTC). It builds the record's `kind`,
+  `environmentKey`, `accountId`, `queued_at` and `source` first and only then merges the fields its validators return,
+  and those return `handle`, `op`, `text` and `base` for a knowledge change (`handle`, `verb` and `value` for a member
+  verb, `text` for a directive), so no request body can supply or overwrite the stamp. What remains is a writer that
+  reaches the spool without the intake: an operator, whose requeue (`requeue_stale`) moves the file and keeps its
+  original stamp. A stamp from such a writer that lied about being early would let an undo through until the first
+  applying pass erases the retained copy, which on a stopped home is as long as the home is stopped. NOT measured: any
+  writer beyond the intake and an operator, and the deployed function's own artifact hash (its deploy job asserts it,
+  and the last runs on both branches passed). Re-derive: read the intake's source on each branch, and check that
+  `queued_at` is assigned before the fields are merged and that no validator returns it.
+- **A failed undo holds nothing.** A record whose apply FAILED stays in `processing/` and is not retried (an operator
+  requeues it), so the sweep does not wait for it: its retained copy is erased once the window is over, and a requeue
+  after that is refused. Waiting would let one stuck record keep every erase in the environment from ever running.
 - **The world's history.** Every pipeline write snapshots the file first, so the pre-forget text survives in the
   history store, and the prune policy keeps one weekly snapshot for day 31 onward with no stated end
   (`history.md`, Prune old snapshots). The erase's own writes add snapshots of their own (a probe counted four files

@@ -105,6 +105,8 @@ an exact bring-up checklist.
 
 **Step 3**: Flush continuity to S3 (skip with `--no-flush`).
   `Bash: bash core/scripts/owncloud-flush.sh`
+  If it exits non-zero (a daemon error, or per-file push errors), STOP: the destination
+  would read stale continuity state. Fix the flush and re-run this step before Step 4.
   Pushes the latest `handoff.yaml`, `pending-questions.yaml`, working-memory,
   and any other `sync_tier: continuity` files so the destination picks up the
   agent's most recent state on first daemon read. (These are continuity-tier in

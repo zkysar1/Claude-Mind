@@ -13,7 +13,8 @@ keeps its own semantics and its own ledger rows:
 
   checks            verify-check-eval.sh --goal <id> --all
   closure-evidence  closure-evidence-gate.py --goal <id> --source <s> [--summary-file]
-  artifact          each --artifact is a file on this box
+  artifact          each --artifact is a file on this box, last modified at or after this
+                    unit's claim (a warning when not, never a refusal)
   positive-state    positive-state-gate.py --claim --evidence    (only with --claim)
   q4                q4-provenance-sample.sh --goal --artifact... --json    (only with --artifact)
   q1                derived: the table passed, every artifact exists, and
@@ -36,6 +37,26 @@ you are not closing). This writes NO goal status: the
 status is the closer's judgement, and its write belongs to
 iteration-close.sh --phase verify (guard-2523).
 
+ARTIFACT CURRENCY. Q1's artifact is copied onto the goal verbatim as
+verify_verdict.q1_artifact, and a file left by an EARLIER run (the previous
+occurrence of a recurring goal's log) passes the existence check, so the record
+could name a file this execution did not produce. A found artifact whose mtime is
+before the checkpoint's selected_at, this unit's claim, therefore draws a warning,
+and a diary line when Q1 passes, since the copy is made either way. It answers AGE
+and never correctness: a unit may legitimately cite an earlier file, and a file
+whose mtime a sync or a touch refreshed reads as current, so no warning is not
+proof. Only mtime is compared, so file names and their order play no part. The
+anchor is the checkpoint's selected_at, which is not always this claim's time. A
+re-anchor after the claim (loop-state-save, init from a goal id) is later, so a
+current file can look earlier. And the claim re-initialises the checkpoint only
+when it anchors a different goal (aspirations-claim.sh), so a recurring goal
+re-claimed over its previous occurrence's checkpoint keeps that occurrence's
+earlier time, and that occurrence's log reads as current. When the claim time
+cannot be read for THIS goal (no checkpoint, a checkpoint anchoring another goal,
+a selected_at that is not a time), the line says "currency not checked" and never
+reads as current. A pair written by hand (the OPEN case in the verify skill) is
+checked only when the same file is also passed as --artifact.
+
 VERDICTS. PASS; FAIL; SKIPPED, which means the check did not apply and is NOT
 evidence (a Q4 "skipped" is not a pass); OPEN, for Q1 when the table check did
 not apply, so the closer judges Q1; ERROR, which means the check could not run
@@ -54,6 +75,7 @@ import json
 import socket
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -212,7 +234,25 @@ def resolve(path: str) -> Path:
     return p if p.is_absolute() else resolve_file_path(path)
 
 
-def check_artifacts(artifacts: List[str]) -> dict:
+TS = "%Y-%m-%dT%H:%M:%S"  # the checkpoint's selected_at, naive UTC
+
+
+def claim_time(checkpoint: dict, goal_id: str) -> Tuple[Optional[datetime], str]:
+    """(when this unit claimed the goal, "") from the checkpoint, else (None, why not).
+    Only a checkpoint anchoring THIS goal speaks for it: the slot is reused across goals."""
+    anchor = checkpoint.get("goal_id")
+    if anchor != goal_id:
+        return None, (f"the checkpoint anchors {anchor}, not {goal_id}" if anchor
+                      else "no checkpoint anchors this goal")
+    raw = checkpoint.get("selected_at")
+    try:
+        t = datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None, f"the checkpoint's selected_at {raw!r} is not a time"
+    return (t.astimezone(timezone.utc).replace(tzinfo=None) if t.tzinfo else t), ""
+
+
+def check_artifacts(artifacts: List[str], claimed_at: Optional[datetime], unchecked_why: str) -> dict:
     if not artifacts:
         return verdict("artifact", SKIPPED, "no --artifact given (Q4 needs one)")
     missing, found = [], []
@@ -230,7 +270,28 @@ def check_artifacts(artifacts: List[str]) -> dict:
         return verdict("artifact", FAIL, f"{len(missing)} of {len(artifacts)} artifact(s) missing or not a file",
                        missing, "pass the file this goal produced: an absolute path, or one under "
                        "world/, meta/ or the project root", paths=found)
-    return verdict("artifact", PASS, f"{len(found)} file(s) exist: {', '.join(found)}", paths=found)
+    # Currency answers AGE only (module docstring), so it warns and never refuses.
+    warnings, stale = [], []
+    if claimed_at is None:
+        warnings.append(f"warning: currency not checked ({unchecked_why}), so a file left by an "
+                        "earlier run would read the same as this unit's")
+    else:
+        for f in found:
+            try:
+                made = datetime.fromtimestamp(Path(f).stat().st_mtime, tz=timezone.utc).replace(tzinfo=None)
+            except (OSError, OverflowError, ValueError) as e:
+                warnings.append(f"warning: currency not checked for {f} ({e})")
+                continue
+            if made < claimed_at:
+                hours, minutes = divmod(int((claimed_at - made).total_seconds()) // 60, 60)
+                stale.append(f)
+                warnings.append(f"warning: {f} predates this unit's claim (modified {made.strftime(TS)}, "
+                                f"claimed {claimed_at.strftime(TS)}, {hours} h {minutes} min earlier), so it "
+                                "reads as left by an earlier run. Pass the file THIS execution produced; if "
+                                "citing the earlier file is the point, say so in the close note")
+    return verdict("artifact", PASS, f"{len(found)} file(s) exist: {', '.join(found)}"
+                   + (f"; {len(stale)} predate this unit's claim" if stale else ""),
+                   warnings, paths=found, stale=stale)
 
 
 def check_positive_state(claim: Optional[str], evidence: str, override: Optional[str], run: Runner) -> dict:
@@ -311,16 +372,14 @@ def derive_q1(ce: dict, art: dict, ps: dict) -> dict:
 class Writer:
     """The skill's state writes, through the same wrappers the skill named."""
 
-    def __init__(self, goal_id: str, run: Runner):
+    def __init__(self, goal_id: str, run: Runner, checkpoint: dict):
         self.goal_id, self.run, self.done, self.failed, self.held = goal_id, run, [], [], []
         # The checkpoint is ONE slot reused across goals, and iteration-close copies
         # its phase_progress onto whichever goal it anchors. So a key written while it
         # anchors another goal lands on THAT goal's record as its verdict. Absent is
         # different: the update still runs, because its missing-checkpoint warning and
         # ledger row are how a skipped anchor is detected (loop-state-save.cmd_update).
-        rc, out, _err = run(bash_cmd(SCRIPT_DIR / "loop-state-save.sh", "read"), None)
-        d = parse_json(out) if rc == 0 else None
-        self.anchor = d.get("goal_id") if isinstance(d, dict) else None
+        self.anchor = checkpoint.get("goal_id")
 
     def _do(self, what: str, argv: List[str], stdin: Optional[str] = None) -> None:
         rc, _out, err = self.run(argv, stdin)
@@ -360,6 +419,8 @@ def record(results: Dict[str, dict], w: Writer) -> None:
     if q1["state"] == PASS:
         w.checkpoint(q1_passed="true", q1_artifact=q1["data"]["artifact"])
         w.diary("finding", f"Q1 passed: artifact={q1['data']['artifact']}")
+        for p in results["artifact"]["data"].get("stale") or []:
+            w.diary("finding", f"Q1 artifact predates this unit's claim: {p}")
     ps = results["positive-state"]
     if ps["state"] == FAIL:
         w.gap("positive-state", ps["data"].get("reason") or "; ".join(ps["findings"]))
@@ -381,13 +442,17 @@ def preflight(goal_id: str, source: str, artifacts: List[str], *, source_file=No
     results: Dict[str, dict] = {}
     results["checks"] = check_structured(goal_id, run)
     results["closure-evidence"] = check_closure_evidence(goal_id, source, summary_file, run)
-    results["artifact"] = check_artifacts(artifacts)
+    # One read of the checkpoint serves the artifact's claim time and the Writer's anchor.
+    rc, out, _err = run(bash_cmd(SCRIPT_DIR / "loop-state-save.sh", "read"), None)
+    cp = parse_json(out) if rc == 0 else None
+    checkpoint = cp if isinstance(cp, dict) else {}
+    results["artifact"] = check_artifacts(artifacts, *claim_time(checkpoint, goal_id))
     results["positive-state"] = check_positive_state(claim, evidence, override_ps, run)
     results["q4"] = check_q4(goal_id, results["artifact"]["data"].get("paths") or [], source_file, run)
     results["q1"] = derive_q1(results["closure-evidence"], results["artifact"], results["positive-state"])
     wrote, failures, held = [], [], ["every write (--no-write)"]
     if write:
-        w = Writer(goal_id, run)
+        w = Writer(goal_id, run, checkpoint)
         record(results, w)
         wrote, failures, held = w.done, w.failed, w.held
     states = [r["state"] for r in results.values()]
@@ -423,7 +488,8 @@ def main(argv=None) -> int:
     ap.add_argument("--goal", required=True)
     ap.add_argument("--source", default="world", choices=("world", "agent"))
     ap.add_argument("--artifact", action="append", default=[],
-                    help="a file this goal produced (repeatable): Q1 checks it exists, Q4 samples it")
+                    help="a file this goal produced (repeatable): Q1 checks it exists and warns if it "
+                         "predates this unit's claim, Q4 samples it")
     ap.add_argument("--source-file", default=None, help="Q4: the source the artifact must be faithful to")
     ap.add_argument("--claim", default=None, help="Q1: a file-state claim for the positive-state gate")
     ap.add_argument("--evidence", default="", help="the in-turn Read/ls output that backs --claim")

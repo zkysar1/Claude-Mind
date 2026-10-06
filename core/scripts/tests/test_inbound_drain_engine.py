@@ -730,7 +730,24 @@ class TestKnowledgeDispositions(DrainTestBase):
         self.assertEqual(res["processed"], 1)
         self.assertEqual(self.knowledge_applier.calls,
                          [["--handle", "0123456789abcdef", "--op", "undo", "--text=", "--base=",
-                           f"--retention-dir={self.env / drain.RETENTION}", "--apply"]])
+                           f"--retention-dir={self.env / drain.RETENTION}",
+                           "--queued-at=2026-09-30T18:00:00", "--apply"]])
+
+    def test_an_undo_whose_record_has_no_usable_send_time_is_forwarded_with_none(self):
+        """The applier decides what an absent stamp means (it judges at apply time); the drain
+        neither rejects the member's undo over the stamp nor forwards a value that is not text."""
+        for i, stamp in enumerate((None, 5, {"at": "yesterday"})):
+            record = self.knowledge(op="undo")
+            if stamp is None:
+                record.pop("queued_at")
+            else:
+                record["queued_at"] = stamp
+            self.write_record(f"2026093018000000000{i}-a.json", record)
+
+        res = self.run_drain()
+
+        self.assertEqual(res["processed"], 3, res["records"])
+        self.assertEqual([call[-2] for call in self.knowledge_applier.calls], ["--queued-at="] * 3)
 
     def test_each_environment_has_its_own_retention_directory(self):
         other = self.root / "env-two"
@@ -1598,6 +1615,145 @@ class TestTheErasureThroughTheDrain(_RealWorldBase):
         res = self.run_drain()
 
         self.assertEqual((res["rejected"], res["erased"]), (1, 1), res["records"])
+
+    # --- an undo is judged by when it was sent, and the sweep waits for a queue (u7e) ---------------
+    #
+    # ``age_retention()`` makes the forget 31 days old, so the window closed a day ago. A stopped
+    # home would then find the member's undo in ``inbound/`` and the retained copy due for erasure
+    # in one pass.
+
+    UNDO = "20260930T180000000001-b.json"
+
+    def sent(self, delta):
+        return (datetime.now(tz=timezone.utc) + delta).replace(microsecond=0).isoformat()
+
+    def queue_undo(self, sent, name=None):
+        record = self.knowledge(op="undo", handle=self.handle)
+        if sent is None:
+            record.pop("queued_at")
+        else:
+            record["queued_at"] = sent
+        self.write_record(name or self.UNDO, record)
+
+    def restored(self):
+        return self.node.read_text(encoding="utf-8") == self.NODE
+
+    def test_an_undo_sent_inside_the_window_is_restored_by_the_pass_that_would_have_erased_it(self):
+        self.forget()
+        self.age_retention()
+        self.queue_undo(self.sent(timedelta(days=-2)))
+
+        res = self.run_drain()
+
+        self.assertEqual((res["processed"], res["rejected"]), (1, 0), res["records"])
+        self.assertEqual(self.outcome("processed", self.UNDO)["result"], "applied")
+        self.assertEqual((res["erased"], res["erase_failed"], res["erase_pending"]), (0, 0, 0), res["erasures"])
+        self.assertEqual(res["erasures"], [])
+        self.assertTrue(self.restored(), "the page is back byte for byte")
+        import knowledge_retention as kr  # noqa: PLC0415
+        [(_path, record)] = list(kr.list_records(str(self.env / drain.RETENTION)))
+        self.assertFalse(kr.is_live(record), "the retained record holds a marker now, not the text")
+
+    def test_the_same_undo_sent_after_the_window_is_refused_and_the_same_pass_erases(self):
+        """The control for the test above: only the send time differs."""
+        self.forget()
+        self.age_retention()
+        self.queue_undo(self.sent(timedelta(hours=-12)))
+
+        res = self.run_drain()
+
+        self.assertEqual((res["processed"], res["rejected"]), (0, 1), res["records"])
+        self.assertEqual(self.outcome("rejected")["result"], "undo_expired")
+        self.assertEqual((res["erased"], res["erase_failed"]), (1, 0), res["erasures"])
+        self.assertEqual(self.retained_files(), [])
+        self.assertFalse(self.restored())
+
+    def test_an_undo_with_no_send_time_is_judged_when_the_pass_applies_it(self):
+        self.forget()
+        self.age_retention()
+        self.queue_undo(None)
+
+        res = self.run_drain()
+
+        self.assertEqual(self.outcome("rejected")["result"], "undo_expired")
+        self.assertEqual((res["rejected"], res["erased"]), (1, 1), res["erasures"])
+
+    def test_a_pass_that_leaves_records_queued_behind_its_cap_does_not_erase(self):
+        """A cap is an operator's (the fleet's wrapper passes none). The undo sorts after the cap,
+        so this pass does not reach it, and erasing now would leave it nothing to restore."""
+        self.forget()
+        self.age_retention()
+        self.write_record("20260930T180000000000-z.json",
+                          self.knowledge(op="edit", handle=self.handle, base=self.base))
+        self.queue_undo(self.sent(timedelta(days=-2)))
+        kept = self.retained_files()
+
+        capped = self.run_drain(max_records=1)
+
+        self.assertEqual(os.listdir(self.inbound), [self.UNDO], "the undo is still queued")
+        self.assertEqual((capped["erased"], capped["erase_failed"], capped["erase_pending"]), (0, 0, 0))
+        self.assertEqual(self.retained_files(), kept, "nothing was erased")
+        self.assertEqual([(e["kind"], e["record"], e["action"]) for e in capped["erasures"]],
+                         [("-", "-", "deferred")])
+        self.assertIn("1 queued record", capped["erasures"][0]["detail"])
+
+        res = self.run_drain()
+
+        self.assertEqual((res["processed"], res["erased"]), (1, 0), res["records"])
+        self.assertTrue(self.restored(), "the next pass restores what the capped pass left queued")
+
+    def test_a_pass_that_left_a_record_unclaimed_on_an_unprovisioned_box_does_not_erase(self):
+        self.forget()
+        self.age_retention()
+        self.queue_undo(self.sent(timedelta(days=-2)))
+        kept = self.retained_files()
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("KNOWLEDGE_HANDLE_SECRET")
+            blind = self.run_drain()
+
+        self.assertEqual((blind["unprovisioned"], blind["claimed"]), (1, 0))
+        self.assertEqual(os.listdir(self.inbound), [self.UNDO])
+        self.assertEqual((blind["erased"], blind["erase_failed"]), (0, 0))
+        self.assertEqual(self.retained_files(), kept, "nothing was erased")
+        self.assertEqual([e["action"] for e in blind["erasures"]], ["deferred"])
+
+        res = self.run_drain()
+
+        self.assertEqual((res["processed"], res["erased"]), (1, 0), res["records"])
+        self.assertTrue(self.restored())
+
+    def test_a_cap_that_truncates_nothing_does_not_defer_the_erase(self):
+        """A cap larger than the queue leaves nothing behind it, so the sweep still runs."""
+        self.forget()
+        self.age_retention()
+
+        res = self.run_drain(max_records=50)
+
+        self.assertEqual((res["erased"], res["erase_failed"]), (1, 0), res["erasures"])
+        self.assertNotIn("deferred", [e["action"] for e in res["erasures"]])
+
+    def test_a_capped_pass_on_an_environment_that_never_forgot_has_nothing_to_defer(self):
+        """No retention directory means no erase to wait on, so the pass says nothing about one."""
+        for i in range(3):
+            self.write_record(f"2026093018000000000{i}-z.json",
+                              self.knowledge(op="edit", handle=self.handle, base=self.base))
+
+        res = self.run_drain(max_records=1)
+
+        self.assertEqual(len(os.listdir(self.inbound)), 2, "two records are left behind the cap")
+        self.assertEqual(res["erasures"], [])
+        self.assertFalse((self.env / drain.RETENTION).exists())
+
+    def test_an_uncapped_pass_with_nothing_left_behind_adds_no_deferred_entry(self):
+        """The positive control for the deferral: the sweep still runs when nothing waits."""
+        self.forget()
+        self.age_retention()
+
+        res = self.run_drain()
+
+        self.assertEqual((res["erased"], res["erase_failed"]), (1, 0), res["erasures"])
+        self.assertNotIn("deferred", [e["action"] for e in res["erasures"]])
 
     def test_the_summary_line_the_json_and_the_exit_code_carry_the_erase(self):
         self.forget()

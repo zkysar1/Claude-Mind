@@ -14,6 +14,7 @@ Imported by all write scripts to provide:
 
 import fnmatch
 import gzip
+import contextvars
 import copy
 import json
 import os
@@ -1003,9 +1004,38 @@ def resolve_base_dir(path):
     return None
 
 
+# The agent the mind_api request on this thread is serving. The daemon inherits the env of
+# whichever session SPAWNED it and then serves every agent on the box, so its MIND_AGENT
+# names the spawner, not the caller (guard-2480). The dispatcher names the caller once per
+# request from the X-Mind-Agent header (), so changelog and history attribution,
+# and the gate firings _gate_log writes, carry the agent the write is for. Unset outside a
+# request, where the process env is the caller's own.
+_request_agent = contextvars.ContextVar("ayoai_request_agent", default=None)
+
+
+def set_request_agent(agent):
+    """Name the calling agent for the current request; a blank name names none.
+
+    Returns a token the caller MUST pass to reset_request_agent() in a ``finally``,
+    so the agent never outlives its request on a reused thread.
+    """
+    return _request_agent.set((agent or "").strip() or None)
+
+
+def reset_request_agent(token):
+    """Restore what the context held before the matching set_request_agent()."""
+    _request_agent.reset(token)
+
+
+def request_agent():
+    """The agent the dispatcher named for the current request, or None outside one."""
+    return _request_agent.get()
+
+
 def _agent_name():
-    """Get the current agent name, defaulting to 'system'."""
-    return os.environ.get("MIND_AGENT", "system")
+    """The agent a write is attributed to: the request's agent when the mind_api
+    dispatcher named one, else MIND_AGENT, else 'system'."""
+    return request_agent() or os.environ.get("MIND_AGENT", "system")
 
 
 # ---------------------------------------------------------------------------

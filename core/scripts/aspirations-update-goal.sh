@@ -403,6 +403,29 @@ if { [ -n "$LEDGER_EVIDENCE" ] || [ -n "$LEDGER_VERDICT" ]; } && [ "$FIELD" != "
     exit 1
 fi
 
+# : A WORKER BODY'S NOTE IS SIGNED HERE, the way goal-field-append.py and
+# closure-evidence-write.sh sign the notes they write (; why the writer
+# signs, never the Body: _body_stamp.py). This wrapper REPLACES the field, so the
+# line ends the whole value it writes. Measured over the 8 zc worker Bodies'
+# transcripts from 2026-10-02T18:44 to 2026-10-03T23:10: 35 of their 100 note
+# writes came through here and none was signed, while worker-loop tells a Body
+# never to type its host or sid because scripts add them. Signed: a progress_note
+# or outcome_note value, and an outcome_note riding a status write (the encoder
+# below adds the line). goal-field-append.py and closure-evidence-write.sh pass
+# MIND_NOTE_SIGNED=1 on their call here: their value is already signed, or
+# deliberately unsigned (a preserved note), and a second line would misstate it.
+# A failure to sign is said aloud and the note is written unsigned. A worker with
+# no agent or sid in its environment gets no line and no warning: no line beats a
+# wrong one (_body_stamp.py).
+NOTE_STAMP=""
+if [[ "${BODY_ROLE:-}" == "worker" && -z "${MIND_NOTE_SIGNED:-}" ]] \
+        && [[ "$FIELD" == "progress_note" || "$FIELD" == "outcome_note" || -n "$OUTCOME_NOTE" ]]; then
+    if ! NOTE_STAMP="$($(rt_python_launcher) "$CORE_ROOT/scripts/_body_stamp.py" line)"; then
+        NOTE_STAMP=""
+        echo "Warning: could not sign this worker note (_body_stamp.py failed); writing it unsigned." >&2
+    fi
+fi
+
 # Encode value as JSON, mirroring aspirations.py parse_value. Single py -3
 # call (~30-50ms on Windows) vs full aspirations.py module load (~400-500ms).
 # : VALUE travels on STDIN, never argv. Passing it as `-c '...' "$VALUE"`
@@ -413,7 +436,7 @@ fi
 # The program still arrives via `-c` (argv), which is what keeps stdin free for the
 # data: `python3 -` or a heredoc-fed program would consume stdin ITSELF and silently
 # discard the piped value (guard-4740 / guard-4728).
-ENCODED_VALUE=$(printf '%s' "$VALUE" | MIND_COMPANION_NOTE="$OUTCOME_NOTE" MIND_COMPANION_LEDGER_EVIDENCE="$LEDGER_EVIDENCE" MIND_COMPANION_LEDGER_VERDICT="$LEDGER_VERDICT" $(rt_python_launcher) -c '
+ENCODED_VALUE=$(printf '%s' "$VALUE" | MIND_NOTE_STAMP="$NOTE_STAMP" MIND_NOTE_FIELD="$FIELD" MIND_COMPANION_NOTE="$OUTCOME_NOTE" MIND_COMPANION_LEDGER_EVIDENCE="$LEDGER_EVIDENCE" MIND_COMPANION_LEDGER_VERDICT="$LEDGER_VERDICT" $(rt_python_launcher) -c '
 import json, sys
 v = sys.stdin.read()
 if v == "true":
@@ -448,10 +471,23 @@ import os
 _n = os.environ.get("MIND_COMPANION_NOTE", "")
 _le = os.environ.get("MIND_COMPANION_LEDGER_EVIDENCE", "")
 _lv = os.environ.get("MIND_COMPANION_LEDGER_VERDICT", "")
+# : a worker Body note ends with the signature line bash put in
+# MIND_NOTE_STAMP (empty for anyone else, and for a writer that signed its own
+# value). A note whose last line already is that line is left as it is, so a
+# Body that re-sends a note it signed never stacks a second line. Only text is
+# signed: a value read as JSON, a number or a literal is stored as before.
+_stamp = os.environ.get("MIND_NOTE_STAMP", "")
+def _signed(t):
+    b = t.rstrip()
+    if not _stamp or not b or b.rsplit("\n", 1)[-1].strip() == _stamp:
+        return t
+    return b + "\n\n" + _stamp
+if os.environ.get("MIND_NOTE_FIELD") in ("progress_note", "outcome_note") and isinstance(r, str):
+    r = _signed(r)
 if _n or _le or _lv:
     r = {"value": r}
     if _n:
-        r["outcome_note"] = _n
+        r["outcome_note"] = _signed(_n)
     if _le:
         try:
             r["ledger_evidence"] = json.loads(_le)

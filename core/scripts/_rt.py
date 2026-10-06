@@ -308,6 +308,23 @@ def aspirations_update_goal(goal_id, field, value, source="world"):
                 query=query, body=json.dumps(value)))
 
 
+def aspirations_update_goal_fields(goal_id, fields, source="world"):
+    """POST /v1/aspirations/update-goal-fields (): several flat
+    fields of ONE goal in ONE locked rewrite of the store, each read back from
+    the authoritative store. `fields` maps name -> PYTHON value (None clears).
+
+    Only the recurring-close counter fields are accepted; the endpoint names
+    its allowlist in the refusal. A refusal, and a field the read-back could
+    not confirm, both raise RtError (never a False): `.body` is the daemon's
+    JSON, whose `unwritten` lists EXACTLY the fields that did not land, so a
+    caller can name them without parsing prose.
+    """
+    query = "id=%s&source=%s" % (_q(goal_id), _q(source))
+    return json.loads(
+        rt_call("POST", "/v1/aspirations/update-goal-fields",
+                query=query, body=json.dumps({"fields": fields})))
+
+
 def wm_read(slot=None, as_json=True):
     """GET /v1/wm/read. Returns the raw body the deleted `wm.py read` CLI
     printed (JSON when as_json, else YAML)."""

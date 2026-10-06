@@ -60,12 +60,15 @@ def _mk_origin_and_clone(tmp_path: Path, name: str) -> Path:
     return clone
 
 
-def _world_with_manifest(tmp_path: Path, roots: list[str]) -> Path:
+def _world_with_manifest(tmp_path: Path, roots: list[str],
+                         owners: list[str] | None = None) -> Path:
     world = tmp_path / "world"
     world.mkdir(exist_ok=True)
     lines = "\n".join(f'  - "{r}"' for r in roots)
-    (world / "delivery-repos.yaml").write_text(
-        f"# test manifest\nroots:\n{lines}\n")
+    text = f"# test manifest\nroots:\n{lines}\n"
+    if owners is not None:
+        text += "owners:\n" + "".join(f'  - "{o}"\n' for o in owners)
+    (world / "delivery-repos.yaml").write_text(text)
     return world
 
 
@@ -524,7 +527,10 @@ def _land_on_origin(tmp_path: Path, clone: Path, tag: str,
                     str(other)], capture_output=True, check=True)
     _git(other, "config", "user.email", "t@t"); _git(other, "config", "user.name", "t")
     for name, text in files.items():
-        (other / name).write_text(text)
+        if isinstance(text, bytes):
+            (other / name).write_bytes(text)
+        else:
+            (other / name).write_text(text)
     _git(other, "add", "-A"); _git(other, "commit", "-m", msg)
     _git(other, "push", "-q", "origin", "master")
 
@@ -581,10 +587,11 @@ def test_single_commit_squash_phantom_is_released_as_patch_equivalent(
     assert "whose CONTENT is already on it (patch-equivalent)" in err, err
 
 
-def _multi_commit_squash(tmp_path: Path) -> tuple:
+def _multi_commit_squash(tmp_path: Path, later: dict | None = None) -> tuple:
     """A two-commit branch squashed into ONE commit on origin, after which the
-    ref moves on with unrelated work, so whole trees differ. The union patch
-    matches neither original's patch-id (guard-4009)."""
+    ref moves on with unrelated work (or with `later`, the files to write
+    instead), so whole trees differ. The union patch matches neither original's
+    patch-id (guard-4009)."""
     clone = _mk_origin_and_clone(tmp_path, "product")
     _git(clone, "checkout", "-q", "-b", "feature")
     (clone / "app.py").write_text("v2\n")
@@ -596,7 +603,8 @@ def _multi_commit_squash(tmp_path: Path) -> tuple:
 
     _land_on_origin(tmp_path, clone, "squash",
                     {"app.py": "v2\n", "lib.py": "helper\n"}, "part 1+2 (#2)")
-    _land_on_origin(tmp_path, clone, "unrelated", {"other.py": "x\n"}, "unrelated")
+    _land_on_origin(tmp_path, clone, "unrelated", later or {"other.py": "x\n"},
+                    "unrelated")
     _git(clone, "fetch", "-q", "origin")
     for sha in shas:
         _assert_local_only(clone, sha)
@@ -692,3 +700,325 @@ def test_landed_probe_fails_closed_on_an_unreadable_ref(tmp_path):
     clone = _mk_origin_and_clone(tmp_path, "product")
     sha = _git(clone, "rev-parse", "HEAD")
     assert _landed_by_content(clone, "refs/remotes/origin/no-such-ref", [sha]) == {}
+
+
+# ── : scope the gate to the repos the fleet delivers ──────────────
+# A glob over a checkout directory also matches clones of someone else's repo.
+# `owners:` in delivery-repos.yaml drops a root only when its origin NAMES a
+# different GitHub account; anything the probe cannot name is KEPT.
+
+
+def _repo_with_origin(path: Path, url: str | None) -> Path:
+    """An empty repo whose `origin` URL reads as `url` (no network involved)."""
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "master", str(path)],
+                   capture_output=True, check=True)
+    if url is not None:
+        _git(path, "remote", "add", "origin", url)
+    return path
+
+
+def test_owners_filter_drops_foreign_origins_and_keeps_the_rest(tmp_path, capsys):
+    estate = tmp_path / "estate"
+    mine = _repo_with_origin(estate / "mine", "https://github.com/acme/mine.git")
+    theirs = _repo_with_origin(estate / "theirs", "git@github.com:outsider/theirs.git")
+    no_origin = _repo_with_origin(estate / "no-origin", None)
+    elsewhere = _repo_with_origin(estate / "elsewhere",
+                                  "https://gitlab.com/outsider/elsewhere.git")
+
+    # CONTROL: with no `owners:` every root is scanned, exactly as before.
+    world = _world_with_manifest(tmp_path, [str(estate / "*")])
+    assert sorted(_delivery_repo_roots(world)) == sorted(
+        [mine, theirs, no_origin, elsewhere])
+
+    world = _world_with_manifest(tmp_path, [str(estate / "*")], owners=["acme"])
+    capsys.readouterr()
+    assert sorted(_delivery_repo_roots(world)) == sorted(
+        [mine, no_origin, elsewhere])
+    err = capsys.readouterr().err
+    # Reported, never silent (guard-1760) -- by name and owner, never by URL.
+    assert "skipped 1 delivery repo(s)" in err and "theirs (outsider)" in err, err
+    assert "github.com" not in err, err
+
+
+_URL_SHAPES = [
+    pytest.param("https://github.com/acme/r.git", True, id="https-owned"),
+    pytest.param("https://GitHub.com/AcMe/r", True, id="mixed-case-owned"),
+    pytest.param("git@github.com:acme/r.git", True, id="scp-owned"),
+    pytest.param("ssh://git@github.com:22/acme/r.git", True, id="ssh-port-owned"),
+    pytest.param("https://x-access-token:notarealtoken@github.com/acme/r.git",
+                 True, id="token-owned"),
+    pytest.param("https://github.com/outsider/r.git", False, id="https-foreign"),
+    pytest.param("git@github.com:outsider/r.git", False, id="scp-foreign"),
+    pytest.param("ssh://git@github.com:22/outsider/r.git", False,
+                 id="ssh-port-foreign"),
+    pytest.param("https://x-access-token:notarealtoken@github.com/outsider/r.git",
+                 False, id="token-foreign"),
+    pytest.param("HTTPS://GITHUB.COM/OUTSIDER/r", False, id="upper-foreign"),
+    # An owner that cannot be NAMED is kept: only a positively identified
+    # foreign owner is ever dropped.
+    pytest.param("https://gitlab.com/outsider/r.git", True, id="other-host-kept"),
+    pytest.param("https://github.com.evil.example/outsider/r", True,
+                 id="host-prefix-spoof-kept"),
+    pytest.param("https://notgithub.com/outsider/r", True,
+                 id="host-suffix-spoof-kept"),
+    pytest.param("/srv/mirrors/outsider/r.git", True, id="local-path-kept"),
+    pytest.param("https://github.com/outsider", True, id="no-repo-segment-kept"),
+]
+
+
+@pytest.mark.parametrize("url, kept", _URL_SHAPES)
+def test_owners_filter_url_shapes(tmp_path, capsys, url, kept):
+    repo = _repo_with_origin(tmp_path / "estate" / "r", url)
+    world = _world_with_manifest(tmp_path, [str(tmp_path / "estate" / "*")],
+                                 owners=["acme"])
+    assert (repo in _delivery_repo_roots(world)) is kept
+    err = capsys.readouterr().err
+    # A remote URL can embed a token: it must never reach the operator's stderr.
+    assert url not in err and "notarealtoken" not in err, err
+
+
+def test_manifest_owners_may_precede_roots_and_unknown_keys_end_a_list(tmp_path):
+    estate = tmp_path / "estate"
+    mine = _repo_with_origin(estate / "mine", "https://github.com/acme/mine")
+    _repo_with_origin(estate / "theirs", "https://github.com/outsider/theirs")
+    world = tmp_path / "world"
+    world.mkdir()
+    (world / "delivery-repos.yaml").write_text(
+        "# owners first, an unrelated key between, quoting styles mixed\n"
+        "owners:\n  - 'AcMe'\n"
+        "note: not a list entry\n"
+        f'roots:\n  - "{estate}/*"\n')
+    assert _delivery_repo_roots(world) == [mine]
+
+
+def _stranded_clone_reading_as(tmp_path: Path, name: str, url: str) -> Path:
+    """A stranded-state repo (one fresh commit only on a local branch) whose
+    `origin` URL READS as `url` while git still reaches the local bare origin
+    through url.<path>.insteadOf, so the gate's one fetch works offline."""
+    clone = _mk_origin_and_clone(tmp_path, name)
+    real = _git(clone, "remote", "get-url", "origin")
+    _git(clone, "remote", "set-url", "origin", url)
+    _git(clone, "config", f"url.{real}.insteadOf", url)
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "app.py").write_text("v2 unmerged\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", f"fix(g-test-6841c): {name}")
+    _git(clone, "checkout", "-q", "master")
+    return clone
+
+
+def test_foreign_repo_no_longer_blocks_a_close_but_an_owned_one_still_does(
+        tmp_path, framework_repo):
+    owned = _stranded_clone_reading_as(tmp_path, "owned",
+                                       "https://github.com/acme/owned")
+    foreign = _stranded_clone_reading_as(tmp_path, "foreign",
+                                         "https://github.com/outsider/foreign")
+
+    # CONTROL: without `owners:` the foreign repo's local-only commit blocks.
+    world = _world_with_manifest(tmp_path, [str(foreign)])
+    res = evaluate(goal_id="g-test-6841c", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+
+    # Scoped to the owned account, the foreign repo is not scanned at all.
+    world = _world_with_manifest(tmp_path, [str(foreign)], owners=["acme"])
+    res = evaluate(goal_id="g-test-6841c", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is False, res["stranded_repos"]
+    assert res["stranded_repos"] == [], res["stranded_repos"]
+
+    # The filter must not blind the gate to a repo the fleet DOES deliver.
+    world = _world_with_manifest(tmp_path, [str(owned), str(foreign)],
+                                 owners=["acme"])
+    res = evaluate(goal_id="g-test-6841c", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+    assert [f["repo"] for f in res["stranded_repos"]] == [str(owned)], res
+
+
+# ── : an N>1 squash is released even after the ref moved on ───────
+# Test 2 (content-on-ref) cannot see a squash whose paths the ref changed again
+# afterwards. Test 3 compares the branch's COMBINED patch-id with a commit on
+# the ref. Each release test proves the block with the discriminator disabled.
+
+_REF = "refs/remotes/origin/master"
+
+
+def test_multi_commit_squash_then_same_path_change_is_released_by_range_patch(
+        tmp_path, framework_repo, monkeypatch, capsys):
+    """The survivor of  (bravo's measurement): a two-commit branch
+    squashed into one, after which a later PR changed one of the squashed files
+    again. Whole-file content no longer matches and the union patch matches
+    neither original, so only the combined-range patch-id can see it."""
+    clone, shas = _multi_commit_squash(tmp_path, later={"app.py": "v3 later\n"})
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    assert _blocks_with_discriminator_disabled(
+        monkeypatch, world, framework_repo, "g-test-6841a") is True
+
+    capsys.readouterr()
+    res = evaluate(goal_id="g-test-6841a", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is False, res["stranded_repos"]
+    finding = res["stranded_repos"][0]
+    assert sorted(finding["landed_stranded_commits"]) == sorted(shas), finding
+    assert set(finding["landed_via"].values()) == {"range-patch-equivalent"}, finding
+    assert not finding["unattributed_unmerged"], finding
+    assert "(range-patch-equivalent)" in capsys.readouterr().err
+
+
+def test_range_patch_does_not_release_a_commit_the_squash_never_carried(
+        tmp_path, framework_repo):
+    """POSITIVE CONTROL (outcome 3). Only the first of two commits was squashed
+    to the ref, and the ref has since changed that file again; the second
+    exists nowhere upstream. The first is released, the second must block: the
+    second's combined range is BOTH commits, which no ref commit matches."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "app.py").write_text("v2\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-6841b): part 1")
+    first = _git(clone, "rev-parse", "HEAD")
+    (clone / "lib.py").write_text("helper\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-6841b): part 2")
+    second = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "checkout", "-q", "master")
+
+    _land_on_origin(tmp_path, clone, "squash", {"app.py": "v2\n"}, "part 1 only (#4)")
+    _land_on_origin(tmp_path, clone, "later", {"app.py": "v3 later\n"}, "later")
+    _git(clone, "fetch", "-q", "origin")
+    _assert_local_only(clone, first)
+    _assert_local_only(clone, second)
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-6841b", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+    finding = res["stranded_repos"][0]
+    assert finding["stranded_commits"] == [second], finding
+    assert finding["landed_stranded_commits"] == [first], finding
+    assert finding["landed_via"] == {first: "patch-equivalent"}, finding
+
+
+def test_range_patch_still_blocks_when_the_squash_folded_in_an_extra_edit(
+        tmp_path, framework_repo):
+    """The squash carries the branch PLUS a review fixup inside one of the
+    branch's own files, then the ref changes that file again. It is no longer
+    the branch's patch, so releasing the branch would hide content the ref
+    lacks. Same fixture as the release test minus the fixup."""
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "app.py").write_text("v2\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-6841e): part 1")
+    (clone / "lib.py").write_text("helper\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-6841e): part 2")
+    shas = _git(clone, "rev-list", "HEAD", "--not", "master").split()
+    _git(clone, "checkout", "-q", "master")
+
+    _land_on_origin(tmp_path, clone, "squash",
+                    {"app.py": "v2\nreview fixup\n", "lib.py": "helper\n"},
+                    "part 1+2 with a fixup (#6)")
+    _land_on_origin(tmp_path, clone, "later", {"app.py": "v3 later\n"}, "later")
+    _git(clone, "fetch", "-q", "origin")
+    for sha in shas:
+        _assert_local_only(clone, sha)
+
+    world = _world_with_manifest(tmp_path, [str(clone)])
+    res = evaluate(goal_id="g-test-6841e", override=None,
+                   repo_path=framework_repo, world_dir=world)
+    assert res["stranded_would_block"] is True, res["stranded_repos"]
+    finding = res["stranded_repos"][0]
+    assert sorted(finding["stranded_commits"]) == sorted(shas), finding
+    assert not finding["landed_stranded_commits"], finding
+
+
+def test_range_patch_declines_a_binary_change(tmp_path):
+    """A branch that changes a binary file is declined by the third test. git
+    2.43 hashes a binary file's blob ids, so its patch-id is content-sensitive,
+    but that is the git version's doing and is not verified on older ones,
+    where an id built from the `Binary files ... differ` marker alone would
+    equate two different edits of one path. The squash here carries the SAME
+    bytes, so an unguarded third test releases it (the ids are shown equal
+    below); the guard keeps it blocking, the conservative direction."""
+    import gates.uncommitted_work as uw
+    clone = _mk_origin_and_clone(tmp_path, "product")
+    _git(clone, "checkout", "-q", "-b", "feature")
+    (clone / "app.py").write_text("v2\n")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-6841d): part 1")
+    (clone / "data.bin").write_bytes(b"\x00\x01branch bytes")
+    _git(clone, "add", "-A"); _git(clone, "commit", "-m", "fix(g-test-6841d): part 2")
+    shas = _git(clone, "rev-list", "HEAD", "--not", "master").split()
+    _git(clone, "checkout", "-q", "master")
+    _land_on_origin(tmp_path, clone, "squash",
+                    {"app.py": "v2\n", "data.bin": b"\x00\x01branch bytes"},
+                    "part 1+2 (#5)")
+    _land_on_origin(tmp_path, clone, "later", {"app.py": "v3 later\n"}, "later")
+    _git(clone, "fetch", "-q", "origin")
+    for sha in shas:
+        _assert_local_only(clone, sha)
+
+    # What the third test would compare, computed the same way, unguarded.
+    flags = ["-U3", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"]
+
+    def raw(*args, feed=None):
+        return subprocess.run(["git", "-C", str(clone), *args], input=feed,
+                              capture_output=True, check=True).stdout
+
+    base = _git(clone, "merge-base", _REF, shas[0])
+    span = raw("diff", *flags, base, shas[0], "--")
+    assert b"Binary files" in span, span
+    mine = raw("patch-id", "--stable", feed=span).split()[0]
+    since = raw("log", "-p", "--pretty=medium", "--no-merges", *flags,
+                f"{base}..{_REF}", "--", "app.py", "data.bin")
+    theirs = {ln.split()[0] for ln in
+              raw("patch-id", "--stable", feed=since).splitlines() if ln.split()}
+    assert mine in theirs, (
+        "setup failed: an unguarded third test would not release this fixture, "
+        "so this test would pass without the guard")
+
+    # The tip touches the binary file and is declined, so it keeps blocking. The
+    # first commit is text only and its whole patch is the app.py half of the
+    # squash, so it is still released on its own.
+    assert uw._landed_by_content(clone, _REF, shas) == {
+        shas[1]: "range-patch-equivalent"}
+
+
+def test_range_patch_fails_closed_when_patch_id_cannot_run(tmp_path, monkeypatch):
+    """Tri-state (guard-4009 rule 2): a patch-id that errors or times out is not
+    a proof of landing, so the commits stay out of the result and keep blocking."""
+    import gates.uncommitted_work as uw
+    clone, shas = _multi_commit_squash(tmp_path, later={"app.py": "v3 later\n"})
+    # CONTROL: the same call releases both commits while patch-id works.
+    assert set(uw._landed_by_content(clone, _REF, shas).values()) == {
+        "range-patch-equivalent"}
+
+    real_run = subprocess.run
+
+    def no_patch_id(args, *a, **k):
+        if "patch-id" in args:
+            raise subprocess.TimeoutExpired(args, 1)
+        return real_run(args, *a, **k)
+
+    monkeypatch.setattr(uw.subprocess, "run", no_patch_id)
+    assert uw._landed_by_content(clone, _REF, shas) == {}
+
+
+def test_range_patch_respects_its_commit_and_path_caps(tmp_path, monkeypatch):
+    import gates.uncommitted_work as uw
+    clone, shas = _multi_commit_squash(tmp_path, later={"app.py": "v3 later\n"})
+    _land_on_origin(tmp_path, clone, "later2", {"app.py": "v4 later still\n"},
+                    "later still")
+    _git(clone, "fetch", "-q", "origin")
+    # CONTROL: with the default caps the squash is found two commits back.
+    assert set(uw._landed_by_content(clone, _REF, shas).values()) == {
+        "range-patch-equivalent"}
+
+    with monkeypatch.context() as m:
+        m.setattr(uw, "_RANGE_PATCH_COMMIT_CAP", 1)  # only the newest commit
+        assert uw._landed_by_content(clone, _REF, shas) == {}
+    first = _git(clone, "rev-parse", "feature~1")
+    with monkeypatch.context() as m:
+        # The tip touches 2 paths, past the cap, so it is declined. The first
+        # commit touches 1, and its whole patch IS the app.py half of the
+        # squash, so it is still released on its own.
+        m.setattr(uw, "_RANGE_PATCH_PATH_CAP", 1)
+        assert uw._landed_by_content(clone, _REF, shas) == {
+            first: "range-patch-equivalent"}

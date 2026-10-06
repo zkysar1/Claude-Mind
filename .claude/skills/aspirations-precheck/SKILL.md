@@ -126,7 +126,7 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 | 0.5b.7 | unblock-parent-status-sweep | deferrable | `bash core/scripts/unblock-parent-status-sweep.sh --apply` |
 | 0.5b.8 | routing-audit-target-status-sweep | deferrable | `bash core/scripts/routing-audit-target-status-sweep.sh --apply` |
 | 0.5b.9 | credential-defer-recheck | deferrable | `bash core/scripts/credential-defer-recheck.sh --apply` |
-| 0.5b.10 | defer-drift-check | deferrable | `bash core/scripts/defer-drift-check.sh --output json` |
+| 0.5b.10 | defer-drift-check | deferrable | `bash core/scripts/defer-drift-check.sh --apply --output json` |
 | 0.5b.11 | reason-less-blocked-check | deferrable | `bash core/scripts/reason-less-blocked-check.sh --apply --output json` |
 | 0.5b.12 | blocked-signal-resolution-check | deferrable | `bash core/scripts/blocked-signal-resolution-check.sh --post-routing --output json` |
 | 0.5b.13 | reclaim-defer-audit | deferrable | `bash core/scripts/audit-deferred-defers.sh --output json` (script name ≠ sweep name — lane B of reclaim-routed-work.md) |
@@ -181,10 +181,10 @@ Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours
 **0.5k recheck disposal (g-115-11721) — a 0.5k detector (the ratchets 0.5k.12 / .14 / .20 / .21 above, or any 0.5k lane) re-fired on a finding whose owner goal is OPEN and UNCLAIMED:** do NOT compose a new reading paragraph. Re-derive the number yourself, then append ONE short line to the owner goal's `progress_note` via `goal-field-append.sh` (its idempotency sentinel caps it at one line per agent per day):
 
 ```
-Bash: goal-field-append.sh --source <src> <owner-goal-id> progress_note recheck-<agent>-<YYYYMMDD> "[recheck:<agent> <YYYY-MM-DD>] <lane> re-fired: <one clause — what re-fired, and that nothing new was found, or the new delta>"
+Bash: goal-field-append.sh --source <src> <owner-goal-id> progress_note recheck-<agent>-<YYYYMMDD> "<lane> re-fired [recheck:<agent> <YYYY-MM-DD>]: <one clause — what re-fired, nothing new or the delta>"  # text opens with a word: a leading [ is refused on an empty note (guard-6075)
 ```
 
-The marker line is the selection signal: once ≥2 DISTINCT agents carry a `[recheck:...]` line within 7 days while the owner stays unclaimed, the goal-selector owned-redetection floor hoists the owner goal to the top selection slot and emits a banner — the repeat-detection IS the escalation, and the claim path is ordinary. (The 0.5k lanes carry no `## Phase` headers of their own — the table rows ARE the phase; this pointer is how the full body is reached.)
+The marker line is the selection signal: once ≥2 DISTINCT agents carry a `[recheck:...]` line within 7 days while the owner stays unclaimed, the goal-selector owned-redetection floor hoists the owner goal to the top selection slot and emits a banner — the repeat-detection IS the escalation, and the claim path is ordinary. (The 0.5k lanes have no `## Phase` headers: the table rows ARE the phase.)
 
 ▸ Body in `core/config/aspirations-precheck-digest.md` (§ Phase 0.5k) — `bash core/scripts/load-precheck-digest.sh`. g-115-11721.
 

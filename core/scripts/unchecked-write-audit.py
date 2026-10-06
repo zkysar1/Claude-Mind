@@ -28,8 +28,10 @@ records a count, so a regression arrives as "+N" with nothing naming the sites, 
 member set is kept for it to name them from. Git already holds every corpus the count
 was ever taken over, so the old one is rebuilt from the revision and BOTH corpora go
 through the CURRENT matcher, which leaves the corpus as the only variable. REV is a
-commit, or `baseline` for the last commit at or before the newest history row that
-read the recorded baseline; the other side is the working tree, or `--until REV`.
+commit, or `baseline` for the head the ratchet recorded on the newest history row that
+read the recorded baseline (the last commit at or before that row when it recorded
+none); the other side is the working tree, or `--until REV`. The census JSON carries
+`provenance` ({head, dirty}) so the ratchet can record the tree beside each reading.
 Design and the alternatives it rejected:
 core/config/rationale/unchecked-write-delta-localisation.md
 """
@@ -60,6 +62,10 @@ BASELINE_KEY = "unchecked_writes"
 # classifies the same as the checkout it came from.
 INPUT_PATHSPECS = ("core/scripts/*.sh", SKILLS_GLOB)
 TREE_INPUT = re.compile(r"^(?:core/scripts/[^/]+\.sh|\.claude/skills/[^/]+/SKILL\.md)$")
+
+# A head read back from the baselines file must be a FULL object name before it reaches git:
+# a symbolic name (`main`, `HEAD`) moves, and every box writes that file.
+FULL_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 MUTATING = re.compile(r"rt_call\s+(POST|PUT|PATCH|DELETE)\b")
 READING = re.compile(r"rt_call\s+GET\b")
@@ -290,6 +296,29 @@ def _describe(sha):
     return _git("log", "-1", "--format=%h %cI %s", sha).decode().strip()[:120]
 
 
+def provenance():
+    """-> {"head", "dirty"}: the tree this reading was taken over, for the ratchet to record.
+
+    `head` is HEAD's full sha. `dirty` counts the audited inputs whose working-tree state
+    differs from it: modified, staged, deleted AND untracked, because the census walks the
+    filesystem, so an untracked wrapper moves the count exactly as an edited one does. A
+    reader treats dirty > 0 as "the head only approximates the corpus". Both are None when
+    git cannot answer, so a reading is never lost to a checkout that is not a git tree.
+    """
+    try:
+        head = _git("rev-parse", "HEAD").decode().strip()
+        # --no-optional-locks: this runs beside live commits, and a status refresh must
+        # not hold the index against them. --untracked-files=all: a checkout configured
+        # with status.showUntrackedFiles=no would otherwise hide an untracked input, which
+        # the census still counts.
+        status = _git("--no-optional-locks", "status", "--porcelain", "-z", "--no-renames",
+                      "--untracked-files=all", "--", *INPUT_PATHSPECS)
+    except (RuntimeError, OSError):
+        return {"head": None, "dirty": None}
+    names = (e[3:] for e in status.decode("utf-8", "replace").split("\0") if len(e) > 3)
+    return {"head": head, "dirty": sum(1 for n in names if TREE_INPUT.match(n))}
+
+
 def collect_at(rev):
     """collect() over the audit's inputs as they were at `rev`; the checkout is untouched.
 
@@ -309,10 +338,12 @@ def collect_at(rev):
 
 
 def baseline_reading(path=None):
-    """-> (baseline, recorded_at): the newest retained history row that read AT the baseline.
+    """-> (baseline, recorded_at, seen): the newest retained history row that read AT the baseline.
 
-    The ratchet keeps the baseline and its history and nothing else, in a file that is
-    merge-protected across boxes. Parsed with yaml, never a line scan.
+    `seen` is the {"head", "dirty"} the ratchet recorded in that row's breakdown, None for
+    each on a row that predates them. The ratchet keeps the baseline and its history and
+    nothing else, in a file that is merge-protected across boxes. Parsed with yaml, never a
+    line scan.
     """
     import yaml
     if path is None:
@@ -325,34 +356,52 @@ def baseline_reading(path=None):
     baseline, history = entry.get("baseline"), entry.get("history") or []
     if not isinstance(baseline, int):
         raise RuntimeError("no %s baseline is recorded in %s" % (BASELINE_KEY, path))
-    stamps = [str(r["recorded_at"]) for r in history
-              if isinstance(r, dict) and r.get("drift_total") == baseline
-              and r.get("recorded_at")]
-    if not stamps:
+    rows = [r for r in history
+            if isinstance(r, dict) and r.get("drift_total") == baseline
+            and r.get("recorded_at")]
+    if not rows:
         raise RuntimeError(
             "none of the %d retained history rows reads the recorded baseline (%d), so its "
             "reading has left the window; name a revision with --new-since REV"
             % (len(history), baseline))
-    return baseline, max(stamps)
+    row = max(rows, key=lambda r: str(r["recorded_at"]))
+    breakdown = row.get("breakdown") if isinstance(row.get("breakdown"), dict) else {}
+    return (baseline, str(row["recorded_at"]),
+            {"head": breakdown.get("head"), "dirty": breakdown.get("dirty")})
 
 
 def resolve_since(spec, until):
     """-> {"sha", "how", "baseline"}: the commit `--new-since` names.
 
-    `baseline` is the last commit at or before the newest history row that read the
-    recorded baseline. Row stamps are naive UTC (the framework's timestamp posture) and
-    are handed to git as UTC. The match is by commit date, so it is approximate: the
-    caller prints the commit it landed on, and `--new-since <sha>` overrides it.
+    `baseline` is the head the ratchet recorded on the newest history row that read the
+    recorded baseline, when that row has one and this checkout holds the commit; `until`
+    bounds only the date walk below, since a recorded head is an exact commit. Otherwise it
+    is the last commit at or before that row. Row stamps are naive UTC (the framework's
+    timestamp posture) and are handed to git as UTC. The match by commit date is
+    approximate: the caller prints the commit it landed on and how, and
+    `--new-since <sha>` overrides it.
     """
     if spec != "baseline":
         return {"sha": _commit(spec), "how": "named", "baseline": None}
-    baseline, stamp = baseline_reading()
+    baseline, stamp, seen = baseline_reading()
+    head, dirty = seen.get("head"), seen.get("dirty")
+    if isinstance(head, str) and FULL_SHA.match(head):
+        try:
+            sha = _commit(head)
+        except RuntimeError:
+            sha = None  # recorded by a box whose commit this checkout does not hold
+        if sha:
+            approx = ("; %d audited file(s) differed from it, so the corpus is approximate"
+                      % dirty) if isinstance(dirty, int) and dirty > 0 else ""
+            return {"sha": sha, "baseline": baseline,
+                    "how": "head recorded with the baseline reading of %s%s" % (stamp, approx)}
+    unusable = " (the head recorded on that row is not a commit in this checkout)" if head else ""
     sha = _git("rev-list", "-1", "--before=%s+0000" % stamp,
                _commit(until) if until else "HEAD").decode().strip()
     if not sha:
         raise RuntimeError("no commit at or before the baseline reading %s" % stamp)
     return {"sha": sha, "baseline": baseline,
-            "how": "last commit at or before the baseline reading of %s" % stamp}
+            "how": "last commit at or before the baseline reading of %s%s" % (stamp, unusable)}
 
 
 def _populated(label, collected):
@@ -574,6 +623,8 @@ def main():
         },
         "by_store": {k: {**v, "frac": round(v["v"] / v["n"], 3)}
                      for k, v in sorted(by_store.items(), key=lambda kv: -kv[1]["n"])},
+        # The tree this count was taken over; the ratchet records it beside the reading.
+        "provenance": provenance(),
     }
     if args.json:
         out["records"] = records

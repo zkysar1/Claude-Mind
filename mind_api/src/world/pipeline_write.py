@@ -1458,6 +1458,26 @@ def _fold_tombstone(archive_rec: Optional[Dict[str, Any]],
     (guard-1072) cannot walk the archive back: a null never erases a set value,
     reflected=True dominates, and replay_metadata merges field-wise
     (replay_count only grows, the newer date wins).
+
+    KNOWN EXPOSURE, PINNED AS THE CONTRACT (g-115-11841). Outside those three
+    rules a stale tombstone still overwrites an edit the archive copy took after
+    an EARLIER prune: a reviewer probe (2026-10-02) held outcome UNRESOLVABLE and
+    a newer note on the archive row against an aged resurrected tombstone
+    reading CORRECTED with an older note, and the fold left CORRECTED and the
+    older note. No write stamps a per-record edit time (update_field sets the
+    field and nothing else), so the fold cannot tell that copy from a tombstone
+    that lived its grace window in place, where the tombstone IS the later copy
+    and must win; yielding to the archive row would revert the very writes the
+    grace window exists to carry. Measured on the store of record, 2026-10-04:
+    of 171 live tombstones (each with an archive row) 142 equal it, 27 differ
+    only in replay_metadata and 2 differ in an unprotected field, the tombstone
+    being the later copy in both; none is older than the previous prune's
+    cutoff, so no resurrected tombstone was live. The first prune-fold run
+    (g-001-06, 2026-10-03: 74 pruned, 29 differing) displaced no archive value
+    either. The archive is snapshotted (history.snapshot) before the fold writes
+    it, so a displaced value is recoverable with history.py diff (never
+    restore). Revisit when a sweep displaces an archive value: what is missing
+    is a per-record edit stamp, not a cleverer tie-break.
     """
     if archive_rec is None:
         return dict(tombstone)

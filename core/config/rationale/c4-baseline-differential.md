@@ -63,3 +63,38 @@ suite run, on the pre-adopt commit: the adopt-commit run's cost again.
 A test that fails on both runs for a NEW reason is invisible to a node-id comparison
 (same id, different cause). The report carries the counts so a reader sees how many
 reds were inherited.
+
+## Extension to the invisible half (g-358-237)
+
+The first real `--adopt --c4-baseline` on a downstream deployment rolled back. One
+of its three causes is this file's subject: the deployment's invisible half was red
+BEFORE the adoption (5 of 111 files), and the original design refused before the
+baseline run whenever any framework half was red, so no baseline could excuse a
+standing red. The causes of those five reds were not diagnosed when this was
+decided.
+
+Decided: the differential extends to the invisible half, by FILE; the alternative,
+quarantine entries for the standing reds, was rejected. A quarantine entry needs a
+triage verdict and an open goal per file, and for undiagnosed reds that is curation
+the deployment cannot do before it can adopt. The differential is blind to the cause,
+which is the same argument as above, and it handles every deployment-specific red,
+present or future.
+
+Where the names come from: not `halves.jsonl`, which keeps the half's rc and one
+summary line (`81/84 files passed`), and not a log, because run-full-suite.sh deletes
+the half's own log right after recording that line. The runner's stdout carries one
+`FAIL(rc=N) <file>` line per red file, and `run_suite()` already captures it for both
+runs, so no runner change was needed and the baseline's older runner prints the same
+lines. The parser is pinned to the real runner's output by a test that drives
+`run-invisible-suites.sh --files` over four tiny files, with the passing-only run as
+the positive control.
+
+Traps the design avoids, each pinned by a test: a red invisible half with no name read
+is a refusal, never a pass (the half's rc alone cannot say what is new); a baseline
+whose invisible half is red but names nothing is a refusal, because "green at
+baseline" and "unread" both leave the set empty; and an unreadable baseline
+`halves.jsonl` is a refusal for the same reason.
+
+Not covered: the `deferred` half names no files, so a red `deferred` half still blocks;
+and a file red on both runs for a NEW reason is invisible to a name comparison, as a
+test red for a new reason is invisible to the node-id comparison above.

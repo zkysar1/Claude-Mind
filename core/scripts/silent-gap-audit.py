@@ -118,6 +118,13 @@ WRITTEN_NEVER_READ_EXCLUDE = (
     # stay under detection. Narrower than the "gate-firings" entry above, which
     # suppresses its own legacy file as a side effect.
     "productivity-snapshots-",
+    #  — retrieval-trace date SEGMENTS only, the same mechanism as the
+    # entry above: a segment basename carries a date that appears in no source
+    # file, so _store_reader_patterns finds zero readers and false-flags each
+    # day's file, while the real reader exists (_retrieval_trace.py globs
+    # `retrieval-trace-*.jsonl`). Trailing hyphen: a legacy `retrieval-trace.jsonl`
+    # would stay under detection.
+    "retrieval-trace-",
 )
 
 # Detectors (b) telemetry-stale, (c) zero-input, and (d)'s situational-skill

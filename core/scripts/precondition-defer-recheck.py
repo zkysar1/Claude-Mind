@@ -63,6 +63,10 @@ Exit: always 0 (reporting tool). JSON output:
     "skipped_uncovered_gate": N,  # all predicates passed, but the defer text
                                   # named a gate none of them mentions
                                   # () — the pre-fix wrong-clear count
+    "uncovered_gate_goals": [goal_ids],  # the goals behind that count, so the
+                                  # medium battery can print them as a finding
+                                  # instead of leaving the freeze silent
+                                  # ()
     "cleared": N,             # actually cleared (apply only)
     "would_clear": [goal_ids],# dry-run list
     "details": [...],         # per-goal reasoning
@@ -117,7 +121,35 @@ from predicate import evaluate_all  # noqa: E402
 # id like `-fixture` to `-f`, which both mangles the id shown
 # to the operator in `uncovered_gate_refs` and makes the token disagree with
 # the same id read off a predicate.
-_DEFER_GID_RE = re.compile(r"g-\d+-\d+(?:-[a-z]+)?", re.IGNORECASE)
+#
+# TWO BOUNDARIES (). The pattern used to have neither, and each
+# absence produced a measured false "foreign gate" that froze a defer whose
+# predicates had all passed:
+#   LEFT  `(?<![A-Za-z0-9])`. `msg-20260928-042559-alpha-117` ends its `msg-`
+#         in `g-`, so the unbounded pattern read the fragment
+#         `g-20260928-042559-alpha` out of a board message id. A snapshot of
+#         the live defers (2026-10-04) had 8 of 112 carrying one.
+#   RIGHT a suffix belongs to the id only where it ENDS the token: a
+#         multi-letter suffix may not be followed by an alphanumeric or by
+#         another `-<alnum>` segment, a single letter may not be followed by an
+#         alphanumeric (`-g37566`). A suffix failing that is a SLUG word
+#         (`-progress-alpha-cc10-0510`, `-sample-run`) and the token falls back
+#         to the id it was built from. SLUGS ARE REDUCED, NOT DROPPED: dropping
+#         one would hide a gate named only inside a branch or worktree name
+#         (`wt--unit2-lib`) from the guard, and the module's rule is
+#         that over-matching costs a skip, never a clear (guard-2486). Reduced,
+#         the goal's OWN progress-note marker `[-progress-alpha-0101]`
+#         becomes ``, which the own-id normalisation below equates with
+#         the goal itself through the SAME tokenizer (rb-11386), while a
+#         FOREIGN goal's marker stays visible as that goal.
+# A single-letter suffix is always kept (`-d`, `-a`; the live
+# queue has no multi-letter-suffix id, only fixture ids such as
+# `-fixture`, which are still read whole when they end the token).
+_DEFER_GID_RE = re.compile(
+    r"(?<![A-Za-z0-9])g-\d+-\d+"
+    r"(?:-(?:[a-z](?![A-Za-z0-9])|[a-z]{2,}(?![A-Za-z0-9]|-[A-Za-z0-9])))?",
+    re.IGNORECASE,
+)
 
 
 def _gid_tokens(text):
@@ -339,6 +371,7 @@ def main():
     evaluated = 0
     skipped_free_form = 0
     skipped_uncovered_gate = 0
+    uncovered_gate_goals = []
     cleared = 0
     would_clear = []
     details = []
@@ -448,6 +481,7 @@ def main():
         uncovered = _uncovered_gate_refs(reason, struct_pcs, g.get("id"))
         if uncovered:
             skipped_uncovered_gate += 1
+            uncovered_gate_goals.append(g["id"])
             details.append({
                 "goal_id": g["id"],
                 "source": g["_source"],
@@ -526,6 +560,7 @@ def main():
         "evaluated": evaluated,
         "skipped_free_form": skipped_free_form,
         "skipped_uncovered_gate": skipped_uncovered_gate,
+        "uncovered_gate_goals": uncovered_gate_goals,
         "cleared": cleared,
         "would_clear": would_clear,
         "details": details,

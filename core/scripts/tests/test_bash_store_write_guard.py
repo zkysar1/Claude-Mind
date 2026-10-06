@@ -405,6 +405,54 @@ def test_start_cw1a_step_does_not_reference_the_retired_copy():
     assert "owncloud-pull.sh --agent <agent-name> --only working-memory.yaml" in skill
 
 
+def _cw1a_adopt_archive_command():
+    """The `cp -p` the CW1a-adopt convention prescribes, read from the doc itself so doc and guard cannot drift."""
+    doc = (ROOT / "core" / "config" / "conventions" / "working-memory.md").read_text(encoding="utf-8")
+    opener = "`cp -p agents/<agent>/session/working-memory.yaml agents/<agent>/temp/wm-pre-adopt-"
+    start = doc.find(opener)
+    assert start != -1, "the CW1a-adopt archive step no longer prescribes a literal cp -p destination under agents/<agent>/temp/"
+    start += 1
+    cmd = doc[start:doc.index("`", start)]
+    return cmd.replace("<agent>", "alpha").replace("<YYYY-MM-DD>", "2026-10-04").replace("<hostname>", "host-a")
+
+
+def test_cw1a_adopt_archive_step_is_admitted_as_documented():
+    """: the archive `cp -p` the CW1a-adopt convention prescribes must run unmodified.
+
+    The archive keeps the ORIGINAL filename (working-memory.yaml) inside agents/<agent>/temp/wm-pre-adopt-*/.
+    The guard admits it because the operand's own text carries the temp marker. The refusal that filed this
+    goal (2026-10-01) reproduces only for destinations that hide the marker -- the next test pins those.
+    """
+    cmd = _cw1a_adopt_archive_command()
+    assert cmd.endswith("/working-memory.yaml"), cmd
+    decision, reason = run(cmd)
+    assert decision == "allow", f"the documented archive copy was refused: {reason[:160]}"
+    assert direct_store_writes(cmd) == []
+    # the mkdir the convention also prescribes, chained in one command
+    assert run("mkdir -p agents/alpha/temp/wm-pre-adopt-2026-10-04-host-a && " + cmd)[0] == "allow"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # destination reached through a shell variable: textually identical for an archive and for the live store
+        'D=agents/alpha/temp/wm-pre-adopt-2026-10-04-host-a; cp -p agents/alpha/session/working-memory.yaml "$D/working-memory.yaml"',
+        # cd into the archive dir, then a bare or ./ filename: the operand carries no temp marker
+        "cd agents/alpha/temp/wm-pre-adopt-2026-10-04-host-a && cp -p ../../session/working-memory.yaml working-memory.yaml",
+        "cd agents/alpha/temp/wm-pre-adopt-2026-10-04-host-a && cp -p ../../session/working-memory.yaml ./working-memory.yaml",
+        # control: the same file copied over the live store
+        "cp -p agents/alpha/temp/wm-pre-adopt-2026-10-04-host-a/working-memory.yaml agents/alpha/session/working-memory.yaml",
+    ],
+)
+def test_cw1a_adopt_archive_destination_the_guard_cannot_see_through_is_refused(command):
+    """, the other direction: the convention says to type the destination as ONE literal path because
+    these shapes are refused. A variable-prefixed temp destination cannot be told from a variable-prefixed
+    live-store destination by a text matcher, so loosening this is a deliberate decision, not a quiet fix."""
+    decision, reason = run(command)
+    assert decision == "deny", command
+    assert "direct store write refused" in reason
+
+
 # ---- board channel files (). Measured 2026-09-02 on a downstream
 # deployment: five board posts hand-appended with `cat >> .../board/findings.jsonl
 # <<'EOF'` by both Bodies in one day, each carrying a Z-suffixed timestamp that

@@ -77,16 +77,20 @@ def _goal(gid: str, reason: str, **kw) -> dict:
 
 
 def _run(monkeypatch, capsys, goals, pq=None, msgs=None,
-         goal_err=None, pq_err=None, board_err=None, argv=("--output", "json")):
+         goal_err=None, pq_err=None, board_err=None, argv=("--output", "json"),
+         real_pq=False):
     """Drive main() end-to-end with the three I/O boundaries stubbed.
 
     Only the boundaries are faked — the premise grouping, the pq classification
-    ladder and the verdict logic all execute for real.
+    ladder and the verdict logic all execute for real. `real_pq=True` leaves the
+    pending-question reader unstubbed, for the tests that wire it to a fake store.
     """
     monkeypatch.setattr(
         hbdj, "_read_goals",
         lambda source: ([g for g in goals if g["_source"] == source], goal_err))
-    monkeypatch.setattr(hbdj, "_read_pending_questions", lambda: (pq or {}, pq_err))
+    if not real_pq:
+        monkeypatch.setattr(hbdj, "_read_pending_questions",
+                            lambda: (pq or {}, pq_err))
     monkeypatch.setattr(hbdj, "_read_board", lambda ch, since: (msgs or [], board_err))
     monkeypatch.setattr(sys, "argv", ["human-blocked-defer-join.py", *argv])
     rc = hbdj.main()
@@ -306,13 +310,17 @@ def test_readable_but_empty_is_clean(monkeypatch, capsys):
     assert res["verdict"] == "clean" and res["errors"] == []
 
 
-def test_partial_read_failure_with_hits_still_reports_hits(monkeypatch, capsys):
+def test_partial_read_failure_with_hits_reports_partial_and_keeps_the_hits(
+        monkeypatch, capsys):
     """Errors are carried even when the readable half produced records — the
-    caller needs both, not a verdict that hides one."""
+    caller needs both, not a verdict that hides one. The verdict is `partial`
+    rather than `hits` (g-115-4265): a renderer that branches on the verdict and
+    only reads `errors` under `unreadable` never sees a swallowed source."""
     goals = [_goal("g-1", "human_blocked: relay_down per pq-real.")]
     _, res = _run(monkeypatch, capsys, goals, pq={"pq-real": "answered"},
                   board_err="decisions: daemon down")
-    assert res["verdict"] == "hits" and res["errors"] == ["decisions: daemon down"]
+    assert res["verdict"] == "partial" and res["errors"] == ["decisions: daemon down"]
+    assert [r["goal_id"] for r in res["records"]] == ["g-1"]
 
 
 # ── Scope + posture ──────────────────────────────────────────────────────
@@ -387,3 +395,315 @@ def test_pq_cited_twice_is_reported_once(monkeypatch, capsys):
     goals = [_goal("g-1", "human_blocked: relay_down pq-real ... again pq-real.")]
     _, res = _run(monkeypatch, capsys, goals, pq={"pq-real": "answered"})
     assert len(res["records"][0]["signals"]) == 1
+
+
+# ── : an incomplete pending-question map must not read as a broken
+# citation. The swallowed per-agent error (F-001) and the verdict that hid
+# `errors` on the non-`unreadable` branches (F-002) manufactured `pq_missing`
+# against ids that were real, filed by an agent whose file this box could not
+# read. `pq_missing` is a negative claim, so it needs a COMPLETE map.
+
+def test_incomplete_map_emits_pq_unverifiable_not_pq_missing(monkeypatch, capsys):
+    """VERIFY (b). The cited id is absent from what WAS read, but the read was
+    known-incomplete, so the sweep cannot say the citation is broken."""
+    goals = [_goal("g-1", "human_blocked: relay_down blocked on pq-unreadable-owner.")]
+    _, res = _run(monkeypatch, capsys, goals, pq={"pq-other": "pending"},
+                  pq_err="pending-questions map INCOMPLETE — bravo store: read failed")
+    sigs = _sig(res, "g-1")
+    assert "pq_missing" not in sigs, "an incomplete map manufactured a broken-citation claim"
+    assert sigs["pq_unverifiable"]["confidence"] == "none"
+    assert sigs["pq_unverifiable"]["pq"] == "pq-unreadable-owner"
+    assert "NOT a broken citation" in sigs["pq_unverifiable"]["detail"]
+    assert res["records"][0]["best_confidence"] == "none"
+
+
+def test_known_id_survives_an_incomplete_map(monkeypatch, capsys):
+    """A positive found in a readable file stays valid however incomplete the rest is."""
+    goals = [_goal("g-1", "human_blocked: relay_down per pq-real.")]
+    _, res = _run(monkeypatch, capsys, goals, pq={"pq-real": "answered"},
+                  pq_err="pending-questions map INCOMPLETE — bravo store: read failed")
+    assert _sig(res, "g-1")["pq_answered"]["confidence"] == "deterministic"
+    assert res["deterministic_count"] == 1
+
+
+def test_complete_map_still_reports_missing(monkeypatch, capsys):
+    """The fail-safe must not blunt the real signal: pq_err None means COMPLETE."""
+    goals = [_goal("g-1", "human_blocked: relay_down blocked on pq-never-filed.")]
+    _, res = _run(monkeypatch, capsys, goals, pq={"pq-other": "pending"})
+    assert "pq_missing" in _sig(res, "g-1") and "pq_unverifiable" not in _sig(res, "g-1")
+
+
+def test_errors_without_hits_is_partial_not_clean(monkeypatch, capsys):
+    """VERIFY (c), the clean branch. Defers exist, none carried a signal, and one
+    source failed: that is not `clean`, which would assert the whole population
+    was examined."""
+    goals = [_goal("g-1", "human_blocked: relay_down per pq-real.")]
+    _, res = _run(monkeypatch, capsys, goals, pq={"pq-real": "pending"},
+                  board_err="decisions: daemon down")
+    assert res["records"] == []
+    assert res["verdict"] == "partial" and res["errors"] == ["decisions: daemon down"]
+
+
+def test_errors_travel_directly_after_the_verdict(monkeypatch, capsys):
+    """A buried instrument is not an instrument (guard-5004): `errors` sat at the
+    far tail of a ~33 KB payload, past every `head` a lane runner prints."""
+    goals = [_goal("g-1", "human_blocked: relay_down per pq-real.")]
+    _, res = _run(monkeypatch, capsys, goals, pq={"pq-real": "answered"})
+    assert list(res)[:2] == ["verdict", "errors"]
+
+
+# The store-of-record reader. A fake backend stands in for the store; the tmp
+# agents root is the box's local mirror.
+
+class _FakeStore:
+    """`objects` maps an absolute path to bytes, or to an exception to raise."""
+
+    def __init__(self, objects, listing, list_exc=None):
+        self.objects, self.listing, self.list_exc = objects, listing, list_exc
+
+    def read_authoritative_bytes(self, path):
+        assert Path(path).is_absolute(), (
+            "a relative path silently falls back to the local mirror (g-115-4256)")
+        v = self.objects.get(str(path))
+        if v is None:
+            raise FileNotFoundError(str(path))
+        if isinstance(v, Exception):
+            raise v
+        return v
+
+    def list_dir(self, path):
+        assert Path(path).is_absolute()
+        if self.list_exc is not None:
+            raise self.list_exc
+        return list(self.listing)
+
+
+def _pq_a(*rows):
+    """Shape A: {"questions": [...]}"""
+    return ("questions:\n" + "".join(
+        f"- id: {i}\n  status: {s}\n" for i, s in rows)).encode()
+
+
+def _pq_env(monkeypatch, tmp_path, store=None, local=None, listing=None,
+            list_exc=None, backend_exc=None):
+    """Point the REAL reader at a tmp agents root plus a fake store of record."""
+    for name, raw in (local or {}).items():
+        d = tmp_path / name / "session"
+        d.mkdir(parents=True)
+        (d / "pending-questions.yaml").write_bytes(raw)
+    objects = {str(tmp_path / n / "session" / "pending-questions.yaml"): v
+               for n, v in (store or {}).items()}
+    fake = _FakeStore(objects, sorted(store or {}) if listing is None else listing,
+                      list_exc)
+
+    def _get_backend():
+        if backend_exc is not None:
+            raise backend_exc
+        return fake
+
+    monkeypatch.setattr(hbdj, "agents_root", lambda: tmp_path)
+    monkeypatch.setattr("storage_backend.get_backend", _get_backend)
+
+
+def test_corrupt_agent_file_propagates_an_error(monkeypatch, tmp_path):
+    """VERIFY (a), F-001. The old reader hit `except Exception: continue` and
+    returned a clean map minus that agent's questions."""
+    _pq_env(monkeypatch, tmp_path, store={
+        "alpha": _pq_a(("pq-a-1", "pending")),
+        "bravo": b"questions:\n- id: pq-b-1\n  note: [unclosed\n  status: pending\n"})
+    pq, err = hbdj._read_pending_questions()
+    assert err is not None and "bravo" in err and "alpha" not in err
+    assert pq == {"pq-a-1": "pending"}, "the readable agent's rows must survive"
+
+
+def test_error_text_carries_no_file_content(monkeypatch, tmp_path):
+    """A pending-questions file holds questions addressed to the owner. The error
+    names the agent, the exception type and the parser position, never a snippet."""
+    _pq_env(monkeypatch, tmp_path, store={
+        "bravo": b"questions:\n- id: pq-b-1\n  note: [CANARY-OWNER-TEXT\n"})
+    _, err = hbdj._read_pending_questions()
+    assert err is not None and "bravo" in err
+    assert "Error" in err and "line " in err, "type and parser position must be named"
+    assert "CANARY" not in err
+
+
+def test_truncated_file_parsing_as_a_scalar_is_a_failure(monkeypatch, tmp_path):
+    """A write cut short mid-key parses as a bare string, which the old flatten
+    read as "no questions" — a clean-looking empty agent."""
+    _pq_env(monkeypatch, tmp_path, store={"alpha": b"questi"})
+    _, err = hbdj._read_pending_questions()
+    assert err is not None and "alpha" in err and "unrecognized top-level shape" in err
+
+
+def test_a_constructor_value_error_is_a_failure_not_a_crash(monkeypatch, tmp_path):
+    """`safe_load` raises ValueError, not YAMLError, for a value such as an
+    impossible date. The old blanket `except Exception` absorbed it; narrowing the
+    catch to YAML errors alone would turn one odd value into a dead precheck lane."""
+    _pq_env(monkeypatch, tmp_path, store={
+        "alpha": b"questions:\n- id: pq-1\n  created: 2026-02-30\n  status: pending\n"})
+    pq, err = hbdj._read_pending_questions()
+    assert pq == {} and err is not None and "alpha" in err and "ValueError" in err
+
+
+def test_corrupt_local_mirror_is_moot_beside_a_good_store_copy(monkeypatch, tmp_path):
+    """The store is the record: a half-synced mirror beside a readable store copy
+    must not turn every cited id of that agent `pq_unverifiable`."""
+    _pq_env(monkeypatch, tmp_path,
+            store={"alpha": _pq_a(("pq-a-1", "answered"))},
+            local={"alpha": b"questions: [unclosed\n"})
+    pq, err = hbdj._read_pending_questions()
+    assert err is None and pq == {"pq-a-1": "answered"}
+
+
+def test_corrupt_local_mirror_is_a_failure_when_it_is_the_only_copy(
+        monkeypatch, tmp_path):
+    _pq_env(monkeypatch, tmp_path, store={}, listing=[],
+            local={"alpha": b"questions: [unclosed\n"})
+    pq, err = hbdj._read_pending_questions()
+    assert pq == {} and err is not None and "alpha local:" in err
+
+
+def test_many_failures_are_capped_in_the_error_text(monkeypatch, tmp_path):
+    """A down store fails every agent at once; the text stays one readable line."""
+    _pq_env(monkeypatch, tmp_path,
+            store={f"agent{i}": b"questions: [unclosed\n" for i in range(7)})
+    _, err = hbdj._read_pending_questions()
+    assert err is not None and err.count(" store: ") == 5 and err.endswith("(+2 more)")
+
+
+def test_store_row_beats_stale_local_mirror(monkeypatch, tmp_path):
+    """The stale-peer-mirror cause: a mirror that never saw the answer."""
+    _pq_env(monkeypatch, tmp_path,
+            store={"alpha": _pq_a(("pq-x", "answered"))},
+            local={"alpha": _pq_a(("pq-x", "pending"))})
+    pq, err = hbdj._read_pending_questions()
+    assert err is None and pq == {"pq-x": "answered"}
+
+
+def test_local_only_row_is_known_not_missing(monkeypatch, tmp_path):
+    """The owner's just-filed question may not have reached the store yet."""
+    _pq_env(monkeypatch, tmp_path,
+            store={"alpha": _pq_a(("pq-old", "pending"))},
+            local={"alpha": _pq_a(("pq-old", "pending"), ("pq-new", "pending"))})
+    pq, err = hbdj._read_pending_questions()
+    assert err is None and pq == {"pq-old": "pending", "pq-new": "pending"}
+
+
+def test_agent_absent_from_the_local_tree_is_still_enumerated(monkeypatch, tmp_path):
+    """A cold box never materialises peers' dirs; the store listing is the roster."""
+    _pq_env(monkeypatch, tmp_path, store={"alpha": _pq_a(("pq-a-1", "answered"))})
+    assert not (tmp_path / "alpha").exists()
+    pq, err = hbdj._read_pending_questions()
+    assert err is None and pq == {"pq-a-1": "answered"}
+
+
+def test_store_failure_is_named_and_local_rows_still_count(monkeypatch, tmp_path):
+    """No SILENT local fallback: the degrade is an error, so a not-found id turns
+    `pq_unverifiable`; the mirror's rows are still honoured as positives."""
+    _pq_env(monkeypatch, tmp_path,
+            store={"alpha": ConnectionError("store down")},
+            local={"alpha": _pq_a(("pq-real", "answered"))})
+    pq, err = hbdj._read_pending_questions()
+    assert pq == {"pq-real": "answered"}
+    assert err is not None and "alpha" in err and "ConnectionError" in err
+
+
+def test_store_absent_object_is_not_an_error(monkeypatch, tmp_path):
+    """An agent that never filed a question has no file anywhere."""
+    _pq_env(monkeypatch, tmp_path,
+            store={"alpha": _pq_a(("pq-a-1", "pending"))},
+            listing=["alpha", "bravo"])
+    pq, err = hbdj._read_pending_questions()
+    assert err is None and pq == {"pq-a-1": "pending"}
+
+
+def test_non_agent_listing_entries_fail_open(monkeypatch, tmp_path):
+    """The store listing holds files and fixtures beside the agent dirs; reading
+    `<file>/session/...` must not read as a failure."""
+    _pq_env(monkeypatch, tmp_path,
+            store={"alpha": _pq_a(("pq-a-1", "pending")),
+                   "skill-invocations.jsonl": NotADirectoryError("not a dir")},
+            listing=["alpha", "skill-invocations.jsonl", "tricks-dryrun"])
+    pq, err = hbdj._read_pending_questions()
+    assert err is None and pq == {"pq-a-1": "pending"}
+
+
+def test_listing_failure_is_an_error_not_a_smaller_roster(monkeypatch, tmp_path):
+    """guard-2549: a set-valued read needs its own enumeration-completeness signal."""
+    _pq_env(monkeypatch, tmp_path,
+            local={"alpha": _pq_a(("pq-a-1", "pending"))},
+            list_exc=ConnectionError("listing down"))
+    pq, err = hbdj._read_pending_questions()
+    assert pq == {"pq-a-1": "pending"}
+    assert err is not None and "store listing failed" in err
+
+
+def test_unavailable_backend_is_an_error_not_a_local_only_box(monkeypatch, tmp_path):
+    _pq_env(monkeypatch, tmp_path, local={"alpha": _pq_a(("pq-a-1", "pending"))},
+            backend_exc=RuntimeError("no backend"))
+    pq, err = hbdj._read_pending_questions()
+    assert pq == {"pq-a-1": "pending"}
+    assert err is not None and "storage backend unavailable" in err
+
+
+def test_unresolvable_agents_root_is_an_error_not_a_crash(monkeypatch):
+    """The lane always exits 0 (a precheck detective must never block the loop)."""
+    def _boom():
+        raise RuntimeError("no agents root")
+
+    monkeypatch.setattr(hbdj, "agents_root", _boom)
+    pq, err = hbdj._read_pending_questions()
+    assert pq == {} and err is not None and "agents_root unavailable" in err
+
+
+def test_no_file_anywhere_is_an_error(monkeypatch, tmp_path):
+    """The old guard, kept: an empty map from a fleet with no files is a blind read."""
+    _pq_env(monkeypatch, tmp_path, listing=[])
+    pq, err = hbdj._read_pending_questions()
+    assert pq == {} and err is not None and "no pending-questions.yaml found" in err
+
+
+@pytest.mark.parametrize("doc", [
+    # shape A: {"questions": [...]}
+    b"questions:\n- id: pq-1\n  status: answered\n- id: pq-2\n  status: pending\n",
+    # shape B: a list of {"questions": [...]} documents
+    b"- questions:\n  - id: pq-1\n    status: answered\n"
+    b"- questions:\n  - id: pq-2\n    status: pending\n",
+    # shape C: a bare list of entries, one non-entry item ignored
+    b"- id: pq-1\n  status: answered\n- id: pq-2\n  status: pending\n- just a string\n",
+])
+def test_every_container_shape_flattens_alike(monkeypatch, tmp_path, doc):
+    """Lock-step with pending-questions-sweep.py::_load_questions. Shape B was
+    invisible to the old reader: its items carry `questions`, not `id`."""
+    _pq_env(monkeypatch, tmp_path, store={"alpha": doc})
+    pq, err = hbdj._read_pending_questions()
+    assert err is None and pq == {"pq-1": "answered", "pq-2": "pending"}
+
+
+def test_end_to_end_a_corrupt_peer_file_yields_partial_and_unverifiable(
+        monkeypatch, capsys, tmp_path):
+    """The whole chain through main() with only the store faked: the id in the
+    readable file classifies normally, the id that lives in the unreadable file is
+    UNVERIFIABLE (never `pq_missing`), `errors` names the agent, the verdict is
+    `partial`."""
+    _pq_env(monkeypatch, tmp_path, store={
+        "alpha": _pq_a(("pq-readable", "answered")),
+        "bravo": b"questions: [unclosed\n"})
+    goals = [_goal("g-1", "human_blocked: relay_down per pq-readable."),
+             _goal("g-2", "human_blocked: relay_down per pq-in-bravo-file.")]
+    _, res = _run(monkeypatch, capsys, goals, real_pq=True)
+    assert res["verdict"] == "partial"
+    assert len(res["errors"]) == 1 and "bravo" in res["errors"][0]
+    assert "pq_answered" in _sig(res, "g-1")
+    sigs2 = _sig(res, "g-2")
+    assert "pq_unverifiable" in sigs2 and "pq_missing" not in sigs2
+
+
+def test_end_to_end_a_complete_read_is_unchanged(monkeypatch, capsys, tmp_path):
+    """No regression on the healthy path: no errors, `hits`, a real `pq_missing`."""
+    _pq_env(monkeypatch, tmp_path, store={"alpha": _pq_a(("pq-readable", "answered"))})
+    goals = [_goal("g-1", "human_blocked: relay_down per pq-readable."),
+             _goal("g-2", "human_blocked: relay_down per pq-never-filed.")]
+    _, res = _run(monkeypatch, capsys, goals, real_pq=True)
+    assert res["verdict"] == "hits" and res["errors"] == []
+    assert "pq_missing" in _sig(res, "g-2")

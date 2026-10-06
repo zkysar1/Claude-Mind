@@ -12,6 +12,11 @@ what 'notify user' physically IS -- a text message, an email." So:
 
 Pipeline (in order; each step is skippable only by an explicit, recorded flag):
 
+  0. data-class gate   -- outbound_data_class.check(): the owner's personal address
+                          or a credential in the subject, body or payload -> refuse
+                          before anything is ledgered or re-routed (g-306-571,
+                          guard-4061, guard-4525). exit 7. --override-data-class
+                          '<why it is a false positive>' (recorded).
   1. routing gate      -- notification_routing_gate.decide(): "is the fleet
                           telling him something it can handle itself?"
                           SUPPRESS -> re-route to the findings board, never
@@ -33,7 +38,8 @@ Pipeline (in order; each step is skippable only by an explicit, recorded flag):
                           mirror a user-outreach line to reachable peer worlds.
 
 Exit codes: 0 sent | 2 usage/build error | 3 suppressed by routing (re-routed)
-| 4 duplicate | 5 no transport configured | 6 transport failed.
+| 4 duplicate | 5 no transport configured | 6 transport failed
+| 7 refused by the data-class gate.
 """
 from __future__ import annotations
 
@@ -50,10 +56,12 @@ sys.path.insert(0, str(HERE))
 
 from _paths import WORLD_DIR, PROJECT_ROOT  # noqa: E402
 import notification_outreach as outreach  # noqa: E402
+import outbound_data_class as data_class  # noqa: E402
 
 TRANSPORT_SLOT = "scripts/notify-transport.sh"
 
 RC_SENT, RC_USAGE, RC_ROUTED, RC_DUP, RC_NO_TRANSPORT, RC_TRANSPORT_FAIL = 0, 2, 3, 4, 5, 6
+RC_DATA_CLASS = 7   # : the text carries the owner's personal address or a credential
 
 # . `reply` is an ALWAYS_SEND category, so it is the one shape that
 # can walk past the 2026-08-10 suppression directive. The citation is what keeps
@@ -253,7 +261,8 @@ def run_transport(payload: dict, *, world: Path | None, env_extra: dict) -> tupl
 def dispatch(*, agent: str, category: str, subject: str = "", message: str | None = None,
              message_file: str | None = None, payload: dict | None = None, goal_id: str = "",
              allow_duplicate: str = "", builder_args: list | None = None, world: Path | None = None,
-             mirror_peers: bool = True, dry_run: bool = False, in_reply_to: str = "") -> int:
+             mirror_peers: bool = True, dry_run: bool = False, in_reply_to: str = "",
+             override_data_class: str = "") -> int:
     builder_args = builder_args or []
     to_shape_src = os.environ.get("USER_EMAIL", "")
 
@@ -291,6 +300,26 @@ def dispatch(*, agent: str, category: str, subject: str = "", message: str | Non
                  "routing gate refused (guard-4722). If this is not an answer to "
                  "something he asked, use a different category.")
             return RC_USAGE
+
+    # 0b. outbound data-class gate (). BEFORE the routing gate and the outreach
+    # ledger on purpose: both copy the text into a durable store (a re-route posts it to
+    # the board, a suppressed duplicate ledgers its body fingerprint), so a match caught
+    # after them has already been written. It runs under --dry-run too -- the verdict is
+    # the point of a dry run -- and a dry run records nothing. The checker's own crash
+    # fails OPEN and LOUD (guard-142, guard-3737): it must not take notification down.
+    texts = [("subject", subject), ("body", body)]
+    if payload is not None:
+        texts += list(data_class.iter_strings(payload))
+    try:
+        verdict = data_class.check("notify-user", texts, override=override_data_class, record=not dry_run)
+    except Exception as exc:
+        _log(f"WARN: outbound data-class gate could not run ({type(exc).__name__}: {exc}) -- sending UNCHECKED.")
+    else:
+        for note in verdict.notes:
+            print(note, file=sys.stderr)
+        if verdict.decision == "refuse":
+            print(verdict.message, file=sys.stderr)
+            return RC_DATA_CLASS
 
     # 1. routing gate
     suppress, reason, destination = route_check(category, subject, body)
@@ -416,6 +445,9 @@ def main(argv=None) -> int:
     ap.add_argument("--builder-arg", action="append", default=[],
                     help="extra flag passed through to notify-build-payload.py (repeatable), e.g. "
                          "--builder-arg=--disproof-probe --builder-arg='<cmd>'")
+    ap.add_argument("--override-data-class", default="",
+                    help="send despite a data-class match: the justification that it is a FALSE POSITIVE "
+                         "(not the owner's address / a credential); recorded in the override ledger")
     ap.add_argument("--no-mirror-peers", action="store_true")
     ap.add_argument("--world", default="", help="override world dir (tests)")
     ap.add_argument("--dry-run", action="store_true")
@@ -440,7 +472,7 @@ def main(argv=None) -> int:
                     allow_duplicate=args.allow_duplicate, builder_args=args.builder_arg,
                     world=Path(args.world) if args.world else None,
                     mirror_peers=not args.no_mirror_peers, dry_run=args.dry_run,
-                    in_reply_to=args.in_reply_to)
+                    in_reply_to=args.in_reply_to, override_data_class=args.override_data_class)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,13 @@ number has exactly one definition over time. Do not switch it to the generous
 band without re-seeding — the two are not comparable, and a silent switch
 would render the whole history meaningless.
 
+WHAT EACH HISTORY ROW NAMES. Beside the counts, a row's breakdown records `head` (the git
+HEAD the audit read) and `dirty` (how many audited inputs differed from it, untracked
+included), so a floor can be traced to the tree that set it and
+`unchecked-write-audit.sh --new-since baseline` can rebuild that tree instead of guessing
+it from the clock (g-115-11954). The merge handler content-unions history rows, so both
+fields ride inside the row and need no rule of their own.
+
 Exit codes:
   0  any outcome (advisory — never hard-fails /verify-learning)
   2  script error (audit failed to run or emit parseable JSON)
@@ -54,6 +61,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 from _paths import META_DIR  # type: ignore
 from _fileops import locked_modify_yaml  # type: ignore
+from _ratchet_delta import box_name, describe, since_last_reading  # type: ignore
 
 try:
     import yaml  # type: ignore  # noqa: F401  (locked_modify_yaml needs it present)
@@ -116,6 +124,11 @@ def main():
     pop = audit.get("population")
     pop = pop if isinstance(pop, dict) else {}
     call_sites = int(pop.get("call_sites") or (current + verified))
+    # The tree the audit read ({head, dirty}): recorded beside the count so a floor can be
+    # traced to the checkout that set it. An audit that predates the field reports none,
+    # and the row then records None for both rather than losing the reading.
+    prov = audit.get("provenance")
+    prov = prov if isinstance(prov, dict) else {}
     audit_verdict = str(audit.get("verdict") or "")
 
     now_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -190,16 +203,23 @@ def main():
             message = f"OK: unchecked write sites stable at baseline {current}."
 
         history = entry.get("history") or []
+        # The comparison with this box's previous reading is read BEFORE the row below
+        # is appended, so the new row is never its own predecessor.
+        host = box_name()
+        captured["since"] = since_last_reading(history, current, host, now_iso)
         history.append({
             "recorded_at": now_iso,
             "drift_total": current,
             "verdict": verdict,
+            "hostname": host,
             "breakdown": {
                 "unverified": current,
                 "verified": verified,
                 "call_sites": call_sites,
                 "write_wrappers": pop.get("write_wrappers"),
                 "skill_files": pop.get("skill_files"),
+                "head": prov.get("head"),
+                "dirty": prov.get("dirty"),
             },
         })
         history = history[-50:]
@@ -249,6 +269,7 @@ def main():
         "current": {"unverified": current, "verified": verified,
                     "call_sites": call_sites, "population": pop},
         "message": captured["message"],
+        "since_last_reading": captured.get("since"),
     }
 
     if args.json:
@@ -256,6 +277,9 @@ def main():
     else:
         print(f"[unchecked-write-ratchet] "
               f"{captured['verdict'].upper()}: {captured['message']}")
+        if captured.get("since"):
+            print(f"[unchecked-write-ratchet] since last reading: "
+                  f"{describe(captured['since'])}")
 
     if os.environ.get("VERIFY_LEARNING_DRIFT_HARD_GATE") == "1":
         return 1 if captured["verdict"] == "regressed" else 0

@@ -55,6 +55,10 @@ os.environ.pop("GATE_FIRINGS_SEGMENTED", None)
 # And the tree-index retrieval spool flag (): the daemon's retrieve lane
 # branches on it. Pin OFF; core/scripts/tests/conftest.py does the same.
 os.environ.pop("TREE_RETRIEVAL_SPOOLED", None)
+# And the retrieval-trace segmented-writer flag (): the daemon's retrieve
+# lane writes its trace row through `_retrieval_trace.store_name()`, which
+# branches on it. Pin OFF; core/scripts/tests/conftest.py does the same.
+os.environ.pop("RETRIEVAL_TRACE_SEGMENTED", None)
 
 
 # Suppress the daemon stale-code check for the whole pytest session

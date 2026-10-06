@@ -149,6 +149,111 @@ def test_registry_carries_the_gzip_cutover():
         assert (PROJECT_ROOT / c).is_file(), c
 
 
+def test_registry_carries_the_composite_cutover():
+    """ U4a: the composite layout of world/aspirations.jsonl. Consumers are the
+    READER files (the backend's join, the two raw readers of the queue key, the sync
+    layer's `.composite` exclusion and the composite module itself). The writer flag
+    names env-ids, so `flag` is reporting only, exactly like the gzip entry; it is pinned
+    to the name the WRITER reads, because a typo here would report a flag nothing
+    consults. The sha is a 40-char literal and the entry declares seam_symbols, which is
+    what lets a downstream repository prove on routing alone (g-358-226)."""
+    import _owncloud_composite as composite
+    cfg = scc.STORES["composite"]
+    seam = cfg["seam_commit"]
+    assert seam.startswith("0913fcd2c5")
+    assert len(seam) == 40 and all(c in "0123456789abcdef" for c in seam)
+    assert cfg["field"] == "owncloud_composite_seam"
+    assert cfg["flag"] == composite.FLAG_ENV == "OWNCLOUD_COMPOSITE_STORES"
+    assert cfg["seam_symbols"]
+    for c in ("core/scripts/_owncloud_composite.py", "core/scripts/owncloud_backend.py",
+              "core/scripts/owncloud_sync.py", "core/scripts/worker_stall.py",
+              "mind_api/src/endpoints/aspirations_write.py"):
+        assert c in cfg["consumers"], c
+    assert not any("tests/" in c for c in cfg["consumers"])
+    from _paths import PROJECT_ROOT
+    for c in cfg["consumers"]:
+        assert (PROJECT_ROOT / c).is_file(), c
+
+
+def _composite_texts():
+    from _paths import PROJECT_ROOT
+    return {c: (PROJECT_ROOT / c).read_text(encoding="utf-8")
+            for c in scc.STORES["composite"]["consumers"]}
+
+
+def test_composite_seam_symbols_route_every_consumer_and_say_which_symbol():
+    """Positive control over the files as they sit in the tree. Every consumer routes to a
+    declared symbol, and WHICH symbol carries each file is the one that file really uses,
+    so a verdict is attributable and a symbol that matched by accident would show here."""
+    specs = scc._symbol_specs(scc.STORES["composite"]["seam_symbols"])
+    got = {c: scc._calls_any_symbol(t, specs, c) for c, t in _composite_texts().items()}
+    assert got == {
+        "core/scripts/_owncloud_composite.py": "read_whole",
+        "core/scripts/owncloud_backend.py": "read_whole",
+        "core/scripts/owncloud_sync.py": ".composite",
+        "core/scripts/worker_stall.py": "decode_whole",
+        "mind_api/src/endpoints/aspirations_write.py": "decode_whole",
+    }
+
+
+def test_composite_seam_goes_red_when_any_one_reader_is_reverted():
+    """Injected defects, one per consumer (guard-6244: a gate that cannot go red on a revert is
+    a permanent pass). Each edit reverts exactly the seam in one file and must leave that file
+    unrouted; the control edit leaves the seam alone and must still route."""
+    specs = scc._symbol_specs(scc.STORES["composite"]["seam_symbols"])
+    texts = _composite_texts()
+
+    def routes(path, *edits):
+        text = texts[path]
+        for old, new in edits:
+            assert text.count(old) >= 1, (path, old)   # the defect must really change the file
+            text = text.replace(old, new)
+        assert text != texts[path]
+        return scc._calls_any_symbol(text, specs, path)
+
+    # the backend join every mirror-routed consumer reaches
+    assert routes("core/scripts/owncloud_backend.py",
+                  ("_composite.read_whole(", "_composite.legacy_whole(")) is None
+    # the two raw readers of the queue key (the second binds the seam through an alias)
+    assert routes("core/scripts/worker_stall.py",
+                  ("decode_whole(", "decode_response(")) is None
+    assert routes("mind_api/src/endpoints/aspirations_write.py",
+                  ("_decode_whole(", "_codec_decode_response(")) is None
+    # the sync layer carries its half as a literal, and the exclusion is a line of a set
+    sync_line = '    ".composite",\n'
+    assert texts["core/scripts/owncloud_sync.py"].count(sync_line) == 1
+    assert routes("core/scripts/owncloud_sync.py", (sync_line, "")) is None
+    # the module that defines both joins
+    assert routes("core/scripts/_owncloud_composite.py",
+                  ("def read_whole(", "def read_all("),
+                  ("def decode_whole(", "def decode_all(")) is None
+    # control: an edit that leaves the seam alone still routes
+    assert routes("core/scripts/worker_stall.py",
+                  ("def _read_queue_lines(", "def _read_queue_lines_x(")) == "decode_whole"
+
+
+def test_gzip_still_routes_the_raw_reader_that_swapped_to_decode_whole():
+    """ U3 swapped aspirations_write's raw decode_response call for decode_whole (the
+    codec's decode plus the composite join). Without a scoped spec for it the gzip entry loses
+    that consumer the moment U3 reaches origin/main, and the fleet-level veto then reads UNSAFE
+    for a seam nothing reverted (measured at HEAD before the fix: the file matched no gzip
+    symbol). The spec is scoped to that one file so it cannot soften another consumer, and a
+    revert of the swap must still go red."""
+    from _paths import PROJECT_ROOT
+    cfg = scc.STORES["gzip"]
+    path = "mind_api/src/endpoints/aspirations_write.py"
+    specs = scc._symbol_specs(cfg["seam_symbols"])
+    assert ("decode_whole", "call", frozenset({path})) in specs
+    text = (PROJECT_ROOT / path).read_text(encoding="utf-8")
+    assert scc._calls_any_symbol(text, specs, path) == "decode_whole"
+    # revert: the raw read comes back with no codec decode at all
+    assert "_decode_whole(" in text
+    assert scc._calls_any_symbol(text.replace("_decode_whole(", "_plain_read("), specs, path) is None
+    # the exemption is that file's alone
+    assert scc._calls_any_symbol("x = decode_whole(be, k, o)\n", specs,
+                                 "core/scripts/owncloud_sync.py") is None
+
+
 def test_local_box_veto_blocks_an_otherwise_safe_fleet():
     """The defect  closed on 2026-08-18: every roster proof is
     AGENT-keyed, so a Body on a box that is behind reads SAFE off a sibling

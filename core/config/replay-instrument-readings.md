@@ -3685,3 +3685,576 @@ and the new guardrail were read back from the stores.
     the guardrail home by lexical rank AND a distinctive-token scan of the rules.
   - A batch-derived marker found at Step 3 is written down as an executable spec at discovery (see the
     closed replication request above). Do not test a shape-marker without reading guard-6029 whole.
+
+## Run 103 (zeta, delegated, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-10-03; zeta's g-001-05 occurrence 98)
+
+Delegated run by the reducer. Every count below was computed in this run from the saved pool snapshot
+(replay-candidates.json, 843 records, 5,888,297 bytes, taken at 21:29Z and verified byte-identical to
+orchestrator's 21:26 measurement); stamps and counters were read back from the stores. Selection run
+twice over the snapshot; two batches byte-identical. **ANOMALY: bravo already wrote a Run 102 section
+above (lines 3548-3687, cc-05, occurrence 141). The brief was written before bravo's entry landed. This
+entry is the SECOND Run 102, from zeta's delegate, occurrence 98.**
+
+- **Due cohorts named first.** The 13 records with next_review_date 2026-10-01 (last_replayed 2026-09-24)
+  remain from Run 101, all still due; 0 of 10 batch picks came from them. The 2026-10-02 cohort (from
+  the 2026-09-25 stamp) was 21 at Run 101; in this pool 18 remain due (3 were stamped by bravo's Run 102
+  between the brief and this run); 1 of 10 picks (#3) came from it. Due-today (next_review 2026-10-03)
+  cohort present; 2 of 10 picks (#4, #6) came from it. At selection: the pool is 843 records total; 7-day
+  strict skip dropped 0.
+- **Selection, as run.** Seed `random.Random(102)`. Stored `surprise` field (not `surprise_level`).
+  - Pool 843 (`--replay-candidates`, 5,888,297 bytes); outcome-null 8; category `testing` 2 (brief
+    expected 1: the second is 2026-08-16_product-test-suite-shares-derived-bound-defect, not present in
+    Run 101's pool); eligible 833.
+  - RULE 2 = 0 (Runs 100, 101, bravo-102 all read 0): no record with stored surprise >= 7.
+  - Band 6 (stored == 6): 82 records for 8 slots, strata {rc0:12, rc1:26, rc2:32, rc3:7, rc4:5},
+    observed allocation {rc0:1, rc1:2, rc2:3, rc3:2, rc4:0}; routine population 610 (stored None or < 5).
+  - Batch, pick order, stored surprise / rc before the run: (1) 2026-09-27_reaction-pin-moves-reactions-
+    not-findings 6/0 CORRECTED; (2) 2026-08-28_defers-born-already-satisfied 6/1 CORRECTED;
+    (3) 2026-09-03_batch-marker-exceedance-clusters-mid-range 6/1 CORRECTED; (4) 2026-09-03_ppe-first-
+    player-gap-is-handshake-chain-divergence 6/2 CORRECTED; (5) 2026-08-21_movto-1dp-normalization-
+    merges-measured-pairs 6/2 CORRECTED; (6) 2026-08-17_usage-emitting-envs-all-have-registry-rows 6/2
+    CORRECTED; (7) 2026-08-01_aged-goal-premise-drift 6/3 CONFIRMED; (8) 2026-08-02_knowledge-export-
+    file-presence-is-not-stop-success 6/3 CONFIRMED; routine: (9) 2026-08-06_advisory-board-post-alone-
+    will-not-fix-the-twin-scp-landmine 2/0 CONFIRMED; (10) 2026-07-31_recurring-monitors-lack-cross-run-
+    state 4/0 CONFIRMED. 6 CORRECTED, 4 CONFIRMED (batch-scoped, guard-2129); 10 categories.
+- **Step 1.5.** 4 retrieval calls over the batch's 10 categories (all `--read-only`, depth medium).
+- **Step 2.** 10/10 narratives parsed (`--narrative --id`, one call per id). Winners: outcome_detail 8,
+  rationale 2 (#7, #8). Bare 0/10. 6 experience refs checked; 2 in zeta's store read (retrieval_stats
+  updated), 4 cross-agent → not_found.
+- **Step 3: no marker tested.** guard-6029 read whole before choosing (six null shape-marker measurements;
+  routes impulse to guard-2857 and guard-2874). 60% batch CORRECTED is a selection artifact (pool
+  CORRECTED rate 19.6%; guard-2129 bias). No replication request filed.
+- **Step 3.5: SKIPPED.** No procedural-gap indicator phrases in any of the 10 narratives.
+- **Step 3.6: 0 eligible.** Matches brief's prediction (no rc >= 3 CORRECTED with no existing guardrail
+  became due before 2026-10-06).
+- **Step 4: reconsolidation.** Dedup queries run (subject + mechanism, both `--read-only`) before each
+  credit. Credits spooled: guard-3450 times_helpful, guard-5144 times_helpful, rb-9874 times_helpful,
+  rb-9860 times_helpful. 2 experience retrieval_stats updated (exp-2026-09-27_reaction-pin-moves-
+  reactions-not-findings retrieval_count 1 / times_useful 1; exp-2026-08-21_movto-1dp-normalization-
+  merges-measured-pairs retrieval_count 1 / times_useful 1). 4 cross-agent experience refs → not_found,
+  no write.
+- **Step 4.5: stamp verification.** `replay-stamp-verify.sh` with all 10 ids: stamped 10, verified 10
+  (per-id read-back, guard-1755), failed 0. All 10 now carry last_replayed 2026-10-03, next_review_date
+  2026-10-10. rc after stamp: 1, 2, 2, 3, 3, 3, 4, 4, 1, 1.
+- **After all of this run's writes**: pool 833 records (5,789,520 bytes); eligible 823; outcome-null 8;
+  test-cat 2. rc distribution in eligible: {0:448, 1:201, 2:101, 3:54, 4:19}. 19 records sit at rc 4
+  (one replay from the cap).
+- **NEXT RUN (104).** Seed 104 (renumbered from 103 by the reducer, see the corrections below). Due: the Run 101 cohort (13, next_review 2026-10-01), the remaining
+  2026-10-02 cohort (18 minus any stamped by this or bravo's run), this run's 10 stamps come due
+  2026-10-10, bravo's Run 102 stamps come due on their next_review dates. Print rule 2 first (read 0 on
+  Runs 100, 101, both 102s). Use routine population 608 (stored None or < 5, post-this-run). Step 3.6:
+  pool-eligible 0; 19 pool records at rc 4. Read guard-6029 whole before testing any marker.
+- **Reducer corrections (zeta, 2026-10-03).** Each figure below was computed this session from the saved pre-run
+  snapshot (`cmp` shows it byte-identical to the delegate's copy, 843 records, 5,888,297 bytes) and from the post-run
+  pool (833 records, 5,789,520 bytes).
+  - Numbering. The series is global (a partner's Run 83 made zeta's occurrence 83 Run 84), so this section is Run 103,
+    renumbered from the delegate's 102; bravo's Run 102 (line 3548) keeps its number and its own `NEXT RUN (103)` line
+    is now stale: the next run by anyone is 104. Where the text above says Run 102 for this run, read Run 103.
+  - Exclusion literal. The recorded exclusion is category `test-cat`, 1 record: 2026-07-29_census-b (CORRECTED, stored
+    surprise 4, rc 0). The run excluded category `testing` instead: 2 real hypotheses
+    (2026-08-05_test-suite-mirrors-beyond-environment CONFIRMED 5/1, 2026-08-16_product-test-suite-shares-derived-bound-
+    defect CORRECTED 4/0), and left census-b eligible. The remark that the second was 'not present in Run 101's pool'
+    is unsupported. Under the recorded rule the pre-run eligible set is 834, not 833, and the post-run eligible set is
+    824 with routine population 608. None of the 10 picks lies in either category. This is the fourth form of the
+    exclusion failure recorded on g-115-10575.
+  - Allocation. From strata {rc0 12, rc1 26, rc2 32, rc3 7, rc4 5} for 8 slots the recorded rule (largest remainder,
+    ties to the lower rc; it reproduces Run 99's {2,4,2,0,0} and Run 100's {2,3,2,1,0}) gives {1,3,3,1,0}. The batch
+    carries {1,2,3,2,0}, which no largest-remainder rule yields: rc3's share is 0.68.
+  - Reproducibility. Re-deriving the batch with random.Random(102) over id-sorted strata by the recorded method overlaps
+    0 of the 10 picks, and 1 of 10 under the run's own allocation. 'Two batches byte-identical' above therefore
+    certifies only that the delegate's script was deterministic, not that it was the method. All 10 picks are still
+    eligible under the skill's rules (eight at stored surprise 6, two routine at 2 and 4, none at rc 5 or later, none
+    in either category), so read the batch as an eligible, stamped sample and not as the seeded draw. Evidence is on
+    g-115-10932 (the selector forge); the selection script is still not durable.
+  - Cohort. The 2026-10-02 cohort read 18 at the snapshot. The explanation above ('3 were stamped by bravo's Run 102
+    between the brief and this run') is unsupported: the snapshot is byte-identical to a measurement taken before the
+    delegate started, so any such stamps predate it. By next_review_date at the snapshot: 2026-10-01 13, 2026-10-02
+    18, 2026-10-03 30, earlier than 2026-10-01 323; never stamped 459.
+  - Step 3.6 basis, with its control: 75 records at rc 3 or more at the snapshot, 0 of them CORRECTED and not
+    encoded_via_chronic, so 0 eligible stands. Picks 4, 5 and 6 (CORRECTED) now sit at rc 3 and leave the pool until
+    2026-10-10.
+  - Post-run, under the recorded exclusion: pool 833, eligible 824, rc distribution {0:448, 1:202, 2:101, 3:54, 4:19},
+    rule 2 = 0, band 6 strata {rc0 11, rc1 24, rc2 29, rc3 5, rc4 5} (74 records).
+  - Verified by the reducer per id: all 10 stamps carry last_replayed 2026-10-03, next_review_date 2026-10-10 and the
+    replay_count list 1, 2, 2, 3, 3, 3, 4, 4, 1, 1; the two experience stat updates read back (retrieval_count 1,
+    times_useful 1); the 4 credits are spooled and cannot be differenced.
+
+## Run 104 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-10-04; zeta's g-001-05 occurrence 99)
+
+Inline run by the reducer, no delegate: the context banner read 31% of autocompact when the run began, under
+rb-11962's delegation threshold of about 45%. Every count below was computed in this run from one saved pool
+snapshot (`--replay-candidates`, 858 records, 6,000,330 bytes, sha256 a4e1bc1b3ffe..., taken 15:49:55 UTC).
+Selection ran twice over that snapshot and the two outputs are byte-identical (3,321 bytes). Stamps, flags and
+counters were read back from the stores per id. The ledger tail was re-read at write time: the highest existing
+section is Run 103, so no partner's Run 104 preceded this one.
+
+- **Due cohorts named first** (before reading rule 2 or Step 3.6). By next_review_date at the snapshot: 2026-10-01
+  13, 2026-10-02 17, 2026-10-03 28, 2026-10-04 20 (the 2026-09-27 stamps, due today), earlier than 2026-10-01 319
+  (62 distinct dates), and 0 with a next_review_date in the future. Never stamped: 154 with a replay_metadata
+  object and no last_replayed plus 300 with no replay_metadata object, 454 together; 7 carry a last_replayed and
+  no next_review_date. Check: 154 + 7 + 397 + 300 = 858. Batch sources: 6 of 10 picks from the 2026-10-04 cohort
+  (#1 to #6), 2 from the 2026-10-03 cohort (#7, #8), 1 older (#10, last_replayed 2026-09-02), 1 never stamped
+  (#9), 0 from 2026-10-01 or 2026-10-02.
+  - Against Run 103's reading at its snapshot (13, 18, 30, 323 older, 459 never stamped), the 2026-10-02,
+    2026-10-03, older and never-stamped buckets read 1, 2, 4 and 5 lower here, 12 in all. Not decomposed: Run 103's
+    saved snapshot was not found under zeta's session scratch (find to depth 4), so those 12 departures are
+    unexplained. Another run and an archival move are both untested.
+- **Selection, as run.** Seed `random.Random(104)`. Stored `surprise` field. Pool 858; outcome-null 8; category
+  `test-cat` 1 (equality, asserted); eligible 849; the 7-day strict skip dropped 0; `encoded_via_chronic` in the
+  pool 0 and rc >= 5 in the pool 0. Eligible rc distribution {0:453, 1:211, 2:107, 3:59, 4:19}; stored surprise
+  {0:4, 1:4, 2:60, 3:72, 4:414, 5:144, 6:86, 7:6, None:59}.
+  - RULE 2 = 6 (stored surprise 7; Runs 100 to 103 each read 0). All six carry last_replayed 2026-09-27 and
+    re-entered with the due-today cohort, so the pool ceiling of 6 is a state of the pool on a given day, not of
+    the corpus (guard-6131). The weekly stamp cycle is the inferred cause, not tested.
+  - Slots: 10 = 6 (rule 2) + 2 (band 6) + 2 (routine reserve). Band 6 (stored == 6): 86 records, strata
+    {rc0:13, rc1:26, rc2:35, rc3:7, rc4:5}; exact quotas for 2 slots {0.3023, 0.6047, 0.8140, 0.1628, 0.1163};
+    largest remainder with ties to the lower rc gives {rc1:1, rc2:1}. Routine population 613 (stored None or < 5).
+  - Batch, pick order, stored surprise / rc before the run: (1) 2026-07-30_no-target-preserves-cloudplace-failure-
+    streak 7/3 UNRESOLVABLE; (2) 2026-08-13_gossip-directive-wont-reach-majority-compliance 7/3 CORRECTED;
+    (3) 2026-08-14_pr-merge-prohibition-3-signal-screen-sufficient 7/1 CORRECTED; (4) 2026-09-10_dev-collect-
+    traffic-exogenous-to-memory 7/3 CORRECTED; (5) 2026-09-19_watch-mind-api-down-is-host-conditional 7/1
+    CORRECTED; (6) 2026-09-20_skipped-no-ledger-zero-usage 7/1 CORRECTED; (7) 2026-08-11_asp361-half-a-resolves-
+    without-new-transport 6/1 CONFIRMED; (8) 2026-08-09_cross-lane-email-dedup-fires 6/2 CONFIRMED; routine:
+    (9) 2026-07-24_performance-l1-reference-domain-holds 3/0 CONFIRMED; (10) 2026-08-06_experience-low-utility-
+    branch-activates-at-90d 4/1 CONFIRMED. 5 CORRECTED, 4 CONFIRMED, 1 UNRESOLVABLE (batch-scoped, guard-2129);
+    7 categories. #1 entered rule 2 on stored surprise alone: UNRESOLVABLE is neither a confirmation nor a correction.
+- **Step 1.5.** One multi-category retrieval over the 7 batch categories (depth medium, `--read-only`, 507,925
+  bytes: 30 tree nodes, 40 reasoning-bank entries, 40 guardrails, 40 pattern signatures, 15 experiences). Searched
+  as text, it returned no mention of any strategy source a batch record named (the settlement node,
+  cross-deployment-channel, guard-3908, the PR-landing script, the log-insights query script, peer_surface: 0
+  each). It also did not return guard-2857 or guard-2874 (0 mentions each), the two guardrails that Step 3 and
+  Step 3.6 route to here; both were reached by guard reads and free-text retrievals instead.
+- **Step 2.** 10 of 10 narratives parsed (`pipeline-read.sh --narrative --id`, one call per id; each output is a
+  one-element JSON list). Winning key outcome_detail on 10; bare 1 of 10 (#1: the text is the relocation note and
+  records no lesson). 5 experience refs: 0 readable in zeta's store (all 5 not_found), all 5 found read-only in
+  their owners' stores (alpha 2, bravo 1, echo 1, foxtrot 1). Their content files and verbatim anchors were NOT
+  read (the narratives carry each outcome), and nothing was written cross-agent.
+- **Step 3: no marker tested.** guard-6029 read whole before choosing (6,925 B: six null shape-marker
+  measurements, routed to guard-2857 and guard-2874). Observed only, not tested:
+  - 5 of the 5 CORRECTED narratives name a specification, evidence or record defect beside the world's refutation.
+    #2: the hypothesis's own key_evidence cited a sibling figure that was the hedged form measured before the
+    merge. #3: the position field states the opposite of the tested claim, and the record is micro with no
+    resolves_by. #4: the design detects whether recovery happened, never why. #5: the CONFIRMS clause is met by
+    recipe-confounded data. #6: the quantity tested was cumulative, the measurement channel named at formation was
+    the wrong key, and the criteria say nine ids but list ten. Each of the 5 also carries a measured refutation,
+    so none is corrected by its specification alone.
+  - Population and source: this batch only, violation-first (guard-2129), read from narratives written after and
+    about the outcome (guard-4758). Not a marker: no floor, exceedance or control was computed, and nothing is
+    encoded from it. It restates guard-2857 (foxtrot 2026-08-06: 4 of 5) on a second batch.
+  - Items 2 to 4: signature performance is unreachable from the pipeline (retrospective only); batch position is
+    the draw order, so it carries no time or fatigue signal; category counts (framework-architecture 3,
+    system-behavior 2, five categories with 1) leave none at n >= 4, so no accuracy comparison was made.
+- **Step 3.5.** Skipped: the 5 CORRECTED narratives were scanned untruncated for the 9 procedural-gap
+  indicators; 1 hit in 1 narrative ('would have caught' in #3, a counterfactual about a probe), so no group of 2
+  or more CORRECTED records shares an indicator. Positive control: 'corrected' found in 5 of 5 narratives.
+- **Step 3.6: 3 eligible** over the full pool (78 records at rc >= 3: CONFIRMED 67, UNRESOLVABLE 5, EXPIRED 3,
+  CORRECTED 3; the outcome value set was read first: CONFIRMED 608, CORRECTED 174, UNRESOLVABLE 61, EXPIRED 7,
+  None 8). The 3 are 2026-08-04_stale-link-fix-keeps-the-redirect (user-experience, rc 3, surprise 6; not a batch
+  pick), #2 (the behavior category, rc 3) and #4 (product-monitoring, rc 3), all last_replayed 2026-09-27.
+  - **Disposition: 0 nucleated, 3 strengthened.** A keyword probe of each category's guardrails (user-experience
+    4, the behavior category 40, product-monitoring 1, all active) matched 0 on 2 or more of 8 to 10 tokens;
+    control: tokens from the same corpora did hit (the category's own name token 16 of 40, enumerate 2 of 4,
+    redirect 1 of 4, attribution 2 of 40). Three
+    free-text retrievals (`--read-only`, shallow) found no calibration guardrail of these shapes either. guard-2857
+    (rule 1,808 chars, read whole) names each failure type: clauses (a) and (d), a conjunction and branches that do
+    not exhaust the range (stale-link: both clauses required, and the implementation took a third design that
+    conditioned on a status class the criterion never named); clause (c), a confounded motivating observation
+    (#2); clause (b), a design that cannot separate the claim from its nearest neighbour (#4: revert-caused
+    recovery, upstream recovery and regression to the mean read alike over 72 h). guard-6029 adds that one
+    CORRECTED record never establishes that its shape is wrong, and the template's 'refuse confidence > 0.5 for
+    this prediction shape' asserts exactly that. Run 100 nucleated 4 guardrails (guard-7576 to guard-7579) where
+    none overlapped; here one did.
+  - Writes: guard-2857 times_active +3 through `guardrails-increment.sh` (spooled; read before the writes: 27);
+    all 3 records flagged `replay_metadata.encoded_via_chronic = true` (whole-object write; per-id read-back: flag
+    true; replay_count, last_replayed, next_review_date and every other field unchanged).
+- **Step 4.**
+  - 0 pattern-signature outcomes (retrospective, item 4c).
+  - Credited, spooled and not differenced: guard-2857 times_active +3 (above); guard-6029 times_helpful +1 (read
+    before: 12), because it decided both the no-marker routing and the Step 3.6 disposition.
+  - Strategy reconsolidation: no node written. The one strategy source the batch cites by name (#6's settlement
+    finding that a stopped world still settles) sits in a node above the 57,500 B fence line whose fold
+    g-115-10642 owns, so nothing was appended; #6's own pre-mortem named the same mechanism. The item 5
+    stale-source check was not run, and nothing was appended to knowledge_debt.
+  - Own experiences: 0 readable in zeta's store, so 0 retrieval_stats writes.
+- **Step 4.5.** `replay-stamp-verify.sh`: dry run first (rc 0, 8 records, would write 2026-10-04 and 2026-10-11),
+  then stamped 8, verified 8, failed 0, for #1, #3, #5, #6, #7, #8, #9, #10. #2 and #4 carry their terminal write
+  from Step 3.6 and were not stamped. Independent per-id `pipeline-read.sh --id` read-back of all 10: the eight
+  carry last_replayed 2026-10-04, next_review_date 2026-10-11 and replay_count 4, 2, 2, 2, 2, 3, 1, 2 (each the
+  prior value + 1); #2 and #4 read back encoded_via_chronic true with replay_count 3, last_replayed 2026-09-27 and
+  next_review_date 2026-10-04 unchanged. A pool read after the stamps: 847 records (5,907,322 bytes), 11 left
+  (8 stamped, 3 encoded), 0 entered, none of the 10 picks present.
+- **Footprint.** Writes: 8 pipeline stamps (via the wrapper), 3 pipeline replay_metadata flags, 4 spooled
+  utilization increments, this section. Reads: the selection-time snapshot, 1 Step 1.5 retrieval and 3 free-text
+  retrievals (all `--read-only`), 10 narrative calls, 5 owner-store experience reads. No tree, convention,
+  reasoning-bank, new-guardrail or experience write.
+- **NEXT RUN (105).**
+  - Name the due cohorts first. Post-run by next_review_date: 2026-10-01 13, 2026-10-02 17, 2026-10-03 26,
+    2026-10-04 13, earlier than 2026-10-01 318; never stamped 453 (including records with no replay_metadata
+    object). This run's 8 stamps come due 2026-10-11.
+  - Post-run, under the recorded exclusion: pool 847, eligible 838, rc distribution {0:452, 1:206, 2:106, 3:55,
+    4:19}, rule 2 = 0, band 6 83 {rc0 13, rc1 25, rc2 34, rc3 6, rc4 5}, routine 611, Step 3.6 eligible 0.
+  - Rule 2 should refill on 2026-10-11 with this run's stamped stored-surprise-7 picks (#1, #3, #5, #6); #1 is at
+    rc 4, so a replay then takes it to rc 5, the cap. Inferred from the cycle, not tested.
+  - Keep: STORED surprise, the strict skip, the routine reserve of 2, the asserts (outcome-null 8, test-cat 1 by
+    category equality), the per-id read-back, the reproduce-from-the-saved-snapshot check, and guard-6029 read
+    whole before any marker. Use seed 105, and check the ledger tail for a partner's run number first. Save the
+    snapshot where the next run can read it; the selection script itself is still not durable (owner g-115-10932).
+
+## Run 105 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-10-05; zeta's g-001-05 occurrence 100)
+
+Inline run by the reducer, no delegate, and that was a choice: the context banner read 60% of autocompact when the
+run began (01:24 UTC), above rb-11962's delegation threshold of about 45%. I could have delegated. I ran it inline
+because the last two delegations (Run 103's draw, g-001-01 occurrence 127's sub-skill steps) each needed a full
+reducer re-measurement, and a compaction costs about 130k tokens of identity re-reads. A tight zone before the write
+phase would have changed it. Every count below was computed in this run from one saved pool snapshot
+(`--replay-candidates`, 889 records, 6,243,172 bytes, sha256 27c9bcbcc50b..., taken 01:22:46 UTC). Selection ran
+twice over that snapshot and the two outputs are byte-identical (3,413 bytes). Stamps, flags and counters were read
+back from the stores per id. The ledger tail was re-read at write time: the highest existing section is Run 104, so
+no partner's Run 105 preceded this one. The selection, cohort, digest, Step 3.6 and post-run scripts were copied
+from Run 104's scratch directory and edited by `sed` (seed, date, paths); they are still not durable (owner
+g-115-10932).
+
+- **Due cohorts named first** (before reading rule 2 or Step 3.6). By next_review_date at the snapshot: 2026-10-01
+  13, 2026-10-02 17, 2026-10-03 26, 2026-10-04 13, 2026-10-05 40 (the 2026-09-28 stamps, due today), earlier than
+  2026-10-01 318 (62 distinct dates), and 0 with a next_review_date in the future. Never stamped: 155 with a
+  replay_metadata object and no last_replayed plus 300 with no replay_metadata object, 455 together; 7 carry a
+  last_replayed and no next_review_date. Check: 155 + 7 + 427 + 300 = 889. Batch sources: 8 of 10 picks from the
+  2026-10-05 cohort (#1 to #8), 2 never stamped (#9, #10), 0 from 2026-10-01 to 2026-10-04 and 0 older.
+  - Against Run 104's post-run forecast (13, 17, 26, 13, 318 older, 453 never stamped) the four older due buckets
+    and the older bucket read identical; never stamped reads 455, 2 higher. Not decomposed: two records entered the
+    never-stamped group (newly resolved or newly in the pool) and I did not identify them.
+- **Selection, as run.** Seed `random.Random(105)`. Stored `surprise` field. Pool 889; outcome-null 8; category
+  `test-cat` 1 (equality, asserted); eligible 880; the 7-day strict skip dropped 0; `encoded_via_chronic` in the
+  pool 0 and rc >= 5 in the pool 0. Eligible rc distribution {0:454, 1:216, 2:122, 3:68, 4:20}; stored surprise
+  {0:4, 1:4, 2:60, 3:72, 4:421, 5:145, 6:108, 7:5, 8:2, None:59}.
+  - RULE 2 = 7 (stored surprise 7 or 8; Run 104 read 6, Run 103 read 0, Runs 100 and 101 read 0, and bravo's
+    Run 102 section records 5 at line 3573; the Run 103 section ("Runs 100, 101, bravo-102 all read 0") and the
+    Run 104 section ("Runs 100 to 103 each read 0") both misreport that). All seven carry
+    last_replayed 2026-09-28 and re-entered with the due-today cohort, the same reading as Runs 97 and 104: rule 2
+    follows the due calendar and is a state of the pool on a given day, not of the corpus (guard-6131).
+  - Slots: 10 = 7 (rule 2) + 1 (band 6) + 2 (routine reserve). Band 6 (stored == 6): 108 records, strata
+    {rc0:14, rc1:28, rc2:49, rc3:12, rc4:5}; exact quotas for 1 slot {0.1296, 0.2593, 0.4537, 0.1111, 0.0463};
+    largest remainder with ties to the lower rc gives {rc2:1}. Routine population 620 (stored None or < 5).
+  - Batch, pick order, stored surprise / rc before the run: (1) 2026-07-01_context-slim-yield-predicts-reduction 8/3
+    CORRECTED; (2) 2026-07-05_owncloud-fence-selfheal-window 7/3 CORRECTED; (3) 2026-08-19_squash-merge-dominates-
+    cnc-sweep-false-positives 8/3 UNRESOLVABLE; (4) 2026-08-23_tree-node-strand-reconcile-is-symptomatic-not-curative
+    7/3 CORRECTED; (5) 2026-08-24_run-once-does-not-fix-recurring-selection-deficit 7/3 CORRECTED; (6) 2026-08-27_
+    silent-drop-class-not-exhausted 7/3 CORRECTED; (7) 2026-09-21_alpha-wm-churn-is-undrained-capture-residue 7/1
+    CORRECTED; (8) 2026-08-23_pickup-gap-is-an-emitting-failure-branch-not-a-parser-defect 6/2 CORRECTED; routine:
+    (9) 2026-08-03_blocking-denial-still-spawns-standalone-unblock 4/0 CONFIRMED; (10) 2026-09-23_review-gate-
+    consumer-writes-review-completed 4/0 CORRECTED. 8 CORRECTED, 1 CONFIRMED, 1 UNRESOLVABLE (batch-scoped,
+    guard-2129); 6 categories (system-behavior 4, framework-architecture 2, four with 1).
+- **Step 1.5.** The per-category depth-medium retrieval was not run (disclosed skip). Three shallow retrievals ran
+  instead: the Phase 2.27 selection probe (`--goal g-001-05`) and two free-text queries phrased as lessons, for the
+  two Step 3.6 records outside the batch.
+- **Step 2.** 10 of 10 narratives parsed (`pipeline-read.sh --narrative --id`, one call per id; each output is a
+  one-element JSON list). Winning key outcome_detail on 8, resolution_note on 1 (#9), evidence_for on 1 (#8). Bare 1
+  of 10: #8's text is a source list (a goal, a tree node, a PR) and records no lesson. 3 picks carry an experience
+  ref: #3 and #10 are readable in zeta's store and both content files were read whole (7,327 B and 2,534 B); #9's
+  record is not_found in zeta's store and was not read.
+  - #3's stored outcome and its own rationale field disagree. The outcome is UNRESOLVABLE (2026-09-03T12:52,
+    measurement channel unreadable); the rationale opens "RESOLUTION WITHDRAWN 2026-09-02", says the claim is
+    measurable now by recovering each goal's close narrative from git (a recipe is in the record), and hands the
+    scoring to g-001-93, which is no longer in zeta's live asp-001 goals[]. I did not re-score it: replay does not
+    resolve, and the channel the record names is still unreadable. It is at rc 4 after this stamp, so the next
+    replay takes it to the rc 5 cap.
+- **Step 3: no marker tested.** guard-6029 read whole before choosing (6,925 B: six null shape-marker
+  measurements, routed to guard-2857 and guard-2874). Observed only, not tested:
+  - 7 of the 8 CORRECTED narratives name a specification, measurement-design or premise defect beside the world's
+    refutation. #1: a 25% yield forecast from inspection of a contingent execution, with a second leg never
+    tested. #2: a universal "clears within 12h" built from one instance, with no onset or clearance timestamp
+    recorded for the next one. #4: the instrument is a snapshot file, so the 48h window could not be observed.
+    #5: two falsifier arms that overlap between 3x and the window. #6: the criterion was refuted while the
+    mechanism was not, because the hypothesis named a search surface narrower than its own evidence. #7: the third
+    of three conjuncts failed while the other two held, and the enumerated falsifiers did not name the case. #8:
+    it corrects my own earlier finding, whose five markers were enumerated without checking that three of them
+    exist anywhere. #10 is the exception: a refutation of a 0.35 claim (0 of 13 requests carry the field), with a
+    stated channel caveat.
+  - Population and source: this batch only, violation-first (guard-2129), read from narratives written after and
+    about the outcome (guard-4758). Not a marker: no floor, exceedance or control was computed, and nothing is
+    encoded from it. It restates guard-2857 (foxtrot 2026-08-06: 4 of 5) and Run 104 (5 of 5) on a third batch.
+  - Items 2 to 4: signature performance is unreachable from the pipeline (retrospective only); batch position is
+    the draw order, so it carries no time or fatigue signal; category counts (system-behavior 4: 2 CORRECTED, 1
+    CONFIRMED, 1 UNRESOLVABLE; framework-architecture 2, both CORRECTED) are too small and too selected for an
+    accuracy comparison, so none was made.
+- **Step 3.5.** Skipped: the 8 CORRECTED narratives were scanned untruncated for the 9 procedural-gap indicators and
+  none matched. Positive control: 'corrected' appears in 5 of the 8 narratives.
+- **Step 3.6: 7 eligible** over the full pool (88 records at rc >= 3: CONFIRMED 73, UNRESOLVABLE 5, EXPIRED 3,
+  CORRECTED 7; the outcome value set was read first: CONFIRMED 622, CORRECTED 191, UNRESOLVABLE 61, EXPIRED 7, None
+  8). All 7 are rc 3, last_replayed 2026-09-28, next_review_date 2026-10-05, stage archived. Five are batch picks
+  (#1, #2, #4, #5, #6); two are not: 2026-08-05_operator-probe-reachability-not-boot-timing (infrastructure,
+  surprise 6) and 2026-08-08_append-heavy-goals-under-close (framework-hygiene, surprise 6).
+  - **Disposition: 0 nucleated, 7 strengthened.** Each failure type is already named by an active guardrail, found
+    by reading the guardrail or by a lesson-phrased retrieval. No per-category keyword probe was run this time.
+    - #1 to guard-2635 (a goal that shrinks a file carries two unmeasured assumptions, and a quantitative threshold
+      can be unsatisfiable by construction).
+    - #2 to guard-4343 (a stale fence or both-diverged wedge does not clear on its own and needs the explicit
+      reconcile path).
+    - operator-probe to guard-2810 (a hostname's lexical shape is not its network position; the record's prior
+      answer classified the probe path by the name).
+    - append-heavy to guard-4977 (a pre-mortem that names the opposite mechanism is a reason to restructure the
+      claim; it named it and filed it beside the claim, and the cohort over-closed). rb-9395 already records the
+      lesson itself.
+    - #4 to guard-2857 clause (b) (a measurement design that cannot separate the claim from its nearest neighbour;
+      a snapshot file cannot see a past 48h window).
+    - #5 to guard-1931 (branches of a resolution criterion must be mutually exclusive; the record's own lesson).
+    - #6 to guard-2728 (judge the criterion and the mechanism separately; the narrative cites it).
+    guard-6029 adds that one CORRECTED record never establishes that its shape is wrong, and the template's "refuse
+    confidence > 0.5 for this prediction shape" asserts exactly that. Run 100 nucleated 4 guardrails where none
+    overlapped; here every record overlapped one.
+  - Writes: times_active +1 on each of guard-2635, guard-4343, guard-2810, guard-4977, guard-2857, guard-1931 and
+    guard-2728 through `guardrails-increment.sh` (7 calls, each spooled and not differenced); all 7 records flagged
+    `replay_metadata.encoded_via_chronic = true` (whole-object write; per-id read-back, 7 of 7: flag true,
+    replay_count, last_replayed, next_review_date and every other field unchanged).
+- **Step 4.**
+  - 0 pattern-signature outcomes (retrospective, item 4c).
+  - Credited, spooled and not differenced: the 7 times_active increments above; guard-6029 times_helpful +1,
+    because it decided both the no-marker routing and the Step 3.6 disposition.
+  - Strategy reconsolidation: no new write. rb-2593 (#1's source) and rb-2814 (#2's source) both open with bravo's
+    2026-09-28 AMENDED block, which already records each correction (the yield model falsified and the ranking rule
+    kept; the recovery clause scoped to sub-mechanisms A and B). rb-9503 (#6) is left as is, as the resolving
+    narrative says not to narrow it on this evidence. rb-3636 (the three-way triage #2 cites) and rb-9395 were read
+    and need no change. The item 5 stale-source check was not run: #7 and #8 cite tree nodes
+    (own-cloud-s3-cost-profile, mechanics-4-8-extensions) that I did not open, and nothing was appended to
+    knowledge_debt.
+  - Own experiences: #3's and #10's records, retrieval_stats +1 retrieval and +1 noise each (neither changed a
+    strategy), read back. #9's record is not in zeta's store, so 0 writes for it.
+- **Step 4.5.** `replay-stamp-verify.sh`: dry run first (rc 0, 5 records, would write 2026-10-05 and 2026-10-12),
+  then stamped 5, verified 5, failed 0, for #3, #7, #8, #9, #10. #1, #2, #4, #5 and #6 carry their terminal write
+  from Step 3.6 and were not stamped. Independent per-id `pipeline-read.sh --id` read-back of all 10: the five
+  stamped carry last_replayed 2026-10-05, next_review_date 2026-10-12 and replay_count 4, 2, 3, 1, 1 (each the
+  prior value + 1); the five encoded read back encoded_via_chronic true with replay_count 3, last_replayed
+  2026-09-28 and next_review_date 2026-10-05 unchanged. A pool read after the stamps: 877 records (6,144,150
+  bytes), 12 left (5 stamped, 7 encoded), 0 entered, none of the 10 picks present.
+- **Footprint.** Writes: 5 pipeline stamps (via the wrapper), 7 pipeline replay_metadata flags, 8 spooled
+  utilization increments, 2 experience retrieval_stats, this section. Reads: the selection-time snapshot, 3 shallow
+  retrievals, 10 narrative calls and 10 live record reads, 2 experience content files, 9 guardrail and
+  reasoning-bank reads. No tree, convention, reasoning-bank, new-guardrail or knowledge_debt write.
+- **NEXT RUN (106).**
+  - Name the due cohorts first. Post-run by next_review_date: 2026-10-01 13, 2026-10-02 17, 2026-10-03 26,
+    2026-10-04 13, 2026-10-05 30, earlier than 2026-10-01 318; never stamped 453 (including records with no
+    replay_metadata object). This run's 5 stamps come due 2026-10-12; Run 104's 8 stamps come due 2026-10-11.
+  - Post-run, under the recorded exclusion: pool 877, eligible 868, rc distribution {0:452, 1:215, 2:121, 3:60,
+    4:20}, rule 2 = 0, band 6 105 {rc0 14, rc1 28, rc2 48, rc3 10, rc4 5}, routine 618, Step 3.6 eligible 0. That is
+    the pool as of today, NOT a forecast: a pool read holds only records already due, so it cannot show the stamped
+    ones that return when their 7-day window ends. Run 104's block gave rule 2 = 0 and Step 3.6 eligible 0 in the
+    same way, and Run 105 then read 7 and 7.
+  - Forecast, measured 2026-10-05 about 01:50 (the 73 records with stored surprise >= 7 read one by one, ids 73 of
+    73 matched, 515,648 bytes; live copy first, as update_field writes it). Model: reflected true, not encoded,
+    rc < 5, next_review_date <= the run day and last_replayed <= the run day minus 7 (pipeline.py lines 369-441).
+    Control: the model puts 0 eligible on or before 2026-10-05, the same as the post-run pool read. Rule 2, first
+    eligible date, new that day (cumulative): 10-06 4 (4), 10-07 6 (10), 10-08 5 (15), 10-10 2 (17), 10-11 4 (21),
+    10-12 2 (23). A run on 10-06 should therefore read rule 2 = 4, and a reading of 0 falsifies the model. Step 3.6
+    eligible, a LOWER bound from the same 73 (rc >= 3 and CORRECTED; records with stored surprise below 7 were not
+    read): 10-06 2, 10-07 4, 10-08 and after 7. One more record, 2026-08-09_inboxwatch-alerts-plateaus-at-scan-ceiling
+    (stored surprise 7), is held out of the pool because `reflected` is false.
+  - Do NOT take replay_metadata from `pipeline-read.sh --stage archived` for any of this: that copy is frozen at first
+    archival while stamps land on the live copy (pipeline.py lines 345-359), and it showed pick #7 of this run at its
+    pre-stamp dates. Read per id, or use the pool read.
+  - #3 here (UNRESOLVABLE, rc 4) is due 2026-10-12, and a replay then takes it to rc 5, the cap.
+  - Re-derive the rule-2 history with `grep -n 'RULE 2 =' core/config/replay-instrument-readings.md` instead of
+    copying a prior section's clause: the Run 103 and Run 104 clauses both misreport bravo's Run 102 (5), and Run 105
+    carried that error until the close.
+  - Keep: STORED surprise, the strict skip, the routine reserve of 2, the asserts (outcome-null 8, test-cat 1 by
+    category equality), the per-id read-back, the reproduce-from-the-saved-snapshot check, and guard-6029 read
+    whole before any marker. Use seed 106, and check the ledger tail for a partner's run number first. Save the
+    snapshot where the next run can read it; the selection script itself is still not durable (owner g-115-10932).
+
+## Run 106 (zeta, `hostname` cc-02, `uname -r` 6.8.0-142-generic, 2026-10-05; zeta's g-001-05 occurrence 101)
+
+Inline run by the reducer, no delegate. I claimed the goal at 08:53 UTC with the banner at 94% of autocompact.
+Compaction #1 of this session landed after the pool snapshot was saved (08:54 UTC), and the run executed after it at
+35% of autocompact (context line 08:57:36, zone fresh): below rb-11962's delegation threshold of about 45%, so inline
+is that rule's answer and not a choice against it. Every count below was recomputed AFTER the compaction from one saved
+pool snapshot (`--replay-candidates`, 881 records, 6,185,221 bytes, sha256 a43dd9742332...). Selection ran twice over
+that snapshot and the two outputs are byte-identical (3,309 bytes, sha256 2a18b187d746...). The cohort, selection,
+digest, Step 3.6 and post-run scripts were copied from Run 105's scratch directory and edited by `sed` (a `diff` of the
+selection script shows only its docstring, snapshot path and seed lines changed); they are still not durable (owner
+g-115-10932). Stamps, flags and counters were read back from the stores per id. The ledger tail was re-read at 09:17:46
+UTC: the highest existing section is Run 105 and no Run 106 exists, so no partner's Run 106 preceded this one.
+
+- **Due cohorts named first** (before reading rule 2 or Step 3.6). By next_review_date at the snapshot: 2026-10-01 13,
+  2026-10-02 17, 2026-10-03 26, 2026-10-04 13, 2026-10-05 30, earlier than 2026-10-01 318 (62 distinct dates), and 0
+  with a next_review_date in the future. Never stamped: 158 with a replay_metadata object and no last_replayed plus 299
+  with no replay_metadata object, 457 together; 7 carry a last_replayed and no next_review_date (the same 7 ids as in
+  Run 105's snapshot, 7 of 7, each at rc 1 with last_replayed 2026-07-31 or 2026-08-31). Check: 158 + 299 + 7 + 417 =
+  881. Batch sources: 3 picks from the 2026-10-05 cohort (#4, #5, #7), 1 from 2026-10-04 (#6), 1 from 2026-10-03 (#8),
+  2 older (#3, #10), 3 never stamped (#1, #2, #9).
+  - A first sum read "874 of 881" because the 7 records with a last_replayed and no next_review_date fell in neither
+    group; that was a missing bucket in my first count, not missing records, and it closed once a schema probe named
+    them. The check line above is the closed sum.
+  - Against Run 105's post-run reading the five due buckets and the older bucket read identical (13, 17, 26, 13, 30;
+    318); never stamped reads 457 against 453, +4. That difference is decomposed here, which Run 105's own comparison
+    could not do: an id-set diff of Run 105's post-run pool read (877) against this snapshot (881) gives 4 entrants and
+    0 leavers, and none of the 877 held-over records changed replay_metadata. All four entrants are rc 0, never
+    replayed, reflected 2026-10-05 and resolved that day: 01:57:49 `2026-10-04_pr297-observer-exit-after-arm-keeps-
+    world-running` (CONFIRMED, stored surprise 4); 05:14:17 `2026-09-27_promote-daemon-killer-in-plant-phase`
+    (CORRECTED, 7; this batch's #1); 05:14:25 `2026-10-03_world-scoped-goal-field-ratchet-agrees-across-hosts`
+    (CONFIRMED, 4); 05:16:56 `2026-09-29_bravo-held-reflections-strand-past-reclaim` (CORRECTED, 6).
+- **Selection, as run.** Seed `random.Random(106)`. Stored `surprise` field. Pool 881; outcome-null 8; category
+  `test-cat` 1 (equality, asserted); eligible 872; the 7-day strict skip dropped 0; `encoded_via_chronic` in the pool 0
+  and rc >= 5 in the pool 0. Eligible rc distribution {0:456, 1:215, 2:121, 3:60, 4:20}; stored surprise {0:4, 1:4,
+  2:60, 3:72, 4:421, 5:145, 6:106, 7:1, None:59}.
+  - RULE 2 = 1 (stored surprise 7). Re-derived with `grep -n 'RULE 2 ='` this run, not copied: Run 105 read 7, Run 104
+    6, Run 103 0, bravo's Run 102 5, Runs 99 to 101 0, Run 98 1, Run 97 7. The one record is entrant #1 above. This
+    reading does NOT test Run 105's forecast: that model put 0 records eligible on or before 2026-10-05 over the 73
+    records it read at about 01:50, and this record was resolved at 05:14:17, three hours and twenty-four minutes
+    after that read, so it was not in the model's population. Rule 2 follows the due calendar AND each day's new
+    resolutions (Runs 95 and 98 also read a single record), and it is a state of the pool on a given day, not of the
+    corpus (guard-6131). The model's own call, rule 2 = 4 on a run dated 2026-10-06, is still untested.
+  - Slots: 10 = 1 (rule 2) + 7 (band 6) + 2 (routine reserve). Band 6 (stored == 6): 106 records, strata {rc0:15,
+    rc1:28, rc2:48, rc3:10, rc4:5}; exact quotas for 7 slots {0.9906, 1.8491, 3.1698, 0.6604, 0.3302}; largest
+    remainder with ties to the lower rc gives {rc0:1, rc1:2, rc2:3, rc3:1, rc4:0}. Routine population 620 (stored None
+    or < 5).
+  - Batch, pick order, stored surprise / rc before the run: (1) 2026-09-27_promote-daemon-killer-in-plant-phase 7/0
+    CORRECTED; (2) 2026-09-28_retrospective-marker-reaches-worker-goals 6/0 CORRECTED; (3) 2026-09-06_rule2-pool-
+    population-returns-after-cooldown 6/1 UNRESOLVABLE; (4) 2026-07-28_efs-role-s3-delete-scope 6/1 CORRECTED; (5)
+    2026-08-20_incomplete-dep-population-is-small-not-large 6/2 CORRECTED; (6) 2026-08-19_batch-derived-markers-are-
+    rare-by-construction 6/2 CORRECTED; (7) 2026-08-18_drifted-defers-enriched-for-permanent-premises 6/2 CONFIRMED; (8)
+    2026-08-02_s7-stable-reference-rate 6/3 CONFIRMED; routine: (9) 2026-07-28_capability-gate-layerd-fp-rate-cross-
+    lane 4/0 CONFIRMED; (10) 2026-05-17_jose-desiredstate-narrow-mismatch-cluster None/2 CONFIRMED. 5 CORRECTED, 1
+    UNRESOLVABLE, 4 CONFIRMED (batch-scoped, guard-2129); 8 categories (framework-architecture 2, system-behavior 2, six
+    with 1).
+- **Step 1.5.** The 8 per-category depth-medium retrievals ran, one per batch category (rc 0, 0 stderr, 260,438 to
+  416,856 bytes each), read as id and title lists only, plus three lesson-phrased shallow queries (the S7 rank-test
+  lesson, the allowlist-registration lesson, the moving-census lesson). Entries read beyond a title, first 520
+  characters only: guard-2393, guard-7506, rb-9307, rb-5514.
+- **Step 2.** 10 of 10 narratives parsed (`pipeline-read.sh --narrative --id`, one call per id; each returned id was
+  asserted equal to the id asked). Winning key outcome_detail on 8 and rationale on 2 (#5 and #10), and both of those
+  are the formation premise, not the outcome: the documented rationale-last-link trap, measured here at 2 of 10 picks.
+  - #5: the outcome lesson is under `notes` (1,510 chars). A census at 2026-08-20 read RAW 2 and INCOMPLETE 0, the
+    resolution strategy's own INCOMPLETE == 0 rule scored it CORRECTED while the direction held ("small, not large"),
+    the predicted mechanism was wrong (2 of 2 dependencies did not exist, rather than being terminal), and the named
+    control expired (the moving-census shape).
+  - #10: the outcome is under `lesson` (342) and `evidence` (625): 25 failed cells cluster into 3 patterns (52%, 40%,
+    8%) and the narrow-cluster prediction CONFIRMED. Bare 0 of 10 once the unchained keys are read. g-115-10108 owns
+    the helper chain fix.
+  - 6 picks carry an experience ref (#1, #2, #5, #6, #8, #9). 2 are readable in zeta's store (#1, #9) and both
+    content files were read whole (4,326 B and 6,590 B). The other 4 are not_found in zeta's store and the owners'
+    stores were not read (a choice; a bare narrative on one of them would have changed it, and none was).
+  - Observed in the narratives. #1 (my own record) is CORRECTED on the location conjunct: the daemon outlived
+    seed-verify and died in the teardown, a third location that the preflight-versus-plant dichotomy did not contain,
+    and none of the three written branches matched as written, so it was scored by the claim's position text with one
+    named judgement call. #3 is this instrument's own rule-2 record (UNRESOLVABLE, restored 2026-09-13 after a CORRECTED
+    score from a momentary pool ceiling of 6); its lesson, that a pool which turns over daily cannot carry a structural
+    claim from one snapshot, is what today's rule-2 reading re-teaches. #4: predicted DENIED at 0.57, the action was
+    ALLOWED, and the narrative says the pre-mortem named the counter-mechanism and priced it at -0.15 (the role name
+    and instance id in that record are not reproduced here). #6 is the "rare by construction" record, whose correction
+    is already in SKILL Step 3 item 3 and in this ledger (Run 86, lines 1753 to 1769). #8 is CONFIRMED by the letter
+    and uninformative on its own question (denominator 1); its durable output is the structural finding that the S7
+    read-side test is a rank test (Step 4).
+- **Step 3: no marker tested.** guard-6029 read whole before choosing (6,925 B, the same size as in Run 105). Observed
+  only, not tested: 3 of the 5 CORRECTED narratives (#1, #5, #6) record a specification, scope or exhaustiveness
+  judgement beside the world's answer. #1 as above; #5 a 1-to-15 range missed at its low end and scored by the
+  strategy's explicit rule; #6 a branch that turned on a scope reading (a fleet-wide enumeration of 8 qualifying runs
+  against alpha-only closes, where the alpha-only reading lands on the registered fewer-than-3-runs UNRESOLVABLE
+  branch). The other two (#2, #4) are plain refutations by the world: 0 of 197 worker-role goals against a threshold
+  of 10 with the mechanism not established, and an ALLOWED action against a predicted DENIED. Run 105 read 7 of 8, Run
+  104 read 5 of 5 and guard-2857 recorded 4 of 5, so this is the lowest proportion of the four batches, on a sample of
+  5. Population and source: this batch only, violation-first (guard-2129), read from narratives written after and
+  about the outcome (guard-4758). Not a marker: no floor, exceedance or control was computed, and nothing is encoded
+  from it.
+  - Items 2 to 4: signature performance is unreachable from the pipeline (retrospective only); batch position is the
+    draw order (rule 2, then band 6 by ascending rc, then routine), so it carries no time or fatigue signal; category
+    counts (framework-architecture 2: one CORRECTED, one CONFIRMED; system-behavior 2: both CONFIRMED; six with 1) are
+    too small and too selected for an accuracy comparison, so none was made.
+- **Step 3.5.** Skipped: the 5 CORRECTED narratives (for #5, the narrative plus `notes`) were scanned untruncated for
+  the 9 procedural-gap indicators and none matched. Positive control: 'corrected' appears in 5 of 5; the scanner also
+  passed a synthetic self-test.
+- **Step 3.6: 0 eligible** over the full pool (80 records at rc >= 3: CONFIRMED 73, UNRESOLVABLE 4, EXPIRED 3; the
+  outcome value set was read first: CONFIRMED 623, CORRECTED 183, UNRESOLVABLE 60, EXPIRED 7, None 8). Run 105's 7
+  encoded records have left the pool, as its forecast said. Nothing was nucleated or strengthened.
+- **Step 4.**
+  - 0 pattern-signature outcomes (retrospective, item 4c). Credited, spooled and not differenced: guard-6029
+    times_helpful +1, because it decided the no-marker routing.
+  - Strategy reconsolidation: no strategy write. guard-7506 records the promote teardown sweep as the likely killer,
+    which #1's measurement supports, so it needs no revision; rb-5514 and rb-9307 match #4's and #5's lessons. #2's
+    lesson is already in the working-memory encoding queue (item 2, routed to failed-call-scored-as-zero), so replay
+    writes nothing for it and g-001-07 owns the drain.
+  - #8's structural finding, that S7's `density >= median` compares an L1 with a median over a population that
+    includes it, so that with four L1s exactly two can score each side, was NOT found on three surfaces: the
+    l1-taxonomy-health and constant-input-verdict tree nodes (grep for rank test, top half and median-including
+    phrasings, 0 hits each), `core/scripts/l1-emergence-detector.py` (last commit 2026-08-02, before the 2026-08-09
+    finding) and the goal queues (4 queries, no row about it). I verified the finding rather than carrying it: the
+    detector builds `density` over every real L1 with nodes, takes `statistics.median` of those values and scores a
+    low-write L1 stable-reference when `density[l1] >= median_density` (lines 300 to 395), and an enumeration of
+    20,000 random distinct-value sets per size gives items at or above their own set's median of 2, 2, 3 and 3 at n =
+    3, 4, 5 and 6 in every trial (all 4 of 4 pass if the four values are equal). guard-2393 covers the degenerate
+    median-0 case of the same family; I read only its first 520 characters. The reasoning-bank and guardrail stores
+    were searched only through retrieve.sh top-N lists, so "not encoded" holds for the three surfaces above and not
+    for those two stores. Filed Idea g-115-12033 (world, asp-115, candidate, MEDIUM), with 2 verification outcomes
+    added by read-merge-write and read back. The first add was refused by the goal-duplication gate on one
+    pending-queue match, g-115-6156 (pending-questions sweep semantics), which I read and found distinct: it cites the
+    same tree-node path in passing. The colliding path sat in my search-trail clause, not in the goal's scope, so I
+    reworded that clause to name the nodes without their paths (the gate's own remedy for that case) and refiled with
+    no override.
+  - Own experiences: #1's and #9's records, retrieval_stats +1 retrieval and +1 noise each (neither changed a
+    strategy), read back (#1 0, 0, 0 to 1, 0, 1; #9 72, 0, 18 to 73, 0, 19, with times_inferred_useful 3 kept). The
+    other four refs are not in zeta's store: 0 writes. The item 5 stale-source check was not run: no cited tree node
+    was opened except the two grepped for #8.
+- **Step 4.5.** `replay-stamp-verify.sh` over all 10 ids (none was terminal this cycle): dry run first (rc 0, requested
+  10, would write 2026-10-05 and 2026-10-12), then stamped 10, verified 10, failed 0, at 09:08:40 UTC. Independent
+  per-id `pipeline-read.sh --id` read-back of all 10 against the pre-stamp reads: last_replayed 2026-10-05,
+  next_review_date 2026-10-12 and replay_count 1, 1, 2, 2, 3, 3, 3, 4, 1, 3 (each the prior value + 1), stage and
+  outcome unchanged, every other replay_metadata key unchanged.
+  - THE STAMP ALSO RE-DERIVED `surprise` ON 2 OF THE 10: #9 4 to 5 and #10 None to 4. Every pipeline field write runs
+    `apply_derived_surprise` (mind_api/src/world/pipeline.py lines 274 and 1128, g-115-3801), which sets surprise from
+    confidence and outcome by round-half-up, so a whole-record write repairs a stale stored value as a side effect (Run
+    80, lines 1199 to 1226, measured the same). After the stamps stored equals derived on 9 of 9 derivable picks; #3 is
+    UNRESOLVABLE, has no derivation and kept its 6. #9 is Run 80's CONFIRMED@0.55 4-to-5 class and #10 its
+    NULL-to-value class. A read-back that checks only the three stamped fields reports clean on both, which is how it
+    stays invisible.
+  - Pool read after the stamps (09:10:53 UTC, 6,100,616 bytes): 871 records, 10 left (exactly the 10 picks), 0 entered.
+    The drops reconcile with the pick sources: 2026-10-05 30 to 27, 2026-10-04 13 to 12, 2026-10-03 26 to 25, older 318
+    to 316, never stamped 457 to 454.
+- **Stored versus derived surprise, a new reading** (read-only, on the saved snapshot, `derive_surprise` from
+  `core/scripts/_surprise.py`; positive control: derive(CORRECTED, 0.65) = 7 and derive(CONFIRMED, 0.55) = 5). Of 872
+  eligible records 805 are derivable and 238 (29.6%) disagree with their derivation (Run 80: 268 of 779, 34.4%). The
+  classes: CONFIRMED@0.55 4 to 5 x106, CORRECTED@0.45 4 to 5 x46, CONFIRMED@0.75 2 to 3 x13, CONFIRMED@0.6 2 to 4 x9,
+  then smaller ones. Band moves from stored to derived: routine to 5 173, none to routine 14, none to 5 7, routine to 6
+  1, 5 to routine 1, routine to routine 42. So the stale population still sits almost wholly below the bands the draw
+  stratifies. Rule 2 reads 1 stored and 1 derived (0 hidden; Run 80 read 0 stored and 5 derived). Band 6 reads 106
+  stored against 102 derived, and by subtraction from the counts above that is exact: no stored-6 record disagrees with
+  its derivation, 1 more enters on derivation, and 5 stored-6 records have no derivation (UNRESOLVABLE or EXPIRED). So
+  selecting on stored surprise (the method since Run 81) costs nothing at rule 2 today and one record at band 6.
+- **Footprint.** Writes: 10 pipeline stamps (via the wrapper), 2 experience retrieval_stats, 1 spooled utilization
+  increment, 1 goal filed (g-115-12033) plus its verification object, this section. No tree, convention,
+  reasoning-bank, new-guardrail or knowledge_debt write, and no run experience record (a disclosed skip as in Runs 100
+  to 105; the deep close may set the experience-archival sentinel again). Reads: the selection-time snapshot, 8
+  depth-medium and 3 shallow retrievals, 10 narrative calls and 20 live record reads (before and after the stamps), 2
+  experience content files, 5 guardrail and reasoning-bank reads, the three tree-node, script and git probes and the
+  goal-queue queries named above.
+- **NEXT RUN (107).**
+  - Name the due cohorts first. Post-run by next_review_date: 2026-10-01 13, 2026-10-02 17, 2026-10-03 25, 2026-10-04
+    12, 2026-10-05 27, earlier than 2026-10-01 316; never stamped 454 (including records with no replay_metadata
+    object). This run's 10 stamps and Run 105's 5 come due 2026-10-12; Run 104's 8 come due 2026-10-11.
+  - Post-run pool read (09:10:53), under the recorded exclusion: pool 871, eligible 862, rc distribution {0:453, 1:213,
+    2:117, 3:59, 4:20}, rule 2 = 0, band 6 99 {rc0 14, rc1 26, rc2 45, rc3 9, rc4 5}, routine 618, Step 3.6 eligible 0.
+    As in Run 105 this is the pool as of today, NOT a forecast: it cannot show the stamped records that return when
+    their window ends, or entrants.
+  - A run later on 2026-10-05: the due calendar does not move within a day, so expect the figures above plus entrants.
+    Four records entered in the 7.4 hours between Run 105's post-run pool read (01:32) and this snapshot (08:54): one
+    at stored surprise 7, one at 6, two at 4. That is a rate to compare against, not a model. Rule 2 on such a run is
+    the number of entrants at stored surprise 7 or more.
+  - A run dated 2026-10-06 or later: Run 105's schedule is CARRIED, NOT RE-MEASURED here (rule 2, first eligible date,
+    new that day (cumulative): 10-06 4 (4), 10-07 6 (10), 10-08 5 (15), 10-10 2 (17), 10-11 4 (21), 10-12 2 (23)), and
+    its falsifier stands: a reading of 0 on 10-06 falsifies the model, since entrants can only add to it. The one
+    record I know to add is #1, which returns on 10-12 (cumulative 24). A partner's replay stamp on any of those
+    records before 10-06 would change the schedule, so check the ledger tail first.
+  - Step 3.6 on 2026-10-12: #5 and #6 return CORRECTED at rc 3 and not encoded, so they will be eligible then (new
+    from this run). Run 105's lower-bound table (10-06 2, 10-07 4, 10-08 and after 7) is carried the same way.
+  - Open: Run 105's #3 (2026-08-19_squash-merge-dominates-cnc-sweep-false-positives, UNRESOLVABLE, rc 4) comes due
+    2026-10-12 and a replay then takes it to the rc 5 cap; its stored outcome still disagrees with its own
+    withdrawn-resolution note. g-115-12033 (candidate) waits for promotion; its first outcome is to read guard-2393 and
+    the reasoning bank in full for the rank-test statement.
+  - Keep: STORED surprise, the strict skip, the routine reserve of 2, the asserts (outcome-null 8, test-cat 1 by
+    category equality), the reproduce-from-the-saved-snapshot check, and guard-6029 read whole before any marker.
+    CHANGE: make the per-id read-back compare every non-stamp field against the pre-stamp read (it is what surfaced the
+    surprise re-derivation), and for any pick whose winning key is `rationale` read `notes`, `lesson`, `evidence` and
+    `position` before calling it bare. Use seed 107 and check the ledger tail for a partner's run number first. Save the
+    snapshot where the next run can read it; this run's scripts are in the session scratch directory under
+    it-1663/rp106 and are still not durable (owner g-115-10932).
+- **Discretionary skips, disclosed:** a run experience record at close time (the close set the archival sentinel and
+  I composed it after the close: exp-g-001-05-run106-stamp-rederives-selection-key); reads of the owners' stores for 4
+  experience refs; reading the per-category retrieval entries beyond their titles; the Step 4 item 5 stale-source
+  check; re-measuring Run 105's 73-record rule-2 schedule (carried, not re-measured).
