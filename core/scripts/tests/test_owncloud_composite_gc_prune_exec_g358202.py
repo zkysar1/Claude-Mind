@@ -763,6 +763,8 @@ def test_a_window_or_clock_that_is_not_a_number_is_refused_not_crashed_on(tmp_pa
     clocked = w.be.composite_gc_prune_apply(w.p, bad)  # not through _prune: None there means the fixture's clock
     assert clocked.stopped == "now-invalid" and clocked.pruned == []
     assert _writes(w.tap.ops(mark)) == [] and _exists(s3, w.runs[0].receipt)
+    # a number that is not one reads no receipt either: the age test cannot be made, so the run is not even looked at
+    assert not [c for c in w.tap.calls[mark:] if c[0] == "get_object" and str(c[1]).endswith("/RECEIPT.json")]
 
 
 # ---- 5. the control --------------------------------------------------------------------------------------------------
@@ -859,6 +861,22 @@ def test_the_control_fails_when_the_restored_copy_does_not_read_back(tmp_path, v
     assert not out.ok and out.failed == "control-restored-copy-mismatch" and out.evidence["cleanup"] == "clean"
 
 
+def test_the_control_fails_when_the_put_does_not_read_back(tmp_path, ver_s3):
+    be, tap = _control(tmp_path, ver_s3)
+    seen = []
+
+    def first_current_get(kw):
+        if _is_control(kw) and "VersionId" not in kw:
+            seen.append(1)
+            return len(seen) == 1  # the read-back right after the PUT, before the control deletes anything
+        return False
+    tap.rule("get_object", first_current_get, lambda kw: {"Body": _Stream(b"not what was put")}, when="instead")
+    out = be.composite_gc_prune_control(time.time())
+    assert not out.ok and out.failed == "control-readback-mismatch" and out.evidence["cleanup"] == "clean"
+    assert "version_id" not in out.evidence  # it stopped before the delete
+    assert not _exists(ver_s3, out.evidence["key"])
+
+
 def test_the_control_refuses_a_put_answered_with_the_null_version_id(tmp_path, ver_s3):
     # A store whose versioning is suspended (or was never on) answers a PUT with VersionId "null", not with no VersionId: the literal
     # "null" must refuse by name. The real PUT still happens, so a refusal that is only a LATER miss ('delete left no recoverable
@@ -899,7 +917,8 @@ def _alter_the_chain_read_after_the_delete(tap, real, alter):
     tap.rule("list_object_versions", second_read, altered, when="instead")
 
 
-@pytest.mark.parametrize("what", ["noncurrent-version-has-another-size", "delete-marker-is-not-the-newest-entry"])
+@pytest.mark.parametrize("what", ["noncurrent-version-has-another-size", "delete-marker-is-not-the-newest-entry",
+                                  "a-second-noncurrent-version-behind-the-first"])
 def test_the_control_refuses_a_chain_whose_noncurrent_version_or_marker_is_not_what_its_delete_made(tmp_path, ver_s3, what):
     def other_size(resp):
         for v in resp.get("Versions", []):
@@ -908,8 +927,14 @@ def test_the_control_refuses_a_chain_whose_noncurrent_version_or_marker_is_not_w
     def marker_not_newest(resp):
         for m in resp.get("DeleteMarkers", []):
             m["IsLatest"] = False
+    def second_noncurrent(resp):  # appended AFTER the real one, so the PUT's version is still the first noncurrent entry
+        extra = copy.deepcopy(resp["Versions"][0])
+        extra.update(VersionId="a-second-noncurrent-version", IsLatest=False)
+        resp["Versions"].append(extra)
+    alter = {"noncurrent-version-has-another-size": other_size, "delete-marker-is-not-the-newest-entry": marker_not_newest,
+             "a-second-noncurrent-version-behind-the-first": second_noncurrent}[what]
     be, tap = _control(tmp_path, ver_s3)
-    _alter_the_chain_read_after_the_delete(tap, ver_s3, other_size if what.startswith("noncurrent") else marker_not_newest)
+    _alter_the_chain_read_after_the_delete(tap, ver_s3, alter)
     out = be.composite_gc_prune_control(time.time())
     assert not out.ok and out.failed == "control-delete-left-no-recoverable-version" and out.evidence["cleanup"] == "clean"
     assert not _exists(ver_s3, out.evidence["key"])

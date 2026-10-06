@@ -53,6 +53,7 @@ from _dependency_graph import norm_blocked_by  # type: ignore  (guard-5479 SSOT)
 from _goal_census import effective_counts  # type: ignore  (B9-deep census-augmented counts)
 from _drain_title import (  # type: ignore  ( owner-scope drain SSOT)
     _DRAIN_GOAL_TITLE_PREFIX, _DRAIN_GOAL_TITLE_INFIX, is_drain_action_title)
+import temp_decisions  # type: ignore  (the temp/ review census, 2026-10-05)
 
 try:
     import yaml  # type: ignore
@@ -1478,14 +1479,14 @@ def _temp_footprint(temp_dir, file_cap=_FOOTPRINT_FILE_CAP):
 
 
 def cmd_temp_pressure(args, config, compact):
-    """Count undrained working docs in the bound agent's temp/ store and flag
+    """Count the bound agent's temp/ items awaiting review and flag
     accumulation pressure, so temp/ never becomes the new slush directory.
 
-    temp/ is the single staging SSOT for working docs that drain to the
-    knowledge tree (core/config/conventions/temp-store.md). Files accumulate
-    there until /drain-temp encodes each and moves it to temp/drained/. This
-    check counts the UNDRAINED files — files directly under temp/ (NOT the
-    drained/ subdir) — and emits:
+    temp/ is a staging area (core/config/conventions/temp-store.md): items
+    accumulate there until /drain-temp reviews each one, routes it to its
+    durable home or decides it is junk, and records the decision. This check
+    counts the items no review has decided (top-level files of any suffix and
+    folders, not in flight, outside drained/) and emits:
       - temp_pressure_warn  at >= warn_threshold   (visible nudge, no goal)
       - temp_drain_needed   at >= drain_threshold  (orchestrator files the
                                                     HIGH /drain-temp goal in
@@ -1510,153 +1511,28 @@ def cmd_temp_pressure(args, config, compact):
     # (guard-4654 promotion-coupling class).
     drain_goal_max_age_h = tp.get("drain_goal_max_age_hours") or 48
 
-    # temp/ holds THREE file classes (core/config/conventions/temp-store.md).
-    # The first two are counted below; the third is the COMPLEMENT of both
-    # allowlists and is handled by `unclassified_count` (see  note):
-    #   - drainable working docs (.md/.json) -> /drain-temp encodes to the tree
-    #     then archives to drained/. Counted as `count`.
-    #   - pure ephemera (.log/.txt/.py/.sh/.err/.raw/.out/.bak: test-suite output, tool dumps
-    #     like leak-check.txt, and one-shot scratch scripts like build-*.py /
-    #     orphan-*.py / restart-poller.sh / gs.err) -> carry NO knowledge;
-    #     /drain-temp Phase 1.5 PURGES them (deletes — gitignored + unencodable,
-    #     120-min age guard protects in-flight writes). Counted as
-    #     `ephemera_count`.  added the scratch-script class (.py/.sh/
-    #     .err);  added .log/.txt.
-    # Both classes accumulate in temp/ root, so BOTH must feed the pressure
-    # signal — else the ephemera slush stays invisible to the drain trigger and
-    # grows unbounded (: 7 .log/.txt survived a full drain because the
-    # glob AND this metric both saw only .md/.json). Threshold flags fire on the
-    # COMBINED pressure; the two counts stay distinct so the drain goal can name
-    # what it drains vs purges.
-    # DO NOT EDIT ONE COPY. Must match `_EPHEMERA_GLOB` in
-    # core/scripts/temp-drain-purge.sh (~line 242) — that lane is the SSOT for
-    # what counts as pure ephemera, and THIS metric is the pressure signal that
-    # decides when the lane runs, so a short list here suppresses the trigger for
-    # exactly the files it omits. Hardcoded rather than parsed, per guard-1628 (a
-    # gate reading a constant out of the source it checks defaults to hardcoding);
-    # a second extraction predicate would be the guard-2224 hazard, and
-    # checks/temp_durability_invariant.py already owns the parsing side.
-    # Twin comment per guard-130.
-    #  (bravo, cc-05, 2026-08-28): this tuple carried FIVE entries while
-    # the lane carried EIGHT, so .raw/.out/.bak fell through to the  third
-    # class ("not-drainable, excluded from thresholds") — absent from the very
-    # signal that triggers their own purge. Measured here at fix time: 9 aged .raw.
-    EPHEMERA_SUFFIXES = (".log", ".txt", ".py", ".sh", ".err", ".raw", ".out", ".bak")
-    count = 0
-    # md/json SPLIT — VISIBILITY ONLY, never a threshold input ().
-    # THE 'SMALLEST DIFF' THIS GOAL WAS THREE TIMES ENDORSED TO MAKE IS REFUTED.
-    # Candidate fix (2) was 'count .json separately from .md, or exclude it',
-    # recorded as the chosen direction by foxtrot 2026-08-08 (90.4% .json), echo
-    # 2026-08-16 (~47%) and bravo 2026-08-29 (148 .json / 0 .md = 100.0%). Reading
-    # the CONSUMER kills it: /drain-temp Phase 1's census is literally
-    # `ls -1 "$TEMP_DIR"/*.md "$TEMP_DIR"/*.json` (drain-temp/SKILL.md:65) and
-    # temp-drain-purge.sh:256 protects .md/.json as 'DRAINABLE WORKING DOCS'. So
-    # this predicate is in EXACT agreement with the lane it triggers; dropping
-    # .json here would make the metric say 0 while the lane still enumerates 148 —
-    # manufacturing the twin-divergence guard-130 and the EPHEMERA_SUFFIXES comment
-    # above both forbid. The bravo reading is therefore NOT 'the remedy is empty'
-    # (a claim this goal's own progress_note made and this comment retracts): the
-    # remedy would enumerate all 148. The defect is UPSTREAM — candidate fix (1),
-    # writers staging payloads as bare .json in temp/ root instead of .raw/.out per
-    # temp-store.md. Per 's rule already applied to the third class,
-    # 'Visibility is the fix; changing threshold semantics is not': the split below
-    # is REPORTED so no future reader re-derives it by hand a fourth time, and
-    # `count` is left exactly as the drain lane sees it. (guard-4618, guard-2273.)
-    md_count = 0
-    json_count = 0
-    ephemera_count = 0
-    # : THIRD class. The two classes above are extension ALLOWLISTS, so
-    # every other suffix in temp/ root was invisible to this metric — not counted,
-    # not reported, no hint it existed. Measured on a downstream deployment
-    # 2026-07-30: temp/ root held 26 files and this function returned 7 (a 3.7x
-    # undercount); the missing 19 were 6 .pdf, 4 .yaml, 4 .docx, 2 .jsonl, 1 .ps1,
-    # 1 extensionless. Reported separately and deliberately NOT folded into
-    # pressure_count: these files are not drain-drainable and not purgeable, so
-    # counting them toward the drain threshold would fire drain goals that cannot
-    # drain them. Visibility is the fix; changing threshold semantics is not.
-    unclassified_count = 0
-    dotfile_doc_count = 0
-    # WHY NOT rglob (): the originating goal's verification proposed
-    # reconciling against "an independent rglob enumeration". That is the WRONG
-    # denominator and would be a regression — rglob picks up drained/ (195 files
-    # at measure time), and a drained file is by definition NOT undrained
-    # pressure. iterdir over temp/ ROOT is correct; the undercount was never a
-    # traversal-depth bug, it was the extension allowlist above.
+    # WHAT IS COUNTED (user directive, 2026-10-05): the review's own population.
+    # /drain-temp reviews EVERY top-level item in temp/ (files of any suffix and
+    # folders alike) and nothing is deleted until a review has decided it
+    # (core/scripts/temp_decisions.py). So pressure is the number of items with
+    # no decision in force that are no longer in flight, taken from the SAME
+    # function the review's census applies: metric and remedy cover one
+    # population, so a drain moves the count (guard-5329, rb-2598). Excluded as
+    # the review excludes them: drained/, dotfiles (the purge's Lane 0 reports
+    # them, no lane deletes them), git-tracked files, receipted archives, items
+    # a review kept (until the keep expires) or decided to discard (the purge's
+    # job), and items touched within the purge's age guard (in flight).
+    #
+    # This replaced three suffix classes (drainable .md/.json, purgeable
+    # "ephemera", an unscheduled third class) whose union never matched what any
+    # lane reviewed: the ephemera were deleted unseen and the third class was
+    # reported but never scheduled (, , ). No suffix
+    # list is left here to drift from a twin.
     temp_dir = (AGENT_DIR / "temp") if AGENT_DIR is not None else None
-    ephemera_files = []
-    if temp_dir is not None and temp_dir.is_dir():
-        for f in temp_dir.iterdir():
-            if not f.is_file():
-                continue
-            # DOTFILES ARE UNREACHABLE BY EVERY REMEDY LANE, so they must not
-            # drive the scheduling count (guard-5329: a metric that schedules a
-            # remedy must MOVE when the remedy runs, else metric and remedy are
-            # measuring different populations and the goal re-files forever).
-            # /drain-temp Phase 1 globs temp/*.md + temp/*.json and a glob cannot
-            # match a leading dot; temp-drain-purge Lane 1 exempts `! -name '.*'`
-            # outright, leaving Lane 0 to REPORT them and delete nothing. Counting
-            # them in `count` raised temp_drain_needed for a population no drain
-            # pass can ever clear. Measured 2026-09-05 (echo, cc-03): all 6
-            # "undrained docs" were dotfiles (4 .md/2 .json) immediately after a
-            # full drain took temp/ from 127 -> 10 top-level files. Reported
-            # separately and excluded from thresholds — the same treatment
-            # `unclassified_count` already gets. NOTE the drain-temp SKILL.md
-            # Lane 0 comment claimed dotfiles were "never counted by the
-            # temp-pressure metric"; that was false until this branch existed.
-            if f.name.startswith("."):
-                dotfile_doc_count += 1
-                continue
-            if f.suffix in (".md", ".json"):
-                count += 1
-                if f.suffix == ".md":
-                    md_count += 1
-                else:
-                    json_count += 1
-            elif f.suffix in EPHEMERA_SUFFIXES:
-                ephemera_count += 1
-                ephemera_files.append(f)
-            else:
-                unclassified_count += 1
-
-    #  / guard-273: a purge suggestion must never count a git-TRACKED
-    # file. Extension alone cannot tell a business record from scratch, and the
-    # ephemera classes include .txt/.py/.sh — all plausible tracked deliverables.
-    #
-    # SCOPED HONESTLY: at measure time ZERO ephemera-classified files were
-    # tracked, so this defect was LATENT, not realised. The originating goal
-    # claimed the emitted text "proposes destroying deliverables" and cited two
-    # .pdf files as evidence; .pdf is not in EPHEMERA_SUFFIXES, so those could
-    # never have entered a purge count. That specific claim does not hold. The
-    # general risk does: `.gitignore` now ignores ALL of agents/*/temp/*
-    # (), but it does not UNTRACK what was tracked before that rule,
-    # and legacy-tracked files remained under temp/. So tracked files DO live
-    # here, and one rename away from a .txt is a purge that names a deliverable.
-    # This check makes that structurally impossible.
-    #
-    # FAILS OPEN: any git error leaves the counts untouched. A precheck advisory
-    # must never break the loop over an unavailable git.
-    ephemera_tracked_excluded = 0
-    if ephemera_files:
-        try:
-            import subprocess as _sp
-            _r = _sp.run(["git", "ls-files", "-z", "--", str(temp_dir)],
-                         capture_output=True, text=True, timeout=15,
-                         cwd=str(PROJECT_ROOT))
-            if _r.returncode == 0:
-                _tracked = {p.replace("\\", "/") for p in _r.stdout.split("\0") if p}
-                for f in ephemera_files:
-                    try:
-                        _rel = f.relative_to(PROJECT_ROOT).as_posix()
-                    except ValueError:
-                        continue
-                    if _rel in _tracked:
-                        ephemera_count -= 1
-                        unclassified_count += 1
-                        ephemera_tracked_excluded += 1
-        except Exception:
-            pass  # fail open — see comment above
-
-    pressure_count = count + ephemera_count
+    census = (temp_decisions.pressure_counts(temp_dir)
+              if temp_dir is not None and temp_dir.is_dir() else {})
+    pressure_count = census.get("pending", 0)
+    _classes = ", ".join(f"{n} {c}" for c, n in sorted((census.get("by_class") or {}).items()))
 
     # ── full-depth footprint () — REPORTED, NEVER THRESHOLDED ──
     #
@@ -1665,17 +1541,18 @@ def cmd_temp_pressure(args, config, compact):
     # count. Replacing it would be a REGRESSION and guard-5329 is the reason: a
     # metric that SCHEDULES a remedy must MOVE when the remedy runs, or metric
     # and remedy are measuring different populations and the goal re-files
-    # forever. `count` is in exact agreement with the lane it triggers —
-    # /drain-temp Phase 1 enumerates `ls temp/*.md temp/*.json` (depth 1, no
-    # dotfiles) — so a full-depth `count` would schedule a drain against files
-    # the drain cannot reach, which is the same defect three times over
+    # forever. `pressure_count` is in exact agreement with the review it
+    # triggers — /drain-temp decides top-level items (a folder is ONE item,
+    # decided whole; dotfiles are outside it) — so a full-depth count would
+    # schedule a drain against entries no review decides one by one, which is
+    # the same defect three times over
     # (guard-5329 classifier mismatch, guard-3497 disjoint tool/metric
     # populations, guard-3674 scratch-.json domination). The footprint answers a
     # DIFFERENT question — how much mass is here — and no lane currently acts on
     # its answer, so thresholding it would manufacture an unactionable flag.
-    # This is the treatment `unclassified_count` and `dotfile_doc_count` already
-    # get, under 's rule: "Visibility is the fix; changing threshold
-    # semantics is not."
+    # This is the treatment the census's side counts (in flight, kept,
+    # dotfiles) get, under 's rule: "Visibility is the fix; changing
+    # threshold semantics is not."
     #
     # ## WHAT IT IS FOR
     # The depth-1 count is a good proxy for the FILE population and a bad one
@@ -1750,28 +1627,22 @@ def cmd_temp_pressure(args, config, compact):
     escalation = None
     if pressure_count >= drain_threshold and existing is None:
         flags.append("temp_drain_needed")
-        _purge_clause = (f" + purge {ephemera_count} stale ephemera file(s)"
-                         if ephemera_count else "")
         suggested_goal = {
-            "title": (f"{_DRAIN_GOAL_TITLE_PREFIX}{count} {_DRAIN_GOAL_TITLE_INFIX} "
-                      f"to the knowledge tree" + _purge_clause),
+            "title": (f"{_DRAIN_GOAL_TITLE_PREFIX}{pressure_count} {_DRAIN_GOAL_TITLE_INFIX}: "
+                      "review each, route it to its home, record the decision"),
             "priority": "HIGH",
             "participants": ["agent"],
             "description": (
-                f"agents/<agent>/temp/ holds {count} undrained working docs"
-                + (f" and {ephemera_count} pure-ephemera scratch file(s)"
-                   if ephemera_count else "")
-                + f" (combined >= drain threshold {drain_threshold}). Invoke "
-                f"/drain-temp to encode each working doc into the knowledge "
-                f"tree / reasoning bank / experience and move it to "
-                f"temp/drained/"
-                + (", and PURGE the stale ephemera (Phase 1.5 — pure ephemera "
-                   "carries no knowledge, so it is deleted, not archived)"
-                   if ephemera_count else "")
-                + ". temp/ is a staging SSOT, not an archive — undrained/"
-                f"unpurged accumulation is the slush-directory failure mode the "
-                f"file-model normalization exists to prevent."
-            ),
+                f"agents/<agent>/temp/ holds {pressure_count} item(s) no review has "
+                f"decided ({_classes}), each untouched for "
+                f"{temp_decisions.DEFAULT_AGE_MIN}+ min (>= drain threshold "
+                f"{drain_threshold}). Invoke /drain-temp: it reviews every item "
+                "(scripts, logs and folders as well as docs), routes each to its "
+                "durable home (knowledge tree, reasoning bank or guardrails, "
+                "world/scripts or core/scripts, a receipted archive) or decides it "
+                "is junk, and records every decision in temp/.temp-decisions.jsonl. "
+                "The purge then deletes only reviewed discards. temp/ is a staging "
+                "area, not an archive."),
         }
         # Route to the temp OWNER, not the content classifier (, rb-3876).
         # /drain-temp is bound-agent-scoped (drains agents/<BOUND-AGENT>/temp/), so this
@@ -1850,11 +1721,14 @@ def cmd_temp_pressure(args, config, compact):
     elif pressure_count >= warn_threshold:
         flags.append("temp_pressure_warn")
 
-    # : surface unclassified in the SUMMARY, not just the JSON body. The
-    # summary is what the precheck prints every iteration and therefore the only
-    # part a reader reliably sees; a count that exists only in the JSON is the
-    # same invisibility this fix exists to remove. Named "not-drainable" rather
-    # than a bare number so it cannot be misread as additional drain pressure.
+    # : everything outside the count is NAMED in the summary, the line
+    # the precheck prints every iteration and so the only part a reader reliably
+    # sees. Never thresholded; listed so "clean" is never read as "empty".
+    _side = [f"{census[k]} {label}" for k, label in (
+        ("fresh", "in flight"), ("kept", "kept"), ("awaiting_purge", "awaiting purge"),
+        ("receipted_dirs", "receipted archive(s)"), ("tracked_skipped", "git-tracked"),
+        ("bad_names", "name(s) a review cannot record"), ("symlinks_skipped", "symlink(s)"),
+        ("unmanaged_dotfiles", "unmanaged dotfile(s)")) if census.get(k)]
     # Footprint clause built OUTSIDE the branch, because BOTH branches need it.
     # It lived inside the pressure branch for one revision and the Q1.5 checklist
     # caught what that costs: a tree with mass at depth 3 and ZERO depth-1 docs
@@ -1878,28 +1752,12 @@ def cmd_temp_pressure(args, config, compact):
                if _fp.get("truncated") else "")
             + (f", walk error: {_fp['error']}" if _fp.get("error") else ""))
 
-    if pressure_count or unclassified_count or dotfile_doc_count:
-        _breakdown = f"{count} undrained doc(s)[{md_count} .md/{json_count} .json]"
-        if ephemera_count:
-            # DERIVED from EPHEMERA_SUFFIXES, never re-typed: this literal was a
-            # THIRD copy of the list and it went stale silently — after the
-            # 5->8 reconciliation it reported '16 ephemera(.log/.txt/.py/.sh/.err)'
-            # while 10 of those 16 were the .raw/.out/.bak it did not name
-            # (). A count whose own legend omits the classes it counts
-            # is worse than no legend (guard-2283).
-            _breakdown += f" + {ephemera_count} ephemera({'/'.join(EPHEMERA_SUFFIXES)})"
-        if unclassified_count:
-            _breakdown += (f" + {unclassified_count} not-drainable"
-                           "(other suffixes, excluded from thresholds)")
-        if dotfile_doc_count:
-            _breakdown += (f" + {dotfile_doc_count} dotfile(s)"
-                           "(no lane drains these, excluded from thresholds)")
-        if ephemera_tracked_excluded:
-            _breakdown += (f" [{ephemera_tracked_excluded} git-tracked file(s) "
-                           "reclassified out of purge scope]")
+    if pressure_count or _side:
         summary = (
-            f"temp-pressure: {_breakdown} "
-            f"(warn>={warn_threshold}, drain>={drain_threshold}"
+            f"temp-pressure: {pressure_count} item(s) awaiting review"
+            + (f" [{_classes}]" if _classes else "")
+            + (f"; not counted: {', '.join(_side)}" if _side else "")
+            + f" (warn>={warn_threshold}, drain>={drain_threshold}"
             + (f"; open drain goal {existing}" if existing else "")
             + (f"; STALLED {escalation['age_hours']}h > "
                f"{drain_goal_max_age_h}h — escalate"
@@ -1915,15 +1773,12 @@ def cmd_temp_pressure(args, config, compact):
         "subcommand": "temp-pressure",
         "summary": summary,
         "flags": flags,
-        "count": count,
-        "md_count": md_count,
-        "json_count": json_count,
-        "ephemera_count": ephemera_count,
         "pressure_count": pressure_count,
-        "unclassified_count": unclassified_count,
-        "dotfile_doc_count": dotfile_doc_count,
-        "ephemera_tracked_excluded": ephemera_tracked_excluded,
-        "temp_root_total": count + ephemera_count + unclassified_count,
+        # The census behind the count, as temp_decisions.pressure_counts returns
+        # it: pending, by_class, fresh, kept, awaiting_purge, receipted_dirs,
+        # tracked_skipped, bad_names, symlinks_skipped, unmanaged_dotfiles,
+        # ledger_rows, ledger_bad_lines. Empty when temp/ does not exist.
+        "census": census,
         # Full-depth mass, clone-pruned and scan-capped. Advisory only — see
         # "## WHY THIS DOES NOT REPLACE pressure_count" above before any future
         # change wires this into a threshold ( / guard-5329).

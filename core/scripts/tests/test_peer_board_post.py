@@ -26,7 +26,9 @@ EXIT_OK, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_REFUSED = 0, 2, 3, 4
 
 
 def run(args, stdin="msg", env_extra=None):
-    env = os.environ.copy()
+    # Drop any PEER_WORLD_* the operator set: inherited, it points the unreachable
+    # tests at a REAL peer world (, rb-2312). Tests pin their own.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PEER_WORLD_")}
     # Caller is deliberately own-cloud in every test: that is the hazard shape.
     env.update({"STORAGE_BACKEND": "own-cloud", "ENVIRONMENT_ID": "ayoai-mind",
                 "MIND_AGENT": "foxtrot"})
@@ -73,6 +75,20 @@ def test_unreachable_peer_never_writes_locally(tmp_path):
     assert r.returncode == EXIT_UNREACHABLE
     after = local_board.stat().st_size if local_board.is_file() else None
     assert before == after, "an unreachable peer write must NOT touch the local board"
+
+
+def test_an_inherited_peer_world_override_is_never_used(peer_world, monkeypatch):
+    """run() must not hand the script an operator's PEER_WORLD_* ().
+
+    On a box whose environment set PEER_WORLD_ZDS_MIND to a real clone, the two
+    unreachable tests above resolved the peer anyway, posted "msg" into that REAL
+    peer world on every suite run, and then failed. This pins the scrub on every
+    box, not only on the boxes that happen to set the variable.
+    """
+    monkeypatch.setenv("PEER_WORLD_ZDS_MIND", str(peer_world))
+    r = run(["--peer", "zds-mind", "--channel", "coordination"])
+    assert r.returncode == EXIT_UNREACHABLE, r.stderr
+    assert list((peer_world / "board").iterdir()) == [], "the inherited peer world was written"
 
 
 def test_peer_backend_is_forced_not_inherited(peer_world):

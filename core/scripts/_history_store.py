@@ -163,7 +163,9 @@ def _unique_tmp(target):
     exists for is still defended against.
     """
     name = f".{os.urandom(8).hex()}.tmp"
-    return _windows_long_path(target.parent / name)
+    # Path(), not the bare wrapper: on Windows _windows_long_path returns a str, and every
+    # caller calls .write_bytes()/.write_text()/.unlink() on the result ().
+    return Path(_windows_long_path(target.parent / name))
 
 
 def _atomic_write_bytes(target, content_bytes):

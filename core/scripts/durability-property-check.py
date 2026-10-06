@@ -27,9 +27,9 @@ sub-check distinguishes "measured, and the property holds" from "could not
 measure". The second is reported as FAIL, never PASS: a property check that
 silently degrades to an empty result set is worse than no check, because it
 reports the reassuring answer forever. `cited-temp-not-purged` is the sharpest
-case — under citation_lookup=="failed" the purge lane degrades to the legacy
-allow-list, the cited set is unknown, and the intersection is empty for the
-wrong reason.
+case — under citation_lookup=="failed" (or decisions_lookup=="failed") the purge
+deletes nothing in the lanes it cannot check, so every file list it returns is
+empty and the intersection is empty for the wrong reason.
 """
 import argparse
 import json
@@ -103,18 +103,27 @@ def check_cited_temp_not_purged(_args):
     lookup = d.get("citation_lookup")
     would = d.get("files") or []
 
-    # Degraded lane: Lane 1 fell back to the pre-inversion allow-list, so the
-    # cited exemptions were never applied. An empty intersection here says
-    # nothing about the property — and a cited .py/.log/.txt WOULD be deleted,
-    # since the legacy allow-list carries no ! -name exemptions at all.
+    # Unknown cited set. Since 2026-10-05 the purge fails CLOSED on it: Lanes 1
+    # and 3 delete nothing and Lane 2 is skipped, so every file list is empty by
+    # construction and an empty intersection says nothing about the property.
+    # (Before, Lane 1 fell back to a legacy allow-list with no exemptions, so a
+    # cited file WOULD have been deleted; the verdict is the same either way.)
     if lookup == "failed":
-        print("FAIL: temp-drain-purge reports citation_lookup=\"failed\" — the purge ran "
-              "DEGRADED against the pre-inversion allow-list, so cited-file exemptions were "
-              "NOT applied and a cited .py/.log/.txt would be deleted. Lane 2 (drained/ GC) "
-              "was SKIPPED outright for the same reason, so its empty file list is a "
-              "not-run, not a clean run. The delete-side "
-              "reference guard is INACTIVE; an empty intersection under this condition is "
-              "unmeasured, not clean (g-306-111 / g-306-103 / g-306-102).")
+        print("FAIL: temp-drain-purge reports citation_lookup=\"failed\" — the cited set "
+              "was UNKNOWN, so the purge deleted nothing in Lanes 1 and 3 and skipped Lane 2 "
+              "(drained/ GC). Its empty file lists are a not-run, not a clean run: the "
+              "delete-side reference guard was never exercised, so this run carries no "
+              "evidence either way about the property (g-306-111 / g-306-103 / g-306-102).")
+        return 1
+
+    # Unreadable decision log (2026-10-05): Lanes 1 and 3 delete only reviewed
+    # discards, so with the log unreadable they listed nothing — the same
+    # empty-by-construction shape as the branch above, for those two lanes.
+    if d.get("decisions_lookup") == "failed":
+        print("FAIL: temp-drain-purge reports decisions_lookup=\"failed\" — the decision "
+              "log could not be read, so Lanes 1 and 3 listed nothing BY CONSTRUCTION. "
+              "Their empty lists are a not-run, not a clean run; the property is unmeasured "
+              "for those lanes.")
         return 1
 
     # Third unmeasured door (). "n/a" means temp-drain-purge found no
@@ -161,29 +170,35 @@ def check_cited_temp_not_purged(_args):
     # the field yields [] and this degrades to exactly the prior Lane-1 behaviour
     # rather than raising.
     lane2 = d.get("drained_gc_files") or []
+    # Lane 3 (decided folders) publishes its names as of 2026-10-05, so it joins
+    # on the same basename key: a folder cited by its own path. A folder cited
+    # only through a file inside it is held back upstream (temp_decisions.py
+    # keys the first segment after /temp/ too); this check does not see that
+    # key, so for Lane 3 it is a backstop for directly cited folders only.
+    lane3 = d.get("stray_dirs") or []
     overlap = sorted(set(would) & cited)
     overlap2 = sorted(set(lane2) & cited)
-    if overlap or overlap2:
+    overlap3 = sorted(set(lane3) & cited)
+    if overlap or overlap2 or overlap3:
         parts = []
         if overlap:
             parts.append("Lane 1 (temp/): %s" % (overlap[:8],))
         if overlap2:
             parts.append("Lane 2 (temp/drained/): %s" % (overlap2[:8],))
-        print("FAIL: %d temp file(s) cited by a durable record are scheduled for purge — "
+        if overlap3:
+            parts.append("Lane 3 (temp/ folders): %s" % (overlap3[:8],))
+        print("FAIL: %d temp item(s) cited by a durable record are scheduled for purge — "
               "the next drain would orphan the citing record's evidence: %s. Fold the "
               "evidence inline or re-point the citation at a durable path; do NOT delete "
               "the citing text (guard-952/731/712/667)."
-              % (len(overlap) + len(overlap2), " | ".join(parts)))
+              % (len(overlap) + len(overlap2) + len(overlap3), " | ".join(parts)))
         return 1
 
-    # SCOPE, still narrower than the check's name: Lane 3 (stray DIRS) remains
-    # count-only and is not covered. That is not a gap of the same kind — Lane 3
-    # deletes directories, so there is no file basename to intersect against the
-    # cited set, which is keyed on basenames.
-    print("PASS: cited-temp-not-purged [Lanes 1+2] — %d cited basename(s) vs %d Lane-1 + %d "
-          "Lane-2 would-purge file(s), intersection 0, citation_lookup=%s (delete-side "
-          "reference guard ACTIVE on both file lanes and the property holds)"
-          % (len(cited), len(would), len(lane2), lookup))
+    print("PASS: cited-temp-not-purged [Lanes 1+2+3] — %d cited basename(s) vs %d Lane-1 + "
+          "%d Lane-2 would-purge file(s) + %d Lane-3 folder(s), intersection 0, "
+          "citation_lookup=%s (delete-side reference guard ACTIVE on every lane and the "
+          "property holds)"
+          % (len(cited), len(would), len(lane2), len(lane3), lookup))
     return 0
 
 

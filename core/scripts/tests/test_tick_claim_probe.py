@@ -1,4 +1,5 @@
-"""tick_claim_probe.py -- the one question the cron sync tick asks (, ).
+"""tick_claim_probe.py -- the one question the cron sync tick asks (, ,
+g-375-137).
 
 `none` is the only answer that lets iteration-push.sh --ff-only run the loop's
 integrate, and `noloop` the only one that lets it fast-forward around agents/* files,
@@ -8,6 +9,7 @@ have produced the permissive answer proves nothing about the refusal.
 """
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -91,6 +93,80 @@ def test_every_doubt_is_unknown(row, why):
 
 def test_no_local_session_is_none():
     assert _decide({}, _row({OTHER_BOX: {"goal_id": "g-1-1"}}))[0] == "none"
+
+
+# --------------------------------------------------------------------------- #
+# the claim of record: a claim whose row was never written ()
+# --------------------------------------------------------------------------- #
+STORE_HELD = f"{BODY[:8]} holds g-1-4 (in-progress) in this box's world queue"
+
+
+def _queue(path, *aspirations):
+    """Write a world queue file holding one aspiration per list of goals."""
+    path.write_text("".join(json.dumps({"id": f"asp-{i}", "goals": goals}) + "\n"
+                            for i, goals in enumerate(aspirations, 1)), encoding="utf-8")
+    return path
+
+
+def test_a_store_claim_with_no_row_is_held_and_its_released_twin_is_none():
+    """zc-05's shape on 2026-10-05: its claim committed with no Body row, and the tick
+    integrated under it 19 times."""
+    claims = [(BODY, "g-1-4", "in-progress")]
+    assert tcp.decide({BODY: True}, _row(), STATUS.get, claims) == ("held", STORE_HELD)
+    # CONTROL: the same box once the claim is released (release erases claimed_by_sid).
+    assert tcp.decide({BODY: True}, _row(), STATUS.get, []) == (
+        "none", "no in-flight row for this box's 1 Body session(s)")
+
+
+def test_a_store_claim_holds_beside_a_row_naming_a_closed_goal():
+    row = _row({BODY: {"goal_id": "g-1-2"}})
+    assert tcp.decide({BODY: True}, row, STATUS.get, [(BODY, "g-1-4", "in-progress")]) == (
+        "held", STORE_HELD)
+    # CONTROL: without the store claim, the closed row alone answers none.
+    assert tcp.decide({BODY: True}, row, STATUS.get, [])[0] == "none"
+
+
+def test_another_boxs_store_claim_is_not_this_boxs():
+    claims = [(OTHER_BOX, "g-1-4", "in-progress")]
+    assert tcp.decide({BODY: True}, _row(), STATUS.get, claims)[0] == "none"
+    # CONTROL: the same claim held by one of this box's sessions.
+    assert tcp.decide({BODY: True, OTHER_BOX: True}, _row(), STATUS.get, claims)[0] == "held"
+
+
+def test_a_queue_copy_that_cannot_be_read_is_unknown():
+    assert tcp.decide({BODY: True}, _row(), STATUS.get, None) == (
+        "unknown", "this box's copy of the world queue cannot be read")
+    # CONTROL: the same box with a copy that reads clean.
+    assert tcp.decide({BODY: True}, _row(), STATUS.get, [])[0] == "none"
+
+
+def test_open_store_claims_reads_only_open_goals_these_sessions_hold(tmp_path):
+    queue = _queue(tmp_path / tcp.QUEUE_FILE,
+                   [{"id": "g-1-1", "status": "pending", "claimed_by_sid": BODY},
+                    {"id": "g-1-2", "status": "completed", "claimed_by_sid": BODY},
+                    {"id": "g-1-3", "status": "in-progress", "claimed_by_sid": OTHER_BOX}],
+                   [{"id": "g-2-1", "status": "blocked", "claimed_by_sid": BODY},
+                    {"id": "g-2-2", "status": "pending"}])
+    assert tcp.open_store_claims(queue, {BODY}) == [
+        (BODY, "g-1-1", "pending"), (BODY, "g-2-1", "blocked")]
+    assert tcp.open_store_claims(queue, {OTHER_BOX}) == [(OTHER_BOX, "g-1-3", "in-progress")]
+    assert tcp.open_store_claims(queue, set()) == []
+
+
+@pytest.mark.parametrize("content", [
+    None,                                       # no copy at all
+    b'{"goals": [{"claimed_by_sid": "x"\n',     # a claim line cut short
+    b'["claimed_by_sid"]\n',                    # a claim line that is not an aspiration
+    b'{"claimed_by_sid": "\xff"}\n',            # not UTF-8
+], ids=["missing", "truncated", "not-a-mapping", "not-utf8"])
+def test_a_scan_that_cannot_finish_answers_none_not_an_empty_list(tmp_path, content):
+    queue = tmp_path / tcp.QUEUE_FILE
+    if content is not None:
+        queue.write_bytes(content)
+    assert tcp.open_store_claims(queue, {BODY}) is None
+    # CONTROL: the same path holding a readable copy with no claim in it.
+    _queue(queue, [{"id": "g-1-1", "status": "pending"}])
+    assert tcp.open_store_claims(queue, {BODY}) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -270,6 +346,7 @@ def test_a_reducer_or_observer_seat_beside_a_worker_body_is_unknown(monkeypatch,
     row_file.parent.mkdir(parents=True)
     row_file.write_text(yaml.safe_dump({"in_flight": {"goal_id": "g-1-1"}, "in_flight_bodies": {}}),
                         encoding="utf-8")
+    _queue(world / tcp.QUEUE_FILE, [{"id": "g-1-1", "status": "pending"}])
     monkeypatch.setattr(_paths, "WORLD_DIR", str(world))
     monkeypatch.setattr(tcp, "_goal_status_resolver", lambda w: STATUS.get)
     for sid, r in ((BODY, "worker"), (SEAT, role)):
@@ -285,6 +362,35 @@ def test_a_reducer_or_observer_seat_beside_a_worker_body_is_unknown(monkeypatch,
     row_file.write_text(yaml.safe_dump({"in_flight_bodies": {BODY: {"goal_id": "g-1-1"}}}),
                         encoding="utf-8")
     assert tcp.probe(str(root)) == ("held", "alpha", f"row {BODY[:8]} names g-1-1 (pending)")
+
+
+def test_a_store_claim_with_no_row_holds_the_box_end_to_end(monkeypatch, tmp_path):
+    """: the row file names nothing for this box, and the box's copy of the world
+    queue carries its worker Body's open claim."""
+    import yaml
+    import _paths
+    import _team_state
+    root = _fake_box(monkeypatch, tmp_path, ["alpha"])
+    world = tmp_path / "world"
+    row_file = _team_state.row_path(world, "alpha")
+    row_file.parent.mkdir(parents=True)
+    row_file.write_text(yaml.safe_dump({"in_flight_bodies": {}}), encoding="utf-8")
+    monkeypatch.setattr(_paths, "WORLD_DIR", str(world))
+    monkeypatch.setattr(tcp, "_goal_status_resolver", lambda w: STATUS.get)
+    (root / "agents/alpha/sessions" / BODY).mkdir(parents=True)
+    (root / "agents/alpha/sessions" / BODY / tcp.BODY_MARKER).write_text(
+        "role: worker\n", encoding="utf-8")
+    queue = _queue(world / tcp.QUEUE_FILE,
+                   [{"id": "g-1-4", "status": "in-progress", "claimed_by_sid": BODY}])
+    assert tcp.probe(str(root)) == ("held", "alpha", STORE_HELD)
+    # CONTROL: once the claim is released, the same box hands off to the integrate.
+    _queue(queue, [{"id": "g-1-4", "status": "in-progress"}])
+    assert tcp.probe(str(root)) == (
+        "none", "alpha", "no in-flight row for this box's 1 Body session(s)")
+    # A copy that is gone answers unknown, never none.
+    queue.unlink()
+    assert tcp.probe(str(root)) == (
+        "unknown", "alpha", "this box's copy of the world queue cannot be read")
 
 
 def test_a_foreign_repo_is_unknown_before_any_store_is_read(tmp_path):

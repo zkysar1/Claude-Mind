@@ -623,3 +623,97 @@ def test_undrainable_rows_are_disclosed_beside_the_denominator_not_filtered_out(
     # A row outside the population cannot be undrainable, even with no holder.
     assert "g-9-05" not in pop["fleet_undrainable_goal_ids"]
     assert "g-9-06" not in pop["fleet_undrainable_goal_ids"]
+
+
+# ── A review request is a hold () ────────────────────────────────────
+# Measured 2026-10-06: the reducer drained 6 goals a live session held open for a
+# requested peer review, 4 of them before any verdict existed. The drain now holds a
+# row whose review_requested no RELEASING verdict answers yet. Verdicts are written
+# under CLOSE_REVIEW_LEDGER_DIR, the gate's own seam, so no fixture reaches the world.
+
+_ASKED = "2026-08-16T09:00:00"
+
+
+def _requested(gid, **kw):
+    r = _row(gid, **kw)
+    r["review_requested"] = _ASKED
+    return r
+
+
+def _verdict(tmp_path, gid, verdict, reviewed_at):
+    d = tmp_path / "audit-reports" / "close-reviews"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{gid}.json").write_text(json.dumps([{
+        "verdict": verdict, "reviewer": "bravo", "reviewed_at": reviewed_at,
+    }]), encoding="utf-8")
+
+
+def test_review_held_ids_holds_until_a_releasing_verdict_answers(tmp_path, monkeypatch):
+    """Each way a request can still be open is held, and the one way it is done is not.
+    g-7-04 is the positive control: without it, a reader that held every requested row
+    would pass."""
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    m = _load()
+    _verdict(tmp_path, "g-7-02", "APPROVE", "2026-08-16T08:00:00")      # from before the ask
+    _verdict(tmp_path, "g-7-03", "REJECT", "2026-08-16T10:00:00")       # answers, does not release
+    _verdict(tmp_path, "g-7-04", "APPROVE_WITH_NOTES", "2026-08-16T10:00:00")  # done
+    rows = [_requested("g-7-01"),                 # no verdict at all
+            _requested("g-7-02"), _requested("g-7-03"), _requested("g-7-04"),
+            _row("g-7-05"),                       # never asked for a review
+            _requested("g-7-06", note="")]        # asked, but not a drain candidate
+    assert m.review_held_ids(rows) == {"g-7-01", "g-7-02", "g-7-03"}
+
+
+def test_review_held_row_waits_whatever_its_age_and_is_counted():
+    m = _load()
+    rows = [_row("g-7-01", age_h=300), _row("g-7-02", age_h=200)]
+    out = m.build_slate(rows, "alpha", limit=5, min_age_hours=6, now=NOW,
+                        review_held={"g-7-01"})
+    assert [r["goal_id"] for r in out["slate"]] == ["g-7-02"]
+    pop = out["population"]
+    assert pop["mine_held_back_review_requested"] == 1
+    assert pop["review_held_goal_ids"] == ["g-7-01"]
+    assert pop["mine_noted"] == 2      # held, not vanished from the population
+    # Control: the same rows with nothing held serve the oldest first.
+    free = m.build_slate(rows, "alpha", limit=5, min_age_hours=6, now=NOW, review_held=set())
+    assert [r["goal_id"] for r in free["slate"]] == ["g-7-01", "g-7-02"]
+
+
+def test_main_wires_the_review_hold(tmp_path, monkeypatch, capsys):
+    """main() computes the held set and passes it on: a correct filter nobody calls is
+    the g-306-227 shape."""
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("MIND_AGENT", "alpha")
+    monkeypatch.setenv("MIND_SID", "cd5fd3b9")
+    m = _load()
+    monkeypatch.setattr(m, "holds_path", lambda agent: tmp_path / f"ledger-{agent}.jsonl")
+    _verdict(tmp_path, "g-7-02", "APPROVE", "2026-08-16T10:00:00")
+    rows = [_requested("g-7-01", age_h=300), _requested("g-7-02", age_h=200)]
+    monkeypatch.setattr(m, "_load_rows", lambda timeout: rows)
+    monkeypatch.setattr("sys.argv", ["cnc", "--json"])
+    assert m.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [r["goal_id"] for r in out["slate"]] == ["g-7-02"]
+    assert out["population"]["review_held_goal_ids"] == ["g-7-01"]
+    assert "review_hold_error" not in out
+
+
+def test_main_fails_closed_when_the_verdicts_cannot_be_read(tmp_path, monkeypatch, capsys):
+    """A reader fault holds every requested row and says so. It never drains them."""
+    monkeypatch.setenv("MIND_AGENT", "alpha")
+    monkeypatch.setenv("MIND_SID", "cd5fd3b9")
+    m = _load()
+    monkeypatch.setattr(m, "holds_path", lambda agent: tmp_path / f"ledger-{agent}.jsonl")
+
+    def _broken(rows):
+        raise RuntimeError("queue module did not load")
+
+    monkeypatch.setattr(m, "review_held_ids", _broken)
+    rows = [_requested("g-7-01", age_h=300), _row("g-7-02", age_h=200)]
+    monkeypatch.setattr(m, "_load_rows", lambda timeout: rows)
+    monkeypatch.setattr("sys.argv", ["cnc", "--json"])
+    assert m.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [r["goal_id"] for r in out["slate"]] == ["g-7-02"]
+    assert out["population"]["review_held_goal_ids"] == ["g-7-01"]
+    assert "queue module did not load" in out["review_hold_error"]

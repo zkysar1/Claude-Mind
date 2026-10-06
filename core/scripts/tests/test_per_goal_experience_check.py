@@ -7,8 +7,9 @@ and pins the new wiring of that helper into the NON-recurring close path
 
 THE DEFECT
 ----------
-Both close paths leave the experience WRITE to the LLM (experience-add.sh).
-What differed was ENFORCEMENT GRANULARITY:
+Both close paths leave the experience WRITE to the LLM (experience-add.sh) —
+the split g-115-4661's extraction created and g-115-5314 names. What differed
+was ENFORCEMENT GRANULARITY:
 
   * recurring-close.sh ran a PER-GOAL check keyed on the specific goal_id and
     set force_experience_archival on a miss, which aspirations-precheck Phase
@@ -30,9 +31,20 @@ WHAT THESE TESTS PIN
 2. guard-2015: recurring-close.sh keeps NO fork of the extracted logic.
 3. The non-recurring wiring exists in do_state_update, is gated on
    deep + not-recurring, and carries VISIBLE degradation (not a bare `|| true`).
+4. g-115-5314 PER-PATH coverage: the NON-recurring trigger (startswith the
+   shared NONRECURRING_PRODUCER from spark-fire-dedup.py) matches on
+   goal_id/source_goal ALONE — a record older than the 30-min window still
+   suppresses the sentinel, because a non-recurring goal closes exactly once.
+   The RECURRING trigger keeps the bounded window — a record from a prior
+   close still sets it (the window's load-bearing case). Fail-closed on the
+   unbounded path too: a genuinely absent (or cross-goal) record still sets
+   the sentinel. The discriminator is the sibling's constant object, not a
+   duplicated literal.
 
 Cross-refs:
   - g-115-4661 (this fix), g-115-4660 (zeta's measurement), g-115-547 (origin canary)
+  - g-115-5314 (per-path coverage: unbounded non-recurring, bounded recurring)
+  - g-115-3351 / spark-fire-dedup.py (the shared NONRECURRING_PRODUCER constant)
   - g-115-2511 / guard-697 / guard-713 (the goal_id vs source_goal seam)
   - guard-2015 (extract-and-delete-the-origin)
   - msg-20260801-171952-zeta-5643 (insight trigger: no bare `|| true` on this file)
@@ -230,6 +242,188 @@ def test_empty_goal_id_is_a_noop_not_a_crash():
         assert _sentinel(agent_dir) is None
     finally:
         _rm(tmp)
+
+
+# ─────────────── : per-path coverage bounds ───────────────────
+# The trigger strings below are the VERBATIM values the two call sites pass
+# (iteration-close.sh do_state_update / recurring-close.sh), so these tests
+# exercise the discriminator the same way production does.
+
+TRIGGER_NONRECURRING = "nonrecurring-state-update-deep-no-recent-entry"
+TRIGGER_RECURRING = "recurring-close-postflip-deep-no-recent-entry"
+
+
+def test_unbounded_nonrecurring_record_outside_window_suppresses_sentinel():
+    """ outcome 3: a non-recurring goal whose record was created
+    more than 30 minutes before the check returns 'no sentinel needed' —
+    where the pre-fix code set the sentinel. The goal closed exactly once,
+    so the joined record is necessarily this close's."""
+    tmp, agent_dir = _sandbox_agent([
+        {"id": "exp-1", "goal_id": "g-1", "created": _iso(45)},   # > 30min
+    ])
+    try:
+        r = _run(agent_dir, "g-1", "--trigger", TRIGGER_NONRECURRING)
+        assert r.returncode == 0, r.stderr
+        assert _sentinel(agent_dir) is None, (
+            "non-recurring close: a goal_id-joined record older than the "
+            f"30-min window must still count — the window false-fires on long "
+            f"closes. stderr={r.stderr}"
+        )
+        assert "no sentinel needed" in r.stderr
+    finally:
+        _rm(tmp)
+
+
+def test_unbounded_nonrecurring_record_keyed_on_legacy_source_goal_suppresses():
+    """The unbounded path keeps the goal_id/source_goal DUAL match ():
+    dropping the fallback would re-introduce false fires on this path."""
+    tmp, agent_dir = _sandbox_agent([
+        {"id": "exp-1", "source_goal": "g-1", "goal_id": None, "created": _iso(120)},
+    ])
+    try:
+        r = _run(agent_dir, "g-1", "--trigger", TRIGGER_NONRECURRING)
+        assert r.returncode == 0, r.stderr
+        assert _sentinel(agent_dir) is None, "source_goal match must count on the unbounded path"
+    finally:
+        _rm(tmp)
+
+
+def test_recurring_record_outside_window_still_sets_sentinel():
+    """ outcome 4: the RECURRING call site keeps the window — its
+    load-bearing case. The same goal_id closes many times, so a record from a
+    PRIOR close must not suppress the sentinel for THIS close."""
+    tmp, agent_dir = _sandbox_agent([
+        {"id": "exp-1", "goal_id": "g-1", "created": _iso(45)},   # prior close
+    ])
+    try:
+        r = _run(agent_dir, "g-1", "--trigger", TRIGGER_RECURRING)
+        assert r.returncode == 0, r.stderr
+        assert _sentinel(agent_dir) is not None, (
+            "recurring close: a record older than the window must NOT count as "
+            f"coverage — it may belong to a prior close. stderr={r.stderr}"
+        )
+    finally:
+        _rm(tmp)
+
+
+def test_recurring_record_inside_window_still_suppresses():
+    """The recurring window is unchanged in its load-bearing direction: a
+    fresh record from THIS close still suppresses the sentinel."""
+    tmp, agent_dir = _sandbox_agent([
+        {"id": "exp-1", "goal_id": "g-1", "created": _iso(2)},
+    ])
+    try:
+        r = _run(agent_dir, "g-1", "--trigger", TRIGGER_RECURRING)
+        assert r.returncode == 0, r.stderr
+        assert _sentinel(agent_dir) is None, "a fresh record on the recurring path must still count"
+    finally:
+        _rm(tmp)
+
+
+def test_unknown_trigger_keeps_the_bounded_window():
+    """The default trigger (anything that is not a known close-path trigger)
+    behaves exactly as pre-g-115-5314: stale record, no coverage. This is the
+    direction the change must not leak into: only the non-recurring producer
+    gets the unbounded path."""
+    tmp, agent_dir = _sandbox_agent([
+        {"id": "exp-1", "goal_id": "g-1", "created": _iso(45)},
+    ])
+    try:
+        r = _run(agent_dir, "g-1")   # TRIGGER = "test-trigger"
+        assert r.returncode == 0, r.stderr
+        assert _sentinel(agent_dir) is not None, (
+            "an unknown trigger must NOT inherit the unbounded path — "
+            "the window stays for every trigger that is not the non-recurring producer"
+        )
+    finally:
+        _rm(tmp)
+
+
+def test_fail_closed_on_unbounded_path_when_record_genuinely_absent():
+    """ outcome 5: the unbounded path only removes false POSITIVES.
+    A genuinely absent record on the non-recurring path must STILL set the
+    sentinel — a missing experience record is a real lost artifact."""
+    tmp, agent_dir = _sandbox_agent(None)   # no store at all
+    try:
+        r = _run(agent_dir, "g-1", "--trigger", TRIGGER_NONRECURRING)
+        assert r.returncode == 0, r.stderr
+        assert _sentinel(agent_dir) is not None, "no store at all must still fire, unbounded or not"
+    finally:
+        _rm(tmp)
+
+
+def test_fail_closed_on_unbounded_path_for_cross_goal_record():
+    """ outcome 5 (negative test): the unbounded path is keyed on
+    goal_id — a DIFFERENT goal's fresh record is not coverage for this goal,
+    whatever its age."""
+    tmp, agent_dir = _sandbox_agent([
+        {"id": "exp-1", "goal_id": "g-OTHER", "created": _iso(1)},
+    ])
+    try:
+        r = _run(agent_dir, "g-1", "--trigger", TRIGGER_NONRECURRING)
+        assert r.returncode == 0, r.stderr
+        s = _sentinel(agent_dir)
+        assert s is not None, "another goal's record must not cover this goal on the unbounded path"
+        assert s["goal_id"] == "g-1"
+        assert s["trigger"] == TRIGGER_NONRECURRING
+    finally:
+        _rm(tmp)
+
+
+def test_nonrecurring_discriminator_is_the_sibling_constant_not_a_copy():
+    """ outcome 2: the producer discriminator must be the
+    NONRECURRING_PRODUCER constant imported from spark-fire-dedup.py, not a
+    second literal in this file. If someone 'inlines' it, this fails."""
+    import importlib.util as _ilu
+
+    sfd_spec = _ilu.spec_from_file_location("sfd_test", str(CORE_SCRIPTS / "spark-fire-dedup.py"))
+    sfd = _ilu.module_from_spec(sfd_spec)
+    sfd_spec.loader.exec_module(sfd)
+
+    pgec_spec = _ilu.spec_from_file_location("pgec_test", str(HELPER))
+    pgec = _ilu.module_from_spec(pgec_spec)
+    pgec_spec.loader.exec_module(pgec)
+
+    assert pgec._NONRECURRING_PRODUCER == sfd.NONRECURRING_PRODUCER, (
+        "the helper's discriminator drifted from the sibling's constant — "
+        "import it, do not copy it (g-115-5314)"
+    )
+    # And the REAL call-site triggers must still discriminate as intended:
+    assert TRIGGER_NONRECURRING.startswith(pgec._NONRECURRING_PRODUCER), (
+        "iteration-close.sh's trigger no longer names the non-recurring producer"
+    )
+    assert not TRIGGER_RECURRING.startswith(pgec._NONRECURRING_PRODUCER), (
+        "the recurring trigger must NOT start with the non-recurring producer"
+    )
+    # No EXECUTABLE second copy of the producer value in the helper's source.
+    # A comment/docstring MAY quote the sibling's definition (this file's
+    # module-level note does, for provenance), but no live code line may define
+    # it — the value must come from the import, not a re-typed literal.
+    helper_src = HELPER.read_text(encoding="utf-8")
+    literal = '"nonrecurring-state-update"'
+    code_lines = [
+        ln for ln in helper_src.splitlines()
+        if literal in ln and not ln.lstrip().startswith("#")
+    ]
+    assert not code_lines, (
+        "the producer literal is defined in per-goal-experience-check.py code — "
+        f"it must come from spark-fire-dedup.py (g-115-5314): {code_lines}"
+    )
+
+
+def test_call_site_triggers_match_the_discriminator():
+    """The two call sites pass exactly the triggers the discriminator keys on.
+    Pins the seam end-to-end: if either call site changes its --trigger value
+    without updating this test, one of the two paths silently loses its bound
+    choice."""
+    iter_src = ITERATION_CLOSE_SH.read_text(encoding="utf-8")
+    recur_src = RECURRING_CLOSE_SH.read_text(encoding="utf-8")
+    assert TRIGGER_NONRECURRING in iter_src, (
+        "iteration-close.sh no longer passes the non-recurring trigger this test family assumes"
+    )
+    assert TRIGGER_RECURRING in recur_src, (
+        "recurring-close.sh no longer passes the recurring trigger this test family assumes"
+    )
 
 
 # ──────────────────── extraction + wiring invariants ────────────────────

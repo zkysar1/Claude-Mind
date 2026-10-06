@@ -200,6 +200,10 @@ Configured in `core/config/memory-pipeline.yaml` under `working_memory_pruning`:
   `eviction_deferred` (g-115-9852). The agent-wide WM's append path archives nothing.
   wm-prune's capture evictions archive to `agents/<agent>/capture-evictions-archive.jsonl`
   (g-115-9662).
+- **Unflagged relay warning** (g-115-11077): appending an unflagged `sq_trigger: "sq-013"`
+  entry to `spark_capture` on a worker **Body WM** returns a `warning` that wm-append.sh
+  prints. Only `load_bearing` entries are mirrored to the carrier the reducer reads before
+  the Body closes, so an unflagged relay waits for the close, which can be never (guard-6181).
 - **Item staleness**: Per-slot age thresholds for array items
 - **Protected slots**: `known_blockers` (only prune resolved), `knowledge_debt` (only prune resolved)
 

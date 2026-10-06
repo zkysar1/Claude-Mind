@@ -37,7 +37,9 @@ WHAT "THIS BOX'S BODY" MEANS. A root cron has no session: no MIND_AGENT, no MIND
             agent-level `in_flight` row, which carries no sid, so a box that may host
             the reducer cannot be answered.
   claim     agent_status.<agent>.in_flight_bodies.<sid> for each of those sessions. A row
-            holds a claim while the goal it names is not closed.
+            holds a claim while the goal it names is not closed. So does an open goal in
+            this box's copy of the world queue whose claimed_by_sid is one of those
+            sessions, row or no row (g-375-137).
 
 A BOX NO WORKER BODY HAS RUN ON (g-375-108). The rule above needs one agent and Body
 sessions only. When no session on the box, of any agent configured here, records the
@@ -59,9 +61,23 @@ is the file the loop's own stop hook reads: agents/<agent>/session/agent-state.
 
 WHY THIS BOX'S OWN ROW FILE, NOT THE DAEMON. A Body writes its claim, and its own release,
 into this box's row file first; the store of record catches up from here. So for this
-box's own sids a stale file can only err toward `held` (a release written elsewhere that
-has not arrived yet), never toward `none`. Reading it directly also keeps a root cron from
-spawning a daemon, and the row read itself needs no store credentials.
+box's own sids a stale file errs toward `held` (a release written elsewhere that has not
+arrived yet). A row that was never written is the exception: see the next paragraph.
+Reading it directly also keeps a root cron from spawning a daemon, and the row read itself
+needs no store credentials.
+
+THE CLAIM OF RECORD TOO, NOT ONLY THE ROW (g-375-137). aspirations-claim.sh writes the row
+AFTER the claim commits, so a wrapper that dies in between leaves a claim with no row, and
+the row file alone then reads `none`. Measured 2026-10-05 on the worker Bodies: 2 of
+38 claims in 24 h committed with no row, and zc-05's tick then answered `none` and
+integrated 19 times under its held claim. So the probe also reads this box's copy of the
+world queue, and an open goal whose claimed_by_sid is this box's Body session answers
+`held`. A worker claims through this box's own daemon, which writes that copy (zc-05's copy
+carried its row-less claim when read that day), and a release or close written on another
+box that has not arrived yet errs toward `held`. Claims are erased at release and at close,
+so only the few lines that carry the key are parsed. A copy that cannot be read in full
+answers `unknown`: a scan that cannot finish must never read as "no claim". The copy is
+read from disk, like the row file, with no store credentials.
 
 WHY THE GOAL'S STATUS AND NOT JUST THE ROW. A row can outlive its claim. When another
 session writes the close (zc-02's g-115-11303 was completed at 03:20:01 under a different
@@ -76,7 +92,8 @@ up: an integrate during that unit, the case measured low-harm (g-375-93, g-375-9
 FAIL-SAFE. Every doubt answers `unknown`: the synced repo is not this script's tree, a
 non-Body session ran on a worker Body box, a session's manifest cannot be read or records
 a role this probe does not know, an agent is RUNNING, the row file is missing or
-unreadable, a goal id does not resolve, or anything raises.
+unreadable, a goal id does not resolve, this box's copy of the world queue cannot be read
+in full, or anything raises.
 
 SIDE EFFECTS. Takes no lock and writes nothing of its own. Resolving a row's goal is not
 free: goal-resolve.py first refreshes the world archive from the store (one HEAD, plus a
@@ -89,6 +106,7 @@ row reads nothing from the store, and neither does a box no worker Body has run 
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -117,6 +135,9 @@ WORKER_ROLE = "worker"
 # the two equal). A role outside it is a doubt: it may name a newer kind of session that
 # runs a loop.
 KNOWN_ROLES = ("reducer", "worker", "observer")
+
+# The world queue file, under the world dir: where a claim of record lives ().
+QUEUE_FILE = "aspirations.jsonl"
 
 
 def resident_agent(conf_agents, env_agent):
@@ -169,12 +190,40 @@ def agent_state(agent_dir):
     return "".join(text.split())
 
 
-def decide(sessions, row, status_of):
+def open_store_claims(queue_path, sids):
+    """-> [(sid, goal_id, status)] for every goal in the world queue file at queue_path
+    that one of `sids` holds open (its claimed_by_sid, status not CLOSED), or None when
+    the file cannot be read in full (g-375-137)."""
+    held = []
+    try:
+        with open(queue_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                # Release and close erase the key, so only an aspiration with a live
+                # claim carries it: 12 of zc-05's lines on 2026-10-05.
+                if "claimed_by_sid" not in line:
+                    continue
+                asp = json.loads(line)
+                if not isinstance(asp, dict):
+                    return None
+                for g in asp.get("goals") or []:
+                    if not isinstance(g, dict):
+                        continue
+                    sid = g.get("claimed_by_sid")
+                    if isinstance(sid, str) and sid in sids and g.get("status") not in CLOSED:
+                        held.append((sid, str(g.get("id") or "?"), str(g.get("status"))))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return held
+
+
+def decide(sessions, row, status_of, claims=()):
     """-> (verdict, evidence). Pure, so the rule is testable without a box.
 
     sessions   {sid: True when its manifest records the worker role} for this box
     row        the agent's team-state row as a dict, or None when it could not be read
     status_of  goal_id -> status string, or None when the id does not resolve
+    claims     open_store_claims() for this box's copy of the world queue: the open goals
+               its sessions hold, or None when that copy could not be read
     """
     others = sorted(sid for sid, body in sessions.items() if not body)
     if others:
@@ -198,6 +247,12 @@ def decide(sessions, row, status_of):
         if status not in CLOSED:
             return "held", f"row {sid[:8]} names {gid} ({status})"
         notes.append(f"row {sid[:8]} names {gid} ({status})")
+    # A claim of record holds the box whether or not its row was written ().
+    if claims is None:
+        return "unknown", "this box's copy of the world queue cannot be read"
+    for sid, gid, status in sorted(claims):
+        if sid in sessions:
+            return "held", f"{sid[:8]} holds {gid} ({status}) in this box's world queue"
     if notes:
         return "none", "; ".join(notes)
     return "none", f"no in-flight row for this box's {len(sessions)} Body session(s)"
@@ -268,7 +323,8 @@ def probe(repo):
             row = yaml.safe_load(fh)
     except (OSError, yaml.YAMLError):
         row = None
-    verdict, evidence = decide(sessions, row, _goal_status_resolver(world))
+    claims = open_store_claims(Path(world) / QUEUE_FILE, set(sessions))
+    verdict, evidence = decide(sessions, row, _goal_status_resolver(world), claims)
     return verdict, agent, evidence
 
 

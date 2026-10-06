@@ -22,7 +22,9 @@ Guardrail: guard-2190. Strategy: rb-6174.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -31,9 +33,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 CHECK_PATH = CORE_SCRIPTS / "checks" / "temp_durability_invariant.py"
 
-# The two forms verbatim: the CURRENT inverted predicate and the PRE-inversion
-# allow-list, both copied from temp-drain-purge.sh (_purge_find_predicate and
-# _purge_find_predicate_legacy respectively).
+# The three forms verbatim, copied from temp-drain-purge.sh: the CURRENT
+# decided predicate (applied to each reviewed-discard path, 2026-10-05), the
+# inverted one before it, and the original allow-list
+# (_purge_find_predicate / its 2026-07-31 form / _purge_find_predicate_legacy).
+DECIDED = "  PURGE_FIND_PRED=( -maxdepth 0 -type f ! -name '.*' )\n"
 INVERTED = (
     "  PURGE_FIND_PRED=( -maxdepth 1 -type f ! -name '.*' "
     "\\( ! \\( -name '*.md' -o -name '*.json' \\) -o -empty \\) )\n"
@@ -59,6 +63,11 @@ def _load(monkeypatch, purge_text=None, purge_exists=True, tmp_path=None):
     return mod
 
 
+def test_detects_the_decided_predicate(monkeypatch, tmp_path):
+    mod = _load(monkeypatch, DECIDED, tmp_path=tmp_path)
+    assert mod.predicate_shape() == ("decided", None)
+
+
 def test_detects_the_inverted_predicate(monkeypatch, tmp_path):
     mod = _load(monkeypatch, INVERTED, tmp_path=tmp_path)
     shape, exts = mod.predicate_shape()
@@ -79,13 +88,13 @@ def test_detects_the_pre_inversion_allowlist(monkeypatch, tmp_path):
     assert exts == {".log", ".txt", ".py", ".sh", ".err", ".raw", ".out", ".bak"}
 
 
-def test_the_two_shapes_do_not_collide(monkeypatch, tmp_path):
-    """The discriminating assertion. Both forms contain `-name '*.<ext>'`
-    tokens and both are a PURGE_FIND_PRED assignment, so a token-only parser
-    returns the SAME kind of answer for both. These must differ."""
-    inv = _load(monkeypatch, INVERTED, tmp_path=tmp_path).predicate_shape()
-    allow = _load(monkeypatch, ALLOWLIST, tmp_path=tmp_path).predicate_shape()
-    assert inv[0] != allow[0]
+def test_the_shapes_do_not_collide(monkeypatch, tmp_path):
+    """The discriminating assertion. Every form is a PURGE_FIND_PRED assignment
+    and two carry `-name '*.<ext>'` tokens, so a token-only parser returns the
+    SAME kind of answer for them. All three must differ."""
+    shapes = {_load(monkeypatch, text, tmp_path=tmp_path).predicate_shape()[0]
+              for text in (DECIDED, INVERTED, ALLOWLIST)}
+    assert shapes == {"decided", "inverted", "allowlist"}
 
 
 def test_unparseable_and_missing_both_yield_no_shape(monkeypatch, tmp_path):
@@ -108,7 +117,37 @@ def test_live_script_still_matches_a_known_shape():
     if not mod.PURGE.is_file():
         pytest.skip("temp-drain-purge.sh not present on this box")
     shape, _ = mod.predicate_shape()
-    assert shape in ("inverted", "allowlist"), (
+    assert shape in ("decided", "inverted", "allowlist"), (
         "PURGE_FIND_PRED parsed to no known shape — temp_durability_invariant.py "
         "will SKIP forever and the temp/ durability check goes silently dark"
     )
+
+
+def _age(p, hours):
+    t = time.time() - hours * 3600
+    os.utime(p, (t, t))
+
+
+def test_decided_shape_reports_only_cited_files(monkeypatch, tmp_path, capsys):
+    """Under the decided lane every item has a lifecycle (the review), so the
+    residual is a cited file of ANY suffix, aged past the 24h grace: the review
+    cannot discard it and it has no durable copy. An uncited aged script and a
+    cited fresh file are not orphans."""
+    mod = _load(monkeypatch, DECIDED, tmp_path=tmp_path)
+    temp = tmp_path / "agents" / "agent-a" / "temp"
+    temp.mkdir(parents=True)
+    for name, hours in (("cited.md", 48), ("plain.sh", 48), ("fresh-cited.log", 1)):
+        (temp / name).write_text("x", encoding="utf-8")
+        _age(temp / name, hours)
+    monkeypatch.setattr(mod, "PROJECT_ROOT", str(tmp_path))
+    monkeypatch.setattr(mod, "agents_root", lambda: str(tmp_path / "agents"))
+    monkeypatch.setattr(mod, "active_storage_backend", lambda: "local")
+    monkeypatch.setattr(mod, "cited_basenames", lambda: {"cited.md", "fresh-cited.log"})
+    assert mod.main() == 0
+    out = capsys.readouterr().out
+    assert out.startswith("WARN: 1 temp file(s)") and "review cannot discard" in out
+    assert "cited.md" in out and "plain.sh" not in out and "fresh-cited" not in out
+    monkeypatch.setattr(mod, "cited_basenames", lambda: set())
+    assert mod.main() == 0
+    assert capsys.readouterr().out.startswith("PASS: temp-durability invariant holds "
+                                               "(Lane 1 deletes only reviewed discards")

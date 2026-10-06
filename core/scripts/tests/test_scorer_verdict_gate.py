@@ -7,14 +7,21 @@ replay (a claim of g-115-2798 while the scorer top was g-315-390 must be
 refused). The gate's load-bearing safety property is FAIL-OPEN: a missing,
 malformed, or stale verdict allows without validation so a broken selector
 never wedges claiming.
+
+g-375-133 adds one allowance and pins it from both sides: a worker's claim of a
+row its own select-walk KEPT, over a top that walk DROPPED, passes with no code
+(logged as an override), and without every piece of that evidence the deny
+stands exactly as before.
 """
 from __future__ import annotations
 
 import importlib.util
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
@@ -189,25 +196,34 @@ def test_verdict_roundtrip_writer_to_gate(tmp_path):
 
 # ── gate telemetry: branch labels + registry pairing () ──────
 
+def _census(top="g-1", dropped=True, rows=("g-2", "g-3"), age_s=60, now=NOW):
+    """A select-walk census (worker_execute.worker_view + write_select_census)."""
+    return {"top": 10, "scorer_top": top, "scorer_top_dropped": dropped,
+            "rows": [{"goal_id": g, "verdict": "eligible"} for g in rows],
+            "ts": (now - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%S")}
+
+
 def _branch_cases():
-    """(label, verdict, claimed, code) for every branch `_classify` can reach
-    from a direct call. `path_resolution_failed` is main()-only — no verdict is
-    ever built on that path — and is covered by the completeness test below."""
+    """(label, verdict, claimed, code, census) for every branch `_classify` can
+    reach from a direct call. `path_resolution_failed` is main()-only — no
+    verdict is ever built on that path — and is covered by the completeness test
+    below."""
     return [
-        ("no_verdict",             None,                                      "g-2", ""),
-        ("malformed_verdict",      {"ts": NOW.strftime("%Y-%m-%dT%H:%M:%S")}, "g-2", ""),
-        ("stale_verdict",          _verdict("g-1", ts=NOW - timedelta(minutes=11)), "g-2", ""),
-        ("top_pick_match",         _verdict("g-1"),                           "g-1", ""),
-        ("unsanctioned_deviation", _verdict("g-1"),                           "g-2", ""),
-        ("sanctioned_deviation",   _verdict("g-1"),         "g-2", "self-abstention"),
+        ("no_verdict",             None,                                      "g-2", "", None),
+        ("malformed_verdict",      {"ts": NOW.strftime("%Y-%m-%dT%H:%M:%S")}, "g-2", "", None),
+        ("stale_verdict",          _verdict("g-1", ts=NOW - timedelta(minutes=11)), "g-2", "", None),
+        ("top_pick_match",         _verdict("g-1"),                           "g-1", "", None),
+        ("unsanctioned_deviation", _verdict("g-1"),                           "g-2", "", None),
+        ("sanctioned_deviation",   _verdict("g-1"),         "g-2", "self-abstention", None),
+        ("walk_dropped_top",       _verdict("g-1"),                     "g-2", "", _census()),
     ]
 
 
 def test_classify_emits_expected_branch_label():
     """Every branch of the decision core returns its own stable label — the
     telemetry discriminator guard-502 requires (no two branches conflated)."""
-    for want, verdict, claimed, code in _branch_cases():
-        got = svg._classify(verdict, claimed, code, NOW)[0]
+    for want, verdict, claimed, code, census in _branch_cases():
+        got = svg._classify(verdict, claimed, code, NOW, census=census, census_now=NOW)[0]
         assert got == want, f"expected {want}, got {got}"
 
 
@@ -221,9 +237,11 @@ def test_branch_labels_are_unique():
 def test_evaluate_is_a_faithful_facade_over_classify():
     """`evaluate` keeps its 3-tuple contract and must never disagree with
     `_classify` — the branch logic lives in exactly one place."""
-    for _want, verdict, claimed, code in _branch_cases():
-        path, rc, msg, ev = svg._classify(verdict, claimed, code, NOW)
-        assert svg.evaluate(verdict, claimed, code, NOW) == (rc, msg, ev)
+    for _want, verdict, claimed, code, census in _branch_cases():
+        path, rc, msg, ev = svg._classify(verdict, claimed, code, NOW,
+                                          census=census, census_now=NOW)
+        assert svg.evaluate(verdict, claimed, code, NOW,
+                            census=census, census_now=NOW) == (rc, msg, ev)
         assert path in svg.DECISION_BY_PATH
 
 
@@ -248,6 +266,7 @@ def test_decisions_match_caller_control_flow_effect():
     d = svg.DECISION_BY_PATH
     assert d["unsanctioned_deviation"] == "block"    # caller exits 2
     assert d["sanctioned_deviation"] == "override"   # named bypass flag used
+    assert d["walk_dropped_top"] == "override"       # the walk's census is the bypass
     assert d["top_pick_match"] == "pass"             # validated, claim proceeds
     for path in ("no_verdict", "malformed_verdict", "stale_verdict",
                  "path_resolution_failed"):
@@ -319,7 +338,173 @@ def test_override_reason_only_set_on_sanctioned_branch():
         # a deviation code present on a branch that is NOT the sanctioned one
         svg._log_gate_firing("stale_verdict", "alpha", "g-2", "g-1", "self-abstention")
         svg._log_gate_firing("sanctioned_deviation", "alpha", "g-2", "g-1", "self-abstention")
+        svg._log_gate_firing("walk_dropped_top", "alpha", "g-2", "g-1", "self-abstention")
     finally:
         gate_log.log = orig
     assert seen[0] == ("fail_open", None)
     assert seen[1] == ("override", "self-abstention")
+    assert seen[2] == ("override", "self-abstention")
+
+
+# ── the walk's census as evidence () ──────────────────────────
+#
+# Measured 2026-10-03..05 on the zc worker Bodies: the scorer's top pick was a
+# row the worker's select-walk had dropped (a structural no_claim), so the
+# walk's first kept row drew this gate's deny, and the Body chased the top it
+# could never take. The census select-walk writes is the evidence that lets the
+# gate tell that claim apart from a real unsanctioned divergence.
+
+def test_a_kept_row_over_a_top_the_walk_dropped_passes_with_no_code():
+    path, rc, msg, ev = svg._classify(_verdict("g-1"), "g-2", "", NOW,
+                                      census=_census(), census_now=NOW)
+    assert (path, rc, msg) == ("walk_dropped_top", 0, "")
+    assert ev == {"claimed": "g-2", "scorer_top": "g-1", "code": "self-abstention"}
+    assert ev["code"] in svg.VALID_DEVIATION_CODES, "the logged code is one the audit knows"
+
+
+@pytest.mark.parametrize("census, why", [
+    (None, "no census"),
+    ("not-a-mapping", "a census that is not a mapping"),
+    (_census(top="g-9"), "the census judged a different top"),
+    (_census(dropped=False), "the walk kept the top"),
+    (dict(_census(), scorer_top_dropped="yes"), "dropped must be the boolean true"),
+    (_census(rows=("g-3",)), "the claimed goal is not a kept row"),
+    (dict(_census(), rows="g-2"), "rows that are not a list"),
+    (_census(age_s=11 * 60), "a census older than the verdict window"),
+    (dict(_census(), ts="not-a-timestamp"), "a census with no readable ts"),
+])
+def test_without_every_piece_of_walk_evidence_the_deny_stands(census, why):
+    path, rc, msg, ev = svg._classify(_verdict("g-1"), "g-2", "", NOW,
+                                      census=census, census_now=NOW)
+    assert (path, rc, ev) == ("unsanctioned_deviation", 2, None), why
+    assert "g-1" in msg and "g-2" in msg
+
+
+def test_the_census_ages_on_its_own_utc_clock():
+    """The census is stamped in naive UTC; `census_now` is what it is aged against,
+    so a box whose local clock is not UTC cannot age it wrongly. At the window's
+    edge it is still fresh, one second past it is not."""
+    edge = _census(age_s=10 * 60)
+    assert svg._classify(_verdict("g-1"), "g-2", "", NOW, census=edge,
+                         census_now=NOW)[0] == "walk_dropped_top"
+    later = NOW + timedelta(seconds=1)
+    assert svg._classify(_verdict("g-1"), "g-2", "", NOW, census=edge,
+                         census_now=later)[0] == "unsanctioned_deviation"
+
+
+def test_a_census_with_no_clock_to_age_it_by_is_no_evidence():
+    """A caller that passes a census but no `census_now` gets the deny: the census is
+    never aged on `now`, the verdict's local clock, in its place."""
+    path, rc, _, ev = svg._classify(_verdict("g-1"), "g-2", "", NOW, census=_census())
+    assert (path, rc, ev) == ("unsanctioned_deviation", 2, None)
+
+
+def test_a_code_the_caller_passes_still_decides():
+    """The census sanctions only the claim that names NO code. A valid code takes
+    the ordinary sanctioned branch with the caller's own code; an unknown code is
+    still refused, census or not, so the deny keeps teaching the enum."""
+    path, rc, _, ev = svg._classify(_verdict("g-1"), "g-2", "partner-claim", NOW,
+                                    census=_census(), census_now=NOW)
+    assert (path, rc, ev["code"]) == ("sanctioned_deviation", 0, "partner-claim")
+    path, rc, msg, _ = svg._classify(_verdict("g-1"), "g-2", "nope", NOW,
+                                     census=_census(), census_now=NOW)
+    assert (path, rc) == ("unsanctioned_deviation", 2) and "nope" in msg
+
+
+def test_the_census_changes_no_other_branch():
+    census = _census()
+    assert svg._classify(_verdict("g-1"), "g-1", "", NOW, census=census,
+                         census_now=NOW)[0] == "top_pick_match"
+    stale = _verdict("g-1", ts=NOW - timedelta(minutes=11))
+    assert svg._classify(stale, "g-2", "", NOW, census=census,
+                         census_now=NOW)[0] == "stale_verdict"
+    assert svg._classify(None, "g-2", "", NOW, census=census,
+                         census_now=NOW)[0] == "no_verdict"
+
+
+def test_the_census_file_name_is_the_walk_writer_s():
+    """The gate keeps its own copy of the name (it does not import worker_execute
+    on the claim path); this pins the two equal."""
+    import worker_execute as we
+    assert svg.SELECT_CENSUS_FILENAME == we.SELECT_CENSUS_FILENAME
+
+
+def _run_main(tmp_path, monkeypatch, census, claimed="g-2", top="g-1", code=""):
+    """main() with an explicit verdict and census and the two loggers captured, so
+    nothing reaches a real diary or gate firing store."""
+    vf = tmp_path / "scorer-verdict.json"
+    vf.write_text(json.dumps(_verdict(top, ts=datetime.now())), encoding="utf-8")
+    argv = ["--agent", "alpha", "--goal-id", claimed, "--verdict-file", str(vf)]
+    if census is not None:
+        cf = tmp_path / "select-census.json"
+        cf.write_text(json.dumps(census), encoding="utf-8")
+        argv += ["--census-file", str(cf)]
+    if code:
+        argv += ["--deviation", code]
+    firings, overrides = [], []
+    monkeypatch.setattr(svg, "_log_gate_firing", lambda *a: firings.append(a))
+    monkeypatch.setattr(svg, "_log_override", lambda ev, agent: overrides.append(ev))
+    return svg.main(argv), firings, overrides
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def test_main_reads_the_census_and_logs_the_walk_branch_as_an_override(tmp_path, monkeypatch):
+    rc, firings, overrides = _run_main(tmp_path, monkeypatch, _census(now=_utc_now()))
+    assert rc == 0
+    assert firings == [("walk_dropped_top", "alpha", "g-2", "g-1", "self-abstention")]
+    assert overrides == [{"claimed": "g-2", "scorer_top": "g-1", "code": "self-abstention"}]
+
+
+def test_main_with_no_census_refuses_exactly_as_before(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("MIND_SID", raising=False)
+    rc, firings, overrides = _run_main(tmp_path, monkeypatch, None)
+    assert rc == 2 and overrides == []
+    assert firings == [("unsanctioned_deviation", "alpha", "g-2", "g-1", "")]
+    assert "g-1" in capsys.readouterr().err
+
+
+def test_an_unreadable_or_absent_census_is_no_evidence(tmp_path, monkeypatch):
+    cf = tmp_path / "broken.json"
+    cf.write_text("{not json", encoding="utf-8")
+    assert svg._load_census(str(cf), "alpha") is None
+    assert svg._load_census(str(tmp_path / "absent.json"), "alpha") is None
+    monkeypatch.delenv("MIND_SID", raising=False)
+    assert svg._load_census("", "alpha") is None
+
+
+def _brief(i, **extra):
+    """A row in the selector's brief shape, as select-walk receives it."""
+    row = {"goal_id": f"g-900-{i:02d}", "source": "world", "title": f"T{i}",
+           "score": 10.0 - i / 100, "skill": None, "executable_by_role": None,
+           "recurring": False, "routed_to_me": False}
+    row.update(extra)
+    return row
+
+
+@pytest.mark.parametrize("top_skill, want_rc, want_path", [
+    ("/reflect", 0, "walk_dropped_top"),        # the walk dropped the top
+    (None, 2, "unsanctioned_deviation"),        # positive control: the walk kept it
+])
+def test_round_trip_through_the_real_walk_census(tmp_path, monkeypatch,
+                                                 top_skill, want_rc, want_path):
+    """The producer and the reader composed: worker_view's census, written by
+    write_select_census, read by this gate's main(). A worker claims row 1 with no
+    code. Only the walk that DROPPED row 0 sanctions that claim; the same claim
+    after a walk that KEPT row 0 is refused as before."""
+    import worker_execute as we
+    ranked = [_brief(0, skill=top_skill), _brief(1), _brief(2)]
+    _, census = we.worker_view(ranked, 10)
+    sess = tmp_path / "sessions" / "sid-133"
+    sess.mkdir(parents=True)
+    we.write_select_census(census, sess)
+    vf = tmp_path / "scorer-verdict.json"
+    vf.write_text(json.dumps(_verdict("g-900-00", ts=datetime.now())), encoding="utf-8")
+    firings = []
+    monkeypatch.setattr(svg, "_log_gate_firing", lambda *a: firings.append(a))
+    monkeypatch.setattr(svg, "_log_override", lambda ev, agent: None)
+    rc = svg.main(["--agent", "alpha", "--goal-id", "g-900-01", "--verdict-file", str(vf),
+                   "--census-file", str(sess / we.SELECT_CENSUS_FILENAME)])
+    assert (rc, firings[0][0]) == (want_rc, want_path)

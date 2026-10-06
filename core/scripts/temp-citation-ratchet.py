@@ -157,9 +157,10 @@ def _compute():
     breakdown, total, scanned = {}, 0, 0
     missing = []
     # Distinct cited temp/ paths, collected alongside the (record, path) pair
-    # count. The COUNT is the ratchet's metric; the PATHS are what
-    # temp-drain-purge.sh Lane 1 exempts from its purge-by-default predicate
-    # (temp-store.md § The third class, criterion (a)(1) "Cited"). Same scan,
+    # count. The COUNT is the ratchet's metric; the PATHS are the cited set
+    # the temp review refuses to discard (temp_decisions.py) and
+    # temp-drain-purge.sh exempts in every lane (temp-store.md § The decision
+    # log; § The third class, criterion (a)(1) "Cited"). Same scan,
     # two consumers — the D2 decision's "no new counter is needed" holds only
     # because the pairs this function already builds are made reachable here.
     paths: set[str] = set()

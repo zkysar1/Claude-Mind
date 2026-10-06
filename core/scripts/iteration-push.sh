@@ -525,6 +525,65 @@ if [ "$NO_FETCH" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
   fi
 fi
 
+# --- Keep the bytes of an IGNORED local file the merge would replace () ---
+# git merges with --overwrite-ignore: when UPSTREAM newly TRACKS a path this box holds
+# as an untracked file its ignore rules cover, the merge replaces the file with
+# upstream's bytes, rc 0 and no message. A path NO rule covers is refused instead,
+# which is already loud. Measured on git 2.43.0 (cc-08, 6.8.0-142-generic, 2026-10-05)
+# through both merge shapes of _ip_merge_upstream and the tick's plain fast-forward:
+#   path in info/exclude ...................................... replaced silently
+#   path a committed rule covers, then `git add -f` upstream ... replaced silently
+#   rule dropped in the same upstream commit that tracks it ... replaced silently
+# `merge --no-overwrite-ignore` refuses all three, which wedges the box behind the very
+# file it protects. So the merge still lands and the BYTES are kept instead:
+#   - the paths are those UPSTREAM adds since the merge base. --no-renames matters:
+#     without it a rename's destination is not an "added" path and is missed;
+#   - a path is copied only when a local file or symlink is there, check-ignore does not
+#     say "not ignored" (a path HEAD tracks reads as not ignored; an error counts as
+#     ignored, since in doubt the copy is the safe side), and its bytes differ from
+#     UPSTREAM's blob. Bytes are compared raw (hash-object --no-filters), never as git's
+#     normalized view;
+#   - the copy is cp -p, never mv, into $GITDIR/iteration-push-setaside/<blob id of the
+#     local bytes>/<path>, checked by raw hash. It lives under .git for the reason the
+#     tick's copies do: the worktree is what the merge rewrites. Content-addressed, so a
+#     merge that fails and retries every cycle copies once, never fills the dir and
+#     never overwrites an earlier copy. A copy already there logs nothing: its first
+#     line told the reader.
+# Fail-soft: every refusal logs and returns 0, and the merge then runs as it did before
+# this helper existed (a wrongly-refusing gate freezes framework sync, ).
+# DEFINED HERE, above the tick: this file runs top to bottom, and the tick's merges run
+# before _ip_merge_upstream's definition is reached.
+_ip_local_oid() {  # a file or symlink -> the blob id of its raw bytes (a symlink's target text)
+  if [ -L "$1" ]; then
+    printf '%s' "$(readlink -- "$1")" | git -C "$REPO" hash-object --stdin 2>/dev/null
+  else
+    git -C "$REPO" hash-object --no-filters -- "$1" 2>/dev/null
+  fi
+}
+_ip_setaside_ignored_overwrites() {
+  local _base _meta _p _f _up _lo _dest _rc
+  _base="$(git -C "$REPO" merge-base HEAD "$UPSTREAM" 2>/dev/null)" || return 0
+  while IFS= read -r -d '' _meta && IFS= read -r -d '' _p; do
+    _f="$REPO/$_p"
+    { [ -L "$_f" ] || [ -f "$_f" ]; } || continue
+    git -C "$REPO" check-ignore -q -- "$_p" 2>/dev/null; _rc=$?
+    [ "$_rc" -eq 1 ] && continue
+    _up="${_meta% *}"; _up="${_up##* }"   # ":<mode> <mode> <old id> <new id> A" -> the new id
+    _lo="$(_ip_local_oid "$_f")"
+    [ "$_lo" = "$_up" ] && continue
+    _dest="$GITDIR/iteration-push-setaside/$_lo/$_p"
+    if [ -e "$_dest" ] || [ -L "$_dest" ]; then continue; fi
+    if mkdir -p -- "$(dirname -- "$_dest")" 2>/dev/null && cp -pP -- "$_f" "$_dest" 2>/dev/null \
+       && [ "$(_ip_local_oid "$_dest")" = "$_lo" ]; then
+      log "set-aside (g-306-581): ${_p} is ignored here but ${UPSTREAM} newly tracks it, so git's merge replaces it without a word — the local bytes are kept at ${_dest}; reconcile by hand, then delete the copy"
+    else
+      rm -f -- "$_dest" 2>/dev/null
+      log "set-aside (g-306-581): could NOT copy ${_p} aside intact — the merge replaces it with ${UPSTREAM}'s bytes (fail-open: the merge still runs)"
+    fi
+  done < <(git -C "$REPO" diff -z --raw --no-abbrev --no-renames --diff-filter=A "$_base" "$UPSTREAM" 2>/dev/null)
+  return 0
+}
+
 # --- FF-ONLY SYNC TICK (, ) ------------------------------
 # The out-of-loop floor. Syncing was a side effect of the loop, so a box running
 # none (an idle container, an assistant seat) never pulled: measured 2026-09-27
@@ -659,6 +718,7 @@ _ip_tick_churn_ff() {
     log "ff-only tick (dry-run): no loop runs here; would fast-forward ${_FF_BEHIND} commit(s) around ${#_dirty[@]} modified agents/* file(s), ${#_touched[@]} of them in the incoming range"
     soft_exit 0
   fi
+  _ip_setaside_ignored_overwrites  # : the churn tick, before it copies or checks out anything
   _from="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
   if [ "${#_touched[@]}" -eq 0 ]; then
     _out="$(git -C "$REPO" merge --ff-only -q "$UPSTREAM" 2>&1)"; _ffrc=$?
@@ -754,13 +814,15 @@ if [ "$FF_ONLY" = 1 ]; then
     log "ff-only tick (dry-run): would fast-forward ${_FF_BEHIND} commit(s) to $UPSTREAM"; soft_exit 0
   else
     _FF_FROM="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    _ip_setaside_ignored_overwrites  # : the clean tick fast-forward
     _FF_OUT="$(git -C "$REPO" merge --ff-only -q "$UPSTREAM" 2>&1)"; _FF_RC=$?
     if [ "$_FF_RC" -eq 0 ]; then
       log "ff-only tick: fast-forwarded ${_FF_BEHIND} commit(s) ${_FF_FROM}..$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo '?')"
       soft_exit 0
     fi
-    # git refuses rather than overwrite (an untracked file in the way, a race with a
-    # write that landed after the status check), so a refusal leaves the tree as it was.
+    # git refuses rather than overwrite (an untracked file in the way that no ignore rule
+    # covers, a race with a write that landed after the status check), so a refusal leaves
+    # the tree as it was. One an ignore rule covers was copied aside just above ().
     log "ff-only tick: merge --ff-only refused rc=${_FF_RC} — log only: $(printf '%s' "$_FF_OUT" | tail -n 1)"
     soft_exit 1
   fi
@@ -913,6 +975,8 @@ _ip_merge_upstream() {
   IP_MERGE_CONFLICT=0
   IP_CONFLICT_PATHS=""
   _head="$(git -C "$REPO" rev-parse --verify -q HEAD)"
+  # Before EITHER shape: git replaces an ignored local file UPSTREAM newly tracks, silently.
+  _ip_setaside_ignored_overwrites  # : before either merge shape
   # Capture, then match: `-h` exits 129, which pipefail would carry through a
   # pipe into grep and read as "unsupported".
   _usage="$(git -C "$REPO" merge-tree -h 2>&1)"
@@ -1985,9 +2049,10 @@ _ip_exclude_locally() {  # paths as args -> one anchored, glob-escaped line each
 # of truth for "this path is machine-local": upstream's .gitignore. HEAD's own rules
 # already make the same ignore decision for a path they cover, so pruning needs no
 # record of which run wrote a line, and it also clears the lines boxes wrote before
-# it existed. WHAT THIS DOES NOT FIX: while HEAD's rule still covers the path the
+# it existed. WHAT THIS DOES NOT STOP: while HEAD's rule still covers the path the
 # merge replaces the local copy all the same (the third row above), so a re-track
-# that lands before the rule is dropped is not stopped here ().
+# that lands before the rule is dropped still replaces it. _ip_setaside_ignored_overwrites
+# keeps those bytes first ().
 #   - Candidates are only lines in the exact shape _ip_exclude_locally writes: `/`
 #     plus a literal path whose glob characters are backslash-escaped. A comment, a
 #     glob, or a negation is somebody else's and is never touched.

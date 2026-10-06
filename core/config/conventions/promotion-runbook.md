@@ -60,6 +60,17 @@ exit 2 as a work list, not a blocker override prompt:
   exit 2 by design, so an EMPTY work list does not clear the gate. Set it only
   with the reconcile ledger written and cited in the PR body — measured v2.12.5
   and v2.12.47 (2026-09-02), both with zero unexplained residue.
+- **Triage the whole flagged population mechanically.** `promotion-plan-triage.sh`
+  parses lines of the form `<path>  (N dest-only line(s))`, so for a preflight DRIFT
+  build a flag log from the preflight's own REVIEW list plus its line-level files and
+  run it with `--prior-tag <last planted tag>`: v2.12.93 (2026-10-06) classified 2611
+  of 2611 paths SEED_MOTION with 0 authored residue, replacing the hand-built
+  last-writer census of v2.12.92. On a dest-frozen repo that reading is close to
+  tautological, so give the tool a negative control: clone the dest into session
+  scratch, commit one edit to a flagged file, and the same run must print AUTHORED
+  and exit 2 (it did; delete the clone). The preflight prints at most 3 target-only
+  lines per file; `promotion-preflight.py`'s `target_only_functional_lines(src, tgt,
+  rel, cap=N)` returns the gate's full set.
 
 ## Phase 2 — Cut the release
 
@@ -324,6 +335,18 @@ Run every item; each is a one-liner and each has caught a real defect:
      (known class);
    - a plant that flips prior baseline reds GREEN is evidence in its favor —
      name them.
+   - **Staging hops: run the bounded residue-subset check, not nothing and not the
+     full suite** (rb-12461; the scoped tier selected 678 of 1765 test files on
+     v2.12.93, the tier saying run the full one). Find the test files whose
+     functional content differs between the tag and the planted tree (AST equality
+     for `.py`, comment-stripped lines for the rest), normalize the two systematic
+     transforms (`MIND_` to `MIND_`, goal-id strip), and run what still differs at
+     the tag worktree and at an isolated clone of the dest at the plant commit
+     (`STORAGE_BACKEND=local`, `-m "not daemon_integration"`, `MIND_*` mirrored from
+     the `MIND_*` env), about 15 minutes wall clock. Diff the failing ids, then run
+     the dest-only ones at the PREVIOUS plant: only a red absent there is this hop's.
+     v2.12.93: 198 files, 18 dest-only failing ids in 11 files, the same 18 red at the
+     v2.12.92 plant, none new. State in the PR what was and was not examined.
 9. Transform-damage scan — did the transform DELETE something it should not
    have? This is the mirror of Phase 4: that phase reads lines the DEST carries
    and the seed lacks; this reads the other direction.

@@ -582,12 +582,12 @@ IF signal is not null:
     # Measured six times before this existed; the last three within ~30h by an
     # agent that had documented the failure each time, which is why the
     # corrective is wiring rather than another encoded rule (rb-745, guard-232).
-    # `.raw`, NOT `.json` — the extension is the purge marker (temp-store.md:214).
+    # `.raw`, NOT `.json` — the extension is the bulk-junk marker (temp-store.md).
     # This payload is spent script I/O: the knowledge lands in the experience
     # store via the consuming script, and the leftover file carries nothing.
-    # A bare `.json` here is EXEMPT from /drain-temp Phase 1.5's purge AND is
-    # enumerated by Phase 1 as a drainable working doc, so it is the one suffix
-    # that accumulates permanently — guard-1101 / guard-1034 / guard-3260 all
+    # A bare `.json` here is never decided in bulk: each one waits for a
+    # review by hand as a possible working doc, so it is the one suffix
+    # that piles up — guard-1101 / guard-1034 / guard-3260 all
     # prohibit exactly this write. THIS LINE PRESCRIBED IT ANYWAY, which is why
     # the population kept growing while three guardrails said not to: a
     # guardrail cannot outvote the instrument it guards (guard-1984). Measured

@@ -8,7 +8,10 @@ before the claim call. These tests pin the four properties that fix depends on:
 
   * it fires for a worker and never for the reducer (no BODY_WM_PATH);
   * nothing it prints reaches STDOUT, which carries the goal JSON every caller
-    parses (guard-3189: banner on stderr, payload on stdout);
+    parses (guard-3189: banner on stderr, payload on stdout). Since g-375-137 it
+    prints nothing at all while the claim is pending: its output is held in
+    _CLAIM_HELD_ERR and reaches stderr after the post-claim effects
+    (test_claim_closed_pipe_effects.py pins that emission end to end);
   * a failing pull never fails the claim (fail-soft);
   * it runs at top level between the query build and the claim call, so it
     precedes the claim, rather than inside _post_claim_effects (which runs after).
@@ -69,7 +72,8 @@ def _run(tmp_path: Path, body_wm: str | None, stub_rc: int = 0) -> tuple[subproc
     env["CORE_ROOT"] = str(core)
     if body_wm is not None:
         env["BODY_WM_PATH"] = body_wm
-    script = 'CORE_ROOT="$CORE_ROOT"\n' + _shipped_block() + '\necho "BLOCK-RC=$?" >&2\n'
+    script = ('CORE_ROOT="$CORE_ROOT"\n' + _shipped_block() + '\necho "BLOCK-RC=$?" >&2\n'
+              'printf "HELD<<%s>>\\n" "${_CLAIM_HELD_ERR:-}" >&2\n')
     proc = subprocess.run([BASH, "-c", script], env=env, capture_output=True, text=True, timeout=60)
     return proc, calls
 
@@ -83,8 +87,10 @@ def test_worker_pulls_with_no_push(tmp_path: Path) -> None:
 
 def test_pull_output_never_reaches_stdout(tmp_path: Path) -> None:
     proc, _ = _run(tmp_path, body_wm="/some/body-wm.yaml")
-    assert proc.stdout == "", "stdout carries the goal JSON; the pull must print to stderr"
-    assert "STUB-STDOUT line" in proc.stderr  # positive control: the stub did print
+    assert proc.stdout == "", "stdout carries the goal JSON; the pull must never print there"
+    live, held = proc.stderr.split("HELD<<", 1)
+    assert "STUB-STDOUT line" not in live, "the pull's output must be held, not printed live"
+    assert "STUB-STDOUT line" in held  # positive control: the stub did print, and it was kept
 
 
 def test_reducer_never_pulls_here(tmp_path: Path) -> None:

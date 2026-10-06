@@ -47,7 +47,7 @@ The LLM reads ranked output and applies Phase 2.5 metacognitive assessment.
    class_balance_bonus:  pull under-represented work_class up                  (weight: 0.8)
    per_goal_saturation:  penalty when the SAME goal_id fires rapidly           (weight: 0.8)
    cross_aspiration_support: support for goals that aid other aspirations      (weight: 0.5)
-   co_invest_alignment:  pair-iteration co-investment bias (disabled by default) (weight: 0.0; g-115-563)
+   co_invest_alignment:  retired by g-375-129; raw is always 0.0              (weight: 0.0)
    exploration_noise:    random(0,1) * epsilon * noise_scale    (weight: varies)
 
    TOTAL = sum(score * weight) + exploration_noise

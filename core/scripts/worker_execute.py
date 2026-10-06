@@ -1627,12 +1627,21 @@ def worker_view(rows, n, agent=None):
     LIFECYCLE_DISPOSITIONS["select"] forbids worker logic inside it
     (test_selection_stays_role_blind). Returns (kept rows, each carrying its
     verdict word; the census).
+
+    The census also names the scorer's own top pick (row 0, the goal the
+    selector's scorer-verdict sidecar records) and whether this walk DROPPED it.
+    The claim gate reads that pair (g-375-133): a worker that claims a kept row
+    over a top it was never allowed to take has not deviated from the scorer, and
+    without this record the gate refused it and sent the Body chasing the top.
     """
     kept, skipped, walked = [], 0, 0
+    top_dropped = False
     for row, word in eligibility_walk(rows, agent=agent):
         walked += 1
         if word == "reducer-only":
             skipped += 1
+            if walked == 1:
+                top_dropped = True
             continue
         kept.append(dict(row, verdict=word))
         if len(kept) >= n:
@@ -1642,6 +1651,8 @@ def worker_view(rows, n, agent=None):
               "eligible": words.count("eligible"),
               "undetermined": words.count("undetermined"),
               "reducer_only_skipped": skipped,
+              "scorer_top": rows[0].get("goal_id") if rows else None,
+              "scorer_top_dropped": top_dropped,
               "rows": [{"goal_id": r.get("goal_id"), "verdict": r["verdict"]} for r in kept]}
     return kept, census
 

@@ -256,9 +256,8 @@ def evicted_summary(removed):
 
 
 # Append-only sink, one JSON row per evicted capture entry. Sits beside the
-# agent's other durable archives rather than under temp/, which
-# temp-drain-purge deletes recursively after 120 minutes — staging is never
-# archiving.
+# agent's other durable archives rather than under temp/, a staging area whose
+# items are reviewed and then routed or deleted — staging is never archiving.
 CAPTURE_EVICTION_ARCHIVE = "capture-evictions-archive.jsonl"
 
 
@@ -366,6 +365,22 @@ def archive_evicted_captures(agent_dir, slot_name, removed_list, reason):
 # _EXCLUDE_DIRS-pruned and OwnCloudBackend._machine_local treats it as never on
 # the store, so there is no remote copy or fence for a local write to diverge from.
 EVICTION_ARCHIVE_CEILING = 2
+
+
+#  - byte-identical mirror of wm.py UNFLAGGED_RELAY_WARNING. THIS copy
+# is the LIVE one: append_slot returns it as the response `warning`, which
+# wm-append.sh prints. Plain ASCII with no double quote, backslash or newline on
+# purpose: the wrapper pulls it out of the one-line JSON response with a greedy
+# sed, so a quote inside it would cut the line the operator reads. Why the flag
+# is the delivery predicate for a Body capture: guard-6181.
+UNFLAGGED_RELAY_WARNING = (
+    "this sq-013 relay is UNFLAGGED, so it stays in the working memory of this "
+    "Body until the Body closes: only entries with load_bearing set to true are "
+    "mirrored to the carrier the reducer reads before then (guard-6181). If the "
+    "reducer needs it sooner (a defect another Body could hit, a correction to "
+    "an encoded belief, a blocking dependency), append it again with load_bearing "
+    "set to true; if delivery at close is soon enough, ignore this line."
+)
 
 
 def archive_evicted_capture_local(archive_file, slot_name, removed, reason):
@@ -1534,6 +1549,22 @@ def append_slot(ctx) -> "Response":  # type: ignore[name-defined]
         out["warning"] = (f"goals_completed_this_session was a {type(_healed_scalar).__name__} "
                           "(a counter's name or a last_*-style stamp written into the "
                           "top-level hand-off LIST); reset to [] before appending — find the writer")
+    # : an UNFLAGGED sq-013 relay on a Body WM waits for the Body to
+    # close. The fast lane mirrors load_bearing entries ONLY, and a box holding no
+    # RUNNING claim never pushes sessions/ (guard-1579), so on a parked or active
+    # worker "until close" can be never: 6 of 31 relays were stranded at one /stop
+    # (measured in ; guard-6181 states the rule). The response to the
+    # write that caused it is the last moment the writer can still flag the entry,
+    # and wm-append.sh's `warning` branch is the
+    # consumer that displays it. Routed-to-Body is decided exactly as the eviction
+    # archive above decides it. TWIN of wm.py cmd_append (a stderr line).
+    # `warning` must stay the LAST key of `out`: the wrapper's greedy sed reads to
+    # the final quote on the line.
+    if (root_slot_for_validation == "spark_capture" and isinstance(item, dict)
+            and item.get("sq_trigger") == "sq-013" and not item.get("load_bearing")):
+        _warn_sid = (ctx.headers.get("x-mind-sid") or "").strip()
+        if _warn_sid and _wm_path(ctx) == ctx.paths.body_wm_path(_warn_sid):
+            out["warning"] = UNFLAGGED_RELAY_WARNING
     return Response.json(out)
 
 

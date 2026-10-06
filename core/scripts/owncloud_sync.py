@@ -320,6 +320,22 @@ _EXCLUDE_NAMES = {
     # no append semantics. It is the only file of this name under world/ or
     # meta/ (find, 2026-09-28).
     "_summary.json",
+    # temp/ decision log (user directive 2026-10-05): agents/<agent>/temp/
+    # .temp-decisions.jsonl, the record of every review decision and every
+    # deletion in that temp/. The .lock companion rides the *.lock glob below.
+    #
+    # WHY MACHINE-LOCAL IS THE RIGHT CLASS HERE, per guard-3018 (read the
+    # CONSUMER): the only writer and reader is temp_decisions.py, called by
+    # temp-drain-purge.sh and precheck-eval.py on the same box. A decision is
+    # bound to the content fingerprint of THIS box's copy of a file, and each
+    # box's purge deletes only its own copies, so a peer's rows describe files
+    # this box may not have. The cross-box record is the drain's journal entry.
+    #
+    # NOT the guard-3018 hazard class: it is append-only, but it has no
+    # cross-box reader. Left synced, the claim-owner box would push it and the
+    # next owner would push its own log over it: an append log with no merge
+    # handler both-diverges and freezes.
+    ".temp-decisions.jsonl",
 }
 # Basename glob patterns never synced.
 _EXCLUDE_GLOBS = ("*.lock", "*.pyc", "*.tmp", "*.swp", "*~", "*.sock",

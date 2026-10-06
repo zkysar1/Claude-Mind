@@ -1,23 +1,26 @@
 # Temp Store Convention
 
-Canonical temp store for agent working documents pending drain to the
-knowledge tree. The single permitted write target for transient working
-files that used to scatter across `reports/` and ad-hoc locations.
+Canonical temp store for agent working documents and anything else awaiting
+review. The single permitted write target for transient working files that
+used to scatter across `reports/` and ad-hoc locations.
 
 - **Path**: `agents/<agent>/temp/`
 - **Lifecycle**: between-step staging — preserved across iterations,
-  compactions, and recovery; drained to the knowledge tree by the
-  `/drain-temp` skill (Phase 5 of the file-model normalization).
+  compactions, and recovery until a review decides each item (`/drain-temp`;
+  § The decision log). Nothing in `temp/` is deleted without a recorded
+  decision.
 - **Durability**: own-cloud S3-synced (git-ignored). The owncloud sweep
   pushes `temp/` to S3 like other governed agent state (it is not in
-  `_EXCLUDE_DIRS`), and `pull_temp` — folded into `pull_continuity`, run at
-  `/start` — resumes it on a machine-move via a prefix listing + the same
-  no-clobber freshness gate as session continuity. So temp/ working docs
-  survive a cross-machine agent move without waiting on a git round-trip.
+  `_EXCLUDE_DIRS`). Pulling it back is OPT-IN since g-115-4574:
+  `owncloud-pull.sh --with-temp` runs `pull_temp` (root `.md`/`.json` working
+  docs plus `drained/`, with the same no-clobber freshness gate as session
+  continuity); the default `/start` pull skips temp/, because sweeping it made
+  the pull's cost scale with scratch population. So a machine-moved agent's
+  temp/ stays in S3 until asked for — nothing is lost, it is just not local.
   ALL of `temp/` is gitignored (g-115-1765) — working docs, the `drained/`
   audit trail, pure ephemera (`.log`/`.txt`), and any ad-hoc scripts/subdirs.
   Durability is the S3 sync above, not git: `temp/` is a transient staging area
-  (everything drains to the tree or is discarded), so it does not belong on the
+  (every item is reviewed, then routed home or discarded), so it does not belong on the
   shared git surface — and cross-agent temp peeking is an anti-pattern anyway
   (see 'Searching temp/'). Only `.gitkeep` is tracked, to preserve the dir on a
   fresh clone. Unlike `session/`/`sessions/`, the ignore is now a portable
@@ -32,7 +35,7 @@ files that used to scatter across `reports/` and ad-hoc locations.
   reclaimed. Measured at the time: one agent's local temp went to 31 files / 60 MB
   while its S3 prefix held 23,125 objects / 3.33 GB. `temp-drain-purge.sh` now
   pipes its exact deleted set into `owncloud_sync.py --purge-propagate`
-  (`temp-drain-purge.sh:694`), which `delete_object()`s each key. Three
+  (its "Backend delete-propagation" block), which `delete_object()`s each key. Three
   properties worth knowing before relying on it:
   (a) it is **ownership-gated** — a non-owner box refuses every key, so the S3
   half of a purge is an owner-box act, which is also where residue accumulates;
@@ -60,9 +63,11 @@ invisible to `/prime` and `retrieve.sh` forever. A second, disconnected
 retrieval surface is not a style problem; it is lost knowledge.
 
 `temp/` resolves this by being explicitly a STAGING area, not an archive:
-every file in `temp/` either drains into the knowledge tree (the one
-long-term retrieval surface) or is discarded. Nothing in `temp/` is meant
-to live there permanently.
+every item in `temp/` gets a recorded review decision — its value goes to the
+knowledge tree (the one long-term retrieval surface) or another store, a
+script goes to a scripts folder, data worth keeping goes to a receipted
+archive, and the rest is discarded. Nothing in `temp/` is meant to live there
+permanently.
 
 ## temp/ vs session/scratch/
 
@@ -70,10 +75,10 @@ to live there permanently.
 |---|---|---|
 | Path | `agents/<agent>/temp/` | `agents/<agent>/session/scratch/` |
 | Scope | Agent-wide (not per-session) | Per-session |
-| Lifetime | Preserved until drained by `/drain-temp` | Wiped on `/start --recover` and recovery-gate auto-recovery |
-| Recovery | preserve (drain is the only deletion path) | clear (`session-manifest.yaml recovery_action: clear`) |
+| Lifetime | Preserved until a review decides it (`/drain-temp`) | Wiped on `/start --recover` and recovery-gate auto-recovery |
+| Recovery | preserve (a recorded review decision is the only deletion path) | clear (`session-manifest.yaml recovery_action: clear`) |
 | Content | Working documents with reuse value that DRAIN to the tree: analyses, briefings, audits, design docs, snapshots | IO buffers with no reuse value: probe dumps, JSON staging, one-shot work files |
-| Drain target | Knowledge tree / reasoning bank / experience | Nowhere — ephemeral by definition |
+| Drain target | Knowledge tree / reasoning bank / guardrails / experience; scripts to `world/scripts/` or `core/scripts/`; a receipted archive | Nowhere — ephemeral by definition |
 | Git | Gitignored — all of `temp/` except `.gitkeep` (g-115-1765); durability via S3 sync | Gitignored (`**/session/`) |
 | Cross-machine | Synced to S3 — survives an agent moving boxes | `sync_tier: machine_local` — **never leaves this box**; an agent that moves machines loses it outright |
 
@@ -165,8 +170,11 @@ the agent root — git history is their archive; phase-cost telemetry and the
 completion delta-baseline (`last-outcome-snapshot.yaml`) are operational state
 under `session/`. temp/ holds only working docs that DRAIN to the knowledge tree.)
 
-Flat directory with ONE structural exception: `drained/` (below). No
-other subdirectories, no goal-specific nesting, no ad-hoc scripts.
+Flat directory by convention. Its sanctioned folders are `drained/` (below)
+and receipted archive folders (§ D2); a script belongs in a scripts folder,
+and goal-specific nesting is discouraged. Anything else that lands here — a
+folder, a script, a log — is reviewed like every other item (§ The decision
+log), never deleted unseen.
 
 ## drained/ subdirectory
 
@@ -174,16 +182,18 @@ other subdirectories, no goal-specific nesting, no ad-hoc scripts.
 temp/drained/
 ```
 
-When `/drain-temp` (Phase 5) processes a file — extracting its value into
-the knowledge tree, reasoning bank, or experience archive — it moves the
-file to `temp/drained/` with its original name, leaving an audit trail of
-what was drained and when. `temp/drained/` contents older than 30 days
-carry zero retrieval value (their knowledge is in the tree). As of
-g-115-2948 this GC is **automated** — `temp-drain-purge.sh` **Lane 2**
-(`gc_drained_archive`) prunes `drained/` files older than `--drained-age-days`
-(default 30) on every run, via the same guarded `find -maxdepth 1 -type f
--mtime +N -delete` pattern (the `drained/` dir itself is always preserved).
-No separate maintenance goal is needed.
+When the review (`/drain-temp`) encodes or promotes an item — its value now in
+the knowledge tree, reasoning bank, guardrails or experience archive, or its
+code in a scripts folder — the temp copy moves to `temp/drained/` with its
+original name (no-clobber: `mv -n`, guard-1032). drained/ is a 30-day audit
+copy; the decision log is the permanent record of what went where and why.
+`temp/drained/` contents older than 30 days carry zero retrieval value (their
+knowledge is in its store). As of g-115-2948 this GC is **automated** —
+`temp-drain-purge.sh` **Lane 2** (`gc_drained_archive`) prunes `drained/` files
+older than `--drained-age-days` (default 30) on every run, via the same guarded
+`find -maxdepth 1 -type f -mtime +N -delete` pattern (the `drained/` dir itself
+is always preserved), and logs each deletion with `lane: drained-gc`. No
+separate maintenance goal is needed.
 
 **A citation protects an artifact in `drained/` too (g-306-102).** Lane 2
 exempts any file whose basename is cited by a durable record, the same
@@ -194,89 +204,137 @@ protection and made it age-deletable with no reference check at all. Two
 consequences worth knowing:
 
 - When the cited set cannot be determined, Lane 2 is **skipped entirely**
-  (deletes nothing, warns on stderr) rather than falling back. Lane 1 can
-  degrade to the pre-inversion allow-list because that is strictly
-  no-worse-than-before; Lane 2 has no allow-list to fall back to, so its only
-  no-worse option is to delete nothing. A zero `drained_gc_would_purge` under
+  (deletes nothing, warns on stderr) — and since 2026-10-05 so are Lanes 1
+  and 3, which once degraded to an older allow-list instead. A zero
+  `drained_gc_would_purge` (or `would_purge`, `stray_would_purge`) under
   `citation_lookup=="failed"` is a **not-run, not a clean run**.
 - Lane 2 emits per-file basenames as `drained_gc_files`, so the exemption is
   verifiable from outside — `durability-property-check.py cited-temp-not-purged`
-  now covers Lanes 1+2 rather than Lane 1 only. Lane 3 stays count-only by
-  nature: it deletes DIRS, and the cited set is keyed on file basenames.
+  covers all three lanes. Lane 3 publishes its folder names as `stray_dirs`
+  (2026-10-05) and joins on the same basename key, so it catches a folder
+  cited by its own path; a folder cited only through a file inside it is
+  refused upstream, when the review tries to decide it `discard`.
 
-The "no other subdirectories" rule
-above is likewise enforced by **Lane 3** (`cleanup_stray_dirs`): any dir
-DIRECTLY under `temp/` that is NOT `drained/` and is untouched past the
-`--age-min` guard (default 120 min) is removed via a per-dir-bounded guarded
-`find "$stray" -delete` — sweeping abandoned scratch subdirs (e.g. a leftover
-`gNNN-session/`) that neither the ephemera purge (`-type f`) nor the `.md`/
-`.json` drain ever reach.
+**Lane 3** (`cleanup_stray_dirs`) deletes a folder directly under `temp/` only
+when the review decided it `discard`, and only when nothing under it, at any
+depth, was touched within the `--age-min` guard (default 120 min) — via a
+per-dir-bounded guarded `find "$dir" -delete`. It never deletes `drained/`, a
+receipted folder, or a git repo holding unpushed commits or dirty tracked
+files (g-115-3648), and it fails closed when git cannot answer. Until
+2026-10-05 it removed EVERY folder untouched for 120 minutes, reviewed or not.
 
-## Everything that is not a content-bearing `.md`/`.json` — purged, not drained
+## The decision log — nothing is deleted until a review has seen it
 
-temp/ holds THREE file classes. One drains; the other two are purged. As of
-g-306-111 Lane 1 is **purge-by-default with exemptions**, not an allow-list of
-extensions — so the third class is bounded BY THE PREDICATE rather than by a
-list that goes stale on the next goal (see § The third class, below):
+User directive (2026-10-05), four principles:
 
-| Class | Extensions | Carries knowledge? | `/drain-temp` action |
-|---|---|---|---|
-| Drainable working docs | `.md`, `.json` (with content) | Yes — analyses, briefings, designs | **Exempt from purge.** Encode to tree/RB/experience, then move to `drained/` |
-| Pure ephemera | `.log`, `.txt`, `.py`, `.sh`, `.err`, `.raw`, `.out`, `.bak` — **common examples, NOT a closed list** (these 8 WERE the whole lane pre-g-306-111; they are now merely the frequent members of the row below) | No — test-suite output, tool dumps, one-off scratch scripts, raw command-output dumps, backup copies | **Purge (delete)** in Phase 1.5, once older than a 120-min age guard |
-| Empty scratch | ANY name **except dotfiles**, 0 bytes (`-empty`) | No — nothing was ever written | **Purge (delete)** in Phase 1.5, once older than the 120-min age guard |
-| **Third class** (the complement) | everything else — `.jsonl`, `.yaml`, `.xml`, `.tsv`, `.gz`, `.eml`, `.sha256`, and any suffix a goal invents | Sometimes | **Purge (delete)** past the same 120-min guard, UNLESS cited by a durable record (§ The third class (a)(1)) — **AND only when a completed drain postdates the file** (the `.drain-watermark` gate, 2026-08-21: no watermark → whole class exempt, fail-closed). Cited-but-unwrapped files survive so they can be promoted into a receipted dir. |
+1. **Nothing is deleted until a review has seen it** — scripts, logs and
+   folders too, not only odd file types.
+2. **The review has real destinations**: a script goes to `world/scripts/` or
+   `core/scripts/`, knowledge to the tree, lessons to the lesson stores, data
+   worth keeping to a receipted archive, and junk is deleted.
+3. **Every decision is recorded**, so anyone can see what was deleted and why.
+4. **Obvious junk is handled in bulk** — empty files and logs from finished
+   runs are decided by name in one pass, but still recorded one row each.
 
-> ⚠ **Anything that is not a content-bearing `.md`/`.json` is purged.**
-> Since g-306-111 the predicate in `core/scripts/temp-drain-purge.sh`
-> (`_purge_find_predicate`) is an INVERSION: it matches every depth-1 file
-> EXCEPT (i) dotfiles, (ii) `.md`/`.json` **with content** — 0-byte ones still
-> purge, since nothing was written to drain — and (iii) basenames cited by a
-> durable record. So `.py`, `.sh`, `.raw`, `.out`, `.bak`, 0-byte files, AND
-> every third-class suffix (`.jsonl`, `.yaml`, `.tsv`, `.gz`, one-offs a goal
-> invents) are all purged. A one-off helper script, a raw command-output dump
-> (`selector.raw`, `probe.out`), a `.bak`, a `.jsonl` scratch dump, or an empty
-> scratch file left in
-> `temp/` **will be deleted** once it is >120 min old. That is the intended
-> behaviour (these are ephemera), but do not leave a script or dump you want to
-> keep here — promote a script to `core/scripts/`/`world/scripts/`, and encode a
-> dump's value (or move it out) before it ages past the guard. **Dotfiles (names
-> starting with `.`) are EXCLUDED from both lanes** (`! -name '.*'`): temp/'s
-> tracked 0-byte `.gitkeep` (and any dotfile marker) is protected from the
-> `-empty` lane — else the drain would delete the only git-tracked file in temp/
-> and iteration-commit would commit the deletion, breaking the fresh-clone dir
-> guarantee above (g-115-2947 fresh-eyes catch). This table and the `find_expr`
-> glob in `temp-drain-purge.sh` MUST be updated together.
+**The log.** `temp/.temp-decisions.jsonl`, append-only, written only by
+`core/scripts/temp_decisions.py` (run it as `temp-decisions.sh`) under a local
+lock. A decision row is `{ts, item, kind, bytes, files?, fp, decision, why,
+where?, by, host}`; the purge appends a deletion row after each delete,
+`{ts, item, kind, event: "deleted", lane, why, fp?, bytes?, by, host}`.
+`temp-decisions.sh show` reads it back (`--deleted`, `--item`, `--since`).
+It is **machine-local by design**: it describes this box's `temp/`, and each
+box's purge deletes only its own files, so it is excluded from the own-cloud
+sweep (`owncloud_sync._EXCLUDE_NAMES`) and written with plain local I/O. The
+cross-box record of a review is its journal entry.
 
-**The third-class watermark (ENCODE-BEFORE-DELETE, 2026-08-21).** The inversion
-above now runs in two tiers. The 8 enumerated ephemera extensions + 0-byte
-empties purge at bare age, as always — those classes are knowledge-free by the
-drain skill's own definition. The **third class** (every OTHER suffix) is
-additionally gated on `temp/.drain-watermark`: a third-class file purges only
-when a **completed** `/drain-temp` pass postdates it (mtime ≤ watermark), i.e.
-the LLM provably enumerated it, had its chance to classify/encode, and
-declined. No watermark on a box → the whole third class is exempt there
-(fail-closed; the purge surface degrades to exactly the pre-inversion lane).
-The watermark is written by `/drain-temp` Phase 4 at completion — never under
-`--dry-run` or `--file`, since a targeted single-doc drain classifies nothing
-but its target. Callers may override via `--third-class-watermark <ISO|none>`;
-the JSON reports `watermark` + `watermark_source` (`flag|file|absent|invalid|
-disabled|n/a`) so a cadence caller can log which gate state a run executed
-under. This preserves g-306-111's bound (the class can no longer accrue
-unboundedly — every completed drain advances the watermark past everything it
-saw, and `/drain-temp` invokes the purge in the same run) while restoring the
-user-directed invariant that no file with possible knowledge value is ever
-deleted by a machine that cannot read it: deletion is downstream of encoding,
-never a substitute for it.
+| Decision | Means | `where` |
+|---|---|---|
+| `discard` | junk, already encoded, superseded or a duplicate — the purge deletes it | — |
+| `encode` | its value now lives in a store (tree, reasoning bank, guardrail, experience, a locator file, an applied goal); the temp copy moves to `drained/` | required |
+| `promote` | the script now lives in `world/scripts/` or `core/scripts/`; the temp copy moves to `drained/` | required |
+| `archive` | data worth keeping that no record can absorb; it moves into a receipted folder `temp/<slug>/` (§ D2 below) | required |
+| `keep` | still in use by open work; comes back for review after 30 days | — |
+
+Every decision carries a `why` naming its evidence.
+
+**Which decision is in force**: the latest decision row after the item's last
+deletion row — and only while the item still matches what was reviewed. The
+fingerprint is the `sha256` of a file's content; for a folder, a hash over
+every file's (relative path, size, mtime_ns), a stat walk that stays cheap on
+large folders. An item edited after its review is pending again, and an
+`encode` / `promote` / `archive` whose move never happened stays pending as
+`decided-not-executed`.
+
+**In flight**: an item touched within 120 minutes — for a folder, its newest
+entry at any depth — is not reviewed, not counted as pressure and never
+purged. One rule, applied identically in all three places.
+
+**What `decide` refuses** (a batch is all-or-nothing): a dotfile, `drained/`, a
+name with a path separator or control character, a git-tracked file, a missing
+`why` (or `where` where required), and — for `discard` — a receipted folder, a
+folder whose git repo has unpushed or dirty work (or cannot be read), a cited
+item, or anything at all while the cited set cannot be read. A discard the
+purge would LATER refuse (the item became cited, a folder gained git work)
+returns to review as `discard-blocked: <why>`, so no decision sits forever as
+"awaiting purge".
+
+**Bulk junk** (`temp-decisions.sh bulk-junk`): aged 0-byte files and aged
+`.log` / `.out` / `.err` / `.raw` files, one row each, `by: bulk-junk`. Never a
+folder, a dotfile, a cited or git-tracked file, or an item that already has a
+decision in force. `.txt` and `.bak` are deliberately not on the list — each is
+as often a note or a safety copy as a dump, so they are reviewed one by one.
+A suffix missing from the list only means the item is reviewed individually,
+which is the safe direction.
+
+**What the purge deletes** (`temp-drain-purge.sh`, the only deletion path):
+
+- **Lane 1** — each file `temp_decisions.py deletable` lists (a `discard` in
+  force whose fingerprint still matches, not cited, not tracked), via
+  `find <that path> -maxdepth 0 -type f ! -name '.*' ! -name <cited>… -mmin
+  +120 -delete`, so its guards are re-read inside the delete itself.
+- **Lane 2** — `drained/` files older than 30 days, except cited or tracked
+  ones (§ drained/ above).
+- **Lane 3** — each folder `deletable` lists, when nothing under it was
+  touched within 120 minutes; never a receipted folder or a repo with
+  unpushed or dirty work.
+- **Lane 0** — reports unmanaged dotfiles and deletes nothing. The managed
+  ones: `.gitkeep`, `.archive-marker`, `.temp-decisions.jsonl`,
+  `.temp-decisions.lock`.
+
+Every deletion is appended to the log (`deletions_logged`, `deletion_log`) and
+propagated to the shared store (above). The purge fails CLOSED: if the decision
+log or the cited set cannot be read, Lanes 1 and 3 delete nothing
+(`decisions_lookup` / `citation_lookup` = `"failed"`), and an unreadable cited
+set skips Lane 2 too. **Dotfiles are never decided and never deleted**: the
+git-tracked 0-byte `.gitkeep` keeps `temp/` alive on a fresh clone, and deleting
+it would have iteration-commit commit the deletion (g-115-2947).
+
+**History.** Until 2026-10-05 the purge decided by itself. First an allow-list
+(`.log`, `.txt`, `.py`, `.sh`, `.err`, `.raw`, `.out`, `.bak` and 0-byte files,
+at 120 minutes); then, from g-306-111 (2026-07-31), an inversion that purged
+every file except content-bearing `.md`/`.json` and cited names; then, from
+2026-08-21, a `.drain-watermark` gate over the "third class" of other suffixes.
+Scripts sat in the purged set the whole time and nothing recorded what went: by
+2026-07-29, 20 cited `.py` files had been deleted under the tree nodes citing
+them (tree node `temp-store-reference-integrity`). The watermark's own failure —
+a license by TIME that condemned files no pass had looked at, measured
+`would_purge` 0 -> 31 on recovery layers — is recorded in
+`core/config/rationale/third-class-watermark-gate.md` (guard-4864). The lesson
+the decision log is built on: a deletion license must NAME the items it
+covers. The purge removes a leftover `.drain-watermark` once and logs it as a
+`migration` deletion. The invariant the watermark was reaching for still holds,
+now by construction: no item with possible value is deleted by a machine that
+cannot read it — deletion is downstream of review, never a substitute for it.
 
 **Raw command-output dumps** (redirecting `goal-selector.sh`, `retrieve.sh`, a
 `/tree` summary, or any script's stdout to a file for inspection) are IO buffers
 with no reuse value — per the `temp/ vs session/scratch/` table above they
 belong in `session/scratch/`, not `temp/`. When convenience lands one in `temp/`,
 name it with a `.raw` or `.out` extension (`selector.raw`, NOT `selector.json`)
-so Phase 1.5 **purges** it, rather than Phase 1 enumerating a bare `.json` as a
-drainable working doc and Phase 3 archiving megabytes of valueless scratch into
-`drained/`. The extension is the stable purge marker; a bare-named `.json` dump
-is treated as a working doc and drained. (g-115-2947)
+so the review's bulk-junk pass **decides it by name**, rather than a reviewer
+having to open a bare `.json` as a possible working doc. The extension is the
+stable bulk-junk marker; a bare-named `.json` dump is reviewed one by one.
+(g-115-2947)
 
 **THE DESTINATION ABOVE IS SAFE FOR SMALL, FAST DUMPS AND UNSAFE FOR LONG OR
 LARGE ONES — and the split is `session/` vs `sessions/`, one character.**
@@ -314,7 +372,7 @@ that actually accumulates.** Everything above says "output" — dumps, stdout,
 doc, and the rule above then converts it into permanent residue. An input payload
 is an IO buffer with no reuse value on exactly the same grounds as an output dump:
 once the command has run, the store holds the effect and the buffer holds nothing.
-Name it `.raw`/`.in`, or write it to `session/scratch/`.
+Name it `.raw` (bulk junk decides it once aged), or write it to `session/scratch/`.
 
 Measured 2026-08-16 (echo, cc-03, g-001-84): 153 of 209 root files in one temp/
 were one-shot command IO — 84 outputs, correctly `.raw`-named and purgeable, and
@@ -328,13 +386,17 @@ goals genuinely do not exist, and the cause is deliberate refusal, not loss:
 echo's `goal-duplication-gate` blocked 719 filings in the same window. So the
 payloads are refused-draft residue that the drain lane must never encode and
 cannot archive — a file class with no exit. Correct naming at write time is the
-only place this is cheap to fix. (g-001-84)
+only place this is cheap to fix. (g-001-84) Since 2026-10-05 the class has an
+exit, though not a cheap one: `absent` no longer blocks a discard outright, so
+the review records `discard` with the store-wide evidence that the goal was
+refused rather than lost.
 
 Pure ephemera lands in temp/ legitimately — one-shot tool dumps
 (`leak-check.txt`) and the like. LONG-RUNNING output does not: guard-6416
 moved the suite-log guidance off the synced tree, because the sync layer
-replaces a file under a live fd. These files have nothing to encode, so `/drain-temp`
-DELETES them rather than archiving to `drained/`: all of `temp/` (including
+replaces a file under a live fd. These files have nothing to encode, so the review
+decides them `discard` (bulk junk does most by name) rather than moving them to
+`drained/`: all of `temp/` (including
 `drained/`) is gitignored (g-115-1765), so archiving untracked ephemera into
 `drained/` would only relocate slush between two ignored paths. Deletion loses
 no history — there is none to lose (nothing under `temp/` is git-tracked). The
@@ -343,29 +405,29 @@ ONLY in a machine-local `.git/info/exclude`, which did not travel to fresh
 boxes — so temp/ committed there every iteration until g-115-1765 moved the
 ignore into the shared `.gitignore`.
 
-Both classes feed the aspirations-precheck temp-pressure signal
-(`core/scripts/precheck-eval.py` `cmd_temp_pressure`): `count` (docs) +
-`ephemera_count` (.log/.txt) = `pressure_count`, which drives the warn / drain
-thresholds. Before g-115-1727 the metric AND the drain glob both saw only
-`.md`/`.json`, so ephemera-only accumulation was invisible to both and grew
-unbounded — the exact slush-directory failure mode this convention exists to
-prevent, for the one file class the drain missed.
+The aspirations-precheck temp-pressure signal (`core/scripts/precheck-eval.py`
+`cmd_temp_pressure`) counts the review's own population through
+`temp_decisions.pressure_counts`: items that need a decision — never `drained/`,
+dotfiles, git-tracked files, receipted folders, kept items, discards awaiting
+the purge, or in-flight items, all of which its summary reports separately.
+`pressure_count` drives the warn / drain thresholds, so the trigger falls when
+the review runs; a count that includes what no review can clear re-files the
+review forever (guard-5329). History: before g-115-1727 the metric saw only
+`.md`/`.json`; from then until 2026-10-05 it added ephemera suffixes with no age
+guard, counting files the purge would delete unreviewed.
 
-The 120-min purge age guard protects an actively-written `suite.log` from an
-in-flight run (the daemon-safe full suite is ~32 min); a just-completed log is
-purged on the next drain cycle. The temp-pressure metric applies NO age guard —
-it counts all ephemera so a recent slush still triggers the drain that will
-later purge it.
+The 120-minute in-flight guard protects an actively-written file — a running
+suite's log, a script still being edited — in all three places: it is not
+reviewed, not counted and not purged until it has been quiet for 120 minutes.
 
 ### The purge MUST go through the guarded helper — never a hand-rolled `rm`
 
-The Phase 1.5 purge MUST call `core/scripts/temp-drain-purge.sh` — the canonical
-GUARDED purge path. Do NOT hand-roll an `rm` (or reconstruct the find/rm inline)
-on a temp-dir variable. The helper asserts the temp dir is set + non-empty,
+Every deletion in `temp/` MUST go through `core/scripts/temp-drain-purge.sh` — the
+canonical GUARDED purge path. Do NOT hand-roll an `rm` (or reconstruct the find/rm
+inline) on a temp-dir variable. The helper asserts the temp dir is set + non-empty,
 absolute, strictly under `PROJECT_ROOT`, and `basename=='temp'` BEFORE any
-deletion, then deletes via `find … -maxdepth 1 -type f (ephemera globs) -mmin
-+120 -delete` — never a per-file `rm` on an interpolated path (and `-maxdepth 1`
-leaves `drained/` untouched).
+deletion, then deletes each reviewed discard via a bounded `find <path>
+-maxdepth 0 … -delete` — never a per-file `rm` on an interpolated path.
 
 WHY (g-115-1876): a hand-rolled `rm -f "$TEMP_DIR/$f"` where `$TEMP_DIR` resolves
 empty becomes an `rm` on a root-relative path, which Claude Code flags as a
@@ -376,11 +438,11 @@ while hanging at zero progress until a human intervenes — an agent hung 46+ mi
 this way (observed 2026-07-09, cc-05). The guarded helper eliminates the whole
 hand-rolled-rm class: there is exactly one purge path, and it fails loud
 (non-zero exit, deletes nothing) rather than ever issuing a dangerous rm.
-Regression-guarded by `core/scripts/tests/test_temp_drain_purge.sh` (8 guard
-cases + a dry-run smoke + purge-lane behavior tests that assert the two lanes
-— ephemera extensions and 0-byte empties — purge while content-docs, fresh
-files, and `drained/` contents are excluded, run against the SSOT
-`_purge_find_predicate` function).
+Regression-guarded by `core/scripts/tests/test_temp_drain_purge.sh` (the guard
+cases, a dry-run smoke, and lane tests asserting that only reviewed discards go
+while undecided, in-flight, cited and changed-since-review items stay, run
+against the SSOT `_purge_find_predicate` function) and
+`core/scripts/tests/test_temp_decisions.py` (the decision log itself).
 
 **General rule (applies beyond temp):** any framework guidance that has an agent
 construct an `rm` on a variable path MUST guard the variable (set + non-empty +
@@ -390,7 +452,14 @@ the dialog it triggers cannot be answered by an autonomous agent.
 
 ## The third class: promotion threshold + durable home (D2 decision)
 
-Both lanes above are **allow-lists**. Drain matches `.md`/`.json`; purge matches
+> **Read this section as history plus two live definitions.** It was decided
+> on 2026-07-31, when the purge still chose what to delete by suffix; that
+> lifecycle half is superseded by § The decision log, and its present-tense
+> descriptions of lanes are the mechanism of that time. What still governs is
+> (a) the load-bearing threshold and (b) the receipted-folder home — together,
+> the review's `archive` decision.
+
+Both lanes above were **allow-lists**. Drain matches `.md`/`.json`; purge matches
 eight named extensions plus 0-byte. Everything else is the COMPLEMENT of two
 enumerated sets, so the third class is unbounded *by construction* — not by
 oversight. An extension list can never close it, because its members are
@@ -561,6 +630,7 @@ at write time by the Phase-4 hard gate
 | Completion-report dashboard (latest pointer) | `COMPLETION-REPORT.md` at the agent root (git history is its archive) |
 | **Analyses, briefings, audits, design docs, snapshots** (working docs that DRAIN to the tree) | **`temp/`** — the home for the working docs that used to scatter into `reports/` |
 | Agent identity, config, aspiration queue | The registered top-level agent files only (`self.md`, `*.jsonl`, `*.yaml`, …) |
+| A script or tool you will run again | Not the agent dir: `world/scripts/` (domain) or `core/scripts/` (framework, git-tracked); what it knows goes to the tree. A shell `mkdir` here is not exempt, because this gate sees only Write/Edit (guard-7598) |
 
 **Permitted top-level directories** under `agents/<agent>/`:
 `session`, `sessions`, `journal`, `experience`, `.history`, `temp`.

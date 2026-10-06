@@ -83,17 +83,56 @@ def test_cited_file_scheduled_for_purge_fails(dpc, monkeypatch, capsys):
 
 
 def test_degraded_citation_lookup_fails(dpc, monkeypatch, capsys):
-    """citation_lookup=='failed' => exemptions never applied.
+    """citation_lookup=='failed' => the cited set was unknown.
 
-    The intersection is EMPTY here and the check must still fail: under the
-    legacy allow-list a cited .py/.log/.txt carries no `! -name` exemption at
-    all, so an empty overlap is evidence of nothing.
+    The intersection is EMPTY here and the check must still fail: the purge
+    deletes nothing it cannot check (since 2026-10-05; before, it fell back to
+    an allow-list with no exemptions), so an empty overlap is evidence of
+    nothing either way.
     """
     monkeypatch.setattr(dpc, "_run",
                         lambda *a, **k: _completed(_purge_json(["a.py"], "failed")))
     monkeypatch.setattr(dpc, "_cited_basenames", lambda: {"unrelated.md"})
     assert dpc.check_cited_temp_not_purged(None) == 1
-    assert "INACTIVE" in capsys.readouterr().out
+    assert "never exercised" in capsys.readouterr().out
+
+
+def test_unreadable_decision_log_is_not_a_pass(dpc, monkeypatch, capsys):
+    """decisions_lookup=='failed' => Lanes 1 and 3 listed nothing by construction.
+
+    The cited set is non-empty and the lists do not overlap it, so removing the
+    branch under test reaches PASS and returns 0 — that is what makes this pin
+    go red on mutation (guard-1629/guard-1631)."""
+    payload = json.loads(_purge_json([], drained_gc_files=[]))
+    payload["decisions_lookup"] = "failed"
+    monkeypatch.setattr(dpc, "_run", lambda *a, **k: _completed(json.dumps(payload)))
+    monkeypatch.setattr(dpc, "_cited_basenames", lambda: {"evidence.md"})
+    assert dpc.check_cited_temp_not_purged(None) == 1
+    out = capsys.readouterr().out
+    assert "decisions_lookup" in out and "the property holds" not in out
+
+
+def test_cited_folder_in_lane3_fails(dpc, monkeypatch, capsys):
+    """Lane 3 publishes the decided folders it would delete (2026-10-05); a
+    folder cited by its own path must FAIL. Lanes 1 and 2 are clean on purpose,
+    so only the Lane 3 join can make this red."""
+    payload = json.loads(_purge_json(["junk.log"], drained_gc_files=[]))
+    payload["stray_dirs"] = ["evidence-run", "old-scratch"]
+    monkeypatch.setattr(dpc, "_run", lambda *a, **k: _completed(json.dumps(payload)))
+    monkeypatch.setattr(dpc, "_cited_basenames", lambda: {"evidence-run"})
+    assert dpc.check_cited_temp_not_purged(None) == 1
+    out = capsys.readouterr().out
+    assert "Lane 3" in out and "evidence-run" in out
+
+
+def test_lane3_clean_is_counted_in_the_pass_line(dpc, monkeypatch, capsys):
+    payload = json.loads(_purge_json(["junk.log"], drained_gc_files=[]))
+    payload["stray_dirs"] = ["old-scratch"]
+    monkeypatch.setattr(dpc, "_run", lambda *a, **k: _completed(json.dumps(payload)))
+    monkeypatch.setattr(dpc, "_cited_basenames", lambda: {"evidence.md"})
+    assert dpc.check_cited_temp_not_purged(None) == 0
+    out = capsys.readouterr().out
+    assert "Lanes 1+2+3" in out and "1 Lane-3 folder(s)" in out
 
 
 def test_na_citation_lookup_is_not_a_pass(dpc, monkeypatch, capsys):

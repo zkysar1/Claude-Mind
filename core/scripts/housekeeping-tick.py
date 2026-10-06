@@ -8,10 +8,11 @@ moves the mechanical purge's TRIGGER off the goal scorer — which ranks
 janitorial work last BY DESIGN, the measured root cause of the whole backlog
 (g-115-3319: the open drain goal ranked #120 of 151 for weeks while pressure
 grew 18x; 14 drains completed Jun-Jul, then the lane starved). Nothing about
-WHAT deletes changed: `temp-drain-purge.sh` and its six guards, four lanes,
-citation exemption and third-class watermark are untouched — only the thing
-that decides WHEN it runs. The LLM drain (/drain-temp) deliberately stays
-goal-driven: encoding needs a mind; deleting enumerated ephemera does not.
+WHAT deletes changed: `temp-drain-purge.sh` and its guards and lanes are
+untouched — only the thing that decides WHEN it runs. Since 2026-10-05 the
+purge deletes only what a review decided (temp_decisions.py), so an armed tick
+executes reviewed discards and never decides one. The LLM drain (/drain-temp)
+stays goal-driven: deciding needs a mind; executing a recorded decision does not.
 
 PER-BOX + PER-BOUND-AGENT, deliberately. Read the cadence comment on the
 iteration-close siblings before copying either pattern: cold-snapshot's stamp
@@ -28,7 +29,8 @@ core/logs/housekeeping-<agent>.jsonl — never a default.
 
 LANES
   A  `temp-drain-purge.sh` for the BOUND agent (--dry-run under shadow).
-     `citation_lookup != "ok"` ⇒ verdict DEGRADED — recorded, WARNed, and in
+     `citation_lookup` or `decisions_lookup` != "ok", or `deletion_log` ==
+     "failed" ⇒ verdict DEGRADED — recorded, WARNed, and in
      armed mode ONE deduped Investigate filed. A degraded run NEVER records as
      clean: the purge's own header says a low would_purge under a failed
      lookup is "unmeasured, not clean" (guard-2298 silent-zero class), and a
@@ -283,14 +285,19 @@ def run_lane_a(shadow: bool, purge_cmd: list[str] | None = None) -> dict:
     keep = {k: data.get(k) for k in (
         "purged", "would_purge", "drained_gc_purged", "drained_gc_would_purge",
         "stray_purged", "stray_would_purge", "stray_preserved_git",
-        "unmanaged_dotfiles", "watermark", "watermark_source",
-        "citation_lookup", "dry_run", "temp_dir")}
+        "unmanaged_dotfiles", "decisions_lookup", "citation_lookup",
+        "deletions_logged", "deletion_log", "dry_run", "temp_dir")}
     keep["files"] = (data.get("files") or [])[:50]
+    keep["stray_dirs"] = (data.get("stray_dirs") or [])[:50]
     keep["stray_preserved_git_dirs"] = data.get("stray_preserved_git_dirs") or []
-    # THE LOAD-BEARING CLASSIFICATION: a failed citation lookup means Lane 1
-    # ran degraded and Lane 2 was skipped — the numbers above are UNMEASURED,
-    # not clean, and this verdict is what stops them being logged as ok.
-    keep["verdict"] = "ok" if keep.get("citation_lookup") == "ok" else "degraded"
+    # THE LOAD-BEARING CLASSIFICATION: a failed citation or decision lookup
+    # means Lanes 1 and 3 deleted nothing (and a failed citation lookup skips
+    # Lane 2) — the numbers above are UNMEASURED, not clean. A failed deletion
+    # log means files went with no record of why. This verdict is what stops
+    # either being logged as ok.
+    keep["verdict"] = ("ok" if keep.get("citation_lookup") == "ok"
+                       and keep.get("decisions_lookup") == "ok"
+                       and keep.get("deletion_log") != "failed" else "degraded")
     return keep
 
 

@@ -111,7 +111,9 @@ ADVISORY_PREFIX = "[defer-self-artifact] ADVISORY"
 NARRATIVE_FIELDS = ("progress_note", "outcome_note", "outcome_notes", "description")
 BIND_WINDOW = 160
 
-_GOAL_ID_RE = re.compile(r"^g-\d{3}-\d{1,5}$")
+# The sequence is a growing counter, so it carries no upper bound (guard-1161):
+# an id this rejects falls through to evaluate()'s no-op ALLOW, unchecked.
+_GOAL_ID_RE = re.compile(r"^g-\d{3}-\d+$")
 _CC_TYPES = r"(?:feat|fix|chore|docs|refactor|test|tests|perf|build|ci|revert|style)"
 # A PR ref: "PR #528", "PR 528", "pull request #528", ".../pull/528", or a bare
 # "#528" (two digits minimum, so list ranks like "#1" never count).

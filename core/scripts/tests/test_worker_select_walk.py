@@ -19,6 +19,8 @@ THE CONTRACT PINNED HERE:
   4. The census is written only into an existing session dir.
   5. A supply-gap park is refused, exit 5, until every census row is claimed or
      declined by id with a reason; the reducer-gone park is unchanged.
+  6. The census names the scorer's top pick and whether the walk dropped it; the
+     claim gate reads that pair (g-375-133).
 """
 from __future__ import annotations
 
@@ -89,6 +91,17 @@ def test_the_scorer_order_is_kept_and_every_row_names_its_verdict():
     assert "verdict" not in ranked[0], "the selector's rows are not mutated"
 
 
+def test_the_census_names_the_scorer_top_and_whether_the_walk_dropped_it():
+    """Row 0 is the goal the selector's scorer-verdict sidecar records as its top
+    pick. Only a drop of THAT row counts; a dropped row below it does not."""
+    _, census = we.worker_view([_row(0, skill="/reflect"), _row(1), _row(2)], 10)
+    assert (census["scorer_top"], census["scorer_top_dropped"]) == ("g-900-00", True)
+    _, census = we.worker_view([_row(0), _row(1, skill="/reflect"), _row(2)], 10)
+    assert (census["scorer_top"], census["scorer_top_dropped"]) == ("g-900-00", False)
+    _, census = we.worker_view([], 10)
+    assert (census["scorer_top"], census["scorer_top_dropped"]) == (None, False)
+
+
 def test_the_agent_queue_claim_probe_runs_once_per_walk(monkeypatch):
     calls = []
 
@@ -128,6 +141,8 @@ def test_select_walk_prints_the_kept_rows_the_census_and_the_selector_banners(
     assert "1 reducer-only row(s) among the first 4 dropped BEFORE the cut" in cap.err
     doc = json.loads((sess / we.SELECT_CENSUS_FILENAME).read_text(encoding="utf-8"))
     assert doc["sid"] == SID and [r["goal_id"] for r in doc["rows"]] == ["g-900-01", "g-900-02", "g-900-03"]
+    assert (doc["scorer_top"], doc["scorer_top_dropped"]) == ("g-900-00", True), \
+        "the file the claim gate reads carries the pair"
 
 
 def test_select_walk_refuses_top_zero_and_reports_a_failed_selector(monkeypatch, capsys):

@@ -138,10 +138,12 @@ def test_bad_input_fails_to_tier1_never_tier2():
 
 # ─── 2 + 3. the gate's rc contract, as a subprocess ────────────────────────
 
-def _run_gate(goal, tmp_path, env_extra=None, extra_args=()):
+def _run_gate(goal, tmp_path, env_extra=None, extra_args=(), env_drop=()):
     gj = tmp_path / "goal.json"
     gj.write_text(json.dumps(goal), encoding="utf-8")
     env = dict(os.environ)
+    for k in env_drop:
+        env.pop(k, None)
     env["STORAGE_BACKEND"] = "local"          # guard-955
     # Redirect the override audit ledger into tmp. Without this the two
     # override tests below APPEND TO THE PRODUCTION LEDGER — measured, 20
@@ -162,11 +164,65 @@ def _run_gate(goal, tmp_path, env_extra=None, extra_args=()):
     )
 
 
-def test_gate_is_DORMANT_by_default(tmp_path):
-    """Ship default: both flags off -> noop, rc 0, whatever the goal looks like."""
-    r = _run_gate(_goal(priority="HIGH"), tmp_path)
-    assert r.returncode == 0
-    assert '"decision": "noop"' in r.stdout
+def _decisions(stdout):
+    """(check, decision) for every JSON line the gate printed. With check B on by
+    default, a close can print a note-marker line AND a tier line, so a bare
+    '"decision": "pass"' substring no longer says which check passed."""
+    out = []
+    for ln in stdout.splitlines():
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            out.append((d.get("check"), d.get("decision")))
+    return out
+
+
+# THE SHIPPED POSTURE (): check A off, check B on. These tests read the
+# REAL core/config/aspirations.yaml, and drop both env overrides first, because an
+# override can only switch a flag ON and a set one would hide a wrong shipped value
+# (guard-6333). Mutation pins: reverting note_marker_enabled turns only the refusal
+# test red; flipping enabled turns only the check-A test red; the clean-note test is
+# the control and stays green under both.
+_SHIPPED = ("CLOSE_REVIEW_GATE_ENABLED", "CLOSE_REVIEW_NOTE_MARKER_ENABLED")
+_NOT_DONE = "REOPENED BY ITS OWN CRITERIA - do not re-close on a diagnosis."
+
+
+def test_shipped_config_REFUSES_a_HIGH_not_done_note(tmp_path):
+    r = _run_gate(_goal(outcome_note=_NOT_DONE), tmp_path, {"MIND_AGENT": "nobody"},
+                  env_drop=_SHIPPED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "REFUSED" in r.stderr
+    assert ("note-marker", "block") in _decisions(r.stdout)
+
+
+def test_shipped_config_passes_a_clean_note(tmp_path):
+    """The control for the refusal above: same call, a note that says the work is
+    done. It passes whether check B is on or off."""
+    r = _run_gate(_goal(outcome_note="All three outcomes MET; sources below."), tmp_path,
+                  {"MIND_AGENT": "nobody"}, env_drop=_SHIPPED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REFUSED" not in r.stderr
+
+
+def test_shipped_config_leaves_check_A_off(tmp_path):
+    """A tier-2 goal with no verdict closes: check A ships off until the blockers
+    recorded in aspirations.yaml land."""
+    r = _run_gate(_goal(priority="HIGH"), tmp_path, {"MIND_AGENT": "nobody"},
+                  env_drop=_SHIPPED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [d for d in _decisions(r.stdout) if d[0] == "tier"]
+
+
+def test_note_marker_pass_is_logged(tmp_path):
+    """A clean note logs a note-marker pass, so a quiet field window reads as
+    ran-and-passed (guard-5501). Turned on by env so this pins the emit alone, not
+    the shipped flag."""
+    r = _run_gate(_goal(outcome_note="All three outcomes MET; sources below."), tmp_path,
+                  {"CLOSE_REVIEW_NOTE_MARKER_ENABLED": "1", "MIND_AGENT": "nobody"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert ("note-marker", "pass") in _decisions(r.stdout)
 
 
 def test_gate_REFUSES_tier2_without_verdict(tmp_path):
@@ -182,7 +238,7 @@ def test_gate_PASSES_tier1_when_enabled(tmp_path):
     r = _run_gate(_goal(), tmp_path,
                   {"CLOSE_REVIEW_GATE_ENABLED": "1", "MIND_AGENT": "nobody"})
     assert r.returncode == 0
-    assert '"decision": "pass"' in r.stdout
+    assert ("tier", "pass") in _decisions(r.stdout)
 
 
 def test_gate_tier0_costs_nothing_when_enabled(tmp_path):
@@ -195,10 +251,12 @@ def test_gate_tier0_costs_nothing_when_enabled(tmp_path):
 
 
 def test_gate_override_passes_and_is_recorded(tmp_path):
-    """Outcome 3: the override turns a BLOCK into a logged pass."""
+    """Outcome 3: the override turns a BLOCK into a logged pass. Since  it does
+    so only where team-state lists no other mind, so the roster here is the closer alone."""
     r = _run_gate(_goal(priority="HIGH"), tmp_path,
                   {"CLOSE_REVIEW_GATE_ENABLED": "1", "MIND_AGENT": "nobody"},
-                  extra_args=("--override-close-review", "test justification"))
+                  extra_args=("--override-close-review", "test justification",
+                              "--roster-json", _roster(tmp_path, "nobody")))
     assert r.returncode == 0, r.stdout + r.stderr
     assert '"decision": "override"' in r.stdout
 
@@ -230,8 +288,83 @@ def test_gate_accepts_APPROVE_verdict_artifact(tmp_path):
                   {"CLOSE_REVIEW_GATE_ENABLED": "1",
                    "MIND_AGENT": "pytest-throwaway"})
     assert r.returncode == 0, r.stdout + r.stderr
-    assert '"decision": "pass"' in r.stdout
+    assert ("tier", "pass") in _decisions(r.stdout)
     assert "test-reviewer" in r.stdout
+
+
+# THE POST-HOC LANE (). A closer listed in review_closer_roles or
+# review_sampled_roles is reviewed AFTER the close (), so check A passes it and
+# names the lane. The role is BODY_ROLE, which bash-agent-inject.py exports only on the
+# worker fork path, so unset means reducer-or-unknown and is checked. conftest.py pops
+# BODY_ROLE for the whole session (), so a test sees one only when it sets it.
+# The role under test comes from the shipped config: if the lists stop naming it, the
+# pass test goes red instead of staying green against a list nobody ships.
+_A_ON = {"CLOSE_REVIEW_GATE_ENABLED": "1", "MIND_AGENT": "nobody"}
+
+
+def _shipped_post_hoc_roles():
+    import yaml
+    cfg = yaml.safe_load((SCRIPTS.parent / "config" / "aspirations.yaml")
+                         .read_text(encoding="utf-8"))["close_review_gate"]
+    return [r for key in ("review_closer_roles", "review_sampled_roles")
+            for r in (cfg.get(key) or [])]
+
+
+def _tier_lines(stdout):
+    """Every check-A line the gate printed, parsed. Check B prints its own line too."""
+    out = []
+    for ln in stdout.splitlines():
+        try:
+            d = json.loads(ln)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("check") == "tier":
+            out.append(d)
+    return out
+
+
+def test_post_hoc_role_PASSES_check_A_and_names_the_lane(tmp_path):
+    roles = _shipped_post_hoc_roles()
+    assert roles, "the shipped config lists no post-hoc role"
+    r = _run_gate(_goal(priority="HIGH"), tmp_path, {**_A_ON, "BODY_ROLE": roles[0]})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "REFUSED" not in r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["decision"], line.get("lane"), line.get("role")) == \
+        ("pass", "post-hoc", roles[0].strip().lower())
+
+
+@pytest.mark.parametrize("role_env", [{}, {"BODY_ROLE": ""}, {"BODY_ROLE": "  "}],
+                         ids=["absent", "empty", "blank"])
+def test_UNSET_role_is_still_REFUSED(tmp_path, role_env):
+    """The same goal as the pass test above, with no role: reducer-or-unknown is checked."""
+    r = _run_gate(_goal(priority="HIGH"), tmp_path, {**_A_ON, **role_env})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert [d["decision"] for d in _tier_lines(r.stdout)] == ["block"]
+
+
+def test_UNLISTED_role_is_still_REFUSED(tmp_path):
+    assert "reducer" not in [r.strip().lower() for r in _shipped_post_hoc_roles()]
+    r = _run_gate(_goal(priority="HIGH"), tmp_path, {**_A_ON, "BODY_ROLE": "reducer"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert [d["decision"] for d in _tier_lines(r.stdout)] == ["block"]
+
+
+def test_post_hoc_roles_MALFORMED_lists_exempt_no_one():
+    """A list the gate cannot read as strings contributes nothing. The last case is the
+    positive control: without it, a reader that always returned the empty set passes."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_crg_roles", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    f = mod._post_hoc_roles
+    assert f(None) == frozenset()
+    assert f({}) == frozenset()
+    assert f({"review_sampled_roles": "worker"}) == frozenset()
+    assert f({"review_sampled_roles": [1, None, ["worker"], {"r": "worker"}]}) == frozenset()
+    assert f({"review_closer_roles": ["", "  "]}) == frozenset()
+    assert f({"review_closer_roles": [" Worker "],
+              "review_sampled_roles": ["x", 3]}) == {"worker", "x"}
 
 
 def test_note_marker_refusal_names_the_matched_context(tmp_path):
@@ -489,3 +622,208 @@ def test_ledger_env_override_wins_over_world_dir(tmp_path, monkeypatch):
     assert (redirect / "close-review-overrides.jsonl").is_file(), "env override ignored"
     assert not (fake_world / "close-review-overrides.jsonl").exists(), \
         "wrote to WORLD_DIR despite the override — production would still be polluted"
+
+
+# ─── a self-serve refusal () ──────────────────────────────────────
+# A check-A refusal requests the review itself: it stamps review_requested unless a
+# request is already open, so the queue offers the goal to an independent reviewer and
+# the refusal has a next move that is not the override. The override is honored only
+# where team-state lists no other mind. The subprocess tests read a --goal-json record,
+# which the gate never writes. The store write itself is pinned in-process with
+# bash_cmd spied and pointed at /bin/true, the shape the load_goal pin above uses, so
+# no test here reaches a store.
+
+_ASKED = "2026-10-06T09:00:00"
+
+
+def _verdict_file(tmp_path, gid, verdict, reviewed_at, reviewer="peer-mind"):
+    """One verdict as the producer writes it: a list trail whose last entry wins."""
+    d = tmp_path / "audit-reports" / "close-reviews"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{gid}.json").write_text(json.dumps(
+        [{"verdict": verdict, "reviewer": reviewer, "reviewed_at": reviewed_at}]),
+        encoding="utf-8")
+
+
+def _roster(tmp_path, *names):
+    """A roster file in team-state's agent_status shape, for --roster-json."""
+    p = tmp_path / "roster.json"
+    p.write_text(json.dumps({n: {"last_active": _ASKED} for n in names}), encoding="utf-8")
+    return str(p)
+
+
+@pytest.mark.parametrize("goal_kw,verdict,expect", [
+    ({}, None, "stamp"),
+    ({"review_requested": _ASKED}, None, "open"),
+    ({"review_requested": _ASKED}, ("REJECT", "2026-10-06T10:00:00"), "restamp"),
+    ({"review_requested": _ASKED}, ("REJECT", "2026-10-06T08:00:00"), "open"),
+], ids=["no-request", "open-request", "answered-by-REJECT", "REJECT-before-the-ask"])
+def test_refusal_decides_the_request_and_never_writes_a_goal_json_record(
+        tmp_path, goal_kw, verdict, expect):
+    """No request: stamp one. An open request: leave it. A request a REJECT answered:
+    stamp it again, because the queue no longer lists it. A REJECT from before the ask
+    answers nothing, so that request is still open. The record came from --goal-json, so
+    nothing is written in any case."""
+    if verdict:
+        _verdict_file(tmp_path, "g-999-01", *verdict)
+    r = _run_gate(_goal(priority="HIGH", **goal_kw), tmp_path, _A_ON)
+    assert r.returncode == 1, r.stdout + r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["decision"], line["request"], line["request_written"]) == \
+        ("block", expect, None)
+    if expect == "open":
+        assert line["review_requested"] == _ASKED
+        assert "already open" in r.stderr
+    else:
+        assert line["review_requested"] not in (None, _ASKED)
+        assert "was not written" in r.stderr
+
+
+def test_a_releasing_verdict_that_PREDATES_the_request_does_not_release(tmp_path):
+    """A request made after an APPROVE asks for a fresh review, so the old APPROVE no
+    longer releases the close: the same rule the queue lists requests by."""
+    _verdict_file(tmp_path, "g-999-01", "APPROVE", "2026-10-06T08:00:00")
+    r = _run_gate(_goal(priority="HIGH", review_requested=_ASKED), tmp_path, _A_ON)
+    assert r.returncode == 1, r.stdout + r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["decision"], line["stale"], line["request"]) == ("block", True, "open")
+    assert "predates its review request" in r.stderr
+
+
+def test_a_releasing_verdict_that_ANSWERS_the_request_releases(tmp_path):
+    """The positive control for the stale case: the same APPROVE, written after the ask.
+    `answered` pins that the request rule ran: a queue that failed to load would pass this
+    close too, by the old rule, with answered None."""
+    _verdict_file(tmp_path, "g-999-01", "APPROVE", "2026-10-06T10:00:00")
+    r = _run_gate(_goal(priority="HIGH", review_requested=_ASKED), tmp_path, _A_ON)
+    assert r.returncode == 0, r.stdout + r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["decision"], line["reviewer"], line["answered"], line["answers_fault"]) == \
+        ("pass", "peer-mind", True, None)
+
+
+@pytest.mark.parametrize("closer_kw,reachable", [
+    ({}, False),
+    ({"executed_by": "nobody"}, True),
+], ids=["no-closer", "executed_by"])
+def test_a_refusal_says_whether_a_reviewer_can_be_offered_the_request(
+        tmp_path, closer_kw, reachable):
+    """The queue offers a request only on a goal that names its closer (completed_by,
+    executed_by or claimed_by) and declines one that names none. So a refusal on such a goal
+    says so and hands over the claim that records executed_by, instead of promising a
+    reviewer; one that names its closer says the queue offers the request."""
+    r = _run_gate(_goal(priority="HIGH", review_requested=_ASKED, **closer_kw),
+                  tmp_path, _A_ON)
+    assert r.returncode == 1, r.stdout + r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["request"], line["request_reachable"]) == ("open", reachable)
+    assert ("NO CLOSER IS RECORDED" in r.stderr) is (not reachable)
+    assert ("aspirations-claim.sh g-999-01 --source" in r.stderr) is (not reachable)
+    assert ("offers the request to an independent reviewer" in r.stderr) is reachable
+
+
+def test_override_is_REFUSED_where_another_mind_is_listed(tmp_path):
+    r = _run_gate(_goal(priority="HIGH"), tmp_path, _A_ON,
+                  extra_args=("--override-close-review", "no peer around",
+                              "--roster-json", _roster(tmp_path, "nobody", "peer-mind")))
+    assert r.returncode == 1, r.stdout + r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["decision"], line["override_refused"], line["request"]) == \
+        ("block", ["peer-mind"], "stamp")
+    assert "was NOT honored" in r.stderr
+    assert not (tmp_path / "close-review-overrides.jsonl").exists(), \
+        "an override the gate refused reached the override ledger"
+
+
+@pytest.mark.parametrize("roster", ["solo", "unreadable"])
+def test_override_is_honored_with_no_other_mind_or_an_unreadable_roster(tmp_path, roster):
+    """The positive control for the refusal above. An unreadable roster is the gate's own
+    fault, so it fails open and honors the override, saying which case it was."""
+    path = _roster(tmp_path, "nobody") if roster == "solo" else str(tmp_path / "absent.json")
+    r = _run_gate(_goal(priority="HIGH"), tmp_path, _A_ON,
+                  extra_args=("--override-close-review", "solo deployment",
+                              "--roster-json", path))
+    assert r.returncode == 0, r.stdout + r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["decision"], line["roster"]) == ("override", roster)
+    rows = (tmp_path / "close-review-overrides.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1 and json.loads(rows[0])["roster"] == roster
+
+
+@pytest.mark.parametrize("goal_kw,verdict,expect", [
+    ({}, None, "stamp"),
+    ({"review_requested": _ASKED}, None, "open"),
+    ({"review_requested": _ASKED}, ("REJECT", "2026-10-06T10:00:00"), "restamp"),
+], ids=["no-request", "open-request", "answered-by-REJECT"])
+def test_a_store_read_refusal_STAMPS_the_request_through_the_store_writer(
+        tmp_path, monkeypatch, capsys, goal_kw, verdict, expect):
+    """The production path: the goal comes from the store, so the request is written,
+    through aspirations-update-goal.sh with the script as bash_cmd's first positional
+    (guard-920: the literal call shape). An open request writes nothing."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_crg_stamp", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    seen = []
+
+    def _spy(script, *args):
+        seen.append((Path(script).name, args))
+        return ["/bin/true"]   # the write "lands" and touches no store
+
+    monkeypatch.setattr(mod, "bash_cmd", _spy)
+    monkeypatch.setattr(mod, "load_goal", lambda gid, src: _goal(priority="HIGH", **goal_kw))
+    monkeypatch.setenv("CLOSE_REVIEW_GATE_ENABLED", "1")
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("MIND_AGENT", "nobody")
+    if verdict:
+        _verdict_file(tmp_path, "g-999-01", *verdict)
+    assert mod.main(["--goal", "g-999-01", "--source", "world"]) == 1
+    (line,) = _tier_lines(capsys.readouterr().out)
+    writes = [a for name, a in seen if name == "aspirations-update-goal.sh"]
+    if expect == "open":
+        assert (line["request"], line["request_written"], writes) == ("open", None, [])
+        return
+    assert (line["request"], line["request_written"]) == (expect, True)
+    (args,) = writes
+    assert args == ("--source", "world", "g-999-01", "review_requested",
+                    line["review_requested"]), args
+    assert line["review_requested"] != _ASKED
+
+
+def test_a_failed_stamp_still_refuses_and_prints_the_write(tmp_path, monkeypatch, capsys):
+    """A request that could not be written leaves the close refused, and the refusal
+    hands over the exact command that writes it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_crg_stamp_fail", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setattr(mod, "bash_cmd", lambda script, *a: ["/bin/false"])
+    monkeypatch.setattr(mod, "load_goal", lambda gid, src: _goal(priority="HIGH"))
+    monkeypatch.setenv("CLOSE_REVIEW_GATE_ENABLED", "1")
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("MIND_AGENT", "nobody")
+    assert mod.main(["--goal", "g-999-01", "--source", "world"]) == 1
+    out = capsys.readouterr()
+    (line,) = _tier_lines(out.out)
+    assert (line["request"], line["request_written"]) == ("stamp", False)
+    assert "REVIEW REQUEST NOT WRITTEN" in out.err
+    assert "aspirations-update-goal.sh --source world g-999-01 review_requested" in out.err
+
+
+def test_do_verify_runs_the_close_review_gate_AFTER_closure_evidence():
+    """A check-A refusal now writes a review request, so it must come after the
+    closure-evidence gate: a reviewer is asked only about a close whose evidence rows
+    already pass. Both stay before the intent marker that precedes the status write."""
+    lines = ITERATION_CLOSE.read_text(encoding="utf-8").splitlines()
+
+    def _at(match):
+        hits = [i for i, ln in enumerate(lines) if match(ln.strip())]
+        assert len(hits) == 1, hits
+        return hits[0]
+
+    evidence = _at(lambda s: s == 'if [[ "$GOAL_STATUS" == "completed" && -f '
+                                  '"$SCRIPT_DIR/closure-evidence-gate.py" ]]; then')
+    review = _at(lambda s: s == _BLOCK_HEAD)
+    # The intent marker's own guard line occurs twice in the file; its comment once.
+    intent = _at(lambda s: s.startswith("# g-284-06 Step 0: Ordered-write intent marker"))
+    assert evidence < review < intent, (evidence, review, intent)

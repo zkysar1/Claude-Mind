@@ -21,13 +21,11 @@ never this list (g-115-11317):
   + tail_bonus × 0.8
   + evidence_backing × 0.7 + deferred_readiness × 0.6
   + context_coherence × 1.0 + skill_affinity × 0.4 + directive_boost × 1.5
-  + co_invest_alignment × 0.0 (off by default)
+  + co_invest_alignment × 0.0 (retired: raw is always 0.0)
   + exploration_noise × (epsilon × noise_scale)  [dynamic weight]
 
-  co_invest_alignment: +1.0 raw bonus when this candidate's co_parent_id
-    matches a partner's live team-state in_flight.co_parent_id — pair-
-    iteration bias. Schema + protocol in core/config/conventions/coordination.md
-    Co-Investigation Protocol section. g-115-563.
+  co_invest_alignment: RETIRED by g-375-129, raw always 0.0. It stays a
+    criterion only because live meta files still weight it; see block 13d.
 
   context_coherence: +2.0 if same category as last goal, 0 otherwise.
     Context-pressure agnostic — same-category reuse saves tokens regardless of zone.
@@ -5738,24 +5736,16 @@ def score_goal(cand, wm, resolved, session_completions, epsilon=0.85, noise_scal
                 else:
                     raw["handoff_bonus"] = base * (1.0 - effective_h / decay_h)
 
-    # 13d. co_invest_alignment (): pair-iteration bias.
-    # Bonus when this candidate's co_parent_id matches a partner's live
-    # team-state in_flight.co_parent_id — biases the selector toward "pair
-    # on the same parent right now." Schema: see core/config/conventions/
-    # coordination.md → Co-Investigation Protocol. Reads use the cached
-    # team-state; missing/empty fields produce 0.0 (no bonus).
+    # 13d. co_invest_alignment: RETIRED by , always 0.0. It paired a
+    # goal's co_parent_id with a partner's team-state in_flight.co_parent_id
+    # (), but the goal-field allowlist has refused co_parent_id since
+    # 2026-08-18 and no code ever wrote the in_flight half, so it could not
+    # fire. The key stays because every deployment's meta still weights it and
+    # meta has no way to drop a key: a weight with no criterion warns on every
+    # load_weights() call, and promotion-preflight blocks while a reachable
+    # target's meta names it. Remove it here, in KNOWN_CRITERIA and in the seed
+    # weights together once meta can lose the key.
     raw["co_invest_alignment"] = 0.0
-    candidate_cpi = goal.get("co_parent_id")
-    if candidate_cpi:
-        team = _load_team_state_cached()
-        agent_status = team.get("agent_status", {}) or {}
-        for other_name, other_state in agent_status.items():
-            if other_name == AGENT_NAME:
-                continue
-            in_flight = (other_state or {}).get("in_flight") or {}
-            if in_flight.get("co_parent_id") == candidate_cpi:
-                raw["co_invest_alignment"] = 1.0
-                break
 
     # 13e. critical_blocker_surface (): boost candidates that ARE a
     # high-downstream-unlock bottleneck recorded in team-state.critical_blockers[]

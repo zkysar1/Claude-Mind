@@ -441,8 +441,8 @@ IF no goal: PARK AWAITING SUPPLY — the same resumable park as Phase 0.5 rc=1,
   (stop-hook-compliance.md rules 3-4). A persuasive board post explaining why
   this Body closed itself is the SIGNATURE of the defect (measured: worker-park.md).
   IF A SPECIFIC GOAL WILL NOT FIT, RELEASE THE CLAIM UNSTARTED and keep looping —
-  `aspirations-release.sh <goal-id> --source <world|agent>`, then VERIFY by
-  re-reading that the record shows status=pending / claimed_by=None (the release
+  `aspirations-release.sh <goal-id> --source <world|agent> --reason "<why>" --reason-kind other`,
+  then VERIFY the record reads status=pending / claimed_by=None (the release
   echo is not proof). Never close or park the Body for it.
   A WRONG CLOSE IS NOT RECOVERABLE: the sentinel stages this Body's WM, Phase -0
   then refuses every unit on this SID, and only a user `/start` of a NEW session
@@ -757,14 +757,12 @@ Bash: bash core/scripts/iteration-close.sh --phase verify --goal <goal-id> \
 #     DID NOT FINISH, GOAL STILL VALID (a partial unit, a precondition that
 #     failed mid-way, a gate you found but cannot pass): do NOT call 4a at all.
 #     RELEASE the claim so the next Body starts from your note —
-#       Bash: bash core/scripts/aspirations-release.sh <goal-id> --source <world|agent>
+#       Bash: bash core/scripts/aspirations-release.sh <goal-id> --source <world|agent> --reason "<why>" --reason-kind <progress|not-due|role|other>
 #     and when a NAMED gate remains (elapsed time, a deploy, a partner's leg),
-#     write the structured defer in the SAME step, never a bare release —
-#     g-115-5177: a bare release re-arms finished work at rank 1 on fresh
-#     metadata:
+#     write the structured defer in the SAME step, never a release alone —
+#     g-115-5177: it re-arms finished work at rank 1 on fresh metadata:
 #       Bash: bash core/scripts/aspirations-update-goal.sh --source <world|agent> <goal-id> defer_reason "precondition_unmet: <the gate, short>"
-#     THE PREFIX IS NOT THE STRUCTURE, and reading it as such is why this lane
-#     is starved: that prose is SKIPPED by the only sweep that clears this class.
+#     THE PREFIX IS NOT THE STRUCTURE: the only sweep that clears this class SKIPS that prose.
 #     So ALSO write a machine-evaluable predicate into verification.preconditions
 #     — the ONLY field precondition-defer-recheck reads (predicate.py owns the
 #     types; after_time for an elapsed window) — and make it evaluable on ANY

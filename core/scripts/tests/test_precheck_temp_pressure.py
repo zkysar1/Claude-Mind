@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""test_precheck_temp_pressure.py — precheck-eval.py cmd_temp_pressure contract
-(file-model normalization Phase 5).
+"""test_precheck_temp_pressure.py — precheck-eval.py cmd_temp_pressure contract.
 
-Pins the temp/ accumulation-pressure check that keeps temp/ from becoming the
-new slush directory: it counts UNDRAINED working docs directly under the bound
-agent's temp/ (excluding the drained/ audit subdir) and emits
+Pins the temp/ accumulation-pressure check that keeps temp/ from becoming a
+slush directory. Since 2026-10-05 (user directive: nothing is deleted until a
+review has seen it) it counts what /drain-temp reviews: every top-level item in
+the bound agent's temp/ (files of any suffix and folders) with no decision in
+force that is no longer in flight, via temp_decisions.pressure_counts, the same
+census the review uses. drained/, dotfiles, git-tracked files, receipted
+archives, kept and to-be-purged items, and items touched within the purge's age
+guard are not counted; the summary names them instead. It emits
 
   - no flag                  below warn_threshold
   - temp_pressure_warn       at >= warn_threshold (visible nudge, no goal)
   - temp_drain_needed        at >= drain_goal_threshold (+ suggested HIGH goal)
   - temp_drain_pending       at >= drain_goal_threshold when an open drain goal
                              already exists (deduped — no second goal filed)
+  - temp_drain_stalled       ... when that goal outlived drain_goal_max_age_hours
 
 AGENT_DIR is a module global imported from _paths; the tests monkeypatch it to a
 tmp dir so the count targets a controlled temp/ rather than the live agent.
+Fixtures are AGED past the in-flight window: an item written "now" is in flight
+and is correctly not counted.
 """
 
 import importlib.util
+import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -36,9 +45,20 @@ class _Args:
     pass
 
 
-def _seed_temp(tmp_path, n_flat, n_drained=0, n_ephemera=0):
-    """Create tmp_path/temp/ with n_flat working docs (.md) + n_drained in
-    drained/ + n_ephemera pure-ephemera .log/.txt files in temp/ root."""
+def _age(p, hours=3):
+    """Set p and everything under it to `hours` ago (out of the in-flight window)."""
+    t = time.time() - hours * 3600
+    p = Path(p)
+    if p.is_dir():
+        for root, dirs, files in os.walk(p, topdown=False):
+            for n in files + dirs:
+                os.utime(os.path.join(root, n), (t, t))
+    os.utime(p, (t, t))
+
+
+def _seed_temp(tmp_path, n_flat, n_drained=0, names=()):
+    """tmp_path/temp/ with n_flat working docs, n_drained files in drained/, and
+    one entry per extra name (a trailing '/' makes a folder), all aged."""
     temp = tmp_path / "temp"
     temp.mkdir(parents=True, exist_ok=True)
     for i in range(n_flat):
@@ -47,10 +67,15 @@ def _seed_temp(tmp_path, n_flat, n_drained=0, n_ephemera=0):
         (temp / "drained").mkdir(exist_ok=True)
         for i in range(n_drained):
             (temp / "drained" / f"old-{i:02d}.md").write_text("drained", encoding="utf-8")
-    for i in range(n_ephemera):
-        # alternate .log / .txt so both ephemera suffixes are exercised
-        suffix = ".log" if i % 2 == 0 else ".txt"
-        (temp / f"suite-{i:02d}{suffix}").write_text("ephemera", encoding="utf-8")
+    for name in names:
+        if name.endswith("/"):
+            d = temp / name.rstrip("/")
+            d.mkdir(exist_ok=True)
+            (d / "inner.txt").write_text("x", encoding="utf-8")
+        else:
+            (temp / name).write_text("x", encoding="utf-8")
+    for entry in temp.iterdir():
+        _age(entry)
     return temp
 
 
@@ -58,32 +83,38 @@ def _compact(goals=None):
     return {"aspirations": [{"id": "asp-001", "status": "active", "goals": goals or []}]}
 
 
-def _run(tmp_path, monkeypatch, n_flat, n_drained=0, goals=None, n_ephemera=0):
-    _seed_temp(tmp_path, n_flat, n_drained, n_ephemera)
+def _run(tmp_path, monkeypatch, n_flat, n_drained=0, goals=None, names=()):
+    _seed_temp(tmp_path, n_flat, n_drained, names)
     monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
     return pe.cmd_temp_pressure(_Args(), CONFIG, _compact(goals))
 
 
+def _git(cwd, *args):
+    import subprocess
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+
+
 def test_temp_pressure_clean(tmp_path, monkeypatch):
     r = _run(tmp_path, monkeypatch, n_flat=0)
-    assert r["count"] == 0 and r["flags"] == []
+    assert r["pressure_count"] == 0 and r["flags"] == []
     assert r["suggested_goal"] is None
+    assert r["summary"] == "temp-pressure: clean"
 
 
 def test_temp_pressure_below_warn_no_flag(tmp_path, monkeypatch):
     r = _run(tmp_path, monkeypatch, n_flat=9)
-    assert r["count"] == 9 and r["flags"] == []
+    assert r["pressure_count"] == 9 and r["flags"] == []
 
 
 def test_temp_pressure_warn_at_threshold(tmp_path, monkeypatch):
     r = _run(tmp_path, monkeypatch, n_flat=10)
-    assert r["count"] == 10 and r["flags"] == ["temp_pressure_warn"]
+    assert r["pressure_count"] == 10 and r["flags"] == ["temp_pressure_warn"]
     assert r["suggested_goal"] is None  # warn never files a goal
 
 
 def test_temp_pressure_drain_needed_at_threshold(tmp_path, monkeypatch):
     r = _run(tmp_path, monkeypatch, n_flat=20)
-    assert r["count"] == 20 and r["flags"] == ["temp_drain_needed"]
+    assert r["pressure_count"] == 20 and r["flags"] == ["temp_drain_needed"]
     g = r["suggested_goal"]
     assert g is not None and g["priority"] == "HIGH"
     assert g["participants"] == ["agent"]          # capability-routing: agent, not user
@@ -98,7 +129,7 @@ def test_temp_pressure_drained_subdir_excluded(tmp_path, monkeypatch):
     # 5 live + 50 already-drained -> only the 5 live count (drained/ is the
     # audit archive, already encoded into the tree).
     r = _run(tmp_path, monkeypatch, n_flat=5, n_drained=50)
-    assert r["count"] == 5 and r["flags"] == []
+    assert r["pressure_count"] == 5 and r["flags"] == []
 
 
 def test_temp_pressure_dedup_existing_drain_goal(tmp_path, monkeypatch):
@@ -107,7 +138,7 @@ def test_temp_pressure_dedup_existing_drain_goal(tmp_path, monkeypatch):
     goals = [{"id": "g-001-99", "status": "pending",
               "title": "Maintain: drain accumulated temp/ working docs"}]
     r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
-    assert r["count"] == 25
+    assert r["pressure_count"] == 25
     assert r["flags"] == ["temp_drain_pending"]
     assert r["existing_drain_goal"] == "g-001-99"
     assert r["suggested_goal"] is None
@@ -188,7 +219,7 @@ def test_temp_pressure_other_agent_drain_goal_not_deduped(tmp_path, monkeypatch)
               "title": "Maintain: drain accumulated temp/ working docs",
               "filed_by_agent": "some-other-agent"}]
     r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
-    assert r["count"] == 25
+    assert r["pressure_count"] == 25
     assert r["flags"] == ["temp_drain_needed"]         # NOT temp_drain_pending
     assert r["existing_drain_goal"] is None             # other agent's goal is not ours
     assert r["suggested_goal"] is not None
@@ -203,7 +234,7 @@ def test_temp_pressure_own_agent_drain_goal_deduped(tmp_path, monkeypatch):
               "title": "Maintain: drain accumulated temp/ working docs",
               "filed_by_agent": tmp_path.name}]
     r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
-    assert r["count"] == 25
+    assert r["pressure_count"] == 25
     assert r["flags"] == ["temp_drain_pending"]
     assert r["existing_drain_goal"] == "g-001-77"
     assert r["suggested_goal"] is None
@@ -219,7 +250,7 @@ def test_temp_pressure_investigate_goal_not_treated_as_drain_goal(tmp_path, monk
     goals = [{"id": "g-115-1780", "status": "pending",
               "title": "Investigate: temp-drain goal not auto-surfaced by goal-selector"}]
     r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
-    assert r["count"] == 25
+    assert r["pressure_count"] == 25
     assert r["flags"] == ["temp_drain_needed"]
     assert r["existing_drain_goal"] is None
     assert r["suggested_goal"] is not None
@@ -267,18 +298,18 @@ def test_temp_pressure_maintain_about_drain_not_treated_as_drain_goal(tmp_path, 
               "title": "Maintain: add verify-learning check that precheck "
                        "temp-drain filing carries intended_agent"}]
     r = _run(tmp_path, monkeypatch, n_flat=25, goals=goals)
-    assert r["count"] == 25
+    assert r["pressure_count"] == 25
     assert r["flags"] == ["temp_drain_needed"]           # NOT temp_drain_pending
     assert r["existing_drain_goal"] is None               # Maintain-ABOUT-drain is not the action
     assert r["suggested_goal"] is not None
 
 
 def test_temp_pressure_purge_only_drain_goal_deduped(tmp_path, monkeypatch):
-    # : the template also fires for a purge-only close (count==0, ephemera>0)
-    # and still emits a "Maintain: drain 0 accumulated temp/ working docs ... + purge N
-    # ..." title. The positive signature MUST match that variant too, so a pending
-    # purge-only drain goal correctly dedups. Guards the signature against being
-    # over-narrowed to only the count>0 form.
+    # : a goal filed under the PRE-2026-10-05 template ("... to the
+    # knowledge tree + purge N stale ephemera file(s)", even with a count of 0) can
+    # still be open when this code lands. The positive signature (prefix + infix,
+    # unchanged) MUST keep matching it, or the first precheck after the upgrade
+    # files a duplicate HIGH drain goal on every box that has one open.
     goals = [{"id": "g-001-66", "status": "pending",
               "title": "Maintain: drain 0 accumulated temp/ working docs to the "
                        "knowledge tree + purge 12 stale ephemera file(s)"}]
@@ -294,22 +325,9 @@ def test_temp_pressure_warn_range_ignores_existing_drain_goal(tmp_path, monkeypa
     goals = [{"id": "g-001-99", "status": "pending",
               "title": "Maintain: drain accumulated temp/ working docs"}]
     r = _run(tmp_path, monkeypatch, n_flat=15, goals=goals)
-    assert r["count"] == 15
+    assert r["pressure_count"] == 15
     assert r["flags"] == ["temp_pressure_warn"]
     assert r["suggested_goal"] is None
-
-
-def test_temp_pressure_json_files_count(tmp_path, monkeypatch):
-    # Working docs may be .md or .json; both count toward pressure.
-    temp = tmp_path / "temp"
-    temp.mkdir(parents=True)
-    for i in range(6):
-        (temp / f"a-{i}.md").write_text("x", encoding="utf-8")
-    for i in range(6):
-        (temp / f"b-{i}.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
-    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["count"] == 12 and r["flags"] == ["temp_pressure_warn"]
 
 
 def test_temp_pressure_missing_config_raises(tmp_path, monkeypatch):
@@ -318,238 +336,119 @@ def test_temp_pressure_missing_config_raises(tmp_path, monkeypatch):
         pe.cmd_temp_pressure(_Args(), {}, _compact())
 
 
-# ── Pure-ephemera (.log/.txt) counting () ───────────────────────
-# Pre-fix, .log/.txt files were invisible to BOTH the drain glob and this
-# metric, so ephemera-only accumulation emitted NO flag and grew unbounded.
-# The metric now counts ephemera separately and folds it into the combined
-# pressure that drives the threshold flags.
-
-def test_temp_pressure_ephemera_counted_separately(tmp_path, monkeypatch):
-    # 3 docs + 4 ephemera -> count=3, ephemera_count=4, pressure_count=7,
-    # below warn(10) so no flag; the two counts are NOT conflated.
-    r = _run(tmp_path, monkeypatch, n_flat=3, n_ephemera=4)
-    assert r["count"] == 3
-    assert r["ephemera_count"] == 4
-    assert r["pressure_count"] == 7
-    assert r["flags"] == []
+# ── The review's population (user directive, 2026-10-05) ──────────────────
+# Before it, .md/.json were "drainable", .log/.txt/.py/.sh/.err/.raw/.out/.bak
+# were "ephemera" the purge deleted unseen (, ), any other
+# suffix was reported but never scheduled (), and folders were invisible
+# to the count while the purge deleted them. Now the review covers every item,
+# so the count does too, and it moves when the review decides (guard-5329).
 
 
-def test_temp_pressure_ephemera_only_triggers_warn(tmp_path, monkeypatch):
-    # 0 docs + 12 ephemera -> pressure_count=12 >= warn(10) -> temp_pressure_warn.
-    # This is the exact  bug: pre-fix, 12 invisible ephemera emitted
-    # NO flag; now they are seen.
-    r = _run(tmp_path, monkeypatch, n_flat=0, n_ephemera=12)
-    assert r["count"] == 0 and r["ephemera_count"] == 12
+def test_temp_pressure_counts_every_suffix_and_folders(tmp_path, monkeypatch):
+    names = ("a.md", "b.json", "build.py", "run.sh", "suite.log", "notes.txt",
+             "dump.raw", "vol2.pdf", "cfg.yaml", "NOEXT", "gs.err", "proj/")
+    r = _run(tmp_path, monkeypatch, n_flat=0, names=names)
+    assert r["pressure_count"] == 12
+    assert r["census"]["by_class"] == {"doc": 2, "script": 2, "run-output": 3,
+                                       "other": 4, "dir": 1}
     assert r["flags"] == ["temp_pressure_warn"]
-    assert r["suggested_goal"] is None
+    assert "12 item(s) awaiting review [1 dir, 2 doc, 4 other, 3 run-output, 2 script]" \
+        in r["summary"]
 
 
-def test_temp_pressure_ephemera_only_triggers_drain(tmp_path, monkeypatch):
-    # 0 docs + 20 ephemera -> pressure_count=20 >= drain(20) -> temp_drain_needed;
-    # the suggested goal names the ephemera purge.
-    r = _run(tmp_path, monkeypatch, n_flat=0, n_ephemera=20)
-    assert r["count"] == 0 and r["ephemera_count"] == 20
-    assert r["flags"] == ["temp_drain_needed"]
-    g = r["suggested_goal"]
-    assert g is not None and g["priority"] == "HIGH"
-    assert g["participants"] == ["agent"]          # capability-routing: agent, not user
-    assert "purge" in g["title"].lower() and "20" in g["title"]
-
-
-def test_temp_pressure_docs_plus_ephemera_combined(tmp_path, monkeypatch):
-    # 15 docs + 6 ephemera: neither alone crosses drain(20), combined
-    # pressure_count=21 does -> temp_drain_needed. The goal names both the
-    # drain (15 docs) and the purge (6 ephemera).
-    r = _run(tmp_path, monkeypatch, n_flat=15, n_ephemera=6)
-    assert r["count"] == 15 and r["ephemera_count"] == 6 and r["pressure_count"] == 21
-    assert r["flags"] == ["temp_drain_needed"]
-    g = r["suggested_goal"]
-    assert "drain 15" in g["title"] and "purge 6" in g["title"].lower()
-
-
-def test_temp_pressure_ephemera_clean_when_zero(tmp_path, monkeypatch):
-    # No docs, no ephemera -> clean.
-    r = _run(tmp_path, monkeypatch, n_flat=0, n_ephemera=0)
-    assert r["count"] == 0 and r["ephemera_count"] == 0 and r["pressure_count"] == 0
-    assert r["summary"] == "temp-pressure: clean"
-    assert r["flags"] == []
-
-
-def test_temp_pressure_ephemera_dedup_existing_goal(tmp_path, monkeypatch):
-    # ephemera pushes combined pressure over drain BUT an open drain goal exists
-    # -> temp_drain_pending, no second goal filed.
-    goals = [{"id": "g-001-99", "status": "pending",
-              "title": "Maintain: drain accumulated temp/ working docs"}]
-    r = _run(tmp_path, monkeypatch, n_flat=10, n_ephemera=12, goals=goals)
-    assert r["pressure_count"] == 22
-    assert r["flags"] == ["temp_drain_pending"]
-    assert r["existing_drain_goal"] == "g-001-99"
-    assert r["suggested_goal"] is None
-
-
-# ── One-shot scratch-script ephemera (.py/.sh/.err) counting () ──
-# Pre-fix, one-shot scratch scripts (build-*.py, orphan-*.py, restart-poller.sh,
-# gs.err) in temp/ root were invisible to BOTH the drain glob and this metric,
-# so scratch-only accumulation emitted NO flag and grew unbounded — the exact
-#  gap for a different file class. EPHEMERA_SUFFIXES now includes
-# .py/.sh/.err so they count as ephemera alongside .log/.txt.
-
-def test_temp_pressure_scratch_scripts_counted_as_ephemera(tmp_path, monkeypatch):
-    # 4 scratch scripts (.py/.sh/.err) + 1 legacy .log = 5 ephemera, 0 docs.
-    temp = tmp_path / "temp"
-    temp.mkdir(parents=True)
-    (temp / "build-fix.py").write_text("x", encoding="utf-8")
-    (temp / "orphan-scan.py").write_text("x", encoding="utf-8")
-    (temp / "restart-poller.sh").write_text("x", encoding="utf-8")
-    (temp / "gs.err").write_text("x", encoding="utf-8")
-    (temp / "suite.log").write_text("x", encoding="utf-8")  # legacy class still counts
+def test_temp_pressure_in_flight_items_are_not_counted(tmp_path, monkeypatch):
+    # Touched within the purge's age guard = in flight: not reviewed, not
+    # counted, never purged. For a folder, an entry at ANY depth counts.
+    temp = _seed_temp(tmp_path, n_flat=0, names=("old.md", "busy/"))
+    (temp / "new.md").write_text("x", encoding="utf-8")
+    os.utime(temp / "busy" / "inner.txt", None)
     monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
     r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["count"] == 0
-    assert r["ephemera_count"] == 5
-    assert r["pressure_count"] == 5
-    assert r["flags"] == []  # below warn(10)
+    assert r["pressure_count"] == 1 and r["census"]["fresh"] == 2
+    assert "not counted: 2 in flight" in r["summary"]
 
 
-def test_temp_pressure_scratch_scripts_not_conflated_with_docs(tmp_path, monkeypatch):
-    # A .py/.sh/.err in temp/ root is ephemera, NOT a drainable working doc
-    # (.md/.json). The two classes must stay distinct: 2 docs + 3 scratch.
-    temp = tmp_path / "temp"
-    temp.mkdir(parents=True)
-    (temp / "design.md").write_text("doc", encoding="utf-8")
-    (temp / "plan.json").write_text("{}", encoding="utf-8")
-    (temp / "a.py").write_text("x", encoding="utf-8")
-    (temp / "b.sh").write_text("x", encoding="utf-8")
-    (temp / "c.err").write_text("x", encoding="utf-8")
+def test_temp_pressure_moves_when_the_review_decides(tmp_path, monkeypatch):
+    # guard-5329: a metric that schedules a remedy must MOVE when the remedy
+    # runs. Over threshold; a review then decides every item and the count
+    # falls to zero, with the decided items named instead.
+    temp = _seed_temp(tmp_path, n_flat=25)
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    assert pe.cmd_temp_pressure(_Args(), CONFIG, _compact())["flags"] == ["temp_drain_needed"]
+    td = pe.temp_decisions
+    rows = []
+    for i, f in enumerate(sorted(temp.glob("*.md"))):
+        fp, size, _ = td.stats(f, "file")
+        rows.append({"ts": td._now_ts(), "item": f.name, "kind": "file", "bytes": size,
+                     "fp": fp, "decision": "keep" if i % 2 else "discard", "why": "test"})
+    td.append_rows(temp, rows)
+    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
+    assert r["pressure_count"] == 0 and r["flags"] == []
+    assert (r["census"]["kept"], r["census"]["awaiting_purge"]) == (12, 13)
+    assert "12 kept" in r["summary"] and "13 awaiting purge" in r["summary"]
+
+
+def test_temp_pressure_decided_but_unmoved_items_still_count(tmp_path, monkeypatch):
+    # encode/promote/archive record WHERE an item goes; until the drain has
+    # moved it there it is still in temp/ and still the review's work.
+    temp = _seed_temp(tmp_path, n_flat=0, names=("tool.sh",))
+    td = pe.temp_decisions
+    fp, size, _ = td.stats(temp / "tool.sh", "file")
+    td.append_rows(temp, [{"ts": td._now_ts(), "item": "tool.sh", "kind": "file",
+                           "bytes": size, "fp": fp, "decision": "promote",
+                           "why": "reusable", "where": "world/scripts/tool.sh"}])
+    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
+    assert pe.cmd_temp_pressure(_Args(), CONFIG, _compact())["pressure_count"] == 1
+
+
+def test_temp_pressure_dotfiles_named_never_counted(tmp_path, monkeypatch):
+    # No lane deletes a dotfile (the purge's Lane 0 only reports them), so they
+    # cannot drive the drain (guard-5329); an unmanaged one is still named. The
+    # framework's own markers (the decision log, .gitkeep) are not.
+    r = _run(tmp_path, monkeypatch, n_flat=0,
+             names=(".launch-notes.json", ".gitkeep", ".temp-decisions.jsonl"))
+    assert r["pressure_count"] == 0 and r["flags"] == []
+    assert r["census"]["unmanaged_dotfiles"] == 1
+    assert "1 unmanaged dotfile(s)" in r["summary"]
+
+
+def test_temp_pressure_receipted_archive_not_counted(tmp_path, monkeypatch):
+    temp = _seed_temp(tmp_path, n_flat=0, names=("arc/",))
+    (temp / "arc" / "RECEIPT.md").write_text("restore notes", encoding="utf-8")
+    _age(temp / "arc")
     monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
     r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["count"] == 2           # .md + .json only
-    assert r["ephemera_count"] == 3  # .py + .sh + .err
-    assert r["pressure_count"] == 5
+    assert r["pressure_count"] == 0 and r["census"]["receipted_dirs"] == 1
+    assert "1 receipted archive(s)" in r["summary"]
 
 
-# ---------------------------------------------------------------------------
-# : the third file class + the purge-scope git cross-check.
-#
-# WHY THESE EXIST: the two classes above are extension ALLOWLISTS, so every
-# other suffix in temp/ root was counted by nothing and reported by nothing.
-# Measured on a live agent: 26 files in temp/ root, metric returned 7 (3.7x).
-# The fix reports the remainder as `unclassified_count` and pins the total via
-# `temp_root_total`, WITHOUT feeding pressure_count — those files are neither
-# drainable nor purgeable, so counting them toward the drain threshold would
-# fire drain goals that cannot drain anything. test_pressure_count_excludes_
-# unclassified is the guard for that specific decision.
-# ---------------------------------------------------------------------------
-
-
-def test_unclassified_counts_non_allowlisted_suffixes(tmp_path, monkeypatch):
-    temp = tmp_path / "temp"
-    temp.mkdir(parents=True)
-    (temp / "a.md").write_text("doc", encoding="utf-8")       # counted: doc
-    (temp / "b.log").write_text("x", encoding="utf-8")        # counted: ephemera
-    for name in ("vol2.pdf", "brief.docx", "cfg.yaml", "led.jsonl", "s.ps1", "r.tsv", "NOEXT"):
-        (temp / name).write_text("x", encoding="utf-8")       # counted: unclassified
-    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
-    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["count"] == 1
-    assert r["ephemera_count"] == 1
-    assert r["unclassified_count"] == 7
-    # temp_root_total must reconcile with an independent enumeration of temp/ ROOT
-    assert r["temp_root_total"] == len([f for f in temp.iterdir() if f.is_file()]) == 9
-
-
-def test_pressure_count_excludes_unclassified(tmp_path, monkeypatch):
-    """Unclassified files must NOT move the drain threshold: they are neither
-    drainable nor purgeable, so a drain goal fired by them could not act."""
-    temp = tmp_path / "temp"
-    temp.mkdir(parents=True)
-    for i in range(40):                        # far past drain_goal_threshold=20
-        (temp / f"deliverable-{i:02d}.pdf").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
-    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["unclassified_count"] == 40
-    assert r["pressure_count"] == 0
-    assert r["flags"] == []                    # no warn, no drain_needed
-    assert r["suggested_goal"] is None
-
-
-def test_unclassified_surfaces_in_summary(tmp_path, monkeypatch):
-    """A count that lives only in the JSON body is the same invisibility this
-    fix removes — the summary is what the precheck actually prints."""
-    temp = tmp_path / "temp"
-    temp.mkdir(parents=True)
-    (temp / "vol2.pdf").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(pe, "AGENT_DIR", tmp_path)
-    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert "not-drainable" in r["summary"]
-    assert r["summary"] != "temp-pressure: clean"
-
-
-def _git(cwd, *args):
-    import subprocess
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
-
-
-def _seed_git_repo(tmp_path):
-    """A real repo so the cross-check exercises real `git ls-files` output."""
+def test_temp_pressure_tracked_files_not_counted(tmp_path, monkeypatch):
+    # A git-tracked file under temp/ (legacy deployments) is not scratch: the
+    # review cannot record a decision for it, so it must not schedule one.
+    agent = tmp_path / "agents" / "agent-a"
+    _seed_temp(agent, n_flat=0, names=("deliverable-notes.txt", "scratch.log"))
     _git(tmp_path, "init", "-q")
-    _git(tmp_path, "config", "user.email", "t@t")
-    _git(tmp_path, "config", "user.name", "t")
-
-
-def test_tracked_ephemera_excluded_from_purge_scope(tmp_path, monkeypatch):
-    """POSITIVE CONTROL for the git cross-check: extension alone cannot tell a
-    business record from scratch, so a TRACKED .txt/.py must leave purge scope."""
-    agent = tmp_path / "agents" / "agent-a"
-    temp = agent / "temp"
-    temp.mkdir(parents=True)
-    _seed_git_repo(tmp_path)
-    (temp / "deliverable-notes.txt").write_text("tracked record", encoding="utf-8")
-    (temp / "build-helper.py").write_text("tracked script", encoding="utf-8")
-    (temp / "scratch.log").write_text("real scratch", encoding="utf-8")
-    _git(tmp_path, "add", "-f", "agents/agent-a/temp/deliverable-notes.txt",
-         "agents/agent-a/temp/build-helper.py")
-    _git(tmp_path, "commit", "-qm", "seed")
+    _git(tmp_path, "add", "-f", "agents/agent-a/temp/deliverable-notes.txt")
     monkeypatch.setattr(pe, "AGENT_DIR", agent)
-    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
     r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["ephemera_tracked_excluded"] == 2
-    assert r["ephemera_count"] == 1            # only the untracked .log stays purgeable
-    assert r["unclassified_count"] == 2        # reclassified, NOT dropped
-    assert r["temp_root_total"] == 3           # conservation
+    assert r["pressure_count"] == 1 and r["census"]["tracked_skipped"] == 1
+    assert "1 git-tracked" in r["summary"]
 
 
-def test_untracked_ephemera_stays_in_purge_scope(tmp_path, monkeypatch):
-    """NEGATIVE CONTROL: same tree, nothing tracked -> the check must stay
-    silent. Without this, a broken cross-check that excluded everything would
-    still pass the positive control above."""
-    agent = tmp_path / "agents" / "agent-a"
-    temp = agent / "temp"
-    temp.mkdir(parents=True)
-    _seed_git_repo(tmp_path)
-    for name in ("deliverable-notes.txt", "build-helper.py", "scratch.log"):
-        (temp / name).write_text("x", encoding="utf-8")
-    monkeypatch.setattr(pe, "AGENT_DIR", agent)
-    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
-    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["ephemera_tracked_excluded"] == 0
-    assert r["ephemera_count"] == 3
-    assert r["unclassified_count"] == 0
+def test_temp_pressure_counts_untracked_files(tmp_path, monkeypatch):
+    # NEGATIVE CONTROL for the case above: nothing tracked, everything counts.
+    r = _run(tmp_path, monkeypatch, n_flat=0, names=("deliverable-notes.txt", "scratch.log"))
+    assert r["pressure_count"] == 2 and r["census"]["tracked_skipped"] == 0
 
 
-def test_git_cross_check_fails_open(tmp_path, monkeypatch):
-    """No repo at PROJECT_ROOT -> `git ls-files` fails. A precheck advisory must
-    never break the loop over unavailable git, so counts stay untouched."""
-    agent = tmp_path / "agents" / "agent-a"
-    temp = agent / "temp"
-    temp.mkdir(parents=True)
-    (temp / "scratch.log").write_text("x", encoding="utf-8")
-    (temp / "notes.txt").write_text("x", encoding="utf-8")
-    monkeypatch.setattr(pe, "AGENT_DIR", agent)
-    monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)   # not a git repo
-    r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["ephemera_count"] == 2                     # unchanged — failed open
-    assert r["ephemera_tracked_excluded"] == 0
+def test_temp_pressure_suggested_goal_names_the_review(tmp_path, monkeypatch):
+    r = _run(tmp_path, monkeypatch, n_flat=18, names=("helper.py", "proj/"))
+    assert r["flags"] == ["temp_drain_needed"] and r["pressure_count"] == 20
+    g = r["suggested_goal"]
+    assert g["title"].startswith("Maintain: drain 20 accumulated temp/ working docs")
+    assert pe.is_drain_action_title(g["title"])      # the dedup SSOT still matches it
+    assert "(1 dir, 18 doc, 1 script)" in g["description"]
+    assert "records every decision" in g["description"]
 
 
 # ── full-depth footprint () ────────────────────────────────────────
@@ -560,10 +459,10 @@ def test_git_cross_check_fails_open(tmp_path, monkeypatch):
 
 
 def test_footprint_never_moves_pressure_count(tmp_path, monkeypatch):
-    """A deep subtree adds mass and files to the footprint and NOTHING to the
-    scheduling signal. /drain-temp enumerates depth 1 only, so a full-depth
-    pressure_count would schedule a drain against files the drain cannot reach
-    (guard-5329)."""
+    """A deep subtree adds mass and files to the footprint and no more than ONE
+    item to the scheduling signal: the review decides a folder whole, so a
+    full-depth pressure_count would schedule a drain against entries no review
+    decides one by one (guard-5329)."""
     agent = tmp_path / "agents" / "agent-a"
     temp = agent / "temp"
     temp.mkdir(parents=True)
@@ -572,11 +471,12 @@ def test_footprint_never_moves_pressure_count(tmp_path, monkeypatch):
     deep.mkdir(parents=True)
     for i in range(30):                      # well past drain_goal_threshold=20
         (deep / f"buried-{i:02d}.md").write_text("x" * 100, encoding="utf-8")
+    for entry in temp.iterdir():
+        _age(entry)
     monkeypatch.setattr(pe, "AGENT_DIR", agent)
     monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
     r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["count"] == 1                   # depth-1 only, as /drain-temp sees
-    assert r["pressure_count"] == 1
+    assert r["pressure_count"] == 2          # flat.md + the sub/ folder, as the review sees them
     assert r["flags"] == []                  # 30 buried files trigger nothing
     fp = r["footprint"]
     assert fp["files"] == 31                 # the footprint DOES see them
@@ -652,7 +552,7 @@ def test_footprint_reaches_the_summary_on_a_CLEAN_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(pe, "AGENT_DIR", agent)
     monkeypatch.setattr(pe, "PROJECT_ROOT", tmp_path)
     r = pe.cmd_temp_pressure(_Args(), CONFIG, _compact())
-    assert r["flags"] == [] and r["count"] == 0        # genuinely clean to schedule
+    assert r["flags"] == [] and r["pressure_count"] == 0        # genuinely clean to schedule
     assert r["summary"] != "temp-pressure: clean"      # but not a bare "clean"
     assert "footprint(advisory, not thresholded)" in r["summary"]
     assert "5000 B full-depth" in r["summary"]

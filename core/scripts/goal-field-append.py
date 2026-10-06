@@ -65,9 +65,10 @@ WHAT IT REFUSES, and why each refusal is a real failure someone hit
 
 IDEMPOTENCY
 The caller supplies a marker. The script appends a one-line sentinel
-``[appended:<marker>]`` after the text, and on a re-run sees that sentinel in
-the CURRENT value and exits 0 having changed nothing — so a retry after a
-partial failure is safe.
+``[appended:<marker>]`` after the text, and on a re-run sees that sentinel as a
+whole line of the CURRENT value and exits 0 having changed nothing — so a retry
+after a partial failure is safe. A sentinel quoted inside a sentence is text,
+not a landed write (g-375-132).
 
 VERIFICATION (sig-40 / guard-2444 / guard-2525 / guard-1870)
 The post-write assertion compares against the PRE value, never against the
@@ -270,8 +271,33 @@ def is_block_boundary(line: str) -> bool:
     return line.startswith(SENTINEL_PREFIX) and line.rstrip().endswith("]")
 
 
+def has_sentinel_line(value: str, sentinel: str) -> bool:
+    """True when `sentinel` is a whole line of `value`: the shape compose() writes.
+
+    THE IDEMPOTENCY KEY IS A LINE, NOT A SUBSTRING (g-375-132). compose() ends every
+    block with its sentinel alone on a line, and has since its first version. A
+    substring test also matched a sentinel quoted inside a sentence, so an append
+    whose marker a note merely MENTIONED returned changed:false, stored nothing, and
+    still read as success to its caller. Measured 2026-10-06 over the 4444 goals of
+    the world's active aspirations: 163 (field, marker) pairs held their sentinel
+    only inside a longer line, 144 of them on pending goals, against 5829 with a
+    whole-line copy.
+
+    rstrip() keeps a CRLF or trailing-space copy matching; an indented copy does not
+    match, the rule is_block_boundary applies. goal-note-tail.py's SENTINEL_RE is
+    stricter and wants `]` last on the line; compose() writes no trailing whitespace,
+    so the two agree on every sentinel this script writes.
+
+    Every check below that asks "did my sentinel land?" uses this and never `in`,
+    and they must change together: with only the first one moved, a field that
+    mentions the sentinel gets past it, and a read-back still testing `in` then takes
+    the mention for the write and reports a write that never landed as a success.
+    """
+    return any(ln.rstrip() == sentinel for ln in value.split("\n"))
+
+
 def wrapped_marker_refusal(marker: str) -> "str | None":
-    """Refusal text when the caller passed an ALREADY-WRAPPED marker, else None.
+    """Refusal text for an ALREADY-WRAPPED marker or one with a line break, else None.
 
     This script OWNS the wrapping — `sentinel_for` turns `m` into `[appended:m]`
     — but the only place that convention is ever VISIBLE is inside a record,
@@ -295,7 +321,20 @@ def wrapped_marker_refusal(marker: str) -> "str | None":
     (fail-closed by type-distinctness): make the wrong shape a DISTINCT, refused
     input rather than a silently-accepted one. guard-1338: refuse it BY NAME
     rather than letting it reach code that produces a confusing result.
+
+    A LINE BREAK IN THE MARKER IS REFUSED HERE TOO (g-375-132). The idempotency
+    test matches the sentinel as a whole line, so a sentinel that a newline splits
+    over two lines is never found, and every re-run appends again. This is the one
+    marker check both writers import (store-field-append takes it along with
+    verify_post), so the refusal lives here rather than beside one call site.
     """
+    if "\n" in marker:
+        return (
+            f"refusing a marker with a line break in it {marker!r} — the sentinel "
+            f"must stay on one line, or the idempotency test, which matches it as a "
+            f"whole line, never finds it and every re-run appends again. Pass a "
+            f"one-line token."
+        )
     if not marker.startswith(SENTINEL_PREFIX):
         return None
     bare = marker[len(SENTINEL_PREFIX):]
@@ -647,7 +686,7 @@ def verify_post(pre: str, post, sentinel: str) -> "list[str]":
     problems = []
     if not isinstance(post, str):
         return [f"post value is {type(post).__name__}, not text"]
-    if sentinel not in post:
+    if not has_sentinel_line(post, sentinel):
         problems.append("marker sentinel absent from the stored value")
     if pre and pre not in post:
         problems.append("PRE content did NOT survive the write — the field was overwritten")
@@ -690,8 +729,9 @@ def main(argv=None) -> int:
     # sentinel, or to this Body's line anywhere but the end, is dropped: this
     # script writes both, so nothing is lost. Any other boundary-shaped line is
     # refused, because it would cut the block in two. An indented line, or a marker
-    # inside a sentence, is not a boundary and is stored, though its marker still
-    # meets the substring idempotency test below, a wider hazard ().
+    # inside a sentence, is not a boundary and is stored. It does not count as a
+    # landed write either: the idempotency test below matches only a whole line
+    # ().
     signed = stamp_line() if args.field in ("progress_note", "outcome_note") else None
     if signed:
         lines = text.split("\n")
@@ -725,7 +765,7 @@ def main(argv=None) -> int:
              "and every sibling key you omit is dropped silently at HTTP 200 (guard-2444) — do "
              "that deliberately, by hand, with a PRE/POST sibling-survival assertion.")
 
-    if sentinel in pre:
+    if has_sentinel_line(pre, sentinel):
         out = {"ok": True, "changed": False, "reason": "idempotent: marker already present",
                "goal_id": args.goal_id, "field": args.field, "marker": args.marker,
                "pre_len": len(pre)}
@@ -791,7 +831,7 @@ def main(argv=None) -> int:
     current = fresh.get(args.field)
     if current is None:
         current = ""
-    if isinstance(current, str) and sentinel in current:
+    if isinstance(current, str) and has_sentinel_line(current, sentinel):
         # A concurrent run of THIS marker landed while we were composing. That
         # is the idempotent case, not a conflict — report it and change nothing.
         out = {"ok": True, "changed": False,
@@ -844,7 +884,7 @@ def main(argv=None) -> int:
         try:
             again = read_goal(args.goal_id, args.source)
             val = again.get(args.field)
-            if isinstance(val, str) and sentinel in val and (not pre or pre in val):
+            if isinstance(val, str) and has_sentinel_line(val, sentinel) and (not pre or pre in val):
                 recovered = val
         except SystemExit:
             pass
@@ -879,8 +919,9 @@ def main(argv=None) -> int:
             again = read_goal(args.goal_id, args.source)
             val = again.get(args.field)
             if isinstance(val, str):
-                confirmed_lost = bool(sentinel in val and pre and pre not in val)
-                if not confirmed_lost and sentinel in val:
+                landed = has_sentinel_line(val, sentinel)
+                confirmed_lost = bool(landed and pre and pre not in val)
+                if not confirmed_lost and landed:
                     post = val  # store is sound; report its authoritative value
         except SystemExit:
             pass
@@ -905,7 +946,7 @@ def main(argv=None) -> int:
     try:
         again = read_goal(args.goal_id, args.source)
         val = again.get(args.field) or ""
-        if sentinel not in val:
+        if not has_sentinel_line(val, sentinel):
             confirm = "LAGGING: independent re-read does not yet show the marker"
         elif pre and pre not in val:
             confirm = "DISAGREES: independent re-read is missing the PRE content"

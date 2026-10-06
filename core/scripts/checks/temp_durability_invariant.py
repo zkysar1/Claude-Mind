@@ -9,11 +9,17 @@ durability mechanism does not run -- such a file has no copy anywhere.
 WHAT "COVERED" MEANS DEPENDS ON THE LANE'S SHAPE, which is why predicate_shape()
 detects it rather than assuming (g-306-111):
   * allow-list (pre-2026-07-31): covered == suffix is in the parsed ephemera list.
-  * inverted (current): Lane 1 purges by DEFAULT, so nearly everything is covered
-    and the residual is the EXEMPT set -- a file cited by a durable record, hence
-    never purged, un-drainable if third-class, and untracked because temp/ is
-    gitignored. That is the artifact D2 says to promote into a receipted dir
-    (temp-store.md § The third class (b)), and it is what this check now reports.
+  * inverted (2026-07-31 .. 2026-10-05): Lane 1 purged by DEFAULT, so nearly
+    everything was covered and the residual was the EXEMPT set -- a file cited by
+    a durable record, hence never purged, un-drainable if third-class, and
+    untracked because temp/ is gitignored. That is the artifact D2 says to
+    promote into a receipted dir (temp-store.md § The third class (b)).
+  * decided (current, 2026-10-05): Lane 1 deletes only what a review decided
+    (temp_decisions.py), so every item has a lifecycle -- the review, scheduled
+    by the precheck pressure count. The residual is the same cited set, now for
+    EVERY suffix: the review refuses to discard a cited file, so it stays
+    untracked with no durable copy until someone promotes it or folds it into
+    the citing record. That is what this check reports.
 
 SUPERSEDES g-001-210's proposed check, whose invariant ("git-ignored IFF purged")
 is obsolete: .gitignore now ignores ALL of agents/*/temp/* by design (g-115-1765)
@@ -84,7 +90,7 @@ def active_storage_backend() -> str:
 
 
 def predicate_shape():
-    """('inverted', None) | ('allowlist', {exts}) | (None, None).
+    """('decided', None) | ('inverted', None) | ('allowlist', {exts}) | (None, None).
 
     g-306-111 inverted Lane 1 from an allow-list of ephemera extensions to
     purge-by-default-with-exemptions. That MOVED the meaning of every
@@ -107,6 +113,10 @@ def predicate_shape():
     if not m:
         return None, None
     body = m.group(1)
+    # The decided lane's signature: the predicate is applied to each NAMED
+    # candidate (`find <path> -maxdepth 0 ...`), never to a directory scan.
+    if re.search(r"-maxdepth\s+0\b", body):
+        return "decided", None
     # The inversion's signature: the .md/.json group is NEGATED.
     if re.search(r"!\s*\\\(\s*-name '\*\.md'", body):
         return "inverted", None
@@ -146,12 +156,12 @@ def main():
         print("SKIP: could not parse PURGE_FIND_PRED from temp-drain-purge.sh")
         return 0
     cited = None
-    if shape == "inverted":
+    if shape in ("inverted", "decided"):
         cited = cited_basenames()
         if cited is None:
-            print("SKIP: Lane 1 is purge-by-default but the cited set is UNKNOWN — "
-                  "coverage is not computable, and reporting 0 orphans here would be "
-                  "a vacuous PASS (the purge lane itself degrades in this case too)")
+            print("SKIP: the cited set is UNKNOWN — the residual (cited files) is not "
+                  "computable, and reporting 0 orphans here would be a vacuous PASS "
+                  "(the purge lane itself deletes nothing in this case)")
             return 0
     try:
         tracked = set(subprocess.run(["git", "ls-files"], capture_output=True,
@@ -172,6 +182,11 @@ def main():
         if shape == "allowlist":
             if p.suffix in exts:
                 continue                               # has a lifecycle via purge
+        elif shape == "decided":
+            # Every item has a lifecycle (the review); only a cited file is left
+            # with no way out but a keep. Same glob rule as below.
+            if not any(fnmatch.fnmatch(p.name, c) for c in cited):
+                continue
         else:
             # Purge-by-default: covered unless exempt. The two exemptions have
             # DIFFERENT standing, and only one of them leaves a real residual:
@@ -198,7 +213,14 @@ def main():
         orphans.append(str(p))
 
     if orphans:
-        if shape == "inverted":
+        if shape == "decided":
+            print("WARN: %d temp file(s) >24h are cited by a durable record, so the "
+                  "review cannot discard them, but they are not git-tracked — no "
+                  "durable copy, and a keep is their only lifecycle. Promote each into "
+                  "a receipted dir (agents/<agent>/temp/<slug>/ + RECEIPT.*), or fold "
+                  "the content into the citing record: %s"
+                  % (len(orphans), ", ".join(orphans[:5])))
+        elif shape == "inverted":
             print("WARN: %d temp file(s) >24h are cited by a durable record, so the "
                   "purge lane exempts them, but they are neither git-tracked nor "
                   "drainable — no durability, no lifecycle. Promote each into a "
@@ -210,6 +232,9 @@ def main():
                   "(no durability, no lifecycle): %s" % (len(orphans), ", ".join(orphans[:5])))
         if len(orphans) > 5:
             print("      ... +%d more" % (len(orphans) - 5))
+    elif shape == "decided":
+        print("PASS: temp-durability invariant holds (Lane 1 deletes only reviewed "
+              "discards; %d cited exemption(s) checked, 0 unpromoted)" % len(cited))
     elif shape == "inverted":
         print("PASS: temp-durability invariant holds (Lane 1 purge-by-default; "
               "%d cited exemption(s) checked, 0 unpromoted)" % len(cited))
