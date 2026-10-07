@@ -30,6 +30,7 @@ from __future__ import annotations
 import importlib.util
 import inspect
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -262,6 +263,10 @@ def test_validate_bitemporal_verbatim_in_sync():
     reject. This fails loudly the moment the bodies drift."""
     daemon_src = inspect.getsource(SR._validate_bitemporal)
     cli_src = inspect.getsource(_rb._validate_bitemporal)
+    # Goal ids are compared out, every other byte stays pinned. The seed plant scrubs ids from
+    # comments and docstrings but skips a file carrying the domain-leak-exempt marker, which
+    # reasoning-bank.py does: so at a plant the two copies differ by an id only the daemon lost.
+    daemon_src, cli_src = (re.sub(r"g-\d{3}-\d+", "", s) for s in (daemon_src, cli_src))
     assert daemon_src == cli_src, (
         "_validate_bitemporal diverged between the daemon "
         "(mind_api/src/store_registry.py) and the CLI "

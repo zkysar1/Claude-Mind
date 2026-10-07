@@ -32,7 +32,9 @@ WHAT IT DOES, in order (each step is cheap until the last):
      bound for no verdict. The writer record is the per-agent edit log
      (uncommitted-edits.jsonl, rows stamped with the session id by the
      PostToolUse write hook); the changelog cannot attribute tool writes. The
-     ids matched are the closing process's own plus the claim's. No row for any
+     ids matched are the closing process's own plus the claim's; with --drain (a
+     close by the completed-not-closed drain, g-375-146) the claim's alone, since
+     that closer ran none of the unit. No row for any
      changed file → noop, naming the files it ignored. SKIP ONLY ON THAT
      POSITIVE EVIDENCE: no session id, no log, or a world outside the project
      root (where the hook records nothing) keeps the wide trigger and says why.
@@ -359,7 +361,7 @@ def claim_record(goal_id: str, source: str) -> dict | None:
 
 # ─── whose write it was () ──────────────────────────────────────
 
-def unit_sessions(rec: dict | None) -> set[str]:
+def unit_sessions(rec: dict | None, *, drained: bool = False) -> set[str]:
     """The session ids that ran this unit: the closing process's own, plus the claim's.
 
     MIND_SID is the id bash-agent-inject exports to every command, and the gate
@@ -367,8 +369,15 @@ def unit_sessions(rec: dict | None) -> set[str]:
     claim's two ids (claimed_by_sid, executed_by_sid) add the session that
     started the unit when a restart handed it to another. A wider set only makes
     the gate run MORE often, which is the safe direction.
+
+    A DRAINED close (g-375-146) is the exception: the completed-not-closed drain
+    closes another session's finished unit, so the closing session ran none of
+    it. Counting it charged the drainer's own recent domain writes to that
+    unit's close and ran the suite for them; those writes are checked at the
+    closes of the drainer's own units. The claim's ids alone name the unit's
+    sessions then, and a record carrying neither still keeps the wide trigger.
     """
-    ids = {os.environ.get("MIND_SID", "")}
+    ids = set() if drained else {os.environ.get("MIND_SID", "")}
     if isinstance(rec, dict):
         ids.update(str(rec.get(k) or "") for k in ("claimed_by_sid", "executed_by_sid"))
     return {i.strip() for i in ids if i.strip()}
@@ -729,6 +738,14 @@ def _log_override(world_dir: Path, payload: dict) -> None:
         print(f"domain-suite-gate: override ledger write failed: {e}", file=sys.stderr)
 
 
+# What evaluate() learns about the ONE close it judges, for every firing it emits:
+# "drained" when the completed-not-closed drain made the close, and "seconds" once
+# the suite has run. It rides the firing's `extra`, which the gate-firing log
+# stores in clear, unlike the hashed payload, so the cost of drained closes can be
+# read from any box the log syncs to (). Reset at each evaluate().
+_FIRING_EXTRA: dict = {}
+
+
 def _emit(decision: str, goal_id: str, override: str | None, **fields) -> dict:
     doc = {"gate": GATE_ID, "decision": decision, "goal_id": goal_id}
     doc.update(fields)
@@ -738,7 +755,8 @@ def _emit(decision: str, goal_id: str, override: str | None, **fields) -> dict:
                   payload={"goal_id": goal_id, "runner": fields.get("runner"),
                            "rc": fields.get("rc"), "touched": len(fields.get("touched") or []),
                            "peer_touched": len(fields.get("peer_touched") or [])},
-                  override_reason=override if decision == "override" else None)
+                  override_reason=override if decision == "override" else None,
+                  extra=dict(_FIRING_EXTRA) or None)
     except Exception:  # noqa: BLE001 — telemetry must never break the gate
         pass
     print(json.dumps(doc, ensure_ascii=False))
@@ -749,7 +767,10 @@ def _emit(decision: str, goal_id: str, override: str | None, **fields) -> dict:
 
 def evaluate(goal_id: str, source: str, since: datetime | None, override: str | None,
              timeout: int, world_dir: Path | None, *, ledger: Path | None = None,
-             project_root: Path | None = None) -> int:
+             project_root: Path | None = None, drained: bool = False) -> int:
+    _FIRING_EXTRA.clear()
+    if drained:
+        _FIRING_EXTRA["drained"] = True
     scripts_dir = _scripts_dir(world_dir)
     if scripts_dir is None or not has_domain_tests(scripts_dir):
         _emit("noop", goal_id, override, reason="no domain test suite under world scripts")
@@ -775,10 +796,11 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
     # (own_writes); any blind spot it can see keeps the wide trigger, and says
     # why on the run line below. Why, and the failure direction chosen:
     # core/config/rationale/domain-suite-gate-own-writes.md.
-    mine, unscoped_why = own_writes(scripts_dir, since, unit_sessions(rec),
+    mine, unscoped_why = own_writes(scripts_dir, since, unit_sessions(rec, drained=drained),
                                     ledger or edits_ledger(os.environ.get("MIND_AGENT")),
                                     project_root or PROJECT_ROOT)
     scope_note = ""
+    drained_note = " (a drained close: the unit's sessions are the claim's, not the closer's)" if drained else ""
     if mine is None:
         scope_note = f" [not narrowed to this unit's own writes: {unscoped_why}]"
     else:
@@ -792,7 +814,7 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
                          f"this unit's sessions (the edit log has no row for them): {peer_names}")
             print(f"[domain-suite-gate] not running the domain suite for {goal_id}: {len(peers)} domain "
                   f"script(s) changed since {stamp}{since_note} ({peer_names}) and this unit's sessions wrote "
-                  "none of them. A write made through Bash is not in the edit log: if this unit wrote a "
+                  f"none of them{drained_note}. A write made through Bash is not in the edit log: if this unit wrote a "
                   "domain script that way, run the suite yourself.", file=sys.stderr, flush=True)
             return 0
 
@@ -811,11 +833,12 @@ def evaluate(goal_id: str, source: str, since: datetime | None, override: str | 
         took = "under a minute" if last < 60 else f"{round(last / 60)} min"
         expect += f"; the last run on this box took {took}"
     print(f"[domain-suite-gate] running the world's domain suite before this close, because "
-          f"{len(touched)} domain script(s) changed since the claim ({names}){scope_note}. Expect {expect}. "
-          "It is not hung: let it finish.", file=sys.stderr, flush=True)
+          f"{len(touched)} domain script(s) changed since the claim ({names}){scope_note}{drained_note}. "
+          f"Expect {expect}. It is not hung: let it finish.", file=sys.stderr, flush=True)
     started = time.monotonic()
     rc, tail, failing, log = run_suite(scripts_dir, timeout, goal_id)
     seconds = round(time.monotonic() - started)
+    _FIRING_EXTRA["seconds"] = seconds
     changes = classify_private_changes(before, private_files(roots))
     clobbered = changes["content_changed"]
     if clobbered:
@@ -992,13 +1015,17 @@ def main(argv=None) -> int:
     ap.add_argument("--since", default=None, help="ISO timestamp; overrides the goal's claimed_at")
     ap.add_argument("--override", default=None, help="justification; turns a block into a logged pass")
     ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    ap.add_argument("--drain", action="store_true",
+                    help="a close by the completed-not-closed drain, whose closer ran none of the unit "
+                         "(g-375-146): only the claim's sessions count as the unit's")
     args = ap.parse_args(argv)
     since = _parse_iso(args.since) if args.since else None
     if args.since and since is None:
         print(f"domain-suite-gate: --since {args.since!r} is not an ISO timestamp", file=sys.stderr)
         return 2
     try:
-        return evaluate(args.goal, args.source, since, args.override, args.timeout, WORLD_DIR)
+        return evaluate(args.goal, args.source, since, args.override, args.timeout, WORLD_DIR,
+                        drained=args.drain)
     except Exception as e:  # noqa: BLE001 — fail OPEN: a broken gate must not wedge a close
         _emit("error", args.goal, args.override, reason=f"gate error, fail-open: {type(e).__name__}: {e}")
         return 0

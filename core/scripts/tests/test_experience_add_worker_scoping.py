@@ -203,7 +203,8 @@ def test_predicate_does_not_key_on_body_role():
     Asserted over CODE only: the gate's own commentary cites guard-2445 by name, so
     a whole-text grep would fail on the very comment that documents the rule.
     """
-    gate = (SCRIPTS / "experience-add.sh").read_text(encoding="utf-8").split("g-306-418", 1)[1]
+    # Anchored on the heading text, not the goal id before it: the seed plant scrubs the id from the comment.
+    gate = (SCRIPTS / "experience-add.sh").read_text(encoding="utf-8").split("WORKER SCOPING GATE", 1)[1]
     code = "\n".join(l for l in gate.splitlines() if not l.lstrip().startswith("#"))
     assert BODY_WM_BASENAME in code, "predicate does not test the per-session file"
     assert "BODY_ROLE" not in code, "predicate keys on BODY_ROLE (guard-2445)"

@@ -150,7 +150,8 @@ def test_hook_routes_body_role_on_file_existence_not_manifest_state() -> None:
     # left the prose matching and the test green (measured by mutation-proof-test).
     # An alternative branch in an assertion is a second way to pass, not a second
     # thing checked.
-    assert "DECISION RE-DERIVED AND UPHELD (g-306-210" in text, (
+    # The anchor stops before the goal id: the seed plant scrubs it from the comment.
+    assert "DECISION RE-DERIVED AND UPHELD (" in text, (
         "the routing decision must stay documented at the export site with its reason, "
         "so a future reader does not re-litigate it from the latency argument alone "
         "(measured: the manifest read costs ~1.5% of this hook's own spawn — real, and "

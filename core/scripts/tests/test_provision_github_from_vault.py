@@ -34,7 +34,13 @@ SCRIPT = REPO_ROOT / "core" / "scripts" / "provision-github-from-vault.sh"
 # token as opaque (never format-validates), so any distinctive string exercises
 # the values-blind leak check identically.
 DUMMY_TOKEN = "DUMMY_DEPLOY_ADMIN_TOKEN_g2083_fake_sentinel"
-VAULT_KEY = "MIND_FLEET_GH_DEPLOYKEY_ADMIN_TOKEN"
+# The script derives its vault key at run time: the first segment of ENVIRONMENT_ID, uppercased,
+# then the fixed suffix. The fixture keys are built from that same derivation and not spelled with
+# the literal prefix token, because the seed plant rewrites that token inside this file but cannot
+# see the script computing it, so a spelled-out fixture stops matching at a plant.
+ENVIRONMENT_ID = "ayoai-mind"
+PFX = ENVIRONMENT_ID.split("-")[0].upper() + "_"
+VAULT_KEY = PFX + "FLEET_GH_DEPLOYKEY_ADMIN_TOKEN"
 
 
 def _run(tmp_path, *, vault_body, agent="alpha", extra_args=(), mock_state=None):
@@ -46,8 +52,8 @@ def _run(tmp_path, *, vault_body, agent="alpha", extra_args=(), mock_state=None)
     env["PROVISION_GH_VAULT_FILE"] = str(vault_file)
     env["SSH_KEY_DIR"] = str(ssh_dir)
     env["GH_REPO"] = "zkysar1/Ayoai-Mind"
-    # Control the vault-key derivation (). VAULT_KEY above is a
-    # hardcoded literal, but the script does not take it — it DERIVES
+    # Control the vault-key derivation (). The script does not take
+    # VAULT_KEY above as an input — it DERIVES
     # ${VAULT_KEY_PREFIX}_FLEET_GH_DEPLOYKEY_ADMIN_TOKEN, where VAULT_KEY_PREFIX
     # is the uppercased first segment of ENVIRONMENT_ID (default "ayoai-mind").
     # Since `env` starts as dict(os.environ), both inputs leaked ambiently, so
@@ -73,7 +79,7 @@ def _run(tmp_path, *, vault_body, agent="alpha", extra_args=(), mock_state=None)
     # so an ambient value wins outright and the pin above never gets consulted.
     # guard-1484: clear the value when the run must MEASURE resolution rather
     # than dictate it.
-    env["ENVIRONMENT_ID"] = "ayoai-mind"
+    env["ENVIRONMENT_ID"] = ENVIRONMENT_ID
     env.pop("VAULT_KEY_PREFIX", None)
     env.pop("GH_DEPLOYKEY_VAULT_KEY", None)
     if mock_state is not None:
@@ -87,7 +93,7 @@ def _run(tmp_path, *, vault_body, agent="alpha", extra_args=(), mock_state=None)
 
 def test_dormant_when_vault_lacks_token(tmp_path):
     """Vault without the token entry -> clear skip, exit 0 (bring-up never breaks)."""
-    proc, ssh_dir = _run(tmp_path, vault_body="MIND_STORAGE_BACKEND=own-cloud\n")
+    proc, ssh_dir = _run(tmp_path, vault_body=f"{PFX}STORAGE_BACKEND=own-cloud\n")
     assert proc.returncode == 0, proc.stderr
     assert "DORMANT-BUT-READY" in proc.stderr
     # No keypair generated on the dormant path.

@@ -28,6 +28,9 @@
 #                                            core/scripts/liveness_check.py
 #                                            core/scripts/body_diary_carrier.py
 #                                            core/scripts/knowledge_projection.py
+#                                            core/scripts/peer_board_post.py
+#                                            core/scripts/outbound_data_class.py
+#                                            core/scripts/env.py
 #
 #      peer_surface.py added 2026-08-14 (): board_write.py's post
 #      handler now imports suspected_routing_tags from it for the routing-tag
@@ -63,6 +66,17 @@
 #      instance of guard-7548's shape. test_daemon_import_surface.py was red on it at HEAD (run on a
 #      `git archive HEAD` export, 2026-10-03), unnoticed since u7a because that unit ran its own
 #      suites and not this pin.
+#
+#      peer_board_post.py + outbound_data_class.py + env.py added 2026-10-07 (, found by a
+#      scoped delta run before the next release cut, DESKTOP-O91DLK2). peer_surface.py, which is in
+#      the list, imports peer_board_post inside a function (peer_surface.py:447) since df44ec5270
+#      (); peer_board_post.py:151 imports outbound_data_class at module top, and
+#      outbound_data_class.py:294 imports env inside a function, so all three are held in-process
+#      through mind_api/src/endpoints/board_write.py while none of their own paths was in the
+#      pathspec. A commit touching ONLY one of them diffed clean, post-commit skipped the restart,
+#      and the daemon would keep running the old copy. The sixth instance of guard-7548's shape.
+#      test_daemon_import_surface.py was red on it at HEAD 10fbbf96d9 and green at the v2.12.94 tag;
+#      's own run named test_peer_board_post.py and test_peer_surface.py, not this pin.
 #
 #      predicate.py + aspirations.py added 2026-08-08 (, reducer pass on
 #      hostname cc-04, uname -r 6.8.0-136-generic). Both entered the daemon surface
@@ -216,6 +230,9 @@ DAEMON_PATHSPEC=(
     core/scripts/liveness_check.py
     core/scripts/body_diary_carrier.py
     core/scripts/knowledge_projection.py
+    core/scripts/peer_board_post.py
+    core/scripts/outbound_data_class.py
+    core/scripts/env.py
 )
 
 # --print-pathspec: emit the boundary, one entry per line, exit 0. For consumers

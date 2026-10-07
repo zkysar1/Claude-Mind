@@ -347,6 +347,20 @@ Run every item; each is a one-liner and each has caught a real defect:
      the dest-only ones at the PREVIOUS plant: only a red absent there is this hop's.
      v2.12.93: 198 files, 18 dest-only failing ids in 11 files, the same 18 red at the
      v2.12.92 plant, none new. State in the PR what was and was not examined.
+   - **Before any full run on a planted tree, collect it first, in the isolated clone.**
+     `STORAGE_BACKEND=local py -3 -m pytest --collect-only -q -p no:cacheprovider -m "not daemon_integration" mind_api/tests core/tests/gates core/scripts/tests`
+     takes about 4 minutes for 1721 files and lists EVERY collection error at once. A
+     full run stops at the first chunk with one, after about 12 minutes, as
+     `VERDICT: INVALID` (pytest rc=2), which `framework_pull`'s C4 also refuses. The
+     residue-subset check cannot see this class: a test file identical in the tag and
+     the plant whose SUBJECT differs (v2.12.94: 2 errors, both already at the v2.12.93
+     plant; g-115-12159). The clone's world and meta tiers must be initialized first
+     (`init-mind.sh <agent>` under `STORAGE_BACKEND=local`, the dev `MIND_*` variables
+     unset), or `goal-selector.py` raises MetaNotReadyError at import in two test files
+     and the run is void in 12 minutes (the first v2.12.94 attempt). A known error that
+     stands is run past with `PYTEST_ADDOPTS=--continue-on-collection-errors` (the runner
+     copies `os.environ` into each chunk) and named in the PR. Gitignored runtime state is
+     the whole class: enumerate what the run reads (guard-5253).
 9. Transform-damage scan — did the transform DELETE something it should not
    have? This is the mirror of Phase 4: that phase reads lines the DEST carries
    and the seed lacks; this reads the other direction.

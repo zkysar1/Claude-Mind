@@ -125,7 +125,10 @@ def _prune_block(path, helper_name):
     not see.
     """
     src = path.read_text(encoding="utf-8")
-    idx = src.index("g-306-353: DELIBERATELY pure FIFO")
+    # The anchor stops BEFORE the goal id the comment opens with: the seed plant scrubs
+    # goal ids from source comments, so the id-bearing anchor is a ValueError there.
+    assert src.count("DELIBERATELY pure FIFO") == 1, f"{path.name}: the prune-block anchor must match once"
+    idx = src.index("DELIBERATELY pure FIFO")
     end = src.index("encoding_queue", idx)
     raw = src[idx:end]
     # CODE ONLY — drop comment lines. The block's own comment explains at length

@@ -62,7 +62,7 @@ JSON output:
        "blocked_since", "title"}
     ],
     "open_audit_exists": bool,          # an investigate:reason-less-blocked-audit
-    "open_audit_goal_id": str | None,   #   already pending/in-progress
+    "open_audit_goal_id": str | None,   #   already pending/in-progress/candidate
                                        #   (ANY open audit — report surface;
                                        #   the filing predicate is the
                                        #   per-member rule below)
@@ -100,7 +100,7 @@ import _rt  # canonical Python -> daemon client (post-cutover; see _rt.py)
 
 # : the per-member open-audit coverage rule, shared with the
 # defer-drift lane (same naming-surface semantics, one implementation).
-from audit_open_coverage import uncovered_ids  # noqa: E402
+from audit_open_coverage import OPEN_STATUSES, uncovered_ids  # noqa: E402
 
 # : never hardcode the escalation aspiration —  is the UPSTREAM
 # deployment's queue and does not exist elsewhere, so a literal files nothing.
@@ -114,7 +114,7 @@ except Exception:
         "asp-115", "fallback:import-failed", "world")
 
 AUDIT_ORIGIN_SIGNAL = "investigate:reason-less-blocked-audit"
-NON_TERMINAL_OPEN = ("pending", "in-progress")
+NON_TERMINAL_OPEN = OPEN_STATUSES  # one definition of "open", shared with the filing predicate
 
 
 def _is_reason_less_blocked(goal) -> bool:
@@ -174,8 +174,9 @@ def _find_open_audit(all_goals):
 
     Scans the SAME goal list produced by _read_goals — no separate query. An
     audit is 'open' when its origin_signal == AUDIT_ORIGIN_SIGNAL and its
-    status is pending/in-progress. Resolved/skipped/completed audits do NOT
-    count (the violation may have recurred with new goals).
+    status is pending/in-progress/candidate (audit_open_coverage.OPEN_STATUSES).
+    Resolved/skipped/completed audits do NOT count (the violation may have
+    recurred with new goals).
 
     g-115-11720: this is now the REPORTING surface only ("some open audit
     exists", for the JSON + human output). The FILING predicate is the

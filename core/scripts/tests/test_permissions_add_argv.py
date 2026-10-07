@@ -143,8 +143,14 @@ def test_real_constitutional_anchor_is_never_touched_by_this_suite(harness):
     future edit reintroduces a real-tree path, this fails loudly instead of
     silently rewriting the anchor."""
     real = REPO / ".claude" / "settings.local.json"
-    before = hashlib.sha256(real.read_bytes()).hexdigest()
+
+    def digest():
+        # A seed plant does not ship the anchor (it is per-installation), so "absent" is a state to pin
+        # as well: the suite must not create it there either.
+        return hashlib.sha256(real.read_bytes()).hexdigest() if real.exists() else None
+
+    before = digest()
     run(harness, "--help")
     run(harness, "--bogus")
     run(harness)
-    assert hashlib.sha256(real.read_bytes()).hexdigest() == before
+    assert digest() == before

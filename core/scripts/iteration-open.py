@@ -49,6 +49,16 @@ So `coverage` in the report names wired vs unwired counts explicitly. Reporting
 only what ran is guard-1760's blind spot; this script reports what it declined to
 look at too.
 
+STEP 3 (g-115-8001) IS THE `deferrable-battery` STAGE, the same move one tier
+further. precheck-deferrable-battery.sh owns the deferrable lane registry and runs it
+INSIDE this script's meter window (the stage sits before the `end --keep-state`
+below, which is the "move the meter boundary to enclose them" half of that goal --
+the old precheck-SKILL.md load flipped the zone to tight between this script's close
+and the first deferrable `meter check`, so the tier dropped wholesale 10 times in 14
+on one box). It bounds itself with its own wall-clock budget, so a slow box reports
+a PARTIAL stage rather than a killed one (g-115-7844), and it is reducer-side only:
+a worker Body gets a SKIPPED row, never a clean one.
+
 WHY THE METER STAMPS MATTER MORE THAN THEY LOOK. `precheck-gap-check` reads
 exactly the meter's `start` and `end` stamps. Measured on the reducer: `start`
 fired ~105% of closes and `end` 82% -- start-without-end is the abbreviated-
@@ -69,12 +79,23 @@ Deleting this call instead would fix the window and REGRESS the stamp back to
 82%; `--keep-state` keeps both. The real unlink is the precheck SKILL.md's own
 closing `end` (bare, no flag).
 
+STEP 4 (g-374-504) IS THE `precheck_skill` VERDICT. Every table lane runs here, so
+the only reason left to load Skill(aspirations-precheck) -- ~34k tokens a load, on
+a served resident whose window compacts every few minutes -- is the residue the
+table does not hold. A clean, complete entry whose skill last reached its Phase 0.5
+within _PRECHECK_SKILL_MAX_AGE_MIN says `skip`; anything else, and every doubt,
+says `required` (what the digest did unconditionally before). The stamp is the
+skill's OWN output (the consolidation_health slot, one writer), never a step
+anyone has to remember. Reducer-side only: a worker Body runs no precheck.
+
 Output (guard-424 fail-loud-on-stderr; guard-614 structured on every exit path):
   default -- a per-STAGE rc table first (so a stage that did not run is visible),
-             then FINDINGS ONLY, then selection candidates, then the imperative:
+             then FINDINGS ONLY, then selection candidates, then the verdict
+             line `[iteration-open] PRECHECK-SKILL: skip|required -- <reasons>`,
+             then the imperative:
       [iteration-open] NEXT ACTION REQUIRED: ...
   --json  -- {checked_at, mode, status, completeness, stages, findings, blind,
-              coverage, candidates, error?}
+              coverage, candidates, precheck_skill?, error?}
 
 Fail-open throughout: every stage is independently timed and trapped, a timeout
 renders as rc=124 in the table, and the script exits 0 even when a stage dies. It
@@ -302,6 +323,41 @@ STAGES = (
         # `iteration-open.sh --dry-run` prints the live number.
         "note": "the medium-tier lanes",
     },
+    {
+        # Strangler step 3 (). The deferrable tier ran only when a model
+        # remembered to hand-run it: 4 of 14 iterations on one box, ~25k tokens of
+        # reducer context to read 44 raw outputs. Moving the call into a stage is the
+        # same remedy as the medium tier's (guard-399 amendment 2: change WHO runs it).
+        # `covers` is the tier-table sweep names the battery accounts for -- 1:1 with
+        # its lanes except the cadence battery, which stands for the seven cadence rows
+        # -- and test_iteration_open_stage_registry_parity pins it to the battery.
+        "key": "deferrable-battery",
+        "script": "precheck-deferrable-battery.sh",
+        "args": ("--json",),
+        "apply_flag": True,
+        "covers": (
+            "pending-questions-sweep", "parent-supersession-sweep", "unblock-parent-status-sweep",
+            "routing-audit-target-status-sweep", "credential-defer-recheck",
+            "defer-drift-check", "reason-less-blocked-check", "fresh-eyes-cadence",
+            "fresh-eyes-program-cadence", "fresh-eyes-tree-cadence", "strategic-scan-cadence",
+            "felt-sense-cadence", "curriculum-cadence", "evolution-cadence",
+            "l1-skew-cadence", "scar-tissue-cadence", "completed-not-closed-cadence",
+            "blocked-signal-resolution-check", "reclaim-defer-audit", "reclaim-user-participant-audit",
+            "human-blocked-defer-join", "dependency-cycle-check", "hypothesis-terminal-goal-check",
+            "locus-sweep", "self-blocked-defer-sweep", "phantom-goal-audit",
+            "hardcoded-scope-audit", "closed-against-own-note-check", "abandoned-claim-check",
+            "recurring-precondition-sweep", "health-regression-cadence", "check-stderr-json-merge",
+            "check-uncommitted-edits-log-freshness", "role-multiplier-coverage-audit",
+            "verify-rb-type-parity", "hand-command-audit", "check-agents-parent-dir-sync",
+            "fromisoformat-idiom-guard", "hook-slot-contract-check", "narrative-clobber-audit",
+            "guardrail-pair-audit", "dropped-field-audit", "unchecked-write-ratchet",
+            "tree-last-updated-drift-check", "goal-field-census-ratchet", "check-tests-no-live-agent-wm",
+            "embedded-python-audit", "tree-adjudication-scan", "displaced-id-audit",
+            "repo-hygiene-sweep", "stalled-goal-ratchet", "domain-term-ratchet",
+        ),
+        # No spelled-out count, for the reason the medium note above gives.
+        "note": "the deferrable-tier lanes (reducer-side, self-bounded)",
+    },
 )
 
 
@@ -471,6 +527,27 @@ def _blind_from(stage_key, payload):
             })
         else:
             out.append({"stage": stage_key, "name": stage_key, "reason": str(b)})
+    # A lane that RAN but has no finding spec was not READ, and a lane held by a run
+    # MODE (not a standing registry decision) did not run: neither may read as clean.
+    for u in payload.get("uninterpreted", []) or []:
+        if isinstance(u, dict):
+            out.append({"stage": stage_key, "name": u.get("name", stage_key),
+                        "reason": "ran but has no finding spec (sig: %s)" % u.get("sig", "")})
+    for h in payload.get("held", []) or []:
+        if isinstance(h, dict) and not h.get("standing"):
+            out.append({"stage": stage_key, "name": h.get("name", stage_key),
+                        "reason": "held: " + str(h.get("reason", ""))})
+    return out
+
+
+def _held_from(stage_key, payload):
+    """Lanes a battery registered but deliberately did not run, as HELD rows."""
+    out = []
+    if isinstance(payload, dict):
+        for h in payload.get("held", []) or []:
+            if isinstance(h, dict):
+                out.append({"stage": stage_key, "name": h.get("name", stage_key),
+                            "reason": str(h.get("reason", ""))})
     return out
 
 
@@ -490,7 +567,94 @@ def _coverage(rows):
         "wired_count": len(wired),
         "not_yet_wired_count": len(unwired),
         "by_tier": {k: len(v) for k, v in sorted(by_tier.items())},
-        "stage": "always-run + medium (strangler step 2 — deferrable follows)",
+        "stage": "always-run + medium + deferrable (strangler steps 1-3)",
+    }
+
+
+# --- when the precheck SKILL still has to load () --------------------
+# Every tier-table lane runs in the stages above, so Skill(aspirations-precheck)
+# carries only what the table does not: the partner snapshot, the partner-belief
+# contradiction counter, the stash/branch/boredom surfaces, the Phase 0 hygiene
+# checks, the aspiration-health write, the self-drift and signal-refresh hooks
+# and the Phase 0.5a guardrail pass. The skill is ~34k tokens a load; a served
+# resident (163,840-token window, compaction at 139,264) loaded it on 19 of 27
+# and 13 of 29 passes, and skill text is ~70% of what it appends.
+#
+# The verdict says WHEN that load is due, from evidence the skill itself leaves:
+# the `consolidation_health` slot, whose single writer is the skill's Phase 0.5
+# (the consolidation-health snapshot write). No stage here writes it, so its
+# `computed_at` is the last time the skill REACHED that phase -- not a stamp this
+# script, or a step somebody must remember, could set by running. Every doubt
+# falls toward LOADING: a missing, unreadable, future-dated or stale stamp, a
+# skill that died before Phase 0.5, a dead daemon. `skip` is the one state that
+# must be earned, `required` is the digest's old unconditional behaviour.
+#
+# THE BOUND IS A CAP ON DARKNESS, NOT A MEASUREMENT: nothing measured picks 30
+# minutes, it limits how long the residue may go unrun on an entry that is
+# otherwise clean. The skip RATE is unmeasured too -- it depends on how often a
+# real entry is clean, which no run saved before the all-lanes entry can say.
+#
+# Phase 0.5a (the pre-selection guardrail pass) is deliberately NOT a due-reason:
+# its predicate matched 976 guardrails (2.1 MB, ~10 s; cc-10, 2026-10-06), so it
+# discriminates nothing and would pin the verdict to `required` forever.
+_PRECHECK_SKILL_MAX_AGE_MIN = 30
+_PRECHECK_SKILL_STAMP_SLOT = "consolidation_health"
+
+
+def _precheck_skill_stamp_age(runner, now=None):
+    """Minutes since the skill last reached its Phase 0.5, as (age, None). A stamp
+    that cannot be read as a plain past timestamp is (None, why), never an age."""
+    rc, out, _ms, err = runner(
+        ["wm-read.sh", _PRECHECK_SKILL_STAMP_SLOT, "--json"], 30)[:4]
+    if err is not None:
+        return None, "stamp unreadable (%s)" % err
+    if rc not in (0, None):
+        return None, "stamp unreadable (wm-read.sh rc=%s)" % rc
+    try:
+        slot = json.loads(out)
+    except Exception:
+        return None, "stamp unparseable (reader output is not JSON)"
+    if not isinstance(slot, dict) or "computed_at" not in slot:
+        # An absent slot prints `null` at rc 0 (measured 2026-10-06, cc-10).
+        return None, "stamp slot is empty or carries no computed_at"
+    try:
+        stamped = _dt.datetime.fromisoformat(str(slot["computed_at"]))
+        age = ((now or _dt.datetime.now()) - stamped).total_seconds() / 60.0
+    except Exception as exc:
+        return None, "stamp unparseable (%s)" % type(exc).__name__
+    if age < 0:
+        return None, "stamp is %.0f min in the future (clock skew)" % -age
+    return age, None
+
+
+def _precheck_skill_verdict(report, runner, now=None):
+    """Is Skill(aspirations-precheck) due this iteration? `skip` only when nothing
+    in this entry needs the skill AND the skill's own last run is recent."""
+    due = []
+    cov = report.get("coverage")
+    if not cov:
+        due.append("the tier table was not read")
+    elif cov.get("not_yet_wired_count"):
+        due.append("%d tier-table lane(s) are not dispatched by this entry"
+                   % cov["not_yet_wired_count"])
+    if report.get("findings"):
+        due.append("%d finding(s) to dispose" % len(report["findings"]))
+    if report.get("completeness") != "complete":
+        due.append("%d stage(s)/lane(s) were not read" % len(report.get("blind") or []))
+    if (report.get("candidates") or {}).get("all_blocked"):
+        due.append("every goal is blocked")
+    age, no_stamp = _precheck_skill_stamp_age(runner, now)
+    ran = ("the skill last ran %.0f min ago (bound %d)"
+           % (age, _PRECHECK_SKILL_MAX_AGE_MIN)) if age is not None else None
+    if no_stamp:
+        due.append(no_stamp)
+    elif age > _PRECHECK_SKILL_MAX_AGE_MIN:
+        due.append(ran)
+    return {
+        "verdict": "required" if due else "skip",
+        "reasons": due or ["entry clean and complete; " + ran],
+        "stamp_age_min": None if age is None else round(age, 1),
+        "max_age_min": _PRECHECK_SKILL_MAX_AGE_MIN,
     }
 
 
@@ -531,6 +695,15 @@ def _emit(report, as_json):
             print("  ▸ %s/%s: %s" % (f["stage"], f["name"], f["detail"]))
         for b in blind:
             print("  ▸ BLIND %s/%s: %s" % (b["stage"], b["name"], b["reason"]))
+
+    # HELD lanes are registered, named and deliberately not run (a standing decision
+    # with its reason); they stay out of `blind` so one held lane does not make every
+    # run read "UNREACHABLE", but they are printed every time (guard-1760).
+    held = report.get("held", [])
+    if held:
+        print("\nHELD BY DECISION (registered, named, did not run)")
+        for h in held:
+            print("  ▸ %s/%s: %s" % (h["stage"], h["name"], h["reason"]))
 
     # (3) Selection candidates.
     cands = report.get("candidates")
@@ -682,16 +855,35 @@ def _emit(report, as_json):
     #
     # It does not ASK for anything. This line does not ASK for anything -- asking is what
     # failed for 208h (guard-399 amendment 2: re-wording an instruction does not
-    # change who executes it), and the always-run + medium tiers above now run
-    # without being asked. What it prevents is the reader concluding, from an
-    # imperative that mentions only SELECTION, that loop entry is COMPLETE. It is
-    # not: the deferrable tier is still unwired, and a reader who wants those
-    # lanes must invoke them deliberately (guard-1760 -- report what did NOT run).
+    # change who executes it), and the tiers above now run without being asked.
+    # What it prevents is the reader concluding, from an imperative that mentions
+    # only SELECTION, that loop entry is COMPLETE. It is not whenever a tier-table
+    # lane is still unwired: a reader who wants those lanes must invoke them
+    # deliberately (guard-1760 -- report what did NOT run).
     unwired = (cov or {}).get("not_yet_wired_count")
     if unwired:
         print("[iteration-open] NOT COVERED BY THIS ENTRY: %d tier-table lane(s) "
-              "remain unwired (the deferrable tier). They did not run and nothing "
+              "remain unwired. They did not run and nothing "
               "above reflects them — `--dry-run` lists them by name." % unwired)
+    # Whether the precheck SKILL is in the chain at all is the verdict's call
+    # (), and the loop digest says so: two surfaces that name one chain
+    # must name the SAME chain (rb-10068; the digest side is pinned by
+    # test_the_digest_defers_the_precheck_skill_to_the_printed_verdict). A worker
+    # Body has no verdict and no precheck leg.
+    ps = report.get("precheck_skill")
+    if ps:
+        print("[iteration-open] PRECHECK-SKILL: %s — %s"
+              % (ps["verdict"], "; ".join(ps["reasons"])))
+    if ps and ps["verdict"] == "required":
+        precheck_leg = ("PRECHECK-SKILL is required (reasons above): run Phase "
+                        "0-1: Skill(aspirations-precheck) for the residue the "
+                        "tier table does not hold — it does NOT re-run the "
+                        "lanes this entry ran. THEN ")
+    elif ps:
+        precheck_leg = ("PRECHECK-SKILL says skip: do NOT load "
+                        "Skill(aspirations-precheck) this iteration. THEN ")
+    else:
+        precheck_leg = "THEN "
     # The chain below MUST name Skill(aspirations-select) between the precheck
     # tail and Skill(aspirations-execute). Until 2026-09-03 it read "claim from
     # SELECTION and enter execution — Skill(aspirations-execute)", and a reducer
@@ -703,11 +895,10 @@ def _emit(report, as_json):
     # aspirations-select (Phase 2.07 / 2.55 / 2.94), so skipping the Skill
     # skips all four, silently. test_iteration_open pins the order.
     print("[iteration-open] NEXT ACTION REQUIRED: dispose the findings above "
-          "(each becomes a goal, a defer, or an explicit no-op). THEN, AS THE "
-          "REDUCER, RESUME aspirations-precheck AT ITS FIRST DEFERRABLE SWEEP — "
-          "this entry ran the always-run AND medium tiers, but the deferrable "
-          "tier is still unwired, so going straight to selection silently skips "
-          "it and the meter still reads sweeps_dropped=0 (g-115-7847). THEN "
+          "(each becomes a goal, a defer, or an explicit no-op). This entry ran "
+          "the always-run, medium AND deferrable tiers, so there is no table-lane "
+          "tail to resume; a BLIND or DROPPED lane above falls back to its "
+          "tier-table Invocation (g-115-8001). " + precheck_leg +
           "Phase 2: Skill(aspirations-select) — the candidates printed above "
           "are its INPUT, not a substitute: directive ack/honor, the "
           "insight-trigger scan of the findings board, self-abstention and the "
@@ -801,6 +992,7 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
         "stages": [],
         "findings": [],
         "blind": [],
+        "held": [],
     }
     errors = []
 
@@ -856,6 +1048,10 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
 
         report["findings"].extend(_findings_from(stage["key"], payload))
         report["blind"].extend(_blind_from(stage["key"], payload))
+        report["held"].extend(_held_from(stage["key"], payload))
+        if isinstance(payload, dict) and payload.get("skipped"):
+            # A battery that REFUSED to run (a worker Body) says so in its stage row.
+            row["note"] = "SKIPPED — " + str(payload["skipped"])[:120]
         report["stages"].append(row)
 
     # SELECTION IS A STAGE AND WAS NEVER IN THE STAGE TABLE (). It runs
@@ -915,6 +1111,20 @@ def run(as_json=False, apply=False, runner=None, md_path=None) -> int:
     # guard-4093: two ORTHOGONAL fields, never collapsed. ANY blind -> partial.
     report["completeness"] = "partial" if report["blind"] else "complete"
     report["status"] = "findings" if report["findings"] else "clean"
+    # The skill-load verdict (). A worker Body runs no precheck, so it gets
+    # no verdict. Fail-open AND loud: a verdict that raised is `required` with the
+    # exception named -- never a skip (guard-1977: a silent `pass` hides the defect).
+    if not _is_worker_body():
+        try:
+            report["precheck_skill"] = _precheck_skill_verdict(report, runner)
+        except Exception as exc:
+            report["precheck_skill"] = {
+                "verdict": "required",
+                "reasons": ["verdict raised %s: %s"
+                            % (type(exc).__name__, str(exc)[:80])],
+                "stamp_age_min": None,
+                "max_age_min": _PRECHECK_SKILL_MAX_AGE_MIN,
+            }
     if errors:
         report["error"] = "stage_errors: " + "; ".join(errors)
 
@@ -954,8 +1164,7 @@ def dry_run(as_json=False, md_path=None) -> int:
         print("%-16s %-12s %-6s %s" % (
             l["phase"][:16], l["tier"], "yes" if l["wired"] else "-", l["sweep"]))
     print("\n[iteration-open] %d lanes in the tier table; %d dispatched by this "
-          "battery (always-run + medium; the deferrable tier is the next "
-          "strangler step)"
+          "battery (always-run + medium + deferrable)"
           % (len(lanes), sum(1 for l in lanes if l["wired"])))
     return 0
 

@@ -16,8 +16,34 @@ _RUNTIME_SELF="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
-# --- Passthrough args for fallback ----------------------------------------
-declare -a PASSTHROUGH=("$@")
+# --- Parse args -----------------------------------------------------------
+# This wrapper takes NO arguments. It used to copy its argument list into an
+# array that nothing read (), so ANY argument — --help included — fell
+# through to the sweep below, whose prune half permanently deletes. Refuse instead.
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+# ONE literal, shared by the help text and the refusal message — never two
+# copies (see argv_strict_refuse_unknown's header in _argv_strict.sh).
+_ACCEPTED_FLAGS="-h | --help"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it would be a
+            # regression the guard introduced. Help exits 0 and sweeps NOTHING.
+            argv_strict_help "$(basename "$0")" "(no arguments)" \
+                "$_ACCEPTED_FLAGS" \
+"  This command MUTATES: with no argument it runs the archive sweep. The sweep
+  archives eligible records and PERMANENTLY DELETES tombstones older than the
+  grace window from the live file. There is no --dry-run (the daemon endpoint has
+  none), so --help is the only probe that sweeps nothing."
+            ;;
+        -*)
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
+        *)
+            argv_strict_refuse_extra_positional "$(basename "$0")" "$1" 0 "$_ACCEPTED_FLAGS";;
+    esac
+done
 
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091

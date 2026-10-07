@@ -18,6 +18,8 @@ THE TABLE (§3, BINDING):
   world-source user context           -> pending    (the owner never queues)
   head in exempt_origins              -> pending    (I3: detection lanes)
   head maintain + status completed    -> completed  (inline-fix bookkeeping)
+  head in candidate_origins AND a resolve goal (hypothesis_id, or skill
+  /review-hypotheses as its first token) -> pending  (g-353-185: time-gated)
   head in candidate_origins           -> candidate
   any other head                      -> pending    (I1: unknown fails open)
 
@@ -106,6 +108,13 @@ def route_intake(goal: Dict[str, Any], *, config: Dict[str, Any],
     if head in config["candidate_origins"]:
         if head == "maintain" and status == "completed":
             return "completed"
+        # A resolve goal is time-gated by its own window: a candidate sits past
+        # resolves_by with no reviewer (). The sq-009 handler files `skill`
+        # WITH args ("/review-hypotheses --hypothesis <id>"; 21 of 21 candidates on
+        # 2026-10-06), so match its first token, never the whole string.
+        skill = str(goal.get("skill") or "").split()
+        if goal.get("hypothesis_id") or skill[:1] == ["/review-hypotheses"]:
+            return "pending"
         return CANDIDATE
     return "pending"
 

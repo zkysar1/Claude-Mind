@@ -1,0 +1,106 @@
+{
+ "_provenance": "key -> type read off the REAL output of each JSON lane by a dry survey run on 2026-10-06 (box cc-15, Linux 6.8.0-142-generic, g-115-8001). A spec key absent here, or typed differently, means the lane's output moved or the spec was guessed.",
+ "lanes": {
+  "blocked-signal-resolution-check": {
+   "all_resolved": "list",
+   "all_resolved_count": "int",
+   "archive_degraded": "bool",
+   "archive_read_failed": "list",
+   "dangling_ref": "list",
+   "disagreement": "list",
+   "naive_would_unblock": "list",
+   "pq_corpus_complete": "bool",
+   "pq_unreadable_agents": "list",
+   "routing_cooldown_degraded": "bool",
+   "undecidable": "list"
+  },
+  "check-stderr-json-merge": {
+   "flagged": "list"
+  },
+  "credential-defer-recheck": {
+   "cleared": "int",
+   "skipped_probe_fail": "int",
+   "would_clear": "list"
+  },
+  "defer-drift-check": {
+   "drift_count": "int",
+   "drifted": "list",
+   "uncovered_ids": "list"
+  },
+  "dependency-cycle-check": {
+   "archive_degraded": "bool",
+   "cycles": "list",
+   "cycles_found": "int",
+   "dangling_count": "int",
+   "dangling_edges": "list"
+  },
+  "hardcoded-scope-audit": {
+   "files_scanned": "int",
+   "roots_skipped": "list",
+   "tier_counts.active-scope": "int"
+  },
+  "health-regression-cadence": {
+   "tripped": "bool"
+  },
+  "human-blocked-defer-join": {
+   "deterministic_count": "int",
+   "errors": "list",
+   "shared_premise_clusters": "dict"
+  },
+  "hypothesis-terminal-goal-check": {
+   "degraded": "bool",
+   "goal_read_failed": "list",
+   "hypothesis_dangling": "list",
+   "hypothesis_terminal": "list",
+   "pipeline_read_failed": "list",
+   "stage_conflicts": "dict",
+   "terminal_count": "int"
+  },
+  "parent-supersession-sweep": {
+   "candidates": "list"
+  },
+  "pending-questions-sweep": {
+   "flags": "list"
+  },
+  "phantom-goal-audit": {
+   "flags": "list",
+   "live_phantoms": "int",
+   "phantoms": "list",
+   "schema_verified": "bool"
+  },
+  "reason-less-blocked-check": {
+   "reason_less": "list",
+   "reason_less_count": "int",
+   "uncovered_ids": "list"
+  },
+  "reclaim-defer-audit": {
+   "by_category.c": "int",
+   "by_category.unknown": "int"
+  },
+  "reclaim-user-participant-audit": {
+   "drop_lane.actionable": "int",
+   "promote_lane.candidates": "int",
+   "promote_lane.errors": "list",
+   "promote_lane.reclassified": "list"
+  },
+  "routing-audit-target-status-sweep": {
+   "candidates": "list"
+  },
+  "self-blocked-defer-sweep": {
+   "self_blocked_candidates": "list"
+  },
+  "tree-adjudication-scan": {
+   "adjudicated": "list"
+  },
+  "tree-last-updated-drift-check": {
+   "desynced": "int",
+   "errors": "dict",
+   "index_ahead": "int",
+   "index_stale": "int"
+  },
+  "unblock-parent-status-sweep": {
+   "archive_degraded": "bool",
+   "candidates": "list"
+  }
+ }
+}

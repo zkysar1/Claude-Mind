@@ -10,6 +10,12 @@
 # FAIL-OPEN by contract: /prime is a hot path and this is an observability
 # surface, never a gate. Every failure degrades to a pointer line and exit 0.
 #
+# Also prints ONE line per `backend: local` peer whose world this box holds a
+# pointer for (PEER_WORLD_<ENV_ID> or `peer_world_path:`): a `/!\` line when that
+# working copy holds posts of OURS that have not left it, else a positive or a
+# "not checked" line (). One `git diff` per such peer; no pointer, no
+# line. Detector and its limits: peer_surface.py::local_copy_report.
+#
 # Cost: ~1.5s end-to-end (measured cc-05 / Linux, warm daemon, 2026-07-30).
 # Two bounded board reads dominate (coordination ~350ms, findings ~340ms); the
 # rest is the team-state read plus three py -3 starts. Those two channels are

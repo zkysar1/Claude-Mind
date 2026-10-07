@@ -262,6 +262,46 @@ def test_resolved_but_missing_dir_is_unreachable(tmp_path):
     assert not ghost.exists(), "must not create the peer world it failed to find"
 
 
+# ── delivery is UNCONFIRMED for a local peer (, guard-7610) ─────
+# A local peer is a plain file on THIS box; exit 0 cannot say whether anyone reads or
+# ships that copy. The JSON must say so on stdout, the channel callers actually read,
+# and a peer whose store the tool really wrote to must NOT carry the warning (negative
+# control: without it the positive assertions pass against a tool that warns about
+# everything). It must also stay OFF stderr: the Bash tool merges stderr into the
+# output a caller json-parses (rb-874).
+
+def test_a_real_post_to_a_local_peer_says_delivery_is_unconfirmed(peer_world):
+    r = run(["--peer", "zds-mind", "--channel", "coordination"],
+            env_extra={"PEER_WORLD_ZDS_MIND": str(peer_world)})
+    assert r.returncode == EXIT_OK, r.stderr
+    out = json.loads(r.stdout)  # stdout stays ONE json document
+    # EXACT key set, not a subset check (guard-3948): the two emit sites are separate
+    # literals, and a subset assertion passes on both the shape with the field and the
+    # shape of a site that forgot it.
+    assert set(out) == {"posted", "peer", "peer_backend", "delivery", "delivery_note", "path"}
+    assert out["peer_backend"] == "local"
+    assert out["delivery"] == "unconfirmed"
+    assert "THIS box's copy" in out["delivery_note"] and "pushed" in out["delivery_note"]
+    assert "unconfirmed" not in r.stderr, "the warning belongs in the JSON, not on stderr"
+
+
+def test_a_dry_run_to_a_local_peer_also_says_delivery_is_unconfirmed(peer_world):
+    r = run(["--peer", "zds-mind", "--channel", "coordination", "--dry-run"],
+            env_extra={"PEER_WORLD_ZDS_MIND": str(peer_world)})
+    assert r.returncode == EXIT_OK, r.stderr
+    out = json.loads(r.stdout)
+    assert set(out) == {"would_write", "peer_backend", "delivery", "delivery_note", "record"}
+    assert out["delivery"] == "unconfirmed" and out["delivery_note"]
+
+
+def test_a_store_backed_peer_carries_no_unconfirmed_warning():
+    """Negative control for the two tests above, on the pure function: the peer
+    backends that really write to the peer's store must not be told 'unconfirmed'."""
+    mod = _load_pbp()
+    assert mod.delivery_fields("own-cloud") == {"delivery": "peer-store"}
+    assert mod.delivery_fields("local")["delivery"] == "unconfirmed"
+
+
 # ── G5 cross-world provenance () ───────────────────────────────────
 # guard-3221: a coupling test must call the REAL producer and assert the marker
 # appears, WITH a negative control asserting it does NOT appear when the

@@ -366,6 +366,94 @@ def _requires_fresh_session(goal):
     return _session_has_closed_goals()
 
 
+# . A REVIEW REQUEST IS A HOLD, here as in the completed-not-closed drain
+# (). When close-review check A refuses a close, the gate stamps
+# review_requested, and the loop then releases the goal (Phase 5.3), which clears only
+# the claim. Without this hold the goal is pending again at once, it is offered again,
+# and each re-pick is refused the same way until three in a row trip the circuit
+# breaker (Phase 5.5), which defers the goal and notifies the user. Any verdict that
+# answers the request lifts the hold, a REJECT included: a REJECT sends the work back,
+# and offering it for rework is this module's job. Whether the close may then land is
+# the gate's question, not this one's.
+#
+# Live only while check A is on (close_review_gate.enabled), the flag that makes a
+# refusal happen at all, so this lands dormant beside the gate it serves.
+#
+# NOT a defer_reason or a structured precondition, deliberately. A command_succeeds
+# predicate costs one subprocess per goal per selector pass (0.738 s each, measured
+# for ), and the completed-not-closed drain skips any row that carries a
+# defer_reason, while that drain must keep seeing a held goal so it can close it once
+# a releasing verdict lands.
+_REVIEW_HOLD = None
+
+
+def _review_hold():
+    """close-review-queue.py, loaded once, when check A is on; else None.
+
+    The queue's `answers` and the gate it loads are the one definition of a request
+    being answered, already shared by the queue's listing, the drain and the gate, so
+    this hold cannot disagree with any of them. None also when the queue cannot load:
+    then no goal is held. That fails open like every other filter here, because a
+    filter that cannot read its input must not hide work, and the fault is printed
+    once, never silent.
+
+    Cached module-wide (False for "no hold") so collect_candidates and collect_blocked
+    cannot disagree within one run, the desync the SYMMETRY invariant exists to prevent.
+    """
+    global _REVIEW_HOLD
+    if _REVIEW_HOLD is None:
+        _REVIEW_HOLD = False
+        try:
+            import importlib.util
+            crq = sys.modules.get("close_review_queue")
+            if crq is None:
+                # Hyphenated filename, so loaded by path, the way the drain and the
+                # gate load it; a half-loaded module is never left behind for them.
+                spec = importlib.util.spec_from_file_location(
+                    "close_review_queue",
+                    Path(__file__).resolve().parent / "close-review-queue.py")
+                crq = importlib.util.module_from_spec(spec)
+                sys.modules["close_review_queue"] = crq
+                try:
+                    spec.loader.exec_module(crq)
+                except BaseException:
+                    sys.modules.pop("close_review_queue", None)
+                    raise
+            if crq._gate()._flags()["enabled"]:
+                _REVIEW_HOLD = crq
+        except Exception as e:
+            print(f"[goal-selector] WARN: the close-review hold could not load "
+                  f"({type(e).__name__}: {e}); no goal is held for review", file=sys.stderr)
+    return _REVIEW_HOLD or None
+
+
+def _awaiting_review(goal_id, goal):
+    """True when check A is on and the goal carries a review request that no verdict
+    answers yet: no verdict, or one written before the request.
+
+    The request test comes FIRST and short-circuits, so a goal with no request never
+    loads the queue. A verdict file that cannot be read counts as no verdict, as in the
+    drain, so its goal stays held; only the queue failing to load, or this read
+    raising, fails open.
+
+    SYMMETRY: collect_candidates and collect_blocked BOTH call this and must stay
+    logical complements. Change both or neither.
+    """
+    requested = goal.get("review_requested")
+    if not requested:
+        return False
+    crq = _review_hold()
+    if crq is None:
+        return False
+    try:
+        gate = crq._gate()
+        return not crq.answers(gate.read_verdict(gate.verdict_path(goal_id)), requested)
+    except Exception as e:
+        print(f"[goal-selector] WARN: could not read the close review of {goal_id} "
+              f"({type(e).__name__}: {e}); not held for review", file=sys.stderr)
+        return False
+
+
 def _is_handoff_gated_defer(goal):
     """A STRUCTURED defer on a goal that is ROUTED ELSEWHERE ().
 
@@ -3254,6 +3342,11 @@ def collect_candidates(aspirations, known_blockers=None, source="world",
                 except (ValueError, TypeError):
                     pass  # Corrupt value — fail open
 
+            # Close-review hold (): a review request no verdict answers yet
+            # waits for its reviewer. SYMMETRY: collect_blocked branch 5b is the twin.
+            if _awaiting_review(goal_record_id(asp, goal), goal):
+                continue
+
             # Structured preconditions (cheap filter; strings stay on the LLM path).
             # SYMMETRY: must be the logical complement of the struct_pc check in
             # collect_blocked. If you change one, change the other.
@@ -3625,6 +3718,8 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
       fresh_session_only — requires_fresh_session is set and this session
                          has already closed a goal (g-115-8482)
       hypothesis_gate  — resolves_no_earlier_than is in the future
+      awaiting_review  — close-review check A is on and no verdict answers the goal's
+                         review_requested yet (g-375-149)
       precondition_unmet — a structured verification.preconditions predicate failed
       routed_to_agent  — intended_agent names another agent and no escape applies
       not_my_lane      — the lane-pin claim gate excludes this runner (guard-2900)
@@ -3959,6 +4054,25 @@ def collect_blocked(aspirations, known_blockers=None, global_done_ids=None,
             if rne_dt is not None and datetime.now() < rne_dt:
                 entry["block_reason"] = "hypothesis_gate"
                 entry["block_detail"] = "Not before {date}".format(date=rne)
+                blocked.append(entry)
+                continue
+
+            # 5b. Awaiting review (). SYMMETRY: the twin of the close-review
+            #     hold in collect_candidates. Cheap (one verdict-file read, and only for
+            #     a goal carrying a request), so it sits above the cost skip. The wait
+            #     is on an independent reviewer, which this agent cannot provide, so it
+            #     carries a blocker_ref keyed on the request: quiescence can then fire
+            #     on a queue whose only work waits for reviews.
+            if _awaiting_review(goal_id, goal):
+                entry["block_reason"] = "awaiting_review"
+                entry["block_detail"] = (
+                    "Awaiting review: no verdict answers review_requested {when}; any "
+                    "verdict lifts the hold, and a REJECT returns the goal for rework"
+                    .format(when=goal.get("review_requested")))
+                if not isinstance(entry.get("blocker_ref"), dict):
+                    entry["blocker_ref"] = _synth_block_ref(
+                        "awaiting-review",
+                        "{}:{}".format(goal_id, goal.get("review_requested")))
                 blocked.append(entry)
                 continue
 

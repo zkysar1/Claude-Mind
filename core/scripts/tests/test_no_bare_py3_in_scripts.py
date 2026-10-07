@@ -145,6 +145,20 @@ class DetectorControls(unittest.TestCase):
                 self.assertEqual(bare_py3_sites(snippet), [], snippet)
 
 
+def _scripts_the_seed_never_plants() -> set[str]:
+    """Names under core/scripts that the seed manifest excludes (its `core/` exclude_patterns).
+
+    A plant does not hold them, so the staleness check below cannot ask for them there.
+    """
+    import yaml
+
+    manifest = yaml.safe_load((SCRIPTS.parent / "config" / "seed-manifest.yaml").read_text(encoding="utf-8"))
+    patterns = [p for entry in manifest["include"] if entry.get("path") == "core/"
+                for p in entry.get("exclude_patterns", [])]
+    return {p[len("scripts/"):] for p in patterns
+            if p.startswith("scripts/") and "/" not in p[len("scripts/"):]}
+
+
 class NoBarePy3(unittest.TestCase):
     def setUp(self):
         self.files = sorted(SCRIPTS.glob("*.sh"))
@@ -170,7 +184,8 @@ class NoBarePy3(unittest.TestCase):
                          "A removed resolver site: lower or delete its ALLOWED entry.")
 
     def test_allowlist_names_existing_files(self):
-        missing = sorted(n for n in ALLOWED if not (SCRIPTS / n).exists())
+        absent_by_design = _scripts_the_seed_never_plants()
+        missing = sorted(n for n in ALLOWED if not (SCRIPTS / n).exists() and n not in absent_by_design)
         self.assertFalse(missing, f"ALLOWED names files that no longer exist: {missing}")
 
 

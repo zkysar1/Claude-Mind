@@ -38,7 +38,10 @@ SRC = CLAIM_SH.read_text(encoding="utf-8")
 # Any gate line is accepted here on purpose: the behavioural tests below, not
 # this pattern, decide whether the gate is right (a mutated gate must fail THEM).
 _BLOCK_RE = re.compile(
-    r'# ── WORKER PULL AT THE CLAIM \(g-375-66\).*?\n'
+    # The anchor stops BEFORE the goal-id parenthetical that follows the heading: the seed
+    # plant scrubs it, so the id-bearing anchor matches nothing at a plant. `.*?\n` takes the
+    # rest of the heading line either way.
+    r'# ── WORKER PULL AT THE CLAIM.*?\n'
     r'(if \[[^\n]*\]; then\n.*?\nfi)\n',
     re.S,
 )

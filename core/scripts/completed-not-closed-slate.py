@@ -83,8 +83,9 @@ WHAT IT DOES NOT DO — DELIBERATELY
   this exact corpus and 22 of 423 positive-verdict heads also said "NOT DONE".
   The disposition is the LLM's, per goal, after reading the record.
 * No mutation. There is no --apply and must never be one; the closer is the
-  canonical writer (aspirations-complete-by.sh --key-finding, or
-  aspirations-release.sh + a precondition_unmet: defer).
+  canonical writer (iteration-close.sh --phase verify --drain, so every close
+  gate sees the close (g-375-146), or aspirations-release.sh + a
+  precondition_unmet: defer).
 * No dead-carrier resolution. Liveness is expensive and the age gate does the
   same job for an obligation: since worker-loop Phase 4a a live Body closes its
   own unit at end of unit, so a noted goal still open after `min_claim_age_hours`
@@ -743,10 +744,12 @@ def _render(result: Dict[str, Any]) -> None:
               f"age={age}{xr}{hold}\n     title: {r['title']}\n     note_head: {r['note_head']}")
     print("[cnc-slate] DISPOSE EACH (LLM judgment, never a predicate). READ with "
           "`completed-not-closed-slate.sh --show <goal-id>` (paged; never --full). CLOSE via "
-          "aspirations-complete-by.sh --key-finding + update-goal outcome_class | RELEASE + "
+          "`iteration-close.sh --phase verify --drain ... --key-finding` (every close gate runs; "
+          "a refusal leaves the row open and counts as refused) | RELEASE + "
           "precondition_unmet: defer | HOLD via `--hold <goal-id> --reason ...` (held back "
           f"{result.get('hold_ttl_hours', _DEFAULT_HOLD_TTL_HOURS):g}h, then resurfaces with its "
-          "count — a 3rd hold means file an Investigate). Report consumed == closed + released + held.")
+          "count — a 3rd hold means file an Investigate). Report consumed == closed + released + "
+          "held + refused.")
 
 
 def main() -> int:

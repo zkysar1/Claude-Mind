@@ -852,12 +852,12 @@ State persists via the `loop_state` WM slot.
 
 ## Chaining Map
 
-Hot-path phases (per iteration): `/aspirations-precheck` → `/aspirations-select`
+Hot-path phases (per iteration): `/aspirations-select`
 → `/aspirations-execute` → `/aspirations-verify` → `/aspirations-spark` (deep only)
-→ `/aspirations-state-update` → `/aspirations-learning-gate`. Conditional /
-cadence-triggered: `/aspirations-evolve` (cadence), `/aspirations-complete-review`
-(aspiration near-complete), `/aspirations-strategic-scan` (cadence),
-`/aspirations-all-blocked` (selector returned no goals). Session boundaries:
+→ `/aspirations-state-update` → `/aspirations-learning-gate`. Conditional:
+`/aspirations-precheck` (if NEXT ACTION names it), `/aspirations-evolve` (cadence),
+`/aspirations-complete-review` (near-complete), `/aspirations-strategic-scan`
+(cadence), `/aspirations-all-blocked` (no goals). Session boundaries:
 `/boot`, `/aspirations-consolidate`, `/aspirations-graceful-stop`. Full table
 with call-site and return semantics: **`core/config/aspirations-chaining-map.md`**.
 

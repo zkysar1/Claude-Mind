@@ -34,11 +34,21 @@ THREE measured traps this file exists to encode (g-115-3927, 2026-07-30):
    form. A peer agent attributes (it also posts as `<agent>@<peer-env>`); `investigate`
    does not, so it is reported separately as unattributed rather than silently
    counted or silently dropped.
+
+A FOURTH THING, ADDED g-115-12070 (2026-10-06): LOCAL PEER COPIES. A `local` peer
+is a plain file on THIS box, and peer-board-post exits 0 whether or not anything
+ever delivers it: ten posts sat five days in a copy nobody committed. For each
+local peer whose world resolves here (PEER_WORLD_<ENV_ID>, or `peer_world_path:`
+in the registry, through the poster's own resolver) this reports how many of OUR
+posts have not left that copy. See local_copy_report.
 """
 import json
 import os
 import re
+import subprocess
 import sys
+from datetime import datetime
+from pathlib import Path
 
 
 def parse_jsonl(stream):
@@ -330,6 +340,136 @@ def classify(rows, self_env, registry, roster):
     }
 
 
+# A post of ours still held back in a local peer copy after this long has not left this box.
+# 24h sits far above the push cadence of a peer that runs from the copy (iteration-push.sh:
+# every 5 commits or 20 minutes) and above the few hours a naive timestamp can be off by
+# (), so it fires on a stalled copy and not on one that is merely between pushes.
+LOCAL_COPY_HELD_HOURS = 24
+
+
+def _report(peer, world, status, detail="", **extra):
+    rep = {"peer": peer, "world": str(world), "status": status, "ref": None,
+           "checked": 0, "held": [], "unreadable": 0, "detail": detail}
+    rep.update(extra)
+    return rep
+
+
+def _git(world, *args):
+    """git inside `world` -> (returncode, stdout). A timeout RAISES: a probe that did not
+    finish must surface as an error, never read as a clean copy."""
+    proc = subprocess.run(["git", "-C", str(world), *args], capture_output=True, timeout=10)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+
+def local_copy_report(peer, world, self_env, now, min_age_hours=LOCAL_COPY_HELD_HOURS):
+    """Which of OUR posts are still held back in this box's copy of a local peer's world?
+
+    WHY (g-115-12070, guard-7610). peer-board-post writes a `local` peer as a plain file on
+    THIS box and exits 0, which reads as "delivered". When that copy is a git checkout that
+    nothing commits or pushes, every post sits there for good: ten sat five days. Nothing said
+    so, because the scheduled caller discards the tool's output and keeps only the exit code.
+
+    WHAT THIS MEASURES is delivery, not the peer's health. A line of ours is HELD when it is in
+    the working copy but not in the branch's upstream (HEAD when none is set), so a post
+    committed here but never pushed counts and a pushed one does not. Quiet is not dead: a peer
+    stopped overnight leaves a valid mailbox, and "the copy's last commit is old" would not
+    detect this anyway, since any pull makes it fresh (4 hours old on a copy whose last peer
+    write was five days back). A held line older than `min_age_hours` is a fact whatever caused it.
+
+    Only lines stamped with OUR origin_env count, and only in git-TRACKED board files. An
+    untracked copy has no commit path, so "not delivered" cannot be inferred; that is reported
+    as not checkable, never as clean (guard-1947). Timestamps are naive local time, so an age
+    can be off by the writer's UTC offset (g-115-12131); 24h is chosen to dwarf that.
+
+    status: ok | held | not-tracked | not-a-git-checkout | no-board | error
+    """
+    if not self_env:
+        return _report(peer, world, "error",
+                       "this deployment's environment id is unknown, so its posts cannot be recognised")
+    if not (Path(world) / "board").is_dir():
+        return _report(peer, world, "no-board", "it has no board/ directory")
+    rc, _ = _git(world, "rev-parse", "--is-inside-work-tree")
+    if rc != 0:
+        return _report(peer, world, "not-a-git-checkout",
+                       "it is not a git checkout, so delivery cannot be inferred")
+    rc, listing = _git(world, "ls-files", "--", "board/*.jsonl")
+    if rc != 0:
+        return _report(peer, world, "error", "git ls-files exited %d" % rc)
+    tracked = [ln for ln in listing.splitlines() if ln.strip()]
+    if not tracked:
+        return _report(peer, world, "not-tracked",
+                       "its board files are not tracked by git, so delivery cannot be inferred")
+    # Prefer the branch's upstream: a post committed here but never pushed has not left either.
+    rc, _ = _git(world, "rev-parse", "--verify", "-q", "@{u}")
+    ref, label = ("@{u}", "upstream") if rc == 0 else ("HEAD", "HEAD")
+    # ONE diff for every board file: on Windows each git call costs ~80 ms, and a per-file
+    # loop over 11 files added 1.1 s to every session start on a box with a pointer set.
+    rc, diff = _git(world, "diff", "--no-color", "--no-ext-diff", "-U0", ref, "--", "board/*.jsonl")
+    if rc not in (0, 1):
+        return _report(peer, world, "error", "git diff exited %d" % rc)
+    held, unreadable = [], 0
+    for line in diff.splitlines():
+        if not line.startswith("+") or line.startswith("+++") or not line[1:].strip():
+            continue
+        try:
+            rec = json.loads(line[1:])
+        except ValueError:
+            unreadable += 1
+            continue
+        if not isinstance(rec, dict) or rec.get("origin_env") != self_env:
+            continue
+        try:
+            stamped = datetime.strptime(str(rec.get("timestamp")), "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            unreadable += 1
+            continue
+        age = (now - stamped).total_seconds() / 3600.0
+        if age >= min_age_hours:
+            held.append({"id": rec.get("id"), "channel": rec.get("channel") or "?",
+                         "timestamp": rec.get("timestamp"), "age_hours": round(age, 1)})
+    return _report(peer, world, "held" if held else "ok", ref=label, checked=len(tracked),
+                   held=held, unreadable=unreadable)
+
+
+def check_local_copies(registry, self_env, now=None):
+    """One report per `local` peer whose world resolves on THIS box; nothing for the rest.
+
+    Silent for a peer with no pointer here, which is the common case: most boxes host no peer.
+    Anything else that goes wrong is REPORTED, never swallowed. /prime treats this surface as
+    observability, so a failure here must degrade to a visible line and never take the lines
+    above it down (the module's fail-open contract; a bare except that returned nothing would
+    read as "no stranded posts", the false zero this file exists to prevent).
+    """
+    now = now or datetime.now()
+    try:
+        # Lazy: peer_world_path is THE resolver the poster writes through, so this looks
+        # at exactly the copy a post would have gone into.
+        import peer_board_post
+    except Exception as exc:  # noqa: BLE001
+        return [_report("*", "", "error", "could not load the poster's path resolver (%s: %s)"
+                        % (type(exc).__name__, str(exc)[:80]))]
+    reports = []
+    for peer in sorted(e for e in registry if e != self_env and registry.get(e) == "local"):
+        world = ""
+        try:
+            # A regex, not a YAML parser: the choice peer-surface.sh makes for the registry's
+            # other fields, so /prime never needs a YAML dependency.
+            try:
+                text = (peer_board_post.ENV_REGISTRY / ("%s.yaml" % peer)).read_text(encoding="utf-8")
+            except OSError:
+                text = ""
+            m = re.search(r"^peer_world_path:[ \t]*(.+)$", text, re.MULTILINE)
+            declared = m.group(1).split("#", 1)[0].strip().strip("'\"") if m else ""
+            world = peer_board_post.peer_world_path(peer, {"peer_world_path": declared})
+            if world is None:
+                continue
+            reports.append(local_copy_report(peer, world, self_env, now))
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 -- fail open, but visibly
+            reports.append(_report(peer, world or "", "error",
+                                   "%s: %s" % (type(exc).__name__, str(exc)[:80])))
+    return reports
+
+
 def main():
     self_env = os.environ.get("PEER_SELF_ENV", "").strip()
     try:
@@ -346,6 +486,7 @@ def main():
     result["self_env"] = self_env
     result["self_backend"] = registry.get(self_env)
     result["registry"] = registry
+    result["local_copies"] = check_local_copies(registry, self_env)
 
     if os.environ.get("PEER_JSON") == "1":
         print(json.dumps(result, sort_keys=True))
@@ -396,6 +537,33 @@ def main():
         print("  (excluded %d non-roster author(s) with no deployment marker: %s)"
               % (len(result["unattributed"]),
                  ", ".join("%s x%d" % (a, n) for a, n in top)))
+
+    # Local peer copies: shown only for a peer whose world resolves on this box, so an
+    # ordinary box prints nothing here. A copy that checks out clean still gets one line,
+    # as a positive control: no line at all would be indistinguishable from a check that
+    # never ran (guard-1947).
+    for rep in result["local_copies"]:
+        peer, where = rep["peer"], rep["world"]
+        extra = " [%d changed line(s) unreadable]" % rep["unreadable"] if rep["unreadable"] else ""
+        if rep["status"] == "held":
+            held = sorted(rep["held"], key=lambda h: -h["age_hours"])
+            hours = int(held[0]["age_hours"])
+            age = "%dd %dh" % (hours // 24, hours % 24) if hours >= 24 else "%dh" % hours
+            ids = ", ".join(str(h["id"]) for h in held[:3]) + (" ..." if len(held) > 3 else "")
+            print("  /!\\ %s: this box's copy of its world (%s) holds %d post(s) of ours that "
+                  "have not left it, oldest %s: %s%s" % (peer, where, len(held), age, ids, extra))
+            print("      A local copy delivers only when it is committed and pushed, or the peer "
+                  "runs from it. Read them back on the peer's own board; if that copy is idle, "
+                  "remove the pointer to it (PEER_WORLD_%s, or peer_world_path in "
+                  "core/config/environments/%s.yaml)." % (peer.upper().replace("-", "_"), peer))
+        elif rep["status"] == "ok":
+            print("  %s: local copy at %s holds none of our posts back past %dh "
+                  "(%d board file(s) checked against %s)%s"
+                  % (peer, where, LOCAL_COPY_HELD_HOURS, rep["checked"], rep["ref"], extra))
+        elif rep["status"] == "error":
+            print("  %s: local copy check failed (%s)" % (peer, rep["detail"]))
+        else:
+            print("  %s: local copy at %s: delivery not checked (%s)" % (peer, where, rep["detail"]))
 
     print("Cross via core/scripts/peer-board-post.sh "
           "(convention: core/config/conventions/cross-deployment-channel.md)")

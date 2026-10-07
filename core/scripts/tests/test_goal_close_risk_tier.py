@@ -15,8 +15,10 @@ is not canonical INVOCATION").
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -138,7 +140,7 @@ def test_bad_input_fails_to_tier1_never_tier2():
 
 # ─── 2 + 3. the gate's rc contract, as a subprocess ────────────────────────
 
-def _run_gate(goal, tmp_path, env_extra=None, extra_args=(), env_drop=()):
+def _run_gate(goal, tmp_path, env_extra=None, extra_args=(), env_drop=(), stdin_text=None):
     gj = tmp_path / "goal.json"
     gj.write_text(json.dumps(goal), encoding="utf-8")
     env = dict(os.environ)
@@ -160,7 +162,7 @@ def _run_gate(goal, tmp_path, env_extra=None, extra_args=(), env_drop=()):
     return subprocess.run(
         [sys.executable, str(GATE), "--goal", goal.get("goal_id", "g-999-01"),
          "--goal-json", str(gj), *extra_args],
-        capture_output=True, text=True, env=env, timeout=120,
+        capture_output=True, text=True, env=env, timeout=120, input=stdin_text,
     )
 
 
@@ -507,14 +509,17 @@ def _extract_winpath_def() -> str:
     raise AssertionError("_winpath def has no closing brace")
 
 
-def _run_block(tmp_path, stub_rc, *, overrides=None, goal_status="completed"):
-    """Execute the extracted block against a stub gate. Returns (rc, stderr, argv)."""
+def _run_block(tmp_path, stub_rc, *, overrides=None, goal_status="completed",
+               summary="", note_file=""):
+    """Execute the extracted block against a stub gate. Returns (rc, stderr, argv).
+    The stub also keeps what reached its stdin, in stdin.txt beside argv.txt."""
     script_dir = tmp_path / "scripts"
     script_dir.mkdir(exist_ok=True)
     argv_log = tmp_path / "argv.txt"
     (script_dir / "close-review-gate.py").write_text(
         "import sys, pathlib\n"
         f"pathlib.Path({str(argv_log)!r}).write_text(repr(sys.argv[1:]))\n"
+        f"pathlib.Path({str(tmp_path / 'stdin.txt')!r}).write_text(sys.stdin.read())\n"
         f"sys.exit({stub_rc})\n",
         encoding="utf-8",
     )
@@ -534,6 +539,8 @@ def _run_block(tmp_path, stub_rc, *, overrides=None, goal_status="completed"):
         'SOURCE="world"',
         f'OVERRIDE_CLOSE_REVIEW="{ov.get("close", "")}"',
         f'OVERRIDE_NOTE_MARKER="{ov.get("note", "")}"',
+        f"SUMMARY={shlex.quote(summary)}",
+        f"OUTCOME_NOTE_FILE={shlex.quote(note_file)}",
         "do_verify_frag() {",
         _extract_gate_block(),
         "  return 0",
@@ -827,3 +834,174 @@ def test_do_verify_runs_the_close_review_gate_AFTER_closure_evidence():
     # The intent marker's own guard line occurs twice in the file; its comment once.
     intent = _at(lambda s: s.startswith("# g-284-06 Step 0: Ordered-write intent marker"))
     assert evidence < review < intent, (evidence, review, intent)
+
+
+# ─── a refused close waits for its verdict () ─────────────────────
+# A check-A refusal writes the close's outcome note for the reviewer when the goal
+# carries none: the --outcome-note-file, else the summary do_verify pipes in. The
+# write goes through closure-evidence-write.sh, which exits 0 whatever it did, so
+# whether the note landed is read back from the store. As for the stamp above, the
+# store-read path runs in-process with bash_cmd spied onto /bin/true and load_goal
+# stubbed, so no test here reaches a store.
+
+_NOTE = "Shipped the hold.\nEvidence: 18 tests pass."
+
+
+def _note_gate(monkeypatch, tmp_path, goal, *, lands=True):
+    """The gate module with its store calls stubbed. Returns (mod, writes): writes holds
+    the args of each closure-evidence-write.sh call. load_goal reads a record the spy
+    updates. `lands` is True for the sent note landing as the writer lands it (a
+    --summary-file read the way its `$(cat)` reads it, trailing newlines trimmed), False
+    for nothing landing, or the text that landed instead."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("_crg_note", GATE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    writes, record = [], dict(goal)
+
+    def _spy(script, *args):
+        if Path(script).name == "closure-evidence-write.sh":
+            writes.append(args)
+            if lands is True:
+                record["outcome_note"] = (
+                    args[args.index("--summary") + 1] if "--summary" in args else
+                    Path(args[args.index("--summary-file") + 1])
+                    .read_text(encoding="utf-8").rstrip("\n"))
+            elif lands:
+                record["outcome_note"] = lands
+        return ["/bin/true"]   # every write "succeeds" and touches no store
+
+    monkeypatch.setattr(mod, "bash_cmd", _spy)
+    monkeypatch.setattr(mod, "load_goal", lambda gid, src: dict(record))
+    monkeypatch.setenv("CLOSE_REVIEW_GATE_ENABLED", "1")
+    monkeypatch.setenv("CLOSE_REVIEW_LEDGER_DIR", str(tmp_path))
+    monkeypatch.setenv("MIND_AGENT", "nobody")
+    return mod, writes
+
+
+def _stdin(monkeypatch, text):
+    """What do_verify pipes in: the gate reads sys.stdin.buffer, so a bare StringIO won't do."""
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(text.encode("utf-8"))))
+
+
+@pytest.mark.parametrize("via", ["summary", "outcome-note-file"])
+def test_a_store_read_refusal_WRITES_the_close_s_note_for_the_reviewer(
+        tmp_path, monkeypatch, capsys, via):
+    """The note do_verify would land at the status write, written now through the one
+    closure-narrative writer (argv pinned). The --outcome-note-file wins over the summary,
+    the order the closure-evidence gate reads them in."""
+    mod, writes = _note_gate(monkeypatch, tmp_path, _goal(priority="HIGH"))
+    nf = tmp_path / "note.md"
+    argv = ["--goal", "g-999-01", "--source", "world", "--summary-stdin"]
+    if via == "outcome-note-file":
+        nf.write_text("\n" + _NOTE + "\n\n", encoding="utf-8")   # blank lines either side
+        argv += ["--outcome-note-file", str(nf)]
+        _stdin(monkeypatch, "The loop's one-line summary.")
+    else:
+        _stdin(monkeypatch, _NOTE)
+    assert mod.main(argv) == 1
+    out = capsys.readouterr()
+    (line,) = _tier_lines(out.out)
+    assert (line["note"], line["note_from"], line["note_written"], line["note_error"]) == \
+        ("write", via, True, None)
+    text = ("--summary-file", str(nf)) if via == "outcome-note-file" else ("--summary", _NOTE)
+    assert writes == [("--goal", "g-999-01", "--source", "world", *text,
+                       "--prefix", "[close-review-gate]", "--no-supersede")], writes
+    assert "OUTCOME NOTE WRITTEN" in out.err
+    # The request was written too, so the refusal says the selector now holds the goal.
+    assert "block_reason awaiting_review" in out.err
+
+
+@pytest.mark.parametrize("with_file", [False, True], ids=["summary", "outcome-note-file"])
+def test_a_note_already_on_the_goal_is_KEPT_and_never_rewritten(
+        tmp_path, monkeypatch, capsys, with_file):
+    """A note on the record is what the reviewer reads, so a refusal never replaces it. An
+    --outcome-note-file replaces it only at the status write, and the refusal says so."""
+    mod, writes = _note_gate(monkeypatch, tmp_path,
+                             _goal(priority="HIGH", outcome_note="An earlier note."))
+    argv = ["--goal", "g-999-01", "--source", "world", "--summary-stdin"]
+    if with_file:
+        nf = tmp_path / "note.md"
+        nf.write_text(_NOTE, encoding="utf-8")
+        argv += ["--outcome-note-file", str(nf)]
+    _stdin(monkeypatch, _NOTE)
+    assert mod.main(argv) == 1
+    out = capsys.readouterr()
+    (line,) = _tier_lines(out.out)
+    assert (line["note"], line["note_written"], writes) == ("kept", None, [])
+    assert "already carries an outcome_note (16 chars)" in out.err
+    assert ("replaces it only at the status write" in out.err) is with_file
+
+
+def test_a_note_that_does_not_land_still_refuses_and_prints_the_write(
+        tmp_path, monkeypatch, capsys):
+    """The writer exits 0 whatever it did, so only the read-back can tell. A note that is
+    not on the record leaves the close refused, and the refusal prints the command."""
+    mod, writes = _note_gate(monkeypatch, tmp_path, _goal(priority="HIGH"), lands=False)
+    nf = tmp_path / "note.md"
+    nf.write_text(_NOTE, encoding="utf-8")
+    _stdin(monkeypatch, "")
+    assert mod.main(["--goal", "g-999-01", "--source", "world", "--summary-stdin",
+                     "--outcome-note-file", str(nf)]) == 1
+    out = capsys.readouterr()
+    (line,) = _tier_lines(out.out)
+    assert (line["note"], line["note_written"], line["note_error"]) == \
+        ("write", False, "not on the record after the write (rc=0)")
+    assert len(writes) == 1, writes
+    assert "OUTCOME NOTE NOT WRITTEN" in out.err
+    assert (f"closure-evidence-write.sh --goal g-999-01 --source world --summary-file {nf}"
+            in out.err)
+
+
+@pytest.mark.parametrize("landed,written", [
+    (_NOTE + "\n\n-- signed by a worker Body on its own box", True),
+    (_NOTE.replace("\n", "\r\n") + "\r", True),
+    ("Shipped the hold.\nA different evidence line.", False),
+], ids=["signed-after", "crlf", "shares-only-a-line"])
+def test_the_read_back_wants_the_whole_note(tmp_path, monkeypatch, capsys, landed, written):
+    """The writer may append a signature or a provenance line after the note and its shell
+    may keep a CR, but it never changes the text: the note followed by more has landed.
+    Another writer's note that shares only a line with it has not, so the refusal says the
+    note was not written (fresh-eyes review of g-375-149: a first-line test took it)."""
+    mod, writes = _note_gate(monkeypatch, tmp_path, _goal(priority="HIGH"), lands=landed)
+    _stdin(monkeypatch, _NOTE)
+    assert mod.main(["--goal", "g-999-01", "--source", "world", "--summary-stdin"]) == 1
+    out = capsys.readouterr()
+    (line,) = _tier_lines(out.out)
+    assert (line["note"], line["note_written"], len(writes)) == ("write", written, 1)
+    assert ("OUTCOME NOTE NOT WRITTEN" in out.err) is (not written)
+
+
+@pytest.mark.parametrize("goal_kw,summary,expect", [
+    ({}, _NOTE, "write"),
+    ({"outcome_note": "An earlier note."}, _NOTE, "kept"),
+    ({}, "", "none"),
+], ids=["no-note", "has-a-note", "no-summary"])
+def test_a_goal_json_refusal_decides_the_note_and_never_writes_it(
+        tmp_path, goal_kw, summary, expect):
+    """The subprocess rc path, with the summary on stdin as do_verify sends it. The record
+    came from --goal-json, so the decision is reported and nothing is written. No request
+    was written either, so nothing holds the goal and the refusal does not say it does."""
+    r = _run_gate(_goal(priority="HIGH", **goal_kw), tmp_path, _A_ON,
+                  extra_args=("--summary-stdin",), stdin_text=summary)
+    assert r.returncode == 1, r.stdout + r.stderr
+    (line,) = _tier_lines(r.stdout)
+    assert (line["note"], line["note_written"], line["note_error"]) == (expect, None, None)
+    assert line["note_from"] == ("summary" if summary else None)
+    assert {"write": "so the outcome note was not written",
+            "kept": "already carries an outcome_note",
+            "none": "carried no outcome note and no summary"}[expect] in r.stderr
+    assert "awaiting_review" not in r.stderr
+
+
+@pytest.mark.parametrize("note_file", ["", "/notes/close.md"], ids=["summary-only", "note-file"])
+def test_do_verify_pipes_the_summary_and_forwards_the_note_file(tmp_path, note_file):
+    """The gate writes the note a refused close would have landed, so do_verify hands it
+    both: the summary on stdin, byte for byte, and the --outcome-note-file when given."""
+    summary = "Shipped it; the reviewer's view.\nA second line with $HOME and `ticks`."
+    rc, err, argv = _run_block(tmp_path, 0, summary=summary, note_file=note_file)
+    assert rc == 0, err
+    assert "--summary-stdin" in argv, argv
+    assert ("--outcome-note-file" in argv) is bool(note_file), argv
+    assert not note_file or repr(note_file) in argv, argv
+    assert (tmp_path / "stdin.txt").read_text(encoding="utf-8") == summary

@@ -794,3 +794,120 @@ def test_a_second_path_failure_in_the_fallback_degrades_instead_of_raising(world
     assert ok is False, "an unreadable store must degrade the FLAG, not raise"
     assert "fallback read" in capsys.readouterr().err, \
         "the failure must name itself on stderr, not return a silent tuple"
+
+
+def test_a_corrupt_line_masked_by_a_concurrent_append_is_a_known_limit(world, monkeypatch):
+    """ defect 1: count-then-read trades a false ALARM for a bounded false PASS.
+
+    `rows = lines + appended - dropped`, so `rows >= n_lines` holds whenever the
+    appended lines cover the dropped ones: ONE append between the count and the read
+    masks ONE corrupt line. The comment in `_load_jsonl_checked` used to deny this
+    ("it does not trade one error for another") and nothing pinned it, which is what
+    let the claim stand. This test pins the limit instead of leaving it implied absent.
+
+    IF THIS GOES RED THE GAP WAS CLOSED: delete the comment's THE TRADE paragraph and
+    invert the masked assertion below. Do not "fix" the test to keep it green.
+
+    The peer's append lands BEFORE the real reader runs (after the count, which the
+    function takes first), so the reader sees it. That is the opposite landing to
+    `test_a_peer_append_between_the_count_and_the_read_does_not_flip_the_flag`, whose
+    append follows the read, and it is the landing that masks.
+    """
+    import _fileops
+
+    real_reader = _fileops.read_jsonl_with_recovery
+    path = world / "aspirations.jsonl"
+
+    # Control A: an intact file, undisturbed, reads ok.
+    path.write_text('{"id": "asp-950"}\n{"id": "asp-951"}\n{"id": "asp-952"}\n')
+    assert cd._load_jsonl_checked(path)[1] is True, "control A: an intact store reads ok"
+
+    # Control B: ONE corrupt line, undisturbed -> 3 lines, 2 rows -> the flag works.
+    path.write_text('{"id": "asp-950"}\nNOT-JSON {{\n{"id": "asp-951"}\n')
+    rows, ok = cd._load_jsonl_checked(path)
+    assert len(rows) == 2 and ok is False, "control B: an undisturbed corrupt store must alarm"
+
+    landed = []
+
+    def _append_then_read(p):
+        # The peer's append lands after the count and before the read.
+        with Path(p).open("a", encoding="utf-8") as fh:
+            fh.write('{"id": "asp-953"}\n')
+        landed.append(str(p))
+        return real_reader(p)
+
+    monkeypatch.setattr(_fileops, "read_jsonl_with_recovery", _append_then_read)
+
+    # The limit: one corrupt line + one append in the window -> 3 lines counted, 3 rows read.
+    rows, ok = cd._load_jsonl_checked(path)
+    assert landed, "the stub never ran -- this test proved nothing"
+    assert len(rows) == 3, "precondition: the read saw the appended row (3 counted, 3 parsed)"
+    assert ok is True, ("KNOWN LIMIT: one append masks one corrupt line -- if this is False the "
+                        "gap was closed; see the docstring")
+
+    # Its bound: ONE append cannot mask TWO corrupt lines (3 rows < 4 lines).
+    path.write_text('{"id": "asp-950"}\nNOT-JSON {{\n{"id": "asp-951"}\nNOT-JSON {{\n')
+    landed.clear()
+    rows, ok = cd._load_jsonl_checked(path)
+    assert landed and len(rows) == 3, "precondition: 2 parsed rows plus the appended one"
+    assert ok is False, "an append must mask no more corrupt lines than it adds"
+
+
+@pytest.mark.parametrize("exc_type", [OSError, RuntimeError])
+def test_a_failed_line_count_names_itself_and_the_other_silent_causes_stay_silent(
+        world, monkeypatch, capsys, exc_type):
+    """ defect 2: the count's swallow collapsed three causes into one silent value.
+
+    `_load_jsonl_checked` returns `(rows, False)` with an empty stderr for a MISSING
+    store, for a caller that OPTED OUT of the count, and -- until this fix -- for a
+    count whose open() RAISED on a healthy store. The third is the cause the flag
+    exists for (the synced mount misbehaves transiently, rb-2970, so it is EXPECTED in
+    production): the store was fine, the MEASUREMENT broke, and nothing recorded it.
+    The sibling g-115-10405 gave the fallback read a stderr line and left this branch
+    untouched.
+
+    guard-4448: the two silent causes are evidence only because the loud one is
+    measured under the SAME capture -- a stderr that was never captured would pass
+    them all. guard-2586: the count's text must not be the fallback's. The swallow
+    stays BROAD on purpose (F-2: a failed count degrades only the flag, never the
+    data), so a non-OSError is parametrized too: it must still name its class.
+    """
+    import _fileops
+
+    path = world / "aspirations.jsonl"
+    path.write_text('{"id": "asp-960"}\n{"id": "asp-961"}\n')
+    monkeypatch.setattr(_fileops, "read_jsonl_with_recovery",
+                        lambda p: [{"id": "asp-960"}, {"id": "asp-961"}])
+    capsys.readouterr()  # drop anything the fixture printed
+
+    # Control: a healthy, undisturbed read is ok and silent.
+    rows, ok = cd._load_jsonl_checked(path)
+    assert ok is True and len(rows) == 2
+    assert capsys.readouterr().err == "", "control: a clean read must say nothing"
+
+    # Cause 1 -- MISSING store: unread, and silent here by design (the caller announces it).
+    assert cd._load_jsonl_checked(world / "absent.jsonl") == ([], False)
+    assert capsys.readouterr().err == "", "a missing store must stay silent in this function"
+
+    # Cause 2 -- the caller OPTED OUT of the count on a healthy store: unverified, silent.
+    rows, ok = cd._load_jsonl_checked(path, count_lines=False)
+    assert len(rows) == 2 and ok is False
+    assert capsys.readouterr().err == "", "an opted-out count must stay silent"
+
+    # Cause 3 -- the count's open() RAISES on a healthy store: the rows survive, the flag
+    # degrades, and the failure names itself.
+    real_open = Path.open
+
+    def _open_raises(self, *a, **kw):
+        if self == path:
+            raise exc_type("simulated failure during the count")
+        return real_open(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "open", _open_raises)
+    rows, ok = cd._load_jsonl_checked(path)
+    err = capsys.readouterr().err
+    assert len(rows) == 2, "a COUNT failure must not discard rows that were read correctly"
+    assert ok is False, "an unverifiable count must degrade the flag"
+    assert "line count of aspirations.jsonl failed" in err and exc_type.__name__ in err, \
+        f"the count's failure must name itself and its class on stderr, got {err!r}"
+    assert "fallback read" not in err, "the count's text must differ from the fallback's"

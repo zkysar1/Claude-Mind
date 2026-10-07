@@ -41,6 +41,7 @@ path) -- mirrors test_completed_by_stamp.py, the g-115-1562 precedent.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import subprocess
@@ -303,6 +304,24 @@ def test_daemon_helper_never_reads_env_sid():
     assert "ctx.query" in body, "the daemon must source the sid from the request context"
 
 
+def _has_completion_sid_stamp(src: str) -> bool:
+    """True when an `if` naming value == "completed" assigns goal["completed_by_sid"].
+
+    Read from the AST, not from text: the seed plant scrubs "(g-NNN-NN)" from source
+    comments, so a goal-id marker grep passes here and fails at every plant. The daemon
+    file assigns goal["completed_by_sid"] at two more sites (the recurring and complete
+    paths), so the assignment must sit under the update-goal completion `if`.
+    """
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.If) or "value == 'completed'" not in ast.unparse(node.test):
+            continue
+        if any(isinstance(sub, ast.Assign)
+               and any(ast.unparse(t) == "goal['completed_by_sid']" for t in sub.targets)
+               for stmt in node.body for sub in ast.walk(stmt)):
+            return True
+    return False
+
+
 def test_cli_daemon_completed_by_sid_parity():
     """Both write-path doors carry the stamp (guard-742).
 
@@ -313,7 +332,7 @@ def test_cli_daemon_completed_by_sid_parity():
     cli = CLI_FILE.read_text(encoding="utf-8")
     daemon = DAEMON_FILE.read_text(encoding="utf-8")
     for name, text in (("CLI", cli), ("daemon", daemon)):
-        assert "g-306-134" in text, f"{name} lost the g-306-134 marker"
+        assert _has_completion_sid_stamp(text), f"{name} lost the completion-scoped stamp"
         assert 'goal["completed_by_sid"]' in text, f"{name} lost the stamp assignment"
         # ordering: every stamp must precede its claimed_by_sid pop
         stamp = text.index('goal["completed_by_sid"]')

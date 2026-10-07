@@ -68,13 +68,27 @@ needs both fixes, so both print; the verdict is the strongest of them
 (STOP > CARRY > MERGE-VERIFY-FIRST > MERGE). A conflict is judged before a
 no-change preview (guard-6648).
 
+## Why the retire candidates carry the retire gate's verdict
+
+Reachability from origin/main answers whether the CONTENT of a ref is delivered, and says
+nothing about whether a running Body still pushes to the HANDLE. Measured on the live
+fleet 2026-10-06: 9 outstanding refs were reachable, so the plan listed 9 retire
+candidates, and every one belonged to a Body whose heartbeat carrier was fresh. A plan
+that lists them unqualified sends the reducer to `--retire` nine times to be refused nine
+times, and a plan that hid the refusal would invite the `--force-retire-live` the gate
+exists to make rare. So each candidate prints the gate's one line. The plan reads the gate
+WITHOUT its origin reads (it stays a local, read-only plan), `--retire` re-reads
+everything inside its own call and stays the authority (guard-5952), and a gate that
+cannot run reads CARRY. The detail is in `worker-ref-retire-gate.md`.
+
 ## Cross-references
 
 - g-306-506 (this mode), g-306-284 (the protocol it mechanizes)
 - rb-6101 (merge-tree and drivers, legacy form), rb-12486 (merge-tree preflight),
   rb-12820 (snapshot-first verification), rb-12102 (daemon recycles on the merge commit),
   rb-12157 (record-level check on clean ledger merges)
-- guard-3660 (retire needs the live row; the commit clock is not yet automated),
+- guard-3660 (an absent row is no licence to retire; the commit clock and the heartbeat
+  carrier are asked by `worker_ref_retire_gate.py`, see `worker-ref-retire-gate.md`),
   guard-5718 (loop until a fresh re-read is empty; the plan's pin is for it)
 - `core/scripts/tests/test_worker_ref_drain.py` — verdicts pinned on real git fixtures
 - `core/config/rationale/worker-carrier-and-closure-evidence.md` — the carrier itself

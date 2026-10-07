@@ -38,7 +38,10 @@ from _cross_agent_attribution_filter import (  # noqa: E402
 
 # ── _normalize_rel_path unit tests ───────────────────────────────────────────
 
-ROOT = "<PROJECT_ROOT>"
+# A neutral fixture root, on purpose: the seed plant rewrites the dev box's workspace and
+# project names inside string literals, and it rewrites the drive, backslash and MSYS
+# spellings of one root DIFFERENTLY, so a literal carrying them no longer names one root.
+ROOT = "C:/Work/GitHub/Acme-Project"
 
 
 def test_normalize_relative_passthrough():
@@ -47,14 +50,14 @@ def test_normalize_relative_passthrough():
 
 def test_normalize_windows_drive_absolute():
     assert (
-        _normalize_rel_path("<PROJECT_ROOT>/core/scripts/foo.py", ROOT)
+        _normalize_rel_path("C:/Work/GitHub/Acme-Project/core/scripts/foo.py", ROOT)
         == "core/scripts/foo.py"
     )
 
 
 def test_normalize_backslash_absolute():
     assert (
-        _normalize_rel_path(r"<PROJECT_ROOT>\core\scripts\foo.py", ROOT)
+        _normalize_rel_path(r"C:\Work\GitHub\Acme-Project\core\scripts\foo.py", ROOT)
         == "core/scripts/foo.py"
     )
 
@@ -62,7 +65,7 @@ def test_normalize_backslash_absolute():
 def test_normalize_msys_form_against_drive_root():
     # Log written by Git-Bash as /c/...; project_root resolved by Python as C:/...
     assert (
-        _normalize_rel_path("/c/<WORKSPACE>/GitHub/Ayoai-Mind/core/scripts/foo.py", ROOT)
+        _normalize_rel_path("/c/Work/GitHub/Acme-Project/core/scripts/foo.py", ROOT)
         == "core/scripts/foo.py"
     )
 
@@ -71,8 +74,8 @@ def test_normalize_drive_form_against_msys_root():
     # Symmetric: project_root in MSYS form, entry in Windows-drive form.
     assert (
         _normalize_rel_path(
-            "<PROJECT_ROOT>/core/foo.py",
-            "/c/<WORKSPACE>/GitHub/Ayoai-Mind",
+            "C:/Work/GitHub/Acme-Project/core/foo.py",
+            "/c/Work/GitHub/Acme-Project",
         )
         == "core/foo.py"
     )

@@ -23,7 +23,9 @@ against the merge each tip would actually be part of:
     that deletes lines
   * overlap between the changed paths and this tree's uncommitted files
   * base freshness (HEAD against origin/main), a pin of the worker-ref store for
-    a later terminating re-read, and the refs already reachable from origin/main
+    a later terminating re-read, and the refs already reachable from origin/main,
+    each with what the retire gate says (worker_ref_retire_gate.py: tip clock and
+    heartbeat carrier, the same gate --retire asks when a Body's row is absent)
 
 Verdicts, one per tip. Every applicable reason is listed; the strongest decides:
 
@@ -372,7 +374,20 @@ def partition(repo, refs_doc):
     return tips, held, unreadable, others
 
 
-def build_plan(repo, refs_doc, audit_py, now=None):
+def _default_retire_gate(repo, ref, now):
+    """What `--retire`'s independent-signal gate says about this ref, read WITHOUT the origin
+    reads: --retire re-reads those inside its own call (guard-5952) and stays the authority.
+    A gate that cannot run reads CARRY, never RETIRE."""
+    try:
+        import worker_ref_retire_gate as rg
+        parts = ref.split("/")
+        res = rg.gate(repo, ref, parts[-2], parts[-1], now=now, check_remote=False)
+        return {"verdict": res["verdict"], "code": res["code"], "line": rg.line_of(res)}
+    except BaseException as e:  # noqa: BLE001 - SystemExit from a CLI-shaped helper included
+        return {"verdict": "CARRY", "code": "gate-error", "line": "CARRY gate-error: " + type(e).__name__}
+
+
+def build_plan(repo, refs_doc, audit_py, now=None, retire_gate=None):
     now = time.time() if now is None else now
     head = rev_commit(repo, "HEAD")
     tips, held, unreadable, others = partition(repo, refs_doc)
@@ -401,12 +416,14 @@ def build_plan(repo, refs_doc, audit_py, now=None):
             else:
                 chain_err = "no preview commit for %s: %s" % (t["ref"], why)
     if om:
+        ask = retire_gate or _default_retire_gate
         for r in tips + others:
             if not r["is_self"] and _is_ancestor(repo, r["tip"], om):
                 ct = _tip_ct(repo, r["tip"])
                 plan["retire_candidates"].append({
                     "ref": r["ref"], "tip": r["tip"],
-                    "tip_age_min": None if ct is None else max(0, int((now - ct) // 60))})
+                    "tip_age_min": None if ct is None else max(0, int((now - ct) // 60)),
+                    "gate": ask(repo, r["ref"], now)})
     plan["head_end"] = rev_commit(repo, "HEAD")
     plan["head_moved"] = plan["head_end"] != head
     counts = {v: 0 for v in RANK}
@@ -461,15 +478,19 @@ def render(plan):
     for u in plan["unreadable"]:
         out.append("UNREADABLE (not planned): %s (%s)" % (u["ref"] or "?", u["why"]))
     if plan["retire_candidates"]:
-        out.append("retire candidates (tip reachable from origin/main; --retire still applies its own live-row "
-                   "refusal, and a tip younger than a Body's cadence is live, guard-3660):")
+        out.append("retire candidates (tip reachable from origin/main). gate = --retire's independent-signal gate "
+                   "(tip clock + heartbeat carrier) read without the origin reads; --retire re-reads everything "
+                   "inside its own call and is the authority, and an absent in_flight row alone is no licence "
+                   "(guard-3660):")
         for c in plan["retire_candidates"]:
-            out.append("  %s tip=%s age=%s" % (c["ref"], c["tip"][:12],
-                                              "?" if c["tip_age_min"] is None else "%dmin" % c["tip_age_min"]))
+            out.append("  %s tip=%s age=%s gate: %s" % (
+                c["ref"], c["tip"][:12], "?" if c["tip_age_min"] is None else "%dmin" % c["tip_age_min"],
+                c["gate"]["line"]))
+    ready = sum(1 for c in plan["retire_candidates"] if c["gate"]["verdict"] == "RETIRE")
     out.append("drain plan: %d tip(s): MERGE=%d MERGE-VERIFY-FIRST=%d CARRY=%d STOP=%d | held=%d unreadable=%d | "
-               "retire-candidates=%d | base fresh=%s behind=%s ahead=%s | pin refs=%s sha256:%s | HEAD %s" % (
+               "retire-candidates=%d (gate RETIRE=%d) | base fresh=%s behind=%s ahead=%s | pin refs=%s sha256:%s | HEAD %s" % (
                    s["tips"], s["MERGE"], s["MERGE-VERIFY-FIRST"], s["CARRY"], s["STOP"], s["held"],
-                   s["unreadable"], s["retire_candidates"],
+                   s["unreadable"], s["retire_candidates"], ready,
                    {True: "yes", False: "NO", None: "UNMEASURED"}[b["fresh"]], b["behind"], b["ahead"],
                    pin["refs"], pin["digest"], (plan["head"] or "unresolved")[:12]))
     return out

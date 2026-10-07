@@ -18,16 +18,36 @@ PROJECT_ROOT="$(cd "$_RUNTIME_SELF/../.." && pwd)"
 CORE_ROOT="$PROJECT_ROOT/core"
 
 # --- Parse args -----------------------------------------------------------
+source "$CORE_ROOT/scripts/_argv_strict.sh"
+
+# ONE literal, shared by the help text and the refusal message — never two
+# copies (see argv_strict_refuse_unknown's header in _argv_strict.sh).
+_ACCEPTED_FLAGS="--source <world|agent> | -h | --help"
+
 SOURCE_VAL="world"
-declare -a PASSTHROUGH_SOURCE=()
+# () A write-only copy of the --source argv used to be kept here: nothing
+# below ever read it, so it was deleted.
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source)
             SOURCE_VAL="${2-}"
-            PASSTHROUGH_SOURCE=(--source "${2-}")
             shift $(( $# >= 2 ? 2 : 1 ));;
-        *) shift;;
+        -h|--help)
+            # BEFORE the -*) arm: --help is a `-*` token, and refusing it would be a
+            # regression the guard introduced. Help exits 0 and sweeps NOTHING — the
+            # old catch-all arm ignored it and ran the sweep ().
+            argv_strict_help "$(basename "$0")" "[--source <world|agent>]" \
+                "$_ACCEPTED_FLAGS" \
+"  This command MUTATES: it SWEEPS completed/retired aspirations out of the live
+  queue into the archive. There is no --dry-run (the daemon endpoint has none),
+  so --help is the only probe that sweeps nothing. --source selects WHICH queue
+  is swept and defaults to world."
+            ;;
+        -*)
+            argv_strict_refuse_unknown "$(basename "$0")" "$1" "$_ACCEPTED_FLAGS";;
+        *)
+            argv_strict_refuse_extra_positional "$(basename "$0")" "$1" 0 "$_ACCEPTED_FLAGS";;
     esac
 done
 

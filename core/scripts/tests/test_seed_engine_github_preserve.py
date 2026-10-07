@@ -161,7 +161,9 @@ def test_skip_entry_is_present_and_reasoned():
     """The entry itself, so a silent removal is loud."""
     assert ".github" in _engine._ORPHAN_SCAN_SKIP_TOP
     src = ENGINE_PATH.read_text(encoding="utf-8")
-    assert "g-335-1456" in src, (
+    # Anchored on the dated measurement that opens the citation, not on the goal id after it: the
+    # seed plant scrubs the id from that comment and keeps everything before the parenthesis.
+    assert "Measured 2026-09-03 (" in src, (
         "the .github skip entry lost its incident citation; a bare name in this "
         "set reads as arbitrary and is the first thing a future cleanup deletes"
     )

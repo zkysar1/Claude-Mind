@@ -60,11 +60,23 @@
 # READS this data before the delete fires). The gate deliberately forms NO
 # liveness opinion of its own (body_row_reaper.py owns stale-row reaping; two
 # liveness opinions about one Body are worse than one): a row PRESENT = refuse,
-# row ABSENT = proceed, source UNREADABLE = refuse (fail-closed — keeping a ref
-# costs nothing, deleting a live one is an unrecoverable handle loss). A row
-# left by an uncleanly-dead body is the reaper's to remove, after which retire
-# passes; --force-retire-live "<why>" is the operator-knows-it-is-dead override
-# and is recorded verbatim in the receipt.
+# row ABSENT = ask the independent-signal gate below, source UNREADABLE = refuse
+# (fail-closed — keeping a ref costs nothing, deleting a live one is an
+# unrecoverable handle loss). A row left by an uncleanly-dead body is the
+# reaper's to remove, after which retire passes the row check;
+# --force-retire-live "<why>" is the operator-knows-it-is-dead override and is
+# recorded verbatim in the receipt.
+#
+# An ABSENT row is not proof the Body is gone ( unit (d), guard-3660): the
+# row is written per CLAIM, so every live Body has none between two units, and a
+# tip's commit clock is only the age of that Body's last PUSH. So an absent row also
+# asks worker_ref_retire_gate.py, which permits only when origin's tip is the local
+# copy, the tip is older than body_row_reaper's stale threshold, and the reaper's
+# own decision for the Body's heartbeat carrier is "dead". Anything else refuses,
+# and so does any failure of the gate itself; --force-retire-live overrides it and
+# the receipt records the gate's line. The gate asks the reaper's opinion, it
+# forms none.
+# Rationale (WHY these signals and this fail direction): core/config/rationale/worker-ref-retire-gate.md
 #
 # --carry records a CARRY disposition: "leave this tip outstanding on purpose".
 # The record is keyed on (ref, tip SHA) in a fleet-synced append-only ledger
@@ -134,6 +146,9 @@ TEAM_STATE_READER="${WORKER_REF_TEAM_STATE_READER:-$SCRIPT_DIR/team-state-read.s
 # TEST-ONLY seam, same contract as the reader above: the --check by-record audit helper.
 # Production NEVER sets the env; a test pins that the default is the real sibling.
 AUDIT_PY="${WORKER_REF_AUDIT_PY:-$SCRIPT_DIR/carrier_merge_audit.py}"
+# TEST-ONLY seam, same contract again: the --retire independent-signal gate (
+# unit (d)). Production NEVER sets the env; a test pins that the default is the real sibling.
+RETIRE_GATE_PY="${WORKER_REF_RETIRE_GATE_PY:-$SCRIPT_DIR/worker_ref_retire_gate.py}"
 
 log() { echo "[worker-ref-consume] $*"; }
 
@@ -267,6 +282,7 @@ if [ -n "$RETIRE_REF" ]; then
   # : LIVENESS precondition. Reachability proved the CONTENT durable;
   # this proves no RUNNING body still needs the HANDLE.
   body_row_state="absent"
+  retire_gate_field=""
   row_json="$(bash "$TEAM_STATE_READER" --field "agent_status.${ref_agent}.in_flight_bodies.${ref_sid}" --json 2>/dev/null)"
   reader_rc=$?
   if [ "$reader_rc" -ne 0 ] || [ -z "$row_json" ]; then
@@ -357,6 +373,39 @@ print("")' 2>/dev/null)"
         exit 1
       fi
       body_row_state="SCHEMA-DRIFT-OVERRIDDEN $drift"
+    else
+      #  unit (d), guard-3660: a genuinely ABSENT row is still not "no live Body".
+      # The row is written per CLAIM, so every live Body has none between two units, and
+      # the drift probe above only catches a renamed key. Ask the independent signals
+      # (origin's tip, the tip commit's clock, the reaper's opinion of the heartbeat
+      # carrier) INSIDE this call, never from an earlier snapshot (guard-5952). TWO keys
+      # permit: rc 0 AND a line that opens "RETIRE: ". A CARRY, a crash, a usage error, a
+      # missing helper, and a helper that exits 0 without having decided all land in the
+      # refusal below, so the deny path cannot turn into an approval (guard-3803). The
+      # helper's own line is control-stripped before it goes into a JSON receipt.
+      retire_gate_line="$($PYLAUNCH -W ignore "$RETIRE_GATE_PY" check --repo "$REPO" --ref "$RETIRE_REF" \
+        --agent "$ref_agent" --sid "$ref_sid" 2>&1)"
+      retire_gate_rc=$?
+      retire_gate_line="${retire_gate_line//$'\n'/ | }"
+      retire_gate_line="$(printf '%s' "$retire_gate_line" | tr -d '[:cntrl:]"\\')"
+      # Keep the TAIL of a long line (a traceback ends in its exception). The guard matters:
+      # ${v: -N} is EMPTY, not the whole value, when the value is shorter than N characters.
+      if [ "${#retire_gate_line}" -gt 600 ]; then retire_gate_line="${retire_gate_line: -600}"; fi
+      retire_gate_field=",\"retire_gate\":\"$retire_gate_line\""
+      retire_gate_ok=0
+      if [ "$retire_gate_rc" -eq 0 ]; then
+        case "$retire_gate_line" in "RETIRE: "*) retire_gate_ok=1;; esac
+      fi
+      if [ "$retire_gate_ok" -ne 1 ]; then
+        if [ -z "$FORCE_RETIRE_LIVE_JUST" ]; then
+          log "REFUSED: ${ref_agent}/${ref_sid} has no in_flight_bodies row, which does not mean its Body is gone: the row is written per claim, so every live Body has none between two units (guard-3660)." >&2
+          log "Independent signals (gate rc=$retire_gate_rc): ${retire_gate_line}" >&2
+          log "CARRY it: leave the ref in place. It becomes retire-eligible once its tip and its heartbeat carrier have both gone stale." >&2
+          log "Or - only if you KNOW the Body is dead - retry with --force-retire-live \"<justification>\"." >&2
+          exit 1
+        fi
+        body_row_state="ABSENT-ROW-GATE-OVERRIDDEN ${retire_gate_line}"
+      fi
     fi
   fi
 
@@ -392,8 +441,8 @@ print("")' 2>/dev/null)"
   # READING THE LEDGER: a record with NO `outcome` field predates this change
   # (71 such records at the time it landed) and its disposition is UNKNOWN —
   # never read an absent marker as success.
-  printf '{"ref":"%s","tip_sha":"%s","retired_at":"%s","retired_by_agent":"%s","verified_ancestor_of_origin_main":"%s","body_row":"%s"%s%s,"outcome":"attempted","recreate_with":"git push origin %s:%s"}\n' \
-    "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" "${MIND_AGENT:-unknown}" "$main_sha" "${body_row_state//\"/\'}" "$liveness_override_field" "$forced_field" "$tip_sha" "$RETIRE_REF" \
+  printf '{"ref":"%s","tip_sha":"%s","retired_at":"%s","retired_by_agent":"%s","verified_ancestor_of_origin_main":"%s","body_row":"%s"%s%s%s,"outcome":"attempted","recreate_with":"git push origin %s:%s"}\n' \
+    "$RETIRE_REF" "$tip_sha" "$(date +%Y-%m-%dT%H:%M:%S)" "${MIND_AGENT:-unknown}" "$main_sha" "${body_row_state//\"/\'}" "$liveness_override_field" "$forced_field" "$retire_gate_field" "$tip_sha" "$RETIRE_REF" \
     >> "$receipt_dir/worker-ref-retirements.jsonl"
   if git -C "$REPO" push origin ":$RETIRE_REF" >/dev/null 2>&1; then
     git -C "$REPO" update-ref -d "$RETIRE_REF" 2>/dev/null || true

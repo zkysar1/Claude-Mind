@@ -27,6 +27,10 @@ TWO INDEPENDENT CHECKS, TWO FLAGS. A ships OFF; B is ON since 2026-10-06:
      A releasing verdict releases the close only if it answers the goal's current
      request. --override-close-review is honored only where team-state lists no other
      mind, which is a solo deployment.
+     A refused close WAITS (g-375-149). The gate writes the close's outcome note for the
+     reviewer when the goal carries none (--outcome-note-file, else the summary on
+     stdin), and goal-selector.py holds a goal whose request no verdict answers yet, so
+     a released loop close is not picked again before its verdict lands.
   B. note-marker          — close_review_gate.note_marker_enabled
      A goal whose own outcome_note/progress_note carries a HIGH-confidence not-done
      marker (REVERTED / REVIEWED-NOT-CLOSED / do-not-close / reopen) REFUSES, printing
@@ -339,6 +343,58 @@ def stamp_request(goal_id: str, source: str, when: str) -> str | None:
     return None
 
 
+def would_be_note(note_file: str | None, summary: str) -> tuple[str, str]:
+    """(text, source) of the outcome note this close would land ().
+
+    The --outcome-note-file, which replaces the record's note at the status write, else
+    the summary, which closure-evidence-write.sh lands after the status write when the
+    record has no note: the same order the closure-evidence gate reads them in. An
+    unreadable file reads as empty text, so nothing is written from it."""
+    if note_file:
+        try:
+            return (Path(note_file).read_text(encoding="utf-8", errors="replace"),
+                    "outcome-note-file")
+        except OSError:
+            return "", "outcome-note-file"
+    return summary, ("summary" if summary.strip() else "")
+
+
+def write_outcome_note(goal_id: str, source: str, note: str,
+                       note_file: str | None) -> str | None:
+    """Write the close's outcome note on the goal for the reviewer ().
+
+    Through closure-evidence-write.sh, the one writer of the closure narrative. The
+    caller writes only when the record carries no note, and the writer never clobbers
+    one either; --no-supersede keeps even a recurring goal's earlier note. That writer
+    always exits 0 by contract, so whether the note landed is read back from the store.
+
+    Returns None when it landed, else why not. Never raises: a note that could not be
+    written still leaves the close refused, and the refusal prints the command that
+    writes it."""
+    script = Path(__file__).resolve().parent / "closure-evidence-write.sh"
+    if bash_cmd is None or not script.is_file():
+        return "closure-evidence writer unavailable"
+    text = ("--summary-file", note_file) if note_file else ("--summary", note)
+    try:
+        res = subprocess.run(
+            bash_cmd(script, "--goal", goal_id, "--source", source, *text,
+                     "--prefix", "[close-review-gate]", "--no-supersede"),
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    # The whole note must be on the record. The writer may append a signature or a
+    # provenance line after it but never changes its text, and a note that only shares
+    # a line with this one was written by someone else. Whitespace is collapsed on both
+    # sides: the writer's shell trims trailing newlines and keeps a CR this read drops.
+    sent = " ".join(note.split())
+    landed = " ".join(str((load_goal(goal_id, source) or {}).get("outcome_note") or "").split())
+    if sent and sent in landed:
+        return None
+    said = (res.stderr or res.stdout or "").strip()[-300:]
+    return f"not on the record after the write (rc={res.returncode})" + (f": {said}" if said else "")
+
+
 def other_minds(agent: str, roster_json: str | None = None) -> list[str] | None:
     """The minds team-state lists other than the closer, or None when the roster cannot be
     read. team-state-retire.sh removes a retired mind's row and composing the roster drops
@@ -429,7 +485,18 @@ def main(argv=None) -> int:
     ap.add_argument("--goal-json", default=None, help="JSON goal record path (tests)")
     ap.add_argument("--roster-json", default=None,
                     help="JSON roster in team-state's agent_status shape (tests)")
+    ap.add_argument("--outcome-note-file", default=None,
+                    help="the close's outcome note, which a check-A refusal writes for the "
+                         "reviewer when the goal carries none (g-375-149)")
+    ap.add_argument("--summary-stdin", action="store_true",
+                    help="read the close's summary from stdin (do_verify's path); the note a "
+                         "refusal writes when no --outcome-note-file is given")
     args = ap.parse_args(argv)
+    # Drain stdin FIRST, as the closure-evidence gate does: do_verify pipes the summary in,
+    # and a return below must not leave its writer on a closed pipe. Decoded as UTF-8 so a
+    # byte the locale cannot read never crashes the gate out of its verdict.
+    summary = (sys.stdin.buffer.read().decode("utf-8", "replace")
+               if args.summary_stdin else "")
 
     agent = args.agent or os.environ.get("MIND_AGENT") or ""
     flags = _flags()
@@ -577,6 +644,21 @@ def main(argv=None) -> int:
             reachable = bool(_queue().executor_of(goal))
         except Exception:
             reachable = None
+        # Write the close's outcome note for the reviewer (). do_verify lands it
+        # only at the status write, after this gate, so a refused close would leave the
+        # reviewer a goal with no closure evidence, and leave the completed-not-closed
+        # drain, which closes an open goal only when it carries a note, nothing to close
+        # once a releasing verdict lands. Written only when the record carries no note;
+        # a --goal-json record is reported, never written. `note` is the decision
+        # (write, kept or none) and `note_written` what became of it, as for the request.
+        note_text, note_from = would_be_note(args.outcome_note_file, summary)
+        existing = str(goal.get("outcome_note") or "")
+        note = "none" if not note_text.strip() else ("kept" if existing.strip() else "write")
+        note_written = note_error = None
+        if note == "write" and not args.goal_json:
+            note_error = write_outcome_note(args.goal, args.source, note_text,
+                                            args.outcome_note_file)
+            note_written = note_error is None
 
         if defect == "self-review":
             print(f"close-review-gate: REFUSED — {args.goal} is tier 2 and its only "
@@ -623,6 +705,31 @@ def main(argv=None) -> int:
         elif reachable and (request == "open" or written):
             print("  close-review-queue.py offers the request to an independent reviewer.",
                   file=sys.stderr)
+        if request == "open" or written:
+            print("  The goal selector holds the goal until a verdict answers the request "
+                  "(block_reason awaiting_review), so a released loop close is not picked "
+                  "again before then; a REJECT returns it for rework.", file=sys.stderr)
+        if note == "write" and note_written:
+            print(f"  OUTCOME NOTE WRITTEN for the reviewer: this close's {note_from} "
+                  f"({len(note_text)} chars) is now the outcome_note of {args.goal}.",
+                  file=sys.stderr)
+        elif note == "write" and note_written is None:
+            print("  The goal record came from --goal-json, so the outcome note was not "
+                  "written.", file=sys.stderr)
+        elif note == "write":
+            src = args.outcome_note_file or "<a file holding this close's summary>"
+            print(f"  OUTCOME NOTE NOT WRITTEN ({note_error}). The reviewer reads the goal "
+                  f"record, so write it: bash core/scripts/closure-evidence-write.sh --goal "
+                  f"{args.goal} --source {args.source} --summary-file {src}",
+                  file=sys.stderr)
+        elif note == "kept":
+            print(f"  {args.goal} already carries an outcome_note ({len(existing)} chars). It "
+                  f"is not overwritten, so the reviewer reads that note"
+                  + (", and this close's --outcome-note-file replaces it only at the status "
+                     "write." if args.outcome_note_file else "."), file=sys.stderr)
+        else:
+            print("  This close carried no outcome note and no summary, so none was written "
+                  "for the reviewer.", file=sys.stderr)
         p = verdict_path(args.goal)
         print(f"  Expected verdict artifact: {p}", file=sys.stderr)
         print("  Produce it with the fresh-eyes close reviewer run by an INDEPENDENT "
@@ -640,7 +747,8 @@ def main(argv=None) -> int:
               defect=defect, stale=stale, request=request, request_written=written,
               review_requested=when, request_error=request_error,
               request_reachable=reachable, override_refused=others or None,
-              answers_fault=answers_fault)
+              answers_fault=answers_fault, note=note, note_from=note_from or None,
+              note_written=note_written, note_error=note_error)
         return 1
 
     return 0

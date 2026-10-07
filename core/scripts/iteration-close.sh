@@ -44,6 +44,13 @@
 #                            a bare $ — an inline --summary is a double-quoted
 #                            shell argument, so those expand before this script
 #                            runs and the prose is silently holed at rc=0.
+#   --drain --key-finding "<one line>"
+#                            verify only, together, with --status completed: a
+#                            close by the completed-not-closed drain of another
+#                            session's finished unit (g-375-146). Every gate
+#                            runs; the steps that assume the closer ran the unit
+#                            (checkpoint, uncommitted-work, the NEXT line, the
+#                            refusal remedy) take their drain branch.
 #
 # Returns exit 0 on success, non-zero on error. set -e means any sub-step failure
 # aborts the phase — the checkpoint file retains phase_completed, and the
@@ -171,6 +178,11 @@ OVERRIDE_CLOSE_REVIEW=""
 OVERRIDE_NOTE_MARKER=""
 OVERRIDE_CLOSURE_EVIDENCE=""
 OUTCOME_NOTE_FILE=""
+# g-375-146: verify-only. --drain marks a close made by the completed-not-closed
+# drain (aspirations-precheck Phase 0.5g.7), whose closer did not run the unit;
+# --key-finding is the one line that close of record carries. See do_verify.
+DRAIN=""
+KEY_FINDING=""
 
 # g-284-04: Recovery instructions on non-zero exit. The trap below reads
 # _CURRENT_PHASE (set by each do_* function at entry) and prints
@@ -648,6 +660,21 @@ _print_recovery_instructions() {
                 echo "  Goal ${GOAL_ID:-?} still reads status=$_vlive — the status write did NOT land; nothing downstream ran." >&2
                 echo "  (No revert needed — the goal is not closed.)" >&2
             fi
+            if [[ -n "${DRAIN:-}" && $rc -ne 2 && -n "$_vlive" && "$_vlive" != "$GOAL_STATUS" ]]; then
+                # g-375-146: a DRAINED close refused by a gate or by the status write
+                # is neither retried nor reverted. The row stays open, and the drain
+                # records the refusal in its report and moves on (aspirations-precheck
+                # Phase 0.5g.7). A retry would only meet the same gate, and a revert
+                # would strip a claim the drain does not own. Only when the probe
+                # read a status other than the target: a write that landed is a
+                # close, and an unread one is probed first, as above. rc 2 is the
+                # entry check (a malformed call), whose remedy is the corrected
+                # retry below.
+                echo "  Drained close: do not retry it and do not revert it. Count it as refused in the drain report, naming the gate above." >&2
+                echo "  A CLOSE REVIEW refusal needs nothing more: the slate holds the row until a verdict answers its review request. For any other gate:" >&2
+                echo "    bash core/scripts/completed-not-closed-slate.sh --hold ${GOAL_ID:-<id>} --reason \"close refused by <gate>: <its reason>\"" >&2
+                return 0  # never modify the script's exit code (trap is informational)
+            fi
             # --outcome is UNCONDITIONAL here, and the empty-case placeholder is
             # explicit rather than the `${OUTCOME:-deep}` default used by the
             # state-update / learning-gate hints below. Two reasons, both specific
@@ -669,6 +696,7 @@ _print_recovery_instructions() {
             [[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && cmd+=" --override-domain-suite \"$OVERRIDE_DOMAIN_SUITE\""
             [[ -n "$OVERRIDE_CLOSURE_EVIDENCE" ]] && cmd+=" --override-closure-evidence \"$OVERRIDE_CLOSURE_EVIDENCE\""
             [[ -n "$OUTCOME_NOTE_FILE" ]] && cmd+=" --outcome-note-file \"$OUTCOME_NOTE_FILE\""
+            [[ -n "${DRAIN:-}${KEY_FINDING:-}" ]] && cmd+=" --drain --key-finding \"${KEY_FINDING:-<one line>}\""
             if [[ "$_vlive" == "candidate" && "$GOAL_STATUS" == "completed" ]]; then
                 # g-375-118: a candidate cannot be completed until it is pending,
                 # so a bare retry is refused again. Here the pending write is a
@@ -833,6 +861,12 @@ while [[ $# -gt 0 ]]; do
         # pair. File transport only here — do_verify passes it straight to
         # aspirations-update-goal.sh --outcome-note-file.
         --outcome-note-file) OUTCOME_NOTE_FILE="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
+        # g-375-146: the completed-not-closed drain closes another session's
+        # finished unit through do_verify, so every gate sees the close. The
+        # flag tells do_verify the closer did not run the unit; the finding is
+        # what the close of record carries (see do_verify's DRAIN branches).
+        --drain) DRAIN="true"; shift ;;
+        --key-finding) KEY_FINDING="$2"; shift $(( $# >= 2 ? 2 : 1 )) ;;
         *)
             # (2026-08-29): a bare `unknown arg: --outcome-class` sent a downstream
             # Body (small local model) into a second invented flag (`--executed-by`),
@@ -1049,6 +1083,38 @@ _checkpoint_update() {
         --if-goal "$goal_id" || true
 }
 
+# ─── Shared helper: the team-state recent_completions row for GOAL_ID ───────
+# $1 is the row's key_finding. Two call sites: do_state_update, for a loop close
+# (its --summary), and do_verify, for a DRAINED close, which runs no state-update
+# phase (g-375-146). CORRECTNESS-CRITICAL: team state drives multi-agent
+# coordination, and the goal-duplication gate matches new filings against these
+# rows. Silent write failure means other agents see stale state. Surface, don't
+# abort.
+_append_recent_completion() {
+    local key_finding="${1:-completed}"
+    # Escape backslashes FIRST, then double-quotes, then collapse newlines —
+    # otherwise the L455 heredoc JSON breaks on any Windows path or regex
+    # pattern in $SUMMARY (a literal `\` would terminate string parsing or
+    # land mid-escape). Order matters: backslashes must be doubled BEFORE
+    # quote-escape, otherwise the freshly-inserted `\"` from quote-escape
+    # would be mangled by a later backslash pass. (g-115-384 / bravo-fec-
+    # iter-close-backslash F-003.)
+    key_finding="$(printf '%s' "$key_finding" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' ')"
+    # BOUND, stated deliberately (g-115-5365 scope item 1). `completed_by` below
+    # is "$AGENT" — the CALLER of this close, not necessarily the executor. On
+    # the Mind/Body split a WORKER executes and a REDUCER closes, so those two
+    # differ by design; on a sweep or bulk close they differ because the closer never
+    # touched the goal. Nothing pops this field, so the value persists.
+    # `executed_by` is deliberately NOT carried here — see the matching note at
+    # the daemon writer (aspirations_write.py, complete-by team-state
+    # cross-write). The goal record is the authority and carries both fields;
+    # a reader wanting the executor JOINS on goal_id rather than trusting a
+    # second copy that only one of the two writers could populate.
+    bash "$SCRIPT_DIR/team-state-update.sh" \
+        --field recent_completions --operation append \
+        --value "{\"goal_id\":\"$GOAL_ID\",\"completed_by\":\"$AGENT\",\"completed_at\":\"$NOW_ISO\",\"key_finding\":\"$key_finding\"}" || echo "[iteration-close] WARN: team-state-update recent_completions failed for $GOAL_ID" >&2
+}
+
 # ─── Shared helper: probe whether GOAL_ID is a recurring goal ───────────────
 # Reads the goal record from the source aspirations file; echoes "true"/"false".
 # Fail-open: any probe error → "false" (treat as non-recurring; the caller's own
@@ -1214,6 +1280,19 @@ for r in rows if isinstance(rows, list) else []:
     return 1
 }
 
+# --drain and --key-finding come as a pair, on a completion (g-375-146). The
+# completed-not-closed drain releases or holds every row it does not close, so a
+# drained call has no other status, and a loop close's finding is its --summary
+# instead. do_verify calls this at entry. It is a function so the tests can source
+# it. Returns 1 to refuse; the EXIT trap then prints the corrected retry (rc 2).
+_refuse_malformed_drain() {
+    [[ -n "$DRAIN" || -n "$KEY_FINDING" ]] || return 0
+    [[ -n "$DRAIN" && -n "$KEY_FINDING" && "$GOAL_STATUS" == "completed" ]] && return 0
+    echo "verify: --drain and --key-finding go together, with --status completed: the completed-not-closed drain closes a finished unit and its close carries the finding. A loop close's finding is its --summary." >&2
+    echo "  usage: iteration-close.sh --phase verify --drain --goal <id> --status completed --source <world|agent> --outcome <deep|routine> --key-finding \"<one line>\" [--outcome-note-file <file>]" >&2
+    return 1
+}
+
 do_verify() {
     _CURRENT_PHASE="verify"
     # CRITICAL — DO NOT add a "default --status from disk" fallback here.
@@ -1248,7 +1327,8 @@ do_verify() {
         echo "  hint: pass --status completed for goals already marked complete via aspirations-update-goal.sh" >&2
         exit 2
     fi
-    echo "[iteration-close] verify: goal=$GOAL_ID status=$GOAL_STATUS source=$SOURCE"
+    _refuse_malformed_drain || exit 2
+    echo "[iteration-close] verify: goal=$GOAL_ID status=$GOAL_STATUS source=$SOURCE${DRAIN:+ (drained close)}"
 
     # ── blocked needs a blocker, and the refusal must name the shell remedy
     # (2026-08-30, coach@zc-03). Without this, the daemon refuses the status
@@ -1364,6 +1444,9 @@ do_verify() {
     if [[ "$GOAL_STATUS" == "completed" && -f "$SCRIPT_DIR/domain-suite-gate.py" ]]; then
         _dsg_args=(--goal "$GOAL_ID" --source "$SOURCE")
         [[ -n "$OVERRIDE_DOMAIN_SUITE" ]] && _dsg_args+=(--override "$OVERRIDE_DOMAIN_SUITE")
+        # g-375-146: a drained close's closer ran none of the unit, so the gate
+        # counts only the claim's sessions as the unit's (domain-suite-gate.py).
+        [[ -n "$DRAIN" ]] && _dsg_args+=(--drain)
         _dsg_rc=0
         python3 "$(_winpath "$SCRIPT_DIR/domain-suite-gate.py")" "${_dsg_args[@]}" \
             >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _dsg_rc=$?
@@ -1426,12 +1509,17 @@ do_verify() {
     # core/config/aspirations.yaml. Flip each flag when its own precondition lands.
     # Only the gate's OWN verdict refuses: rc 1 is a block; rc 0 is
     # pass/noop/override/error; anything else is a gate fault and fails OPEN.
+    # A check-A refusal writes this close's outcome note for the reviewer when the
+    # goal has none (g-375-149), so the gate gets the note the status write would
+    # land: --outcome-note-file, else the summary, which goes on stdin as for the
+    # closure-evidence gate above.
     if [[ "$GOAL_STATUS" == "completed" && -f "$SCRIPT_DIR/close-review-gate.py" ]]; then
-        _crg_args=(--goal "$GOAL_ID" --source "$SOURCE")
+        _crg_args=(--goal "$GOAL_ID" --source "$SOURCE" --summary-stdin)
+        [[ -n "$OUTCOME_NOTE_FILE" ]] && _crg_args+=(--outcome-note-file "$(_winpath "$OUTCOME_NOTE_FILE")")
         [[ -n "$OVERRIDE_CLOSE_REVIEW" ]] && _crg_args+=(--override-close-review "$OVERRIDE_CLOSE_REVIEW")
         [[ -n "$OVERRIDE_NOTE_MARKER" ]] && _crg_args+=(--override-note-marker "$OVERRIDE_NOTE_MARKER")
         _crg_rc=0
-        python3 "$(_winpath "$SCRIPT_DIR/close-review-gate.py")" "${_crg_args[@]}" \
+        printf '%s' "$SUMMARY" | python3 "$(_winpath "$SCRIPT_DIR/close-review-gate.py")" "${_crg_args[@]}" \
             >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _crg_rc=$?
         if [[ $_crg_rc -eq 1 ]]; then
             echo "[iteration-close] ✖ REFUSED — CLOSE REVIEW (g-357-40): goal $GOAL_ID stays open. See the reason above, then re-run this close." >&2
@@ -1448,7 +1536,11 @@ do_verify() {
     # + aspirations.status=pending and surfaces the split-brain. Only fires for
     # completed status with an --outcome — for blocked/skipped the protocol's
     # transitional invariant (intent→committed) is irrelevant.
-    if [[ "$GOAL_STATUS" == "completed" && -n "$OUTCOME" ]]; then
+    # g-375-146: not on a DRAINED close. The checkpoint belongs to the drainer's
+    # own iteration, anchored to its own goal or absent mid-precheck, so these
+    # writes would be refused with a WARN prescribing `init --goal-id <this goal>`,
+    # which would re-anchor the drainer's checkpoint to a goal it never ran.
+    if [[ "$GOAL_STATUS" == "completed" && -n "$OUTCOME" && -z "$DRAIN" ]]; then
         _checkpoint_update "$GOAL_ID" \
             --set "intent_state=complete" \
             --set "intent_outcome=$OUTCOME"
@@ -1573,7 +1665,14 @@ do_verify() {
         # precedence (non-empty check below). Routine outcomes skip this branch
         # because iteration-commit.sh no-ops on routine — the gate retains
         # protective value for routine-with-dirty-code (orphan-code signal).
-        if [[ "$GOAL_STATUS" == "completed" && "$OUTCOME" == "deep" && -z "$OVERRIDE_UNCOMMITTED" ]]; then
+        if [[ "$GOAL_STATUS" == "completed" && -n "$DRAIN" && -z "$OVERRIDE_UNCOMMITTED" ]]; then
+            # g-375-146: a DRAINED close, deep or routine. The gate reads this box's
+            # working tree, and the drainer ran none of the unit, so a dirty file
+            # here is the drainer's own work and would refuse a close it has nothing
+            # to do with. The audit row, written only when something is dirty, says
+            # so instead of naming a state-update phase that never runs for this goal.
+            OVERRIDE_UNCOMMITTED="auto: drained close (completed-not-closed drain): the closer did not run this unit, so this box's working tree is not its work"
+        elif [[ "$GOAL_STATUS" == "completed" && "$OUTCOME" == "deep" && -z "$OVERRIDE_UNCOMMITTED" ]]; then
             if [[ "${BODY_ROLE:-}" == "worker" ]]; then
                 # A WORKER Body never reaches do_state_update, so the reason
                 # above would be FALSE in its audit ledger row. Its commits
@@ -1667,6 +1766,18 @@ do_verify() {
     if [[ -n "$OUTCOME" && "$GOAL_STATUS" == "completed" ]]; then
         bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" outcome_class "$OUTCOME" \
             || echo "[iteration-close] ⚠ outcome_class stamp failed for $GOAL_ID (non-fatal; status is already committed)" >&2
+    fi
+
+    # g-375-146: a DRAINED close carries the drain's finding, as the complete-by
+    # close it replaced did: on the record, where completed-not-closed-slate.sh
+    # --show prints it, and as the team-state recent_completions row, which the
+    # goal-duplication gate matches new filings against. No state-update phase
+    # runs for a drained goal, so nothing else writes either. Non-fatal, like the
+    # stamp above: the status write is the close.
+    if [[ -n "$DRAIN" && "$GOAL_STATUS" == "completed" ]]; then
+        bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" key_finding "$KEY_FINDING" \
+            || echo "[iteration-close] ⚠ key_finding stamp failed for $GOAL_ID (non-fatal; status is already committed)" >&2
+        _append_recent_completion "$KEY_FINDING"
     fi
 
     # g-306-204: stamp WHICH ROLE closed the goal. Sits beside outcome_class
@@ -2034,8 +2145,9 @@ print(json.dumps({
     # All three state stores (iteration-checkpoint phase_completed, aspirations
     # status/outcome_class, team-state in_flight clear) have now landed. The
     # committed marker tells the recovery hook that this iteration's verify
-    # finished cleanly — no retry needed.
-    if [[ "$GOAL_STATUS" == "completed" && -n "$OUTCOME" ]]; then
+    # finished cleanly — no retry needed. Not on a DRAINED close, whose Step 0
+    # marker was not written either (g-375-146; see there).
+    if [[ "$GOAL_STATUS" == "completed" && -n "$OUTCOME" && -z "$DRAIN" ]]; then
         _checkpoint_update "$GOAL_ID" --set "intent_state=committed"
     fi
 
@@ -2168,7 +2280,14 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
         # non-recurring close rather than only when the caller remembered the
         # flag. do_state_update's sentinel remains the backstop for the case this
         # stdout line is emitted but not acted on.
-        if [[ "${BODY_ROLE:-}" == "worker" ]]; then
+        if [[ -n "$DRAIN" ]]; then
+            # g-375-146: the drain closed ANOTHER session's unit, so no spark,
+            # state-update or learning-gate phase is this iteration's to run for it.
+            # Obeying the reducer's imperative below would run state-update for a
+            # goal the drainer never executed: its counters, a second
+            # recent_completions row and an iteration-commit under that goal's id.
+            echo "[iteration-close] NEXT (drain): $GOAL_ID was another session's unit, closed by the completed-not-closed drain. Run no spark, state-update or learning-gate phase for it; continue with the drain's next row."
+        elif [[ "${BODY_ROLE:-}" == "worker" ]]; then
             # A WORKER Body reaches this close via worker-loop Phase 4a and
             # its spark obligation is Phase 3.5 spark_capture (replayed by
             # the reducer at generalize-down) — Skill(aspirations-spark) is
@@ -2183,7 +2302,10 @@ with open(os.environ["GD_FILE"], "a", encoding="utf-8") as f:
     fi
     # ── End Phase-6 spark imperative ──────────────────────────────────────────
 
-    _checkpoint_refresh verify "$GOAL_ID"
+    # Not on a DRAINED close: the checkpoint is the drainer's (g-375-146).
+    if [[ -z "$DRAIN" ]]; then
+        _checkpoint_refresh verify "$GOAL_ID"
+    fi
     # LLM residue at this phase: Q1/Q2/Q3 escalation, output summary generation.
     # See core/config/iteration-close-digest.md § VERIFY.
 }
@@ -2739,30 +2861,7 @@ except: print(0)' 2>/dev/null)" || true
     fi
     echo "\"$SOURCE\"" | bash "$SCRIPT_DIR/wm-set.sh" current_goal_source || echo "[iteration-close] WARN: wm-set current_goal_source failed" >&2
 
-    # CORRECTNESS-CRITICAL: team state drives multi-agent coordination. Silent
-    # write failure means other agents see stale state. Surface, don't abort.
-    local key_finding="${SUMMARY:-completed}"
-    # Escape backslashes FIRST, then double-quotes, then collapse newlines —
-    # otherwise the L455 heredoc JSON breaks on any Windows path or regex
-    # pattern in $SUMMARY (a literal `\` would terminate string parsing or
-    # land mid-escape). Order matters: backslashes must be doubled BEFORE
-    # quote-escape, otherwise the freshly-inserted `\"` from quote-escape
-    # would be mangled by a later backslash pass. (g-115-384 / bravo-fec-
-    # iter-close-backslash F-003.)
-    key_finding="$(printf '%s' "$key_finding" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' ')"
-    # BOUND, stated deliberately (g-115-5365 scope item 1). `completed_by` below
-    # is "$AGENT" — the CALLER of this close, not necessarily the executor. On
-    # the Mind/Body split a WORKER executes and a REDUCER closes, so those two
-    # differ by design; on a sweep or bulk close they differ because the closer never
-    # touched the goal. Nothing pops this field, so the value persists.
-    # `executed_by` is deliberately NOT carried here — see the matching note at
-    # the daemon writer (aspirations_write.py, complete-by team-state
-    # cross-write). The goal record is the authority and carries both fields;
-    # a reader wanting the executor JOINS on goal_id rather than trusting a
-    # second copy that only one of the two writers could populate.
-    bash "$SCRIPT_DIR/team-state-update.sh" \
-        --field recent_completions --operation append \
-        --value "{\"goal_id\":\"$GOAL_ID\",\"completed_by\":\"$AGENT\",\"completed_at\":\"$NOW_ISO\",\"key_finding\":\"$key_finding\"}" || echo "[iteration-close] WARN: team-state-update recent_completions failed for $GOAL_ID" >&2
+    _append_recent_completion "${SUMMARY:-completed}"
     # g-284-06: team-state-clear-in-flight MOVED to do_verify Step 3. The
     # canonical writers of agent_status.<self>.last_active are still:
     # cmd_in_flight (claim), cmd_clear_in_flight (now invoked from do_verify

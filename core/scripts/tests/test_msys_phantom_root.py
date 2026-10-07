@@ -30,8 +30,11 @@ def _fwd(p: Path) -> str:
 
 
 def test_absolutize_converts_msys_root_on_windows_when_target_exists():
-    real = "<PROJECT_ROOT>/.mind-data/world"
-    res = absolutize("/c/<WORKSPACE>/GitHub/Ayoai-Mind/.mind-data/world", PROJECT,
+    # A neutral fixture path: the seed plant rewrites the dev box's workspace and project
+    # names inside string literals, and rewrites the drive and MSYS spellings of one path
+    # DIFFERENTLY, so `real` would stop being what the MSYS form converts to.
+    real = "C:/Work/GitHub/Acme-Project/.mind-data/world"
+    res = absolutize("/c/Work/GitHub/Acme-Project/.mind-data/world", PROJECT,
                      is_windows=True, exists=lambda p: p == real)
     # On a Windows host this is WindowsPath('C:/...'); on POSIX absolutize's
     # stage 1 roots the drive form at '/'. Either way the drive form won and

@@ -181,10 +181,12 @@ def test_usage_errors(world):
 def test_wrapper_and_skill_wiring():
     root = SCRIPTS.parent.parent
     assert (SCRIPTS / "notify-user.sh").exists()
-    skill = (root / ".claude" / "skills" / "notify-user" / "SKILL.md").read_text(encoding="utf-8")
-    assert "core/scripts/notify-user.sh" in skill
     hooks = (root / "core" / "config" / "conventions" / "domain-hooks.md").read_text(encoding="utf-8")
     assert "notify-transport" in hooks
+    skill_path = root / ".claude" / "skills" / "notify-user" / "SKILL.md"
+    if not skill_path.exists():
+        pytest.skip("notify-user is a forged domain skill; a seed plant does not ship it")
+    assert "core/scripts/notify-user.sh" in skill_path.read_text(encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -298,7 +300,10 @@ def test_reply_is_info_shaped_and_deliberately_NOT_step_1_5_exempt():
     assert valid and "reply" in set(re.findall(r'"([a-z-]+)"', valid.group(1)))
     assert '"reply": "Reply"' in builder, "reply must map to an InfoType, or the builder KeyErrors"
 
-    skill = (SCRIPTS.parent.parent / ".claude" / "skills" / "notify-user" / "SKILL.md").read_text(encoding="utf-8")
+    skill_path = SCRIPTS.parent.parent / ".claude" / "skills" / "notify-user" / "SKILL.md"
+    if not skill_path.exists():
+        pytest.skip("notify-user is a forged domain skill; a seed plant does not ship it")
+    skill = skill_path.read_text(encoding="utf-8")
     gate = re.search(r"IF category not in \(([^)]*)\):", skill)
     assert gate, "could not find Step 1.5's exempt tuple in notify-user/SKILL.md"
     assert "reply" not in set(re.findall(r'"([a-z-]+)"', gate.group(1))), (

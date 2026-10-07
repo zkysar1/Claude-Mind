@@ -208,6 +208,29 @@ def _data_class_gate(text: str, override: str, record: bool = True) -> None:
               f"-- posting UNCHECKED.", file=sys.stderr)
 
 
+def delivery_fields(backend: str) -> dict:
+    """What this tool can honestly say about delivery, for the JSON it prints.
+
+    A ``local`` peer is written as a plain file on THIS box. That is delivery only
+    when the peer reads this very copy, or when the copy is later committed and
+    pushed; the tool cannot know which, and exit 0 reads as "delivered" either way.
+    Measured 2026-10-06: ten posts sat five days in a copy nobody committed while
+    every call said "posted" (g-115-12070, guard-7610). So the output says
+    "unconfirmed" in the channel callers actually read. NOT on stderr: the Bash
+    tool merges stderr into the output a caller json-parses (rb-874), and a caller
+    that only records the exit code reads neither (rb-7050).
+    """
+    if backend != "local":
+        return {"delivery": "peer-store"}
+    return {
+        "delivery": "unconfirmed",
+        "delivery_note": ("this is a write into THIS box's copy of the peer's world. "
+                          "It reaches the peer only if that copy is committed and pushed, "
+                          "or read by a running peer; exit 0 does not say which. Read the "
+                          "line back on the peer's own board before calling it delivered."),
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="peer-board-post",
@@ -315,6 +338,7 @@ def main(argv=None) -> int:
             preview_n = sum(1 for ln in target.open(encoding="utf-8",
                                                     errors="replace") if ln.strip())
         print(json.dumps({"would_write": str(target), "peer_backend": backend,
+                          **delivery_fields(backend),
                           "record": _build([None] * preview_n)}, indent=2))
         return EXIT_OK
 
@@ -323,7 +347,8 @@ def main(argv=None) -> int:
     from _fileops import locked_append_jsonl_with_allocator  # noqa: PLC0415
     rec = locked_append_jsonl_with_allocator(target, _build)
     print(json.dumps({"posted": rec["id"], "peer": args.peer,
-                      "peer_backend": backend, "path": str(target)}))
+                      "peer_backend": backend, **delivery_fields(backend),
+                      "path": str(target)}))
     return EXIT_OK
 
 

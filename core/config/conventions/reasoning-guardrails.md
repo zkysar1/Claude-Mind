@@ -123,7 +123,7 @@ Guardrails use JSONL (one JSON object per line) with script-based access:
 ## Record Schema
 Required: `id`, `rule`, `category`, `trigger_condition`, `source`, `created`
 Defaults: `status` ("active"), `utilization` ({`times_active`: 0, `times_skipped`: 0, `times_helpful`: 0, `times_noise`: 0, `retrieval_count`: 0, `utilization_score`: 0.0}). Authoritative field list: `core/scripts/reasoning-bank.py` `UTILIZATION_COUNTERS`. No top-level `times_triggered` — that field belongs to `pattern-signatures.jsonl`, not guardrails.
-Optional: `tags`, `title`, `when_to_use`, `severity`, `action_hint`, `phases`, `context_triggers`, `trigger_pattern`, `experience_ref`, `source_reflection_id`, `auto_flagged_for_review`, `next_review_eligible_at`, `valid_from`, `valid_to`, `retirement_date`, `retirement_reason`
+Optional: `tags`, `title`, `when_to_use`, `severity`, `action_hint`, `phases`, `context_triggers`, `trigger_pattern`, `experience_ref`, `source_reflection_id`, `auto_flagged_for_review`, `next_review_eligible_at`, `valid_from`, `valid_to`, `retirement_date`, `retirement_reason`, `enforced_by`
 `when_to_use` takes the reasoning bank's one shape, `{"conditions": [...], "category": ""}` (see its Record Schema above).
 
 `related_patterns` and `violation_history` are **NOT** guardrail fields — `guardrails-add.sh` rejects both with `validation_failed: Unknown field(s)`. They were documented here in error. The authoritative allowlist is `GUARD_KNOWN_FIELDS` in `mind_api/src/store_registry.py` (~L301; its L487 raises the error), mirrored CLI-side in `core/scripts/reasoning-bank.py` (~L195) — extend BOTH in sync or not at all.
@@ -135,6 +135,27 @@ To cross-link a guardrail to reasoning-bank entries, put the IDs in `tags` or na
 `experience_ref` (format `exp-SLUG`, see `experience.md`) links the
 prescriptive rule to the full-fidelity trace it was learned from. Same
 schema and semantics as on reasoning-bank records. Optional.
+
+`enforced_by` (g-306-572) names the gate(s) that MECHANICALLY check the rule — the
+difference between a guardrail that is retrieved and one that is enforced. A string or a
+list of strings, each a repo-relative path to the gate (`core/scripts/<name>.py`, with an
+optional `:line`, `::name` or `#anchor`) or a hook name. null, absent, `""` and `[]` all
+mean **honor-system**: nothing but a reader's memory checks the rule. The words
+`honor-system` and `none` are not a gate. A wrong type is refused (`Invalid enforced_by`)
+and never coerced. Set it with `guardrails-update-field.sh <id> enforced_by
+core/scripts/<gate>.py` (several: a JSON list, `'["a/b.py","c/d.sh"]'`); clear it with
+`null` or `[]`. It is allowlisted in BOTH validators WITHOUT a default, like `encoded_by`:
+a default would backfill a null onto every historical guardrail a later path rewrites.
+Only a path containing `/` can be checked: the census reads a path that does not exist as
+`stale-gate`, and a bare file name or hook name as `gated-unverified`.
+
+`guardrail-enforcement-census.sh [--json] [--honor-system-only]` (read-only) lists every
+guardrail that carries an owner or user directive with its enforcing gate or `honor-system`.
+The population is a user-origin tag, a speech-act phrase in `source` ("user directive",
+"owner ruling", …), or a rule that opens `STANDING` and names an owner, user, grant or
+directive. Each row also lists the non-test files that cite the id, a hint for backfilling
+`enforced_by` and never a verdict. Definition and measured boundary:
+`core/scripts/guardrail_enforcement_census.py`.
 
 ID format: `guard-NNN` (regex: `^guard-\d+$`, open-ended per guard-1161; new IDs zero-padded to 3+ digits, but legacy sub-3-digit record IDs exist, e.g. guard-97)
 Valid statuses: `active`, `retired`
@@ -151,6 +172,7 @@ The LLM NEVER reads or edits `world/guardrails.jsonl` directly. All operations g
 | `guardrails-add.sh` | Validate + append new guardrail | JSON |
 | `guardrails-update-field.sh <id> <field> <value>` | Update single field | — |
 | `guardrails-increment.sh <id> <field>` | Atomic increment of utilization/trigger field | — |
+| `guardrail-enforcement-census.sh [--json] [--honor-system-only]` | Read-only census: owner/user-directive guardrails with their `enforced_by` gate or `honor-system` | — |
 | `utilization-correct.sh --store <s> --id <id> --counter <c> --reason <why> [--by N]` | Correct a MIS-CREDITED utilization counter (both stores) — see “Correcting a mis-credit” below | — |
 
 All backed by the `core/scripts/guardrails-*.sh` wrappers above (Python 3, stdlib only). Direct read/write of `world/guardrails.jsonl` is prohibited — use the wrappers exclusively.

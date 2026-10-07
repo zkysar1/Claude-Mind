@@ -478,12 +478,13 @@ close_review_gate:
   #      84 of the 178 refused, about 47%.
   #   2. A refusal had no reachable remedy except the override. Any closer could pass
   #      --override-close-review, and a Body did exactly that on another gate
-  #      (2026-09-23, see POST-HOC below). PARTLY FIXED 2026-10-06 (): a refusal
-  #      now stamps review_requested itself, so the queue offers the goal to a reviewer,
-  #      and the override is honored only where team-state lists no other mind. Still
-  #      open, as step 4b (): a refused LOOP close is released and can be
-  #      picked again before its verdict lands, instead of waiting parked, and its
-  #      outcome note is not yet written for the reviewer. Workers stay post-hoc.
+  #      (2026-09-23, see POST-HOC below). FIXED 2026-10-06 (, ): a
+  #      refusal stamps review_requested itself, so the queue offers the goal to a
+  #      reviewer, and the override is honored only where team-state lists no other mind.
+  #      The refusal also writes the close's outcome note when the goal has none, and the
+  #      goal selector holds a goal whose request no verdict answers (awaiting_review),
+  #      so a released loop close waits for its verdict instead of being picked again.
+  #      Workers stay post-hoc.
   #   3. The completed-not-closed drain closes through the complete-by wrapper, outside
   #      do_verify, so it would bypass this check. PARTLY FIXED 2026-10-06 (,
   #      ea86cd6edf): the drain holds a goal whose review request no releasing verdict

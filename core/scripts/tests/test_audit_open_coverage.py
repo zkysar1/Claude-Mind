@@ -5,7 +5,8 @@ reason-less-blocked 0.5b.11).
 The module is pure (no I/O, no daemon), so these tests exercise it directly:
 
   * open_audits filters on origin_signal AND open status (pending /
-    in-progress) — a completed audit does not hold the dedup;
+    in-progress / candidate — the tier a lane's own filing lands in until it
+    is groomed) — a completed audit does not hold the dedup;
   * naming_surface is title + description, lowercased;
   * covered_by is WORD-BOUNDARIED: an audit naming g-115-11720 does NOT
     cover g-115-117 (prefix siblings share per-aspiration prefixes), and an
@@ -61,6 +62,21 @@ def test_open_audits_filters_on_key_and_status():
         {"id": "g-5", "status": "pending",
          "origin_signal": "investigate:reason-less-blocked-audit"},  # other lane
         {"id": "g-6", "status": "pending"},  # no origin_signal
+    ]
+    ids = [a["id"] for a in mod.open_audits(goals, KEY)]
+    assert ids == ["g-1", "g-2"]
+
+
+def test_open_audits_counts_candidate_tier_filings():
+    """A lane's own filing lands in the candidate tier until it is groomed
+    (measured 2026-10-06: 13 candidate audits for 3 drift events, 0 pending).
+    The dedup has to see it, or the lane refiles an identical audit on every
+    run."""
+    mod = _import()
+    goals = [
+        _audit("g-1", "candidate"),
+        _audit("g-2", "pending"),
+        _audit("g-3", "candidate", key="investigate:reason-less-blocked-audit"),
     ]
     ids = [a["id"] for a in mod.open_audits(goals, KEY)]
     assert ids == ["g-1", "g-2"]
@@ -189,6 +205,21 @@ def test_uncovered_ids_terminal_audit_does_not_cover():
         {"id": "g-115-1", "status": "pending"},
     ]
     assert mod.uncovered_ids(goals, KEY, ["g-115-1"]) == ["g-115-1"]
+
+
+def test_uncovered_ids_candidate_audit_covers():
+    """An audit still in the candidate tier is live coverage: it names its
+    members, and nothing has retired it. Counting only pending/in-progress made
+    every run file a fresh duplicate of the previous run's candidate."""
+    mod = _import()
+    goals = [
+        _audit("g-audit", status="candidate",
+               title="re-gate 1 drifted defer(s) g-115-1"),
+        {"id": "g-115-1", "status": "pending"},
+    ]
+    assert mod.uncovered_ids(goals, KEY, ["g-115-1"]) == []
+    # ...and only for the ids it names: a new drift is still uncovered.
+    assert mod.uncovered_ids(goals, KEY, ["g-115-1", "g-115-2"]) == ["g-115-2"]
 
 
 def test_uncovered_ids_empty_surface_audit_is_covering():

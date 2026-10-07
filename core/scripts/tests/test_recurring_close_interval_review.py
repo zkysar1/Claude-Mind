@@ -59,8 +59,11 @@ from _daemon_fixture import DaemonFixture  # noqa: E402  (: counters land via th
 SRC = RECURRING_CLOSE_SH.read_text(encoding="utf-8")
 
 GATE = " (settle the INTERVAL MOVED review above first)"
-REVIEW_ANCHOR = "# INTERVAL-MOVE REVIEW (g-115-6612)"
-LANDING_ANCHOR = "# STATE-MISMATCH LANDING (g-357-51)"
+# Both anchors stop BEFORE the goal-id parenthetical: the seed plant scrubs "(g-NNN-NN)"
+# from script comments, so the fully-spelled anchor matches 0 times in a planted tree
+# and the module-level _between() below aborts collection of the whole chunk.
+REVIEW_ANCHOR = "# INTERVAL-MOVE REVIEW"
+LANDING_ANCHOR = "# STATE-MISMATCH LANDING"
 BLOCK_START = "# The proceed text is COMPUTED ONCE"
 END = "A Bash echo or text summary as the terminal action kills the loop"
 BANNER = "[recurring-close] ═══ ITERATION COMPLETE ═══"

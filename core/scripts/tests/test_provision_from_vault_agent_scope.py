@@ -39,18 +39,25 @@ from _bash_helpers import BASH  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "core" / "scripts" / "provision-from-vault.sh"
 
+# The script derives its vault prefix at run time: the first segment of ENVIRONMENT_ID,
+# uppercased. The fixture keys are built from that same derivation and not spelled with the
+# literal prefix token, because the seed plant rewrites that token inside this file but cannot
+# see the script computing it, so a spelled-out fixture stops matching at a plant.
+ENVIRONMENT_ID = "ayoai-mind"
+PFX = ENVIRONMENT_ID.split("-")[0].upper() + "_"
+
 # Obviously-fake placeholders. Deliberately not AKIA-/token-shaped so the
 # commit-time secret scan (iteration-commit.sh content_secret_regex) does not
 # false-positive. The mapper treats values as opaque, so any distinctive
 # string exercises the leak checks identically.
-VAULT_BODY = """# comment line ignored
-MIND_MIND_AWS_ACCESS_KEY_ID=GENERIC_AKID
-MIND_STORAGE_BACKEND=own-cloud
-MIND_LODESTAR_CONTRIBUTE_KEY__BRAVO=SCOPED_FOR_BRAVO
-MIND_LODESTAR_CONTRIBUTE_KEY__ZETA=SCOPED_FOR_ZETA
-MIND_LODESTAR_CONTRIBUTE_KEY=GENERIC_FALLBACK
-MIND_OVERRIDE_ME=GENERIC_LOSES
-MIND_OVERRIDE_ME__BRAVO=SCOPED_WINS
+VAULT_BODY = f"""# comment line ignored
+{PFX}MIND_AWS_ACCESS_KEY_ID=GENERIC_AKID
+{PFX}STORAGE_BACKEND=own-cloud
+{PFX}LODESTAR_CONTRIBUTE_KEY__BRAVO=SCOPED_FOR_BRAVO
+{PFX}LODESTAR_CONTRIBUTE_KEY__ZETA=SCOPED_FOR_ZETA
+{PFX}LODESTAR_CONTRIBUTE_KEY=GENERIC_FALLBACK
+{PFX}OVERRIDE_ME=GENERIC_LOSES
+{PFX}OVERRIDE_ME__BRAVO=SCOPED_WINS
 OTHERENV_MIND_AWS_ACCESS_KEY_ID=WRONG_ENV
 """
 # Line order is load-bearing for the precedence tests: LODESTAR's generic sits
@@ -110,7 +117,7 @@ def _run(tmp_path, *, agent, vault_body=VAULT_BODY, name="env",
     # guard-1484: clear the value when the run must MEASURE resolution rather
     # than dictate it. Measured before this fix (): baseline 16 passed,
     # VAULT_KEY_PREFIX=BOGUS 13 FAILED / 3 passed.
-    env["ENVIRONMENT_ID"] = "ayoai-mind"
+    env["ENVIRONMENT_ID"] = ENVIRONMENT_ID
     env.pop("VAULT_KEY_PREFIX", None)
     # VAULT_SSH_USER (:106, used at :145/:148) is the one remaining override this
     # test does not pin. It is inert HERE only because the VAULT_SSH_BIN stub above
@@ -227,10 +234,10 @@ def test_verify_output_is_values_blind(tmp_path):
 # The two skip reasons must stay distinguishable, because warning on the
 # expected one would train operators to ignore the warning entirely.
 
-UNKNOWN_SCOPE_BODY = """MIND_MIND_AWS_ACCESS_KEY_ID=GENERIC_AKID
-MIND_SOME__CONFIG=STRAY_ONE
-MIND_OTHER__TYPO__THING=STRAY_TWO
-MIND_LODESTAR_CONTRIBUTE_KEY__BRAVO=SCOPED_FOR_BRAVO
+UNKNOWN_SCOPE_BODY = f"""{PFX}MIND_AWS_ACCESS_KEY_ID=GENERIC_AKID
+{PFX}SOME__CONFIG=STRAY_ONE
+{PFX}OTHER__TYPO__THING=STRAY_TWO
+{PFX}LODESTAR_CONTRIBUTE_KEY__BRAVO=SCOPED_FOR_BRAVO
 """
 
 

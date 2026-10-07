@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,23 @@ def _stub_audit(tmp_path, name, body):
     p = tmp_path / name
     p.write_text(body)
     return str(p)
+
+
+def _carrier_by_sid(tmp_path, table, default="fresh-correct"):
+    """A hermetic stand-in for the heartbeat-carrier read (WORKER_REF_CARRIER_READER, the gate's
+    test seam): answers by sid, so one plan can hold a dead, a live and an unknown Body."""
+    p = tmp_path / "carrier-by-sid.py"
+    p.write_text("import json, sys\nT = %r\nv = T.get(sys.argv[2], %r)\n"
+                 "print(json.dumps({'verdict': v, 'evidence': {'carrier_age_minutes': 400}}))\n" % (table, default))
+    return str(p)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_carrier_read(tmp_path_factory, monkeypatch):
+    """Every retire candidate is now asked what the retire gate says, and the gate reads the
+    heartbeat carrier from the store of record. No test here may read that store: every Body is
+    alive unless a test says otherwise."""
+    monkeypatch.setenv("WORKER_REF_CARRIER_READER", _carrier_by_sid(tmp_path_factory.mktemp("carrier"), {}))
 
 
 # ---------------------------------------------------------------- pure parsers
@@ -446,6 +464,70 @@ def test_merged_refs_are_retire_candidates_and_the_own_body_never_is(fx):
     plan = json.loads(r.stdout)
     assert plan["tips"] == []
     assert [c["ref"].rsplit("/", 1)[1] for c in plan["retire_candidates"]] == ["sid-old"]
+
+
+def _land(fx, sid, when):
+    """A worker tip merged into main and pushed, so it is reachable from origin/main."""
+    sha = fx.tip(sid, {"docs/%s.md" % sid: sid + "\n"}, when=when)
+    _git(fx.work, "merge", "-q", "--ff-only", sha)
+    _git(fx.work, "push", "-q", "origin", "main")
+
+
+def _gates(plan):
+    return {c["ref"].rsplit("/", 1)[1]: c["gate"] for c in plan["retire_candidates"]}
+
+
+def test_retire_candidates_carry_the_retire_gate_verdict_one_variable_at_a_time(fx, tmp_path, monkeypatch):
+    """Measured on the live fleet while this was written: every reachable ref belonged to a Body
+    whose heartbeat was fresh. A plan that lists them as candidates without saying so sends the
+    reducer to --retire, which then refuses each one."""
+    _land(fx, "sid-dead", DAY1)                 # old tip, carrier stale   -> the only RETIRE
+    _land(fx, "sid-live", DAY1)                 # old tip, carrier fresh   -> CARRY, differs in ONE variable
+    _land(fx, "sid-fresh", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))   # carrier stale, tip young
+    monkeypatch.setenv("WORKER_REF_CARRIER_READER", _carrier_by_sid(
+        tmp_path, {"sid-dead": "stale", "sid-live": "fresh-correct", "sid-fresh": "stale"}))
+    g = _gates(fx.plan())
+    assert (g["sid-dead"]["verdict"], g["sid-dead"]["code"]) == ("RETIRE", "retire"), g
+    assert (g["sid-live"]["verdict"], g["sid-live"]["code"]) == ("CARRY", "carrier-alive"), g
+    assert (g["sid-fresh"]["verdict"], g["sid-fresh"]["code"]) == ("CARRY", "tip-recent"), g
+    assert "origin" not in g["sid-dead"]["line"], "the plan reads the gate WITHOUT the origin reads"
+
+
+def test_the_rendered_plan_shows_each_gate_line_and_counts_the_ready_ones(fx, tmp_path, monkeypatch):
+    # Two dead and ONE live, deliberately unequal: with one of each, a count of RETIRE and a count
+    # of CARRY are the same number and an inverted predicate passes (mutation-proof survivor).
+    _land(fx, "sid-dead", DAY1)
+    _land(fx, "sid-dead2", DAY1)
+    _land(fx, "sid-live", DAY1)
+    monkeypatch.setenv("WORKER_REF_CARRIER_READER", _carrier_by_sid(
+        tmp_path, {"sid-dead": "stale", "sid-dead2": "stale", "sid-live": "fresh-correct"}))
+    out = fx.consume("--drain").stdout
+    assert re.search(r"refs/workers/alpha/sid-dead tip=\w{12} age=\d+min gate: RETIRE: ", out), out
+    assert re.search(r"refs/workers/alpha/sid-live tip=\w{12} age=\d+min gate: CARRY carrier-alive: ", out), out
+    assert "retire-candidates=3 (gate RETIRE=2)" in out.splitlines()[-1], out
+
+
+def test_a_gate_that_cannot_run_reads_carry_in_the_plan_never_retire(fx, monkeypatch):
+    import worker_ref_retire_gate as rg
+
+    def boom(*a, **k):
+        raise SystemExit(3)
+
+    monkeypatch.setattr(rg, "gate", boom)
+    out = wrd._default_retire_gate(str(fx.work), "refs/workers/alpha/sid-x", 0)
+    assert out["verdict"] == "CARRY" and out["code"] == "gate-error" and out["line"].startswith("CARRY gate-error")
+
+
+def test_the_injected_gate_is_what_the_plan_asks(fx):
+    _land(fx, "sid-a", DAY1)
+    asked = []
+
+    def stub(repo, ref, now):
+        asked.append(ref)
+        return {"verdict": "RETIRE", "code": "retire", "line": "RETIRE: stub"}
+
+    plan = wrd.build_plan(str(fx.work), fx.report(), str(AUDIT_PY), retire_gate=stub)
+    assert asked == ["refs/workers/alpha/sid-a"] and plan["retire_candidates"][0]["gate"]["line"] == "RETIRE: stub"
 
 
 def test_a_failed_preview_commit_breaks_the_chain_and_stops_the_later_tips(fx, monkeypatch):
