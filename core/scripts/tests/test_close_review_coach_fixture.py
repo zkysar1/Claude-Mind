@@ -246,11 +246,16 @@ def test_an_UNATTRIBUTED_approve_does_NOT_satisfy_the_gate(tmp_path):
 def test_self_review_refusal_is_still_OVERRIDABLE(tmp_path):
     """The demotion routes through the SAME override branch as verdict absence.
     A governance gate whose refusal has no reachable remedy manufactures false
-    records in the store it protects (guard-1532), so this must stay open."""
+    records in the store it protects (guard-1532), so this must stay open. Since
+    g-375-147 the override is honored only where team-state lists no other mind, so the
+    roster is the closer alone, the deployment the justification describes."""
     _write_verdict("APPROVE", tmp_path, reviewer=FIXTURE_AGENT)
+    roster = tmp_path / "roster.json"
+    roster.write_text(json.dumps({FIXTURE_AGENT: {}}), encoding="utf-8")
     r = _run_gate(_coach_goal(), tmp_path,
                   {"CLOSE_REVIEW_GATE_ENABLED": "1", "MIND_AGENT": FIXTURE_AGENT},
-                  extra_args=("--override-close-review", "solo deployment, no peer"))
+                  extra_args=("--override-close-review", "solo deployment, no peer",
+                              "--roster-json", str(roster)))
     assert r.returncode == 0, r.stdout + r.stderr
     assert '"decision": "override"' in r.stdout
     assert '"defect": "self-review"' in r.stdout   # the override RECORDS what it bypassed

@@ -21,8 +21,9 @@ a .py file is not refused. So today the same correct procedure passes or fails o
 WHERE it happens to be typed, and the only workaround is to leave a throwaway
 script on disk. This file is that script, written once.
 
-THE CONTRACT IS NOT RE-DERIVED HERE. The four pure helpers (``sentinel_for``,
-``is_read_projected``, ``compose``, ``verify_post``) are IMPORTED from
+THE CONTRACT IS NOT RE-DERIVED HERE. The pure helpers (``sentinel_for``,
+``compose``, ``verify_post``, ``cas_conflict``, ``wrapped_marker_refusal`` and
+``has_sentinel_line``) are IMPORTED from
 ``goal-field-append.py``, which is the SSOT for this contract and is proven in
 production. Re-typing them would fork the safety invariants: a later fix to the
 verification rule would land in one file and silently not the other, and nothing
@@ -58,9 +59,11 @@ WHAT DIFFERS FROM THE GOAL-SIDE SSOT, and why
 
 IDEMPOTENCY
 The caller supplies a marker. A one-line sentinel ``[appended:<marker>]`` is
-written after the text, and a re-run that sees that sentinel in the CURRENT
-value exits 0 having changed nothing — so a retry after a partial failure is
-safe. Identical to the goal-side, because it is the same function.
+written after the text, and a re-run that finds that sentinel as a WHOLE LINE
+of the CURRENT value exits 0 having changed nothing — so a retry after a
+partial failure is safe. A sentence that only mentions the sentinel is not a
+write, so it never swallows an append. Identical to the goal-side, because both
+sides call ``has_sentinel_line`` (g-375-140).
 
 VERIFICATION
 The post-write assertion compares against the PRE value, never against the
@@ -104,6 +107,11 @@ cas_conflict = _gfa.cas_conflict
 # Imported, not re-typed, for the same reason as the four above: the marker
 # convention and its refusal must not fork between the two sides ().
 wrapped_marker_refusal = _gfa.wrapped_marker_refusal
+# The idempotency key is a whole LINE on both sides, never a substring. A
+# substring test took a note that merely mentions [appended:<marker>] for a
+# landed write: the append returned changed:false and stored nothing
+# (; the goal side moved first, ).
+has_sentinel_line = _gfa.has_sentinel_line
 
 RC_OK = 0
 RC_USAGE = 2
@@ -373,7 +381,7 @@ def main(argv=None) -> int:
     # IDEMPOTENCE before ANCHOR: a completed prior run is a no-op regardless of
     # whether the anchor still holds, and reporting "anchor absent" for work that
     # already landed would send a caller chasing drift that does not exist.
-    if sentinel in pre:
+    if has_sentinel_line(pre, sentinel):
         print(json.dumps({"ok": True, "changed": False,
                           "reason": "idempotent: marker already present",
                           "store": args.store, "id": args.record_id, "field": args.field,
@@ -406,7 +414,7 @@ def main(argv=None) -> int:
     current = fresh_row.get(args.field)
     if current is None:
         current = ""
-    if isinstance(current, str) and sentinel in current:
+    if isinstance(current, str) and has_sentinel_line(current, sentinel):
         print(json.dumps({"ok": True, "changed": False,
                           "reason": "idempotent: marker landed concurrently between read and write",
                           "store": args.store, "id": args.record_id, "field": args.field,

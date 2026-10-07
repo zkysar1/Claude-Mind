@@ -328,13 +328,15 @@ def test_every_kind_that_can_be_forgotten_can_be_undone():
     assert set(apply_mod._FORGETTERS) == set(apply_mod._UNDOERS) == {"node", "hypothesis", "guardrail"}
 
 
+# ids= keeps the node id short: pytest copies it into PYTEST_CURRENT_TEST, and Windows
+# caps an environment value at 32,767 characters (a default id embeds the whole value).
 @pytest.mark.parametrize("field, text, reason", [
     ("claim", "42", "store_would_coerce"),
     ("claim", "true", "store_would_coerce"),
     ("claim", '{"a": 1}', "store_would_coerce"),
     ("title", "1e5", "store_would_coerce"),
     ("claim", "x" * 70_000, "too_long_for_store"),
-])
+], ids=["claim-integer", "claim-bool", "claim-object", "title-float", "claim-70000-chars"])
 def test_a_statement_the_store_would_alter_is_refused_before_anything_is_written(
         world, retention, pipeline, field, text, reason):
     """A forget that cannot be undone is not the soft forget that was ruled. The undo writes the

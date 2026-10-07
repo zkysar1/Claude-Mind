@@ -762,8 +762,8 @@ def _format_transition_mismatches(mismatches: List[Dict[str, Any]]) -> str:
 def _validate_goal(goal: Dict[str, Any], *, require_id: bool = True) -> None:
     """Basic schema check — id format, status enum, type checks.
 
-    Subset of aspirations.py::validate_goal. Skips verification-schema and
-    co_parent_id checks (those depend on cross-record state). There is no
+    Subset of aspirations.py::validate_goal. Skips verification-schema
+    checks (those depend on cross-record state). There is no
     fuller path to send callers to — wrappers are daemon-only (2026-05-14)
     — so CLI-only checks that matter at write time are restored one by one
     as shared gates/ modules called from the ADD sites (the _assert_*
@@ -9303,13 +9303,6 @@ def _validate_aspiration(asp: Dict[str, Any], *, auto_id: bool = False) -> None:
 
     if "sessions_active" in asp and not isinstance(asp["sessions_active"], (int, float)):
         raise ValueError("sessions_active must be a number")
-
-    if "co_investigators" in asp:
-        if not isinstance(asp["co_investigators"], list):
-            raise ValueError("co_investigators must be a list")
-        for name in asp["co_investigators"]:
-            if not isinstance(name, str):
-                raise ValueError("co_investigators entries must be strings")
 
     for goal in asp["goals"]:
         _validate_goal(goal, require_id=not auto_id)

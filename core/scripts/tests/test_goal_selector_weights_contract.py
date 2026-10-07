@@ -155,6 +155,35 @@ def test_opportunity_boost_zero_default():
     assert _score_raw({}) == 0.0
 
 
+# ── (retired criterion) co_invest_alignment,  ───────────────────
+
+def test_co_invest_alignment_stays_zero_on_the_input_that_once_fired_it(monkeypatch):
+    """ retired the co-investigation primitive. The criterion's slot
+    stays (live metas still weight it, so the manifest and seed keep it), but
+    it must read 0.0 even when the candidate's co_parent_id matches a partner's
+    team-state in_flight.co_parent_id, the input that scored 1.0 before.
+
+    Positive control (guard-4166): the same patched team state also carries a
+    critical_blockers row for this goal, and critical_blocker_surface must read
+    it. So score_goal saw the partner's in_flight row, and the 0.0 is the
+    retirement, not a fixture that never reached the scorer."""
+    team = {
+        "agent_status": {"partner-x": {"in_flight": {"co_parent_id": "g-900-01"}}},
+        "critical_blockers": [{"goal_id": "g-t-ci", "downstream_count": 4}],
+    }
+    monkeypatch.setattr(gs, "_load_team_state_cached", lambda: team)
+    monkeypatch.setattr(gs, "CRITICAL_BLOCKER_SURFACE_CONFIG",
+                        {"enabled": True, "min_downstream": 1, "downstream_cap": 4})
+    gs._ACTIVE_DIRECTIVES = []
+    goal = {"id": "g-t-ci", "title": "t", "status": "pending",
+            "participants": ["agent"], "priority": "MEDIUM", "co_parent_id": "g-900-01"}
+    raw = gs.score_goal({"goal": goal, "aspiration": {"id": "asp-t"}, "source": "world"},
+                        {}, [], [])["raw"]
+    assert raw["critical_blocker_surface"] == 1.0
+    assert "co_invest_alignment" in gs.KNOWN_CRITERIA
+    assert raw["co_invest_alignment"] == 0.0
+
+
 # ── (preflight) KNOWN_CRITERIA AST parse + contract check ─────────────────
 
 def test_preflight_parses_manifest_from_this_repo():

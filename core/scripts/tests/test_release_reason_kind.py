@@ -297,7 +297,15 @@ def test_advisory_names_every_vocabulary_token():
 def test_advisory_does_not_change_the_exit_code():
     """ADVISORY means advisory. Both invocations must fail identically on the
     missing goal id; a release that fails CLOSED would strand a claim, which is
-    far worse than an untyped row."""
+    far worse than an untyped row.
+
+    Re-weighed and KEPT 2026-10-05 (g-375-134). A claim its live holder failed
+    to release is refused to every other Body of the agent (409
+    same_agent_other_session), and the zc Bodies left 37 of 110 errored
+    framework-script calls unretried within six calls. The untyped residual was
+    3 of 345 entries since 2026-09-28; the one on a zc Body was a reason added
+    to the bare worker-loop template for an unfinished unit. Section 7 types
+    the worker templates instead of failing the release."""
     rc_with, _, _ = _run_split("--reason", "x")
     rc_without, _, _ = _run_split()
     assert rc_with == rc_without, (rc_with, rc_without)
@@ -347,3 +355,42 @@ def test_convention_documents_every_vocabulary_token():
     assert "Typed release negatives" in doc
     for token in _wrapper_tokens():
         assert f"`{token}`" in doc, f"{token!r} undocumented in conventions/aspirations.md"
+
+
+# --------------------------------------------------------------------------
+# 7. THE WORKER TEMPLATES (). A worker Body copies the release command
+#    its loop shows it. Two worker-loop templates passed NEITHER flag, and a
+#    Body that wrote its own reason onto one sent no kind: measured 2026-10-05,
+#    the one untyped zc entry since 2026-09-28 came from the unfinished-unit
+#    path. So every worker-loop template passes both, and every token it offers
+#    is vocabulary, because an invalid token is refused BEFORE the release and
+#    leaves the claim held.
+# --------------------------------------------------------------------------
+_WORKER_LOOP = PROJECT_ROOT / ".claude" / "skills" / "worker-loop" / "SKILL.md"
+
+
+def _worker_release_templates() -> list[str]:
+    text = _WORKER_LOOP.read_text(encoding="utf-8")
+    return [ln for ln in text.splitlines() if "aspirations-release.sh <goal-id>" in ln]
+
+
+def test_the_worker_template_matcher_finds_every_template():
+    """POSITIVE CONTROL (guard-5501). The two pins below pass vacuously on an
+    empty list, so the matcher must find the loop's three templates: the
+    won't-fit release, the role gate and the unfinished unit."""
+    assert len(_worker_release_templates()) >= 3, _worker_release_templates()
+
+
+def test_every_worker_release_template_passes_a_reason_and_a_kind():
+    for ln in _worker_release_templates():
+        assert '--reason "<why>"' in ln, f"release template with no reason: {ln.strip()}"
+        assert "--reason-kind " in ln, f"untyped release template: {ln.strip()}"
+
+
+def test_every_kind_a_worker_template_offers_is_vocabulary():
+    vocab = set(_wrapper_tokens())
+    for ln in _worker_release_templates():
+        m = re.search(r"--reason-kind (<[^>]+>|[a-z-]+)", ln)
+        assert m, ln.strip()
+        offered = m.group(1).strip("<>").split("|")
+        assert set(offered) <= vocab, (offered, ln.strip())

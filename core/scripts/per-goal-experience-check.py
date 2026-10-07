@@ -13,11 +13,25 @@ entry of ANY kind exceeds a 12h threshold. It has no goal_id join, so a busy
 agent whose store is an hour fresh reads clean while individual deep goals close
 with no record at all — structurally invisible, by that check's own contract.
 
-This check is PER-GOAL: it asks whether THIS goal has a record within a short
-window, and on a miss sets the `force_experience_archival` WM sentinel naming
-the goal. aspirations-precheck Phase 0-pre2 consumes the sentinel next iteration
-and forces the LLM to retro-compose. The two are complementary and BOTH should
-run — the store-level one remains the long-horizon backstop.
+This check is PER-GOAL: it asks whether THIS goal has a record that counts as
+coverage for THIS close, and on a miss sets the `force_experience_archival`
+WM sentinel naming the goal. aspirations-precheck Phase 0-pre2 consumes the
+sentinel next iteration and forces the LLM to retro-compose. The two are
+complementary and BOTH should run — the store-level one remains the
+long-horizon backstop.
+
+WHAT "COVERAGE" MEANS PER PATH (g-115-5314)
+-------------------------------------------
+The RECURRING call site keeps a short wall-clock window: the same goal_id
+closes many times, so an entry from a prior close must NOT count. The
+NON-recurring call site (trigger starts with the shared NONRECURRING_PRODUCER
+from spark-fire-dedup.py) matches on goal_id/source_goal ALONE — a
+non-recurring goal closes exactly once, so any joined entry is necessarily
+this close's, and a window on top of the join could only false-fire as
+iteration length grew (measured 2264s..4365s gaps on real closes). The
+discriminator is imported, not duplicated; if the import fails, every trigger
+keeps the bounded window (fails toward SETTING the sentinel — the fail-closed
+asymmetry; see the module-level note for the full rationale).
 
 Measured coverage that motivated the extraction (echo, cc-03, 2026-08-02, joined
 against experience.jsonl + experience-archive.jsonl + experience/*.md across 5
@@ -44,6 +58,7 @@ missing file never reaches this code to report anything.
 """
 
 import argparse
+import importlib.util
 import json
 import subprocess
 import sys
@@ -59,12 +74,69 @@ def _warn(msg: str) -> None:
     print(f"[per-goal-experience-check] {msg}", file=sys.stderr)
 
 
-def has_recent_record(exp_path: Path, goal_id: str, window_seconds: int,
-                      now: datetime) -> bool:
-    """True when exp_path holds an entry for goal_id created inside the window.
+# : the NON-RECURRING call site (iteration-close.sh do_state_update)
+# gets an UNBOUNDED recency bound — matching on goal_id/source_goal alone.
+# A non-recurring goal closes exactly ONCE, so any entry joined by goal_id is
+# necessarily THIS close's entry; the 30-min window on top of the join only
+# subtracts correctness, at a false-positive rate proportional to iteration
+# length (measured 2264s..4365s across the record's instances). The RECURRING
+# call site keeps the window: the same goal_id closes many times, so an entry
+# from a prior close would satisfy a bare join and wrongly suppress the
+# sentinel — there the window is load-bearing, and it brackets the sibling
+# defect  from the opposite side; a claim-time anchor for that path
+# is a separate, not-yet-tested change and deliberately NOT made here.
+#
+# THE DISCRIMINATOR IS SHARED, NOT DUPLICATED (): spark-fire-dedup.py
+# hit the identical problem on the same code path and fixed it in 
+# with NONRECURRING_PRODUCER = "nonrecurring-state-update" + UNBOUNDED_LOOKBACK
+# (its rationale block: "a non-recurring goal closes exactly once (no prior
+# close to mis-match)"). The non-recurring trigger this check receives —
+# 'nonrecurring-state-update-deep-no-recent-entry' — names that producer as a
+# prefix, so startswith is the producer-awareness test. Load the constant from
+# the sibling (importlib: the file is hyphenated, never a package member — the
+# repo's standard loader shape, cf. _delivery_gate.py). If the load fails,
+# _NONRECURRING_PRODUCER stays None and EVERY trigger falls through to the
+# bounded window — today's behavior, which fails toward SETTING the sentinel.
+# This check must keep that asymmetry: unlike spark-fire-dedup (which fails
+# toward FIRING, because a missed spark loses learning), a missing experience
+# record is a real lost artifact and a spurious sentinel costs one probe.
+_NONRECURRING_PRODUCER: "str | None" = None
+try:
+    _spec = importlib.util.spec_from_file_location(
+        "spark_fire_dedup", str(SCRIPT_DIR / "spark-fire-dedup.py"))
+    if _spec is not None and _spec.loader is not None:
+        _sfd = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_sfd)
+        _candidate = getattr(_sfd, "NONRECURRING_PRODUCER", None)
+        if isinstance(_candidate, str) and _candidate:
+            _NONRECURRING_PRODUCER = _candidate
+        else:
+            _warn("could not read NONRECURRING_PRODUCER from spark-fire-dedup — "
+                  "keeping the bounded window for every trigger")
+    else:
+        _warn("could not load spark-fire-dedup.py — keeping the bounded window "
+              "for every trigger")
+except Exception as _exc:                     # pragma: no cover - env-specific
+    _warn(f"could not import spark-fire-dedup ({_exc}) — keeping the bounded "
+          "window for every trigger")
 
-    Reads only the tail — recent entries are at the end, and the whole point of
-    the window is recency.
+
+def has_recent_record(exp_path: Path, goal_id: str,
+                      window_seconds: "int | None", now: datetime) -> bool:
+    """True when exp_path holds a goal_id (or source_goal) entry that counts as
+    coverage for this close.
+
+    `window_seconds=None` means UNBOUNDED: any joined entry counts, whatever its
+    age — the non-recurring call site's bound (g-115-5314, mirroring
+    spark-fire-dedup's UNBOUNDED_LOOKBACK=None, whose rationale is that a
+    non-recurring goal closes exactly once, so no prior close can mis-match).
+    The RECURRING call site passes the bounded window and needs it: entries
+    from prior closes of the same goal_id must NOT count.
+
+    Reads only the tail — recent entries are at the end. (The tail-order
+    assumption is a SEPARATE defect, g-115-11555: ledger-merge reorderings can
+    park a fresh record outside the tail; the last measured instances excluded
+    it as a rival mechanism. Do not 'fix' it here without that goal's bracket.)
 
     A MISSING file returns False, so the sentinel fires: an agent with no
     experience store has certainly not recorded this goal. A read failure
@@ -86,6 +158,8 @@ def has_recent_record(exp_path: Path, goal_id: str, window_seconds: int,
             continue
         if goal_id not in (entry.get("goal_id"), entry.get("source_goal")):
             continue
+        if window_seconds is None:
+            return True
         try:
             created = datetime.fromisoformat(entry.get("created") or "")
         except (ValueError, TypeError):
@@ -150,15 +224,35 @@ def main() -> int:
 
     exp_path = Path(agent_dir) / "experience.jsonl"
     now = datetime.now()
+
+    # : producer-awareness. The trigger names the calling close path,
+    # and the NON-recurring producer's trigger starts with the shared
+    # NONRECURRING_PRODUCER constant (imported from spark-fire-dedup.py, not
+    # duplicated here). On that path the recency bound is dropped — match on
+    # goal_id/source_goal alone, since a non-recurring goal closes exactly once
+    # so any joined entry is necessarily this close's. The RECURRING path keeps
+    # the --window-seconds bound, where it is load-bearing (a prior close of the
+    # same goal_id must not suppress the sentinel). If the sibling import failed
+    # at module load, _NONRECURRING_PRODUCER is None and EVERY trigger falls to
+    # the bounded window — today's behavior, failing toward SETTING the
+    # sentinel, never toward suppressing it (the fail-closed asymmetry).
+    trigger = (args.trigger or "").strip()
+    if _NONRECURRING_PRODUCER and trigger.startswith(_NONRECURRING_PRODUCER):
+        window = None                                  # unbounded lookback
+        window_label = "unbounded (non-recurring, goal_id match only)"
+    else:
+        window = args.window_seconds
+        window_label = f"within {args.window_seconds}s"
+
     try:
-        recent = has_recent_record(exp_path, goal_id, args.window_seconds, now)
+        recent = has_recent_record(exp_path, goal_id, window, now)
     except Exception as exc:
         _warn(f"could not read {exp_path} ({exc}) — skipping check for {goal_id}")
         return 0
 
     if recent:
         print(f"[per-goal-experience-check] {goal_id}: experience record found "
-              f"within {args.window_seconds}s — no sentinel needed", file=sys.stderr)
+              f"{window_label} — no sentinel needed", file=sys.stderr)
         return 0
 
     payload = build_payload(goal_id, args.trigger, args.original_outcome, now)

@@ -21,6 +21,9 @@ What IS new, and therefore tested:
   8. the write's value travels on stdin as UTF-8 bytes, never in argv, and a
      failed verify restores PRE only while the field holds this run's value
      (g-115-11615)
+  9. both idempotency checks take the sentinel only as a whole line: a sentence
+     that mentions it neither swallows an append nor passes for a concurrent
+     landing (g-375-140)
 """
 from __future__ import annotations
 
@@ -62,7 +65,7 @@ def test_helpers_are_the_ssot_objects_not_copies():
     every behavioural assertion on the day it was pasted.
     """
     for fn in (sfa.compose, sfa.verify_post, sfa.sentinel_for, sfa.cas_conflict,
-               sfa.wrapped_marker_refusal):
+               sfa.wrapped_marker_refusal, sfa.has_sentinel_line):
         assert Path(fn.__code__.co_filename).name == "goal-field-append.py", (
             f"{fn.__name__} is defined in {fn.__code__.co_filename} — the contract has been "
             "forked out of its SSOT")
@@ -78,6 +81,9 @@ def test_helpers_are_the_ssot_objects_not_copies():
     # script accepts the paste the other rejects ().
     assert sfa.wrapped_marker_refusal("[appended:m]") == ssot.wrapped_marker_refusal("[appended:m]")
     assert sfa.wrapped_marker_refusal("plain") is None
+    # The idempotency key is a whole line on both sides ().
+    for value in ("a note\n[appended:m]", "a note that mentions [appended:m] inline"):
+        assert sfa.has_sentinel_line(value, "[appended:m]") == ssot.has_sentinel_line(value, "[appended:m]")
 
 
 def test_missing_ssot_fails_loud_rather_than_degrading():
@@ -617,3 +623,93 @@ def test_no_restore_when_the_write_response_does_not_show_the_stored_value(monke
     assert len(writes) == 1
     assert state["v"] == _cut(sfa.compose(PRE, "new text", "m1"))
     assert "did not show what it stored" in error, error
+
+
+# ── 9. a mention of the sentinel is not a write () ───────────────
+#
+# Both idempotency checks, the first read and the pre-write re-read, used to test
+# a SUBSTRING. A field whose prose merely mentioned [appended:<marker>] inside a
+# line then read as holding the write: the append returned changed:false and
+# stored nothing. Measured 2026-10-06: 57 (record, field, marker) rows in the
+# guardrails, reasoning-bank and pipeline stores hold a sentinel only inside a
+# longer line, and none of those markers is a whole-line sentinel in any of the
+# three stores.
+
+def _racing_store(state, writes, *, before_reread):
+    """``_guard_store``, plus another writer acting on the SECOND read: the
+    pre-write re-read, after the first read and before the write."""
+    inner = _guard_store(state, writes)
+    reads = {"n": 0}
+
+    def _run(cmd, **kw):
+        if "guardrails-read.sh" in " ".join(str(c) for c in cmd):
+            reads["n"] += 1
+            if reads["n"] == 2:
+                before_reread(state)
+        return inner(cmd, **kw)
+    return _run
+
+
+def _run_append(monkeypatch, capsys, run, marker="m1", text="new text"):
+    monkeypatch.setattr(sfa, "_run", run)
+    rc = sfa.main(["--store", "guardrails", "guard-1", "action_hint", marker, text])
+    return rc, _json.loads(capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("mention", [
+    "the earlier fix is the note marked [appended:m1] on guard-2",
+    "the earlier fix is the note marked [appended:m1]",
+    "see the note below\n[appended:m1] marks the earlier fix",
+], ids=["mid", "end", "start"])
+def test_a_mention_of_the_sentinel_does_not_swallow_the_append(monkeypatch, capsys, mention):
+    pre = PRE + "\n\n" + mention
+    state, writes = {"v": pre}, []
+    rc, out = _run_append(monkeypatch, capsys, _guard_store(state, writes))
+    assert rc == sfa.RC_OK
+    assert out["changed"] is True, out
+    # The expected value comes from the writer's own compose(), not from this test.
+    assert writes == [sfa.compose(pre, "new text", "m1")]
+    assert state["v"] == writes[0]
+
+
+def test_a_genuine_rerun_with_the_same_marker_is_still_a_no_op(monkeypatch, capsys):
+    """The control for the first check: a block this script wrote, with a later
+    block after it, is a landed write, and a re-run writes nothing."""
+    state, writes = {"v": PRE}, []
+    run = _guard_store(state, writes)
+    assert _run_append(monkeypatch, capsys, run)[0] == sfa.RC_OK
+    assert _run_append(monkeypatch, capsys, run, marker="m2", text="a later note")[0] == sfa.RC_OK
+    landed = state["v"]
+    rc, out = _run_append(monkeypatch, capsys, run)
+    assert rc == sfa.RC_OK
+    assert out["changed"] is False and out["reason"] == "idempotent: marker already present", out
+    assert len(writes) == 2 and state["v"] == landed
+
+
+def test_a_mention_arriving_before_the_write_is_a_conflict_not_a_landing(monkeypatch):
+    """The pre-write re-read. Another writer adds a sentence that mentions our
+    sentinel after the first read. That is not our append landing, so the run
+    refuses with nothing written instead of reporting success."""
+    def _peer_mentions(s):
+        s["v"] = PRE + "\n\nthe earlier fix is the note marked [appended:m1] on guard-2"
+
+    state, writes = {"v": PRE}, []
+    monkeypatch.setattr(sfa, "_run", _racing_store(state, writes, before_reread=_peer_mentions))
+    with pytest.raises(SystemExit) as exc:
+        sfa.main(["--store", "guardrails", "guard-1", "action_hint", "m1", "new text"])
+    assert exc.value.code == sfa.RC_CONCURRENT_MODIFICATION
+    assert writes == []
+
+
+def test_a_genuine_concurrent_landing_is_still_a_no_op(monkeypatch, capsys):
+    """The control for the re-read: the same append landing between the first
+    read and the write is a landed write, so this run writes nothing."""
+    def _peer_lands(s):
+        s["v"] = sfa.compose(PRE, "new text", "m1")
+
+    state, writes = {"v": PRE}, []
+    rc, out = _run_append(monkeypatch, capsys, _racing_store(state, writes, before_reread=_peer_lands))
+    assert rc == sfa.RC_OK
+    assert out["changed"] is False, out
+    assert out["reason"] == "idempotent: marker landed concurrently between read and write", out
+    assert writes == []

@@ -2495,13 +2495,17 @@ def test_ff_only_no_claim_hands_a_non_fast_forward_to_the_loop_integrate(tmp_pat
 
 @pytest.mark.parametrize("answer", [
     "held alpha row c2503cad names g-1-1 (pending)",
+    # A claim of record with no Body row (): the line test_tick_claim_probe.py
+    # pins for it, word for word.
+    "held alpha c2503cad holds g-1-4 (in-progress) in this box's world queue",
     # A real `unknown` can carry a valid agent, so only the verdict check refuses it.
     "unknown alpha row c2503cad names g-9-9, which does not resolve",
     "",                      # the probe printed nothing: it crashed or was absent
     "none",                  # no agent, so the self-heal could not scope 'self'
     "none - no agent",
     "none al/pha evidence",  # not an agent name
-], ids=["held", "unknown", "no-answer", "bare-none", "dash-agent", "bad-agent"])
+], ids=["held", "held-store-claim", "unknown", "no-answer", "bare-none", "dash-agent",
+        "bad-agent"])
 def test_ff_only_any_answer_but_none_keeps_the_log_only_line(tmp_path, answer):
     origin, a = _non_ff_tree(tmp_path)
     before, origin_before = _tip(a), _origin_tip(origin)
@@ -3267,3 +3271,286 @@ def test_untrack_ahead_prunes_on_a_no_push_run(tmp_path):
             f"{_SPOOL}") in r.stderr, r.stderr
     assert (a / _SPOOL).read_text(encoding="utf-8") == "undrained-line\n"
     assert _untracked_and_ignored(a, _SPOOL)
+
+
+# --------------------------------------------------------------------------- #
+# : an IGNORED local file the merge would replace is copied aside first
+# --------------------------------------------------------------------------- #
+# git merges with --overwrite-ignore, so when upstream newly TRACKS a path this box holds
+# as an untracked file its rules cover, the merge replaces the file with rc 0 and no
+# message (a path NO rule covers is refused instead). Measured on git 2.43.0: a path in
+# info/exclude (s2), a path a committed rule covers that upstream adds with `add -f` (s3),
+# and a rule upstream drops in the SAME commit that tracks the path (s4), through both
+# merge shapes the integrate uses (ff = A only behind; tree = A has a local commit too).
+# Every case runs a CONTROL first: plain git, on a copy of A's tree, replaces the file.
+_SET = "cache/session.spool"  # outside agents/, so no self-heal lane looks at it
+_MINE = "bytes-the-box-wrote\n"
+_THEIRS = "bytes-upstream-tracks\n"
+_SETASIDE_LOG = "set-aside (g-306-581)"
+
+
+def _track_forced(b: Path, rel: str, content: str, msg: str, *also: str) -> None:
+    """B tracks `rel` (add -f: its own rules may cover it) plus any `also` paths in ONE commit."""
+    p = b / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8", newline="\n")
+    _must(b, "add", "-f", "--", f":(literal){rel}", *also)
+    _must(b, "commit", "-q", "-m", msg)
+    _must(b, "push", "-q", "origin", "main")
+
+
+def _ignored_then_tracked(tmp_path: Path, shape: str, merge: str, *, rel: str = _SET,
+                          mine=_MINE, theirs: str = _THEIRS, seed_extra: dict = None,
+                          track: bool = True):
+    """A holds `rel` as an untracked file, then B tracks it. shape: s1 = nothing ignores it
+    (git refuses), s2 = A's info/exclude, s3 = a committed rule that stays, s4 = a committed
+    rule B drops in the commit that tracks the path. merge: ff | tree. `mine` None = absent.
+    `track` False leaves B's commit to the test."""
+    origin, a, b = _clone_pair(tmp_path)
+    seed = {"keep.txt": "k\n", **(seed_extra or {})}
+    if shape in ("s3", "s4"):
+        seed[".gitignore"] = "cache/*.spool\n"
+    _seed_and_sync(a, b, seed)
+    if shape == "s2":
+        with open(a / ".git" / "info" / "exclude", "a", encoding="utf-8", newline="\n") as f:
+            f.write(f"/{rel}\n")
+    if track:
+        also = ()
+        if shape == "s4":
+            (b / ".gitignore").write_text("", encoding="utf-8", newline="\n")
+            also = (".gitignore",)
+        _track_forced(b, rel, theirs, "B: track the spool", *also)
+    if mine is not None:
+        (a / rel).parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(mine, bytes):
+            (a / rel).write_bytes(mine)
+        else:
+            (a / rel).write_text(mine, encoding="utf-8", newline="\n")
+    if merge == "tree":
+        _commit_file(a, "local.txt", "l\n", "A: a local commit")
+    return origin, a, b
+
+
+def _git_alone_replaces(a: Path, tmp_path: Path, merge: str, rel: str, theirs: str) -> None:
+    """CONTROL: on a COPY of A's tree, the merge the integrate would run replaces the
+    ignored file with rc 0. Without this a green test could just mean this git refuses."""
+    ctl = tmp_path / "control"
+    shutil.copytree(a, ctl)
+    _must(ctl, "fetch", "-q", "origin")
+    if merge == "tree":  # the script's second shape: merge-tree off the worktree, then --ff-only
+        mt = _git(ctl, "merge-tree", "--write-tree", "HEAD", "origin/main")
+        if mt.returncode != 0:
+            pytest.skip("this git lacks merge-tree --write-tree, so the integrate never takes this shape")
+        tree = mt.stdout.splitlines()[0]
+        commit = _must(ctl, "commit-tree", tree, "-p", "HEAD", "-p", "origin/main", "-m", "m")
+        r = _git(ctl, "merge", "--ff-only", commit)
+    else:
+        r = _git(ctl, "merge", "--ff-only", "origin/main")
+    assert r.returncode == 0, r.stderr
+    assert (ctl / rel).read_text(encoding="utf-8") == theirs, "plain git no longer replaces it"
+    assert "overwritten" not in (r.stdout + r.stderr), "plain git said something"
+
+
+def _setaside(repo: Path) -> list:
+    root = repo / ".git" / "iteration-push-setaside"
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink())
+
+
+def _loop_integrate(a: Path) -> subprocess.CompletedProcess:
+    return _run_push_env(a, "alpha", *_default_flags("--strict", "--no-push"))
+
+
+def _posix(text: str) -> str:
+    return text.replace("\\", "/")
+
+
+@pytest.mark.parametrize("merge", ["ff", "tree"])
+@pytest.mark.parametrize("shape", ["s2", "s3", "s4"])
+def test_setaside_keeps_the_bytes_git_would_replace_silently(tmp_path, shape, merge):
+    """Outcome 1. The merge still lands (no wedge) and the box's bytes survive in a copy
+    under .git, named by one loud log line, through both merge shapes."""
+    origin, a, b = _ignored_then_tracked(tmp_path, shape, merge)
+    oid = _must(a, "hash-object", "--no-filters", "--", _SET)
+    _git_alone_replaces(a, tmp_path, merge, _SET, _THEIRS)
+
+    r = _loop_integrate(a)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert _git(a, "merge-base", "--is-ancestor", _origin_tip(origin), "HEAD").returncode == 0, out
+    assert (a / _SET).read_text(encoding="utf-8") == _THEIRS, out  # the merge landed
+    assert _setaside(a) == [a / ".git" / "iteration-push-setaside" / oid / _SET], out
+    assert _setaside(a)[0].read_text(encoding="utf-8") == _MINE
+    assert f"{_SETASIDE_LOG}: {_SET} is ignored here but origin/main newly tracks it" in out, out
+    assert f".git/iteration-push-setaside/{oid}/{_SET}" in _posix(out), out
+    assert _posix(out).count(_SETASIDE_LOG) == 1, out
+
+
+@pytest.mark.parametrize("local", ["same", "absent"])
+def test_setaside_copies_nothing_when_no_bytes_are_at_risk(tmp_path, local):
+    """Outcome 2, the negative controls: bytes identical to upstream's blob, and a path
+    absent here, lose nothing, so they leave no copy and no new log line."""
+    mine = _THEIRS if local == "same" else None
+    origin, a, b = _ignored_then_tracked(tmp_path, "s3", "ff", mine=mine)
+
+    r = _loop_integrate(a)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert (a / _SET).read_text(encoding="utf-8") == _THEIRS, out
+    assert _setaside(a) == [] and not (a / ".git" / "iteration-push-setaside").exists(), out
+    assert _SETASIDE_LOG not in out, out
+
+
+def test_setaside_leaves_a_path_no_rule_covers_to_git_which_refuses(tmp_path):
+    """The shape that was already loud: nothing ignores the path, so git REFUSES the merge
+    and the file stays where it is. No copy, no set-aside line (the copy is for the
+    silent shapes), and the refusal is still the one that is logged."""
+    origin, a, b = _ignored_then_tracked(tmp_path, "s1", "ff")
+
+    r = _loop_integrate(a)
+    out = r.stdout + r.stderr
+    assert "untracked working tree files would be overwritten" in out, out
+    assert (a / _SET).read_text(encoding="utf-8") == _MINE
+    assert _setaside(a) == [] and _SETASIDE_LOG not in out, out
+
+
+def test_setaside_sees_a_path_upstream_added_by_rename(tmp_path):
+    """git pairs a delete with an add into a RENAME unless told not to, and a rename's
+    destination is then no longer an "added" path: without --no-renames the helper never
+    looks at it and the ignored file is replaced silently."""
+    origin, a, b = _ignored_then_tracked(tmp_path, "s3", "ff", track=False,
+                                         seed_extra={"moved.txt": _THEIRS})
+    (b / "cache").mkdir(exist_ok=True)
+    _must(b, "mv", "moved.txt", _SET)
+    _must(b, "commit", "-q", "-m", "B: move the file into the ignored directory")
+    _must(b, "push", "-q", "origin", "main")
+    _must(a, "fetch", "-q", "origin")
+    assert "R100" in _must(a, "diff", "--name-status", "HEAD", "origin/main")  # a rename, not an add
+    oid = _must(a, "hash-object", "--no-filters", "--", _SET)
+    _git_alone_replaces(a, tmp_path, "ff", _SET, _THEIRS)
+
+    r = _loop_integrate(a)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert (a / _SET).read_text(encoding="utf-8") == _THEIRS and not (a / "moved.txt").exists(), out
+    assert _setaside(a) == [a / ".git" / "iteration-push-setaside" / oid / _SET], out
+    assert _setaside(a)[0].read_text(encoding="utf-8") == _MINE
+
+
+def test_setaside_measures_newly_tracked_from_the_merge_base_not_from_head(tmp_path):
+    """This box's own commit untracked a path (the file kept here, ignored) that upstream
+    has tracked all along and never touched. The merge leaves it deleted, so nothing is
+    replaced: no copy and no log line, though HEAD lacks a path upstream has."""
+    origin, a, b = _clone_pair(tmp_path)
+    _seed_and_sync(a, b, {"data/x.cfg": "shared\n", "keep.txt": "k\n"})
+    _must(a, "rm", "-q", "--cached", "--", "data/x.cfg")
+    _must(a, "commit", "-q", "-m", "A: untrack x.cfg, keep the file")
+    with open(a / ".git" / "info" / "exclude", "a", encoding="utf-8", newline="\n") as f:
+        f.write("/data/x.cfg\n")
+    (a / "data" / "x.cfg").write_text("box-edit\n", encoding="utf-8", newline="\n")
+    _commit_file(b, "up.txt", "up\n", "B: an unrelated commit")
+    _must(b, "push", "-q", "origin", "main")
+
+    r = _loop_integrate(a)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert (a / "up.txt").exists(), out  # the merge landed
+    assert (a / "data" / "x.cfg").read_text(encoding="utf-8") == "box-edit\n", out
+    assert _setaside(a) == [] and _SETASIDE_LOG not in out, out
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs symlinks and * in a file name")
+def test_setaside_keeps_a_symlink_as_a_symlink_and_a_path_with_glob_characters(tmp_path):
+    """The copy keeps what the box had: a symlink stays a symlink (its target text is the
+    bytes), and a path with spaces and glob characters is matched literally."""
+    odd = "cache/odd name [1]*.spool"
+    origin, a, b = _ignored_then_tracked(tmp_path, "s3", "ff", rel=odd, mine=None)
+    (a / odd).parent.mkdir(parents=True, exist_ok=True)  # mine=None: the builder made no cache/
+    (a / odd).symlink_to("target-elsewhere")
+    sym_oid = subprocess.run(["git", "-C", str(a), "hash-object", "--stdin"], input="target-elsewhere",
+                             capture_output=True, text=True, check=True).stdout.strip()
+
+    r = _loop_integrate(a)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert not (a / odd).is_symlink() and (a / odd).read_text(encoding="utf-8") == _THEIRS, out
+    copy = a / ".git" / "iteration-push-setaside" / sym_oid / odd
+    assert copy.is_symlink() and os.readlink(copy) == "target-elsewhere", out
+    assert f"{_SETASIDE_LOG}: {odd} is ignored here" in out, out
+
+
+def test_setaside_copies_once_while_a_merge_keeps_failing(tmp_path):
+    """A merge that fails every cycle (a true conflict here) runs the helper every cycle.
+    The copy is content-addressed, so the second run adds neither a copy nor a log line,
+    and the file stays where it is because the merge never landed."""
+    origin, a, b = _ignored_then_tracked(tmp_path, "s3", "ff")
+    _commit_file(b, "keep.txt", "k-from-b\n", "B: edits keep.txt")
+    _must(b, "push", "-q", "origin", "main")
+    _commit_file(a, "keep.txt", "k-from-a\n", "A: edits keep.txt too")
+
+    r1 = _loop_integrate(a)
+    out1 = r1.stdout + r1.stderr
+    assert "MERGE CONFLICT" in out1, out1
+    assert len(_setaside(a)) == 1 and _posix(out1).count(_SETASIDE_LOG) == 1, out1
+    assert (a / _SET).read_text(encoding="utf-8") == _MINE  # the merge never landed
+
+    r2 = _loop_integrate(a)
+    out2 = r2.stdout + r2.stderr
+    assert "MERGE CONFLICT" in out2, out2
+    assert len(_setaside(a)) == 1 and _SETASIDE_LOG not in out2, out2
+
+
+@pytest.mark.parametrize("how", ["mkdir", "truncated"])
+def test_setaside_failing_to_copy_is_loud_and_fails_open(tmp_path, monkeypatch, how):
+    """Every helper in this script is fail-soft: a copy that cannot be made, or that does
+    not come back byte for byte, is logged by name and leaves NO copy behind, and the merge
+    runs as it did before the helper existed."""
+    if how == "truncated" and os.name == "nt":
+        pytest.skip("the cp shim needs a POSIX shebang")
+    origin, a, b = _ignored_then_tracked(tmp_path, "s3", "ff")
+    if how == "mkdir":
+        (a / ".git" / "iteration-push-setaside").write_text("in the way\n", encoding="utf-8")
+    else:  # cp reports success but leaves an empty file: only the raw-hash check can see it
+        shim = tmp_path / "shim"
+        shim.mkdir()
+        (shim / "cp").write_text('#!/usr/bin/env bash\ncommand -p cp "$@" || exit $?\n'
+                                 'for last; do :; done\n: > "$last"\n', encoding="utf-8", newline="\n")
+        (shim / "cp").chmod(0o755)
+        monkeypatch.setenv("PATH", f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+    r = _loop_integrate(a)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert f"{_SETASIDE_LOG}: could NOT copy {_SET} aside intact" in out, out
+    assert (a / _SET).read_text(encoding="utf-8") == _THEIRS, out  # fail-open: the merge ran
+    assert _setaside(a) == [], out  # a bad copy is not left to look like a good one
+
+
+@pytest.mark.parametrize("site", ["clean", "churn-untouched", "churn-touched"])
+def test_setaside_covers_the_cron_ticks_fast_forwards_too(tmp_path, site):
+    """The tick merges at three sites that never reach _ip_merge_upstream (a gate is only as
+    broad as its entry points). Each takes the same copy before it merges."""
+    seed_extra = {} if site == "clean" else {_STORE: "base\n"}
+    origin, a, b = _ignored_then_tracked(tmp_path, "s3", "ff", seed_extra=seed_extra)
+    oid = _must(a, "hash-object", "--no-filters", "--", _SET)
+    _git_alone_replaces(a, tmp_path, "ff", _SET, _THEIRS)
+    env = None
+    if site != "clean":
+        (a / _STORE).write_bytes(_CACHE_BYTES)  # the cache has modified a tracked store file
+        env = _noloop(tmp_path)
+        if site == "churn-touched":
+            _commit_file(b, _STORE, "base\nfrom-b\n", "B: commits its copy of the store")
+            _must(b, "push", "-q", "origin", "main")
+
+    r = _ff(a, "--strict", env_extra=env)
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out
+    assert "ff-only tick" in out and "refused" not in out, out
+    assert _git(a, "merge-base", "--is-ancestor", _origin_tip(origin), "HEAD").returncode == 0, out
+    assert (a / _SET).read_text(encoding="utf-8") == _THEIRS, out
+    assert _setaside(a) == [a / ".git" / "iteration-push-setaside" / oid / _SET], out
+    assert _setaside(a)[0].read_text(encoding="utf-8") == _MINE
+    assert f"{_SETASIDE_LOG}: {_SET} is ignored here but origin/main newly tracks it" in out, out
+    if site != "clean":
+        assert (a / _STORE).read_bytes() == _CACHE_BYTES  # the churn still comes back byte for byte

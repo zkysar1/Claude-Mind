@@ -212,14 +212,30 @@ stays OPEN.
 config fault — a gate that blocks work because of its own bugs is worse than the
 problem it catches (guard-142). The single exception, and the reason the gate exists:
 the **absence** of an APPROVE verdict on a tier-2 goal is a REFUSAL, never an error.
-Overrides take `--override-close-review "<justification>"` and land in
+One carve-out is by design, not by fault: a closer whose `BODY_ROLE` is listed in
+`review_closer_roles` or `review_sampled_roles` passes check A, because the post-hoc
+lane reviews its closures after the close (g-375-09, g-375-145). Overrides take
+`--override-close-review "<justification>"` and land in
 `world/close-review-overrides.jsonl` (the per-gate ledger, NOT the `--override-all`
 bulk ledger, whose `slots_filled` field means blast radius across gates).
 
-**Ship state:** both flags default OFF in `core/config/aspirations.yaml`
-(`close_review_gate.enabled`, `.note_marker_enabled`). Check A's remedy names a
-producer — the fresh-eyes close reviewer, sibling goal g-357-41 — that has not landed;
-enabling before it exists would force every tier-2 close onto the override path and
+**A refusal is self-serve (g-375-147).** When check A refuses, the gate stamps
+`review_requested` on the goal itself, unless a request is already open, so
+`close-review-queue.py list` offers the goal to an independent reviewer and the goal
+waits open. The queue offers only a goal that names its closer (`completed_by`, else
+`executed_by`, else `claimed_by`), so a refusal on a goal that names none says to claim
+it first; a claim records `executed_by`. A request that a verdict answered without
+releasing the close (a REJECT, or an APPROVE demoted as self-review) is stamped again.
+A releasing verdict releases the close only if it answers the goal's current request.
+The override is honored only where team-state lists no other mind, a solo deployment;
+anywhere else an independent review is available, and the attempt is logged on the
+block as `override_refused`.
+
+**Ship state** (`close_review_gate` in `core/config/aspirations.yaml`): check B,
+`.note_marker_enabled`, is ON since 2026-10-06 (g-375-144). Check A, `.enabled`, is
+OFF. Its first precondition, the verdict producer g-357-41, landed 2026-09-02; what
+still blocks it is measured and recorded in that config block, the one place it lives.
+Enabling A before those land would force tier-2 closes onto the override path and
 manufacture false records in the ledger that measures whether to enable at all
 (rb-4452: ship a dep-blocked gate's invariant BEFORE the dependency so it constrains
 that dependency's design).
@@ -382,65 +398,25 @@ Agents can decline goals outside their capability band via `abstained_by`. The
 goal-selector skips abstained goals for the abstaining agent; other agents see them
 normally. See `goal-schemas.md` and `aspirations-select/SKILL.md` Phase 2.55.
 
-## Co-Investigation Protocol (g-115-563)
+## Co-Investigation Protocol (retired)
 
-Existing primitives are sequential: claim, handoff, board-post, review-gate.
-None describe how two agents iterate concurrently on the SAME parent
-investigation, posting interim findings to a shared thread until both halves
-inform each other. The empirical baseline (30 days through 2026-05-09):
-zero goals carried `parent_goal_id` or `parent_id` schema fields; reasoning-
-channel reply rate was 0% across 16 posts. The framework had four
-ingredients (`team-state.in_flight`, `board/reasoning.jsonl`,
-`discovered_by`, `related_goals`) that COULD enable co-iteration, but none
-were wired together.
+Retired by g-375-129 on 2026-10-05. The primitive (g-115-563, 2026-05-10) added
+the goal field `co_parent_id`, the aspiration field `co_investigators`, the board
+types `co-investigation-claim` and `co-investigation-update`, and the selector
+criterion `co_invest_alignment`. It could not work. The goal-field allowlist
+(g-115-6573) has refused `co_parent_id` since 2026-08-18. No code ever wrote the
+partner-side `in_flight.co_parent_id` the criterion compared against. The
+criterion's weight was switched off the evening it shipped (meta changes mc-051
+and mc-052). A census on 2026-10-05 found `co_parent_id` on no live or archived
+goal, `co_investigators` on no aspiration, and one `co-investigation-claim` post
+ever.
 
-Full design rationale + 30-day baseline: co-investigation-protocol design (2026-05-09, git-archived).
-
-### Schema additions
-
-| Field | Where | Type | Purpose |
-|---|---|---|---|
-| `co_parent_id` | goal | str (goal-id) or null | "this is a sub-goal of co-investigation X" |
-| `co_investigators` | aspiration or top-level goal | list of agent names | "agents committed to co-iterate on this" |
-
-Both fields validated by `aspirations.py` (`validate_goal`, `validate_aspiration`):
-`co_parent_id`, when non-null, MUST match `GOAL_ID_RE` (`g-NNN-NN[-a]`); `co_investigators`
-MUST be a list of strings. No other enforcement at schema layer — the protocol
-is consumer-driven (selector + board), not prescriptive.
-
-### Board types
-
-- `co-investigation-claim` — replaces individual `claim` for a co-invest
-  parent. Reserves the parent across both agents; lists the agreed sub-goal split.
-- `co-investigation-update` — interim findings posted to the parent's thread.
-  Both agents post; both read. Tag with the parent's goal-id so retrieval
-  via `board-read.sh --tags <parent-goal-id>` returns the full conversation.
-
-### Selector adjustment
-
-`goal-selector.py` adds `co_invest_alignment` (weight 0.5,
-`meta/goal-selection-strategy.yaml`). Bonus value is `1.0 raw` when this
-candidate's `co_parent_id` matches a partner's live
-`team-state.agent_status.<other>.in_flight.co_parent_id`, biasing the selector
-toward "pair on the same parent right now." Small magnitude — co-investigation
-is opt-in coordination, not a hard override of priority/recurring-urgency.
-
-### Acceptance criteria for "co-investigative"
-
-A test case is co-investigative when:
-
-1. Both agents post ≥3 entries to the reasoning channel under the shared tag during the session
-2. Each agent's findings reference the other's at least once
-3. The output (tree node, goal, or report) lists both agents
-4. Neither agent could have produced the same output alone in the same wall-clock time
-
-### First test case shape
-
-The pattern: one shared Investigate parent goal under a tracking aspiration,
-two agents each take a distinct slice of the pipeline (e.g., agent-a takes
-the upstream scoring path; agent-b takes the downstream materialization
-path). Both halves NEED the other's findings to make sense — forces actual
-collaboration, not parallel work.
+- To link sub-goals to a parent, give each child an `origin_signal` naming the
+  parent. `/decompose` already writes `decomposition:<parent-goal-id>`.
+- To work one investigation with a partner, use the sequential primitives:
+  claim, handoff, board posts tagged with the parent's goal id, and the review gate.
+- `co_invest_alignment` stays in `goal-selector.py` as a constant 0.0 only
+  because live meta files still weight it (block 13d there says why).
 
 ## Restricted Files (Concurrent Modification Prevention)
 

@@ -938,6 +938,27 @@ def forced_max_path_positive_control_old_scheme_raises(sandbox, store):
     assert_eq(patch.read_bytes(), b"delta-payload", "fixed write content intact")
 
 
+@with_sandbox
+def unique_tmp_stays_a_path_when_the_long_path_wrapper_hands_back_a_str(sandbox, store):
+    """: on Windows _windows_long_path() returns a str (the extended-length prefix
+    is concatenated onto str(p)), and every writer calls .write_bytes()/.write_text()/.unlink()
+    on what _unique_tmp() returns. Linux hands the Path back unchanged, so the forced-limit
+    tests above could never reach the str. Make the wrapper return a str here, as Windows does:
+    the writers must still land their bytes and leave no tmp behind."""
+    store._windows_long_path = lambda p: str(p)
+    tmp = store._unique_tmp(sandbox / "x" / "blob")
+    assert_true(isinstance(tmp, Path), f"_unique_tmp returns a Path, got {type(tmp).__name__}")
+    blob = sandbox / "x" / "blob"
+    store._atomic_write_bytes(blob, b"payload")
+    assert_eq(blob.read_bytes(), b"payload", "bytes land through a str-returning wrapper")
+    manifest = sandbox / "x" / "m.yaml"
+    store._atomic_write_text(manifest, "k: v\n")
+    assert_eq(manifest.read_text(encoding="utf-8"), "k: v\n",
+              "text lands through a str-returning wrapper")
+    leftovers = [p.name for p in blob.parent.iterdir() if p.name.endswith(".tmp")]
+    assert_eq(leftovers, [], "no tmp left behind")
+
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -979,6 +1000,8 @@ TESTS = [
     forced_max_path_delta_saves_and_restores_byte_for_byte,
     forced_max_path_delta_write_raises_falls_back_to_full,
     forced_max_path_positive_control_old_scheme_raises,
+    #  regression (2026-10-06): the wrapper returns a str on Windows
+    unique_tmp_stays_a_path_when_the_long_path_wrapper_hands_back_a_str,
 ]
 
 

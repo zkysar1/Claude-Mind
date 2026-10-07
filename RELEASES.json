@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.94",
+    "previous_version": "2.12.93",
+    "date": "2026-10-06",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "v2.12.94: demand-pull cut for the temp/ review lifecycle (nothing in temp/ is deleted until a review records a decision: decision log, a reason on every deletion, a scripts destination, obvious junk decided by name and still recorded); history snapshots land on Windows again (_unique_tmp returned a str there since v2.12.91, g-115-12136); close-review gate: note-marker check on, role-aware check A, a refusal requests its own review (g-375-144, -145, -147); composite writer flag disarmed while Gate 1 reads UNSAFE (g-358-202); claim gate and worker-loop fixes (g-375-133, -134, -137); field-append sentinels count only as whole lines (g-375-132, -140); co-investigation primitive retired (g-375-129); promotion runbook gains the whole-population drift triage and the staging-hop residue check (g-358-13); Windows test portability (g-115-12113, g-115-8767); 51 framework commits since v2.12.93",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.93",
     "previous_version": "2.12.92",
     "date": "2026-10-05",

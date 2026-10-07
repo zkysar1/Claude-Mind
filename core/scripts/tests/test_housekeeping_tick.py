@@ -93,17 +93,38 @@ def test_load_config_merges_defaults(tmp_path):
 
 def test_lane_a_ok():
     out = HK.run_lane_a(True, purge_cmd=_stub_purge(
-        {"would_purge": 3, "citation_lookup": "ok", "files": ["a.log"],
-         "watermark_source": "absent", "dry_run": True}))
+        {"would_purge": 3, "citation_lookup": "ok", "decisions_lookup": "ok",
+         "files": ["a.log"], "stray_dirs": ["old-run"], "deletion_log": "n/a",
+         "dry_run": True}))
     assert out["verdict"] == "ok"
     assert out["would_purge"] == 3
+    assert out["stray_dirs"] == ["old-run"]
 
 
 def test_lane_a_degraded_on_failed_citation_lookup():
     """The silent-zero guard: failed lookup => UNMEASURED, never clean."""
     out = HK.run_lane_a(True, purge_cmd=_stub_purge(
-        {"would_purge": 0, "citation_lookup": "failed", "dry_run": True}))
+        {"would_purge": 0, "citation_lookup": "failed", "decisions_lookup": "ok",
+         "dry_run": True}))
     assert out["verdict"] == "degraded"
+
+
+@pytest.mark.parametrize("decisions_lookup", ["failed", "n/a", None])
+def test_lane_a_degraded_unless_the_decisions_were_read(decisions_lookup):
+    """Lanes 1 and 3 delete only reviewed discards; when the decision log could
+    not be read they deleted nothing, so a low count is UNMEASURED."""
+    payload = {"would_purge": 0, "citation_lookup": "ok", "dry_run": True}
+    if decisions_lookup is not None:
+        payload["decisions_lookup"] = decisions_lookup
+    assert HK.run_lane_a(True, purge_cmd=_stub_purge(payload))["verdict"] == "degraded"
+
+
+def test_lane_a_degraded_when_deletions_went_unrecorded():
+    """Every deletion is recorded with its reason; a failed log is not ok."""
+    out = HK.run_lane_a(False, purge_cmd=_stub_purge(
+        {"purged": 2, "citation_lookup": "ok", "decisions_lookup": "ok",
+         "deletions_logged": 0, "deletion_log": "failed", "dry_run": False}))
+    assert out["verdict"] == "degraded" and out["deletion_log"] == "failed"
 
 
 def test_lane_a_purge_error_on_nonzero_rc():

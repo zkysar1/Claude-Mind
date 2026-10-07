@@ -29,6 +29,7 @@ routes.
 | Live-session RAM (micro-hyp, blockers, debt) | Working memory (`agents/<agent>/session/working-memory.yaml`) | `working-memory.md` |
 | Reusable spark prompt | Spark questions (`meta/spark-questions.jsonl`) | `spark-questions.md` |
 | Cross-agent casual musing | Reasoning channel (`world/board/reasoning.jsonl`) | `board.md` |
+| Reusable script or tool (code you will run again) | `world/scripts/` (domain) or `core/scripts/` (framework: domain-free, tested, committed) — never `temp/` or the agent dir | Decision Tree item 12; `temp-store.md` (the review's `promote`) |
 
 ## Decision Tree
 
@@ -128,6 +129,23 @@ more than once — see "Multi-store encodings" below for how to split.
 
     Discovery (which convention covers X?): see the conventions-registry
     tree node at `world/knowledge/tree/system/conventions-registry.md`.
+
+12. **Is this a reusable SCRIPT or TOOL** — something you will RUN again,
+    rather than something you learned?
+    - Code goes to a scripts folder, never to `temp/` or the agent dir:
+      `world/scripts/` when it serves this world's domain; `core/scripts/`
+      only for framework code, which must be domain-free, carry a test under
+      `core/scripts/tests/`, and be committed like any framework change.
+      A world script reaches `core/` only through the inherited
+      `PROJECT_ROOT`: `world/` is an external path, so a path relative to
+      the script's own location never lands in the repo (guard-5419,
+      guard-3695).
+    - A "tool" that is not code — a recipe, checklist or how-to — is
+      knowledge: the knowledge tree (item 6), or a forged skill when it is a
+      multi-step procedure invoked by name (`/forge-skill`).
+    - What the script TAUGHT (why it exists, what it measured) still routes
+      through items 1-10; a scripts folder is not a learning store.
+    In `temp/` this is the review's `promote` decision (`temp-store.md`).
 
 If NOTHING matches, the observation is likely too low-signal to encode. Let
 it drop. Over-encoding bloats retrieval and costs future cycles.

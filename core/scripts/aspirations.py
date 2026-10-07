@@ -517,19 +517,6 @@ def validate_aspiration(asp):
     if "sessions_active" in asp and not isinstance(asp["sessions_active"], (int, float)):
         raise ValueError("sessions_active must be a number")
 
-    # Co-investigation primitive (): co_investigators names the
-    # agents committed to co-iterate on this aspiration. Pass-through at
-    # the schema layer; goal-selector reads goal-level co_parent_id, not
-    # aspiration-level co_investigators (the latter is documentation /
-    # board-display surface). Schema + protocol: coordination.md
-    # → Co-Investigation Protocol.
-    if "co_investigators" in asp:
-        if not isinstance(asp["co_investigators"], list):
-            raise ValueError("co_investigators must be a list")
-        for name in asp["co_investigators"]:
-            if not isinstance(name, str):
-                raise ValueError("co_investigators entries must be strings")
-
     for goal in asp["goals"]:
         validate_goal(goal)
         # Structured-check schema (). Deliberately HERE and not in
@@ -619,19 +606,6 @@ def validate_goal(goal):
         val = goal["defer_reason"]
         if val is not None and not isinstance(val, str):
             raise ValueError(f"Goal {goal['id']}: defer_reason must be a string or null")
-    # Co-investigation primitive (): co_parent_id names the parent
-    # goal both agents are iterating on. When non-null, must be a valid
-    # goal-id; goal-selector.py reads it for the co_invest_alignment bonus.
-    # Schema + protocol: core/config/conventions/coordination.md
-    # → Co-Investigation Protocol.
-    if "co_parent_id" in goal:
-        val = goal["co_parent_id"]
-        if val is not None and not isinstance(val, str):
-            raise ValueError(f"Goal {goal['id']}: co_parent_id must be a string or null")
-        if isinstance(val, str) and not GOAL_ID_RE.match(val):
-            raise ValueError(
-                f"Goal {goal['id']}: co_parent_id must be a valid goal-id (got {val!r})"
-            )
     # user_leg_scope: when set, names what the user must approve. Matched by
     # guard-349 against standing grants in capability-routing.md. Legacy goals
     # with participants:[agent,user] but no user_leg_scope still work — the

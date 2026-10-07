@@ -434,12 +434,14 @@ def test_hypothesis_edit_writes_claim_through_the_daemon(world, monkeypatch, cap
     assert "hypothesis hyp-acme-1: edit -> claim" in capsys.readouterr().out
 
 
+# ids= keeps the node id short: pytest copies it into PYTEST_CURRENT_TEST, and Windows
+# caps an environment value at 32,767 characters (a default id embeds the whole value).
 @pytest.mark.parametrize("text, reason", [
     ("42", "store_would_coerce"),
     ("null", "store_would_coerce"),
     ('{"claim": "x"}', "store_would_coerce"),
     ("汉" * 7000, "too_long_for_store"),
-])
+], ids=["integer", "null", "json-object", "7000-cjk-chars"])
 def test_hypothesis_texts_the_store_would_alter_are_refused(world, monkeypatch, capsys,
                                                             text, reason):
     daemon = _FakeDaemon()

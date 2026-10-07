@@ -236,10 +236,16 @@ def test_landed_claim_behind_stale_daemon_lines_runs_post_claim_effects(tmp_path
     assert STALE in proc.stderr
 
 
-def test_claim_without_the_split_skips_post_claim_effects(tmp_path):
-    """The claim-side defect, reproduced: rc=1 and no effects for a landed claim."""
+def test_claim_without_the_split_exits_1_over_a_landed_claim(tmp_path):
+    """The claim-side defect, reproduced: rc=1 and a traceback for a landed claim.
+
+    Before g-375-137 this run also skipped every post-claim effect: the JSON print
+    came first and set -e ended the script there. The effects now run before
+    anything is printed, so they land even here. What the split still decides is
+    the exit code and the goal JSON on stdout."""
     proc, anchors = _run(tmp_path, CLAIM, [GOAL], _claim_reply(),
                          text=_without_claim_split())
     assert proc.returncode == 1, proc.stderr
     assert "JSONDecodeError" in proc.stderr
-    assert anchors == []
+    assert proc.stdout == ""
+    assert [a["goal_id"] for a in anchors] == [GOAL]

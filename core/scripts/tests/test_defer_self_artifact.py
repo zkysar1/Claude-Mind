@@ -60,6 +60,14 @@ def test_triggers_on_the_field_whatever_the_structured_prefix():
         assert evaluate("g-353-109", text)["refuse"] is True, prefix
 
 
+def test_a_goal_past_the_five_digit_sequence_is_still_checked():
+    #  is the first id a {1,5} sequence bound rejects. Rejected ids get
+    # the no-op ALLOW, so a bound would switch the gate off for every later goal.
+    text = "precondition_unmet: waiting for branch g-115-100000-fix-gate, still open and unmerged."
+    r = evaluate("g-115-100000", text)
+    assert r["checked"] is True and r["refuse"] is True
+
+
 def test_endpoint_wires_it_on_the_field_before_the_narrative_branch():
     src = ENDPOINT.read_text(encoding="utf-8")
     i_gate = src.find("from gates.defer_self_artifact import evaluate as _self_eval\n")

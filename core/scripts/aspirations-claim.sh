@@ -678,12 +678,17 @@ fi
 # this claim, BEFORE its goal executes, so pulling here is the unit boundary
 # the design already allows (rb-11769): never a merge under an executing goal.
 # Workers only (BODY_WM_PATH, the same discriminator as the role recheck above);
-# the reducer pulls and pushes through its own loop. stdout goes to stderr
-# because this script's stdout is the goal JSON its callers parse. Fail-soft:
-# iteration-push exits 0 without --strict and `|| true` covers the rest, so a
-# pull that cannot run leaves the claim exactly as it was.
+# the reducer pulls and pushes through its own loop. Fail-soft: iteration-push
+# exits 0 without --strict and `|| true` covers the rest, so a pull that cannot
+# run leaves the claim exactly as it was.
+# HELD, NOT PRINTED (). The pull's output, stdout and stderr in the
+# order written, waits in _CLAIM_HELD_ERR and reaches stderr only after the
+# post-claim effects have run (see "OUTPUT AFTER EFFECTS" at the claim call).
+# Printed live, it could fill a reader's budget before the claim, and a reader
+# that closed the pipe mid-pull would kill the merge itself with SIGPIPE.
+_CLAIM_HELD_ERR=""
 if [ -n "${BODY_WM_PATH:-}" ]; then
-    bash "$CORE_ROOT/scripts/iteration-push.sh" --no-push >&2 || true
+    _CLAIM_HELD_ERR="$(bash "$CORE_ROOT/scripts/iteration-push.sh" --no-push 2>&1)" || true
 fi
 
 rc=0
@@ -694,16 +699,45 @@ RESPONSE="$(rt_call POST /v1/aspirations/claim --query "$QUERY" 2>&1)" || rc=$?
 # of RESPONSE below, _post_claim_effects included, tolerates only TRAILING residue
 # (), so a claim that LANDED exited 1 before its post-claim effects ran.
 # Pass everything ahead of the first line opening with `{` through to stderr
-# unchanged, and keep the body.
+# unchanged, and keep the body. The lines are held with the pull's output
+# (), so they still print ahead of the body.
 if [ "${RESPONSE:0:1}" != "{" ] && [[ "$RESPONSE" == *$'\n{'* ]]; then
-    printf '%s\n' "${RESPONSE%%$'\n{'*}" >&2
+    _CLAIM_HELD_ERR="${_CLAIM_HELD_ERR:+$_CLAIM_HELD_ERR$'\n'}${RESPONSE%%$'\n{'*}"
     RESPONSE="{${RESPONSE#*$'\n{'}"
 fi
 
-case $rc in
-    0)
-        # shellcheck disable=SC2086
-        printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
+# ── OUTPUT AFTER EFFECTS () ─────────────────────────────────────────
+# A claim that landed must finish its post-claim effects (checkpoint anchor,
+# Body row, claim-time diary breadcrumb, board announce) however its caller
+# reads the output, and callers pipe this script. Measured 2026-10-05 on the
+# worker Bodies: 2 of 38 claims in 24 h committed with no Body row, both piped
+# through head with stderr merged, and the sync tick then integrated 19 times
+# (05:31 to 17:11) under one of them, because tick_claim_probe.py read the
+# missing row as no claim. The mechanism, reproduced in a sandbox but not traced
+# on a Body: under set -euo pipefail the first write after the reader closes the
+# pipe kills the script (SIGPIPE, or a BrokenPipeError in the JSON print), and
+# every write used to come BEFORE the effects. So nothing reaches the caller
+# until the effects have run. (One narrow exception: on the autospawn retry,
+# rt_call's own stderr still streams, and it prints there only when the daemon
+# it just spawned is already stale.) Their output is captured, and _claim_emit then
+# prints the held pull and runtime lines, the goal JSON and the effects' output,
+# in the order they always printed. A closed pipe can still end the script
+# there, but only after the effects, so all it cuts short is output nobody is
+# reading. As before, the exit code is 0 only when the goal JSON was delivered.
+_claim_flush_held() {
+    if [ -n "$_CLAIM_HELD_ERR" ]; then
+        printf '%s\n' "$_CLAIM_HELD_ERR" >&2
+    fi
+    _CLAIM_HELD_ERR=""
+}
+
+# _claim_emit <response> <captured effects output>: both success paths write
+# to the caller through it, and only after _post_claim_effects has run.
+_claim_emit() {
+    local json_rc=0
+    _claim_flush_held || true
+    # shellcheck disable=SC2086
+    printf '%s' "$1" | $(rt_python_launcher) -c "
 import json, sys
 #  fix: raw_decode tolerates stale-daemon stderr-leakage appended
 # after the JSON body (rt_call 2>&1 merges streams). Re-emit residual to
@@ -716,9 +750,24 @@ if _residual:
 goal = resp.get('goal')
 if goal is not None:
     print(json.dumps(goal, indent=2, ensure_ascii=False))
-"
-        _post_claim_effects "$GOAL_ID" "$AGENT" "$RESPONSE"
-        exit 0;;
+" || json_rc=$?
+    if [ -n "$2" ]; then
+        printf '%s\n' "$2" >&2 || true
+    fi
+    return "$json_rc"
+}
+
+# A refusal or failure prints what was held first, as it did before, and a
+# failed write here never replaces the exit code the case below reports.
+if [ "$rc" != "0" ]; then
+    _claim_flush_held || true
+fi
+
+case $rc in
+    0)
+        _effects_out="$(_post_claim_effects "$GOAL_ID" "$AGENT" "$RESPONSE" 2>&1)" || true
+        _claim_emit "$RESPONSE" "$_effects_out" || rc=$?
+        exit "$rc";;
     2)
         # T2.2: parity with CLI cmd_claim exit code. cross_lane_refused -> exit 2.
         # lane_pin_refused joins it (): same class — a routing-POLICY
@@ -736,23 +785,9 @@ if goal is not None:
             rc=0
             RESPONSE="$(rt_call POST /v1/aspirations/claim --query "$QUERY")" || rc=$?
             if [ "$rc" = "0" ]; then
-                # shellcheck disable=SC2086
-                printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
-import json, sys
-#  fix: raw_decode tolerates stale-daemon stderr-leakage appended
-# after the JSON body (rt_call 2>&1 merges streams). Re-emit residual to
-# stderr to preserve daemon-staleness warning visibility.
-_src = sys.stdin.read()
-resp, _idx = json.JSONDecoder().raw_decode(_src)
-_residual = _src[_idx:].strip()
-if _residual:
-    print(_residual, file=sys.stderr)
-goal = resp.get('goal')
-if goal is not None:
-    print(json.dumps(goal, indent=2, ensure_ascii=False))
-"
-                _post_claim_effects "$GOAL_ID" "$AGENT" "$RESPONSE"
-                exit 0
+                _effects_out="$(_post_claim_effects "$GOAL_ID" "$AGENT" "$RESPONSE" 2>&1)" || true
+                _claim_emit "$RESPONSE" "$_effects_out" || rc=$?
+                exit "$rc"
             fi
         fi
         rt_no_daemon_error "aspirations-claim.sh";;

@@ -123,7 +123,7 @@ bash core/scripts/board-channels.sh
 
 ## Agent Integration Points
 
-- **At goal claim** (aspirations Phase 4 start): Post `--type claim` to `coordination` with tags `{goal_id},{aspiration_id}`
+- **At goal claim**: `aspirations-claim.sh` posts `--type claim` to `coordination` itself (tags `claim,{goal_id},{agent}`). Do not post a second one.
 - **After goal completion** (aspirations-verify Phase 5): Post `--type complete` to `coordination` with tags `{goal_id}`
 - **When blocked** (aspirations-execute Phase 4.0/4.1): Post `--type blocked` to `coordination` with tags `{goal_id}`
 - **Before tree encoding** (aspirations-state-update Step 8): Post `--type encoding` to `coordination` with tags `{node_path}`

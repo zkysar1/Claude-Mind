@@ -37,6 +37,7 @@ SKIPS where the external world tree is absent (world/ is a user-configured
 external path; see core/config/conventions/external-paths.md).
 """
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -62,6 +63,14 @@ cat > "$FAKE_SSH_STDIN"
 echo fake-ssh-out
 exit "${FAKE_SSH_RC:-0}"
 """
+
+
+def _msys(p) -> str:
+    """C:/Users/x -> /c/Users/x. Identity on POSIX, where as_posix() is already
+    the right form and there is no drive letter to collide with the separator."""
+    s = Path(p).as_posix()
+    m = re.match(r"^([A-Za-z]):/(.*)$", s)
+    return f"/{m.group(1).lower()}/{m.group(2)}" if m else s
 
 
 def _world_path():
@@ -92,8 +101,11 @@ class EfsSshSshTransport(unittest.TestCase):
     def setUpClass(cls):
         # guard-956: never build an rm on an unguarded variable (see
         # test_efs_ssh_path_warning.py for the measured hazard).
-        _tmp = subprocess.run([BASH, "-c", "mktemp -d"], capture_output=True,
-                              text=True, timeout=60).stdout.strip()
+        # cygpath -m: the MSYS path `mktemp -d` prints (/tmp/tmp.X) is not one native Python can
+        # open; the mixed form (C:/...) is, and both sides accept it (guard-581: -m, never -w).
+        _tmp = subprocess.run(
+            [BASH, "-c", 'd=$(mktemp -d) && { cygpath -m "$d" 2>/dev/null || echo "$d"; }'],
+            capture_output=True, text=True, timeout=60).stdout.strip()
         if not _tmp or _tmp in (".", "/"):
             raise unittest.SkipTest(f"mktemp -d gave no usable path: {_tmp!r}")
         cls._tmp = Path(_tmp)
@@ -121,7 +133,7 @@ class EfsSshSshTransport(unittest.TestCase):
 
     def _run(self, command, extra_env=None, stdin_text=None, drop=()):
         env = dict(os.environ, EFS_SSM_RUN=str(self._stub),
-                   PATH=f"{self._tmp / 'bin'}{os.pathsep}{os.environ['PATH']}",
+                   FAKE_SSH_BIN=_msys(self._tmp / "bin"),
                    FAKE_SSH_ARGS=str(self._args), FAKE_SSH_STDIN=str(self._stdin),
                    STUB_RAN=str(self._ran))
         for k in ("EFS_TRANSPORT", "EFS_SSH_HOST", "EFS_SSH_KEY_PATH", "EFS_SSH_KNOWN_HOSTS",
@@ -130,8 +142,11 @@ class EfsSshSshTransport(unittest.TestCase):
         env.update(extra_env or {})
         for k in drop:
             env.pop(k, None)
+        # The fake ssh goes on PATH from INSIDE bash: Git-for-Windows bash rebuilds PATH at
+        # startup, so a PATH set through env cannot shadow its own /usr/bin/ssh (guard-4445).
         return subprocess.run(
-            [BASH, str(_EFS_SSH), command], cwd=str(PROJECT_ROOT), capture_output=True,
+            [BASH, "-c", 'export PATH="$FAKE_SSH_BIN:$PATH"; exec bash "$0" "$@"', str(_EFS_SSH),
+             command], cwd=str(PROJECT_ROOT), capture_output=True,
             text=True, timeout=180, env=env,
             input=stdin_text if stdin_text is not None else None,
             stdin=None if stdin_text is not None else subprocess.DEVNULL,

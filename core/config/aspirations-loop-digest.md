@@ -326,7 +326,6 @@ re-introduces the clobber class g-115-1561 fixed.
               # g-115-2175/g-115-2187-t). An LLM `started today` write would clobber
               # the precise claim-time first-attempt timestamp with a coarse date.
               Bash: aspirations-update-goal.sh status in-progress.
-              board-post.sh claim.
               Bash: load-execute-protocol.sh → Read; follow inline.
               IF infrastructure_failure: aspirations-release.sh --source {source};
               team-state-clear-in-flight.sh --agent <self>;

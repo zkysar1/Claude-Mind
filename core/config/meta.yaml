@@ -287,7 +287,7 @@ initial_state:
       class_balance_bonus: 0.8       # nudge toward the agent's under-served work_class targets
       role_affinity: 1.0             # weight goals matching the agent's role multipliers
       cross_aspiration_support: 0.5  # favor goals that unblock work in other aspirations
-      co_invest_alignment: 0.0       # off by default — cross-agent co-investment alignment
+      co_invest_alignment: 0.0       # retired (g-375-129): raw is always 0.0; kept because live metas weight it
       critical_blocker_surface: 1.2  # surface goals that unblock high-downstream critical blockers
     custom_criteria: []
     selection_heuristics: []

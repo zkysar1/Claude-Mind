@@ -1,8 +1,18 @@
 # Rationale: The Third-Class Watermark Gate
 
-Referenced from `.claude/skills/drain-temp/SKILL.md` Phase 2.5. Explains why the
-stamp gate is a three-step transaction rather than a pre-check, and why the
-retraction restores a prior value instead of deleting the marker.
+> **RETIRED 2026-10-05.** The watermark, the third class and `/drain-temp`
+> Phase 2.5 no longer exist: every item in `temp/` now gets a recorded per-item
+> review decision, and the purge deletes only a `discard` whose content
+> fingerprint still matches what the reviewer saw
+> (`core/config/conventions/temp-store.md` § The decision log). The purge
+> removes a leftover `.drain-watermark` once and logs it. This file stays as
+> the incident record behind that design — both measurements below are why a
+> deletion license must name the items it covers rather than a time or a
+> type. Nothing below describes current behaviour.
+
+Was referenced from `.claude/skills/drain-temp/SKILL.md` Phase 2.5. Explains why
+the stamp gate was a three-step transaction rather than a pre-check, and why the
+retraction restored a prior value instead of deleting the marker.
 
 ## What the watermark licenses
 
@@ -75,6 +85,6 @@ unverified stamp.
   and only the WHY lives here; a same-day pass had already refused this stamp
   and recorded it in an outcome_note, where the next executor never read it
 - `.claude/rules/archive-before-delete.md` — the protocol both incidents violate
-- `core/scripts/temp-drain-purge.sh` — `_purge_find_predicate` header is the
-  SSOT for which suffixes are third-class
-- `core/config/conventions/temp-store.md` § The third-class watermark
+- `core/scripts/temp-drain-purge.sh` — `_purge_find_predicate` header (now the
+  per-path predicate for reviewed discards; it no longer has a third class)
+- `core/config/conventions/temp-store.md` § The decision log (the replacement)

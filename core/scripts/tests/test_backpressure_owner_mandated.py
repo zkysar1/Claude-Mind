@@ -62,7 +62,10 @@ def _import():
 MOD = _import()
 CLI_SRC = SCRIPT.read_text(encoding="utf-8")
 API_SRC = MIRROR.read_text(encoding="utf-8")
-BOTH = pytest.mark.parametrize("src,name", [(CLI_SRC, "core/scripts"), (API_SRC, "mind_api/src")])
+# ids= keeps the node id short: pytest copies it into PYTEST_CURRENT_TEST, and Windows
+# caps an environment value at 32,767 characters (a default id embeds the whole value).
+BOTH = pytest.mark.parametrize("src,name", [(CLI_SRC, "core/scripts"), (API_SRC, "mind_api/src")],
+                               ids=["core/scripts", "mind_api/src"])
 
 
 def _owner_allowlist():

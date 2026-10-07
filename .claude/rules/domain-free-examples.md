@@ -56,7 +56,7 @@ than the framework core. Use this decision sub-tree to route correctly:
 | **Framework structural protocol/schema/API** (JSONL field definitions, script CLI signatures, integration catalogs) | `core/config/conventions/<kebab-case>.md` | Declarative, domain-agnostic, catalog-style |
 | **Domain reference docs / lookup tables** (resource locators, endpoint catalogs, agent-name list) | `world/conventions/*.md` per `encode-stable-facts.md` | Lookup data, not learned knowledge |
 
-The full decision tree (with all 11 routing rules) lives in
+The full decision tree (with all 12 routing rules) lives in
 `core/config/conventions/learning-routing.md` § "Decision Tree". The
 "Rules vs Conventions" sub-tree is rule 11 there.
 

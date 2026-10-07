@@ -50,6 +50,19 @@ Cost: the pending query is ~11 MB / ~2 s per iteration on top of the ~30 KB
 in-progress one — accepted, because a lane that cannot see its population is
 worth nothing at any speed.
 
+A REVIEW REQUEST IS A HOLD (g-375-143)
+--------------------------------------
+A holder that asks for a peer review (`review_requested`, coordination.md Review
+Gate) keeps the goal open on purpose until a verdict comes back, the same way a
+`defer_reason` parks it. The lane never read the field: measured 2026-10-06, the
+reducer closed 6 goals a live session held for review, 4 of them before any
+verdict existed. So `build_slate` holds back a row whose request no RELEASING
+verdict answers yet (`review_held`, computed in main() from close-review-queue's
+`answers` and the gate's own `releases_close`). A REJECT answers the request but
+does not release the close: that goal needs rework, not a close. Held rows stay
+in the population, counted (`mine_held_back_review_requested`) and named. If the
+verdicts cannot be read, every requested row is held and the report says so.
+
 WHY THIS EXISTS BESIDE completed-not-closed-triage.py
 -----------------------------------------------------
 The triage lane is correct and stays: it is the DEEP census (dead-carrier
@@ -109,13 +122,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 _DEFAULT_PER_ITERATION = 3
 _DEFAULT_MIN_CLAIM_AGE_HOURS = 6.0
@@ -232,11 +246,47 @@ def holder_of(g: Dict[str, Any]) -> str:
     return (g.get("claimed_by") or g.get("executed_by") or _UNATTRIBUTED)
 
 
+def _review_queue():
+    """close-review-queue.py by path (its filename is hyphenated), cached the way it caches
+    the gate. Its `answers` and the gate it loads keep ONE definition of when a review
+    request is done (g-375-143)."""
+    cached = sys.modules.get("close_review_queue")
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(
+        "close_review_queue",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "close-review-queue.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["close_review_queue"] = mod
+    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+    return mod
+
+
+def review_held_ids(rows: List[Dict[str, Any]]) -> Set[str]:
+    """Drain candidates whose `review_requested` no RELEASING verdict answers yet: no
+    verdict, one from before the request, or a REJECT. An unreadable verdict file reads as
+    no verdict, so its row is held. Raises only when the reader itself cannot load, and
+    main() then holds every requested row."""
+    crq = _review_queue()
+    gate = crq._gate()
+    held: Set[str] = set()
+    for g in rows:
+        requested = g.get("review_requested")
+        gid = g.get("goal_id") or g.get("id") or ""
+        if not requested or not gid or not is_drain_candidate(g):
+            continue
+        v = gate.read_verdict(gate.verdict_path(gid))
+        if not (crq.answers(v, requested) and gate.releases_close(v.get("verdict"))):
+            held.add(gid)
+    return held
+
+
 def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
                 min_age_hours: float, now: datetime,
                 own_sid: str = "",
                 holds: Optional[List[Dict[str, Any]]] = None,
-                hold_ttl_hours: float = _DEFAULT_HOLD_TTL_HOURS) -> Dict[str, Any]:
+                hold_ttl_hours: float = _DEFAULT_HOLD_TTL_HOURS,
+                review_held: Optional[Set[str]] = None) -> Dict[str, Any]:
     """Pure: filter + rank + bound. `rows` is aspirations-query --full output.
 
     Population counts are computed BEFORE the age gate and the bound so the
@@ -246,6 +296,9 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
     most recent hold is younger than `hold_ttl_hours` is held back and COUNTED
     (`mine_held_back_recent_hold`); older holds expire and the row resurfaces
     carrying `hold_count` + `last_hold_reason` so a repeat is visible.
+
+    `review_held` is the set from review_held_ids(): those rows wait for their
+    review and are COUNTED (`mine_held_back_review_requested`), whatever their age.
     """
     hold_by_goal: Dict[str, List[Dict[str, Any]]] = {}
     for h in holds or []:
@@ -309,17 +362,22 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
     held_back_recent_hold = 0
     held_back_note_unchanged = 0
     note_unchanged_rows: List[Any] = []
+    review_held_rows: List[str] = []
     for g in mine_noted:
+        gid = g.get("goal_id") or g.get("id") or ""
         sid = g.get("claimed_by_sid") or ""
         if own_sid and sid == own_sid:
             held_back_own_sid += 1
+            continue
+        # A review request is the holder's own hold (), so it wins over age.
+        if review_held and gid in review_held:
+            review_held_rows.append(gid)
             continue
         ts = _parse_ts(g.get("claimed_at")) or _parse_ts(g.get("last_modified"))
         age_h = (now - ts).total_seconds() / 3600.0 if ts else None
         if age_h is not None and age_h < min_age_hours:
             held_back_fresh += 1
             continue
-        gid = g.get("goal_id") or g.get("id") or ""
         recent = None
         for h in hold_by_goal.get(gid, []):
             hts = _parse_ts(h.get("held_at"))
@@ -406,6 +464,8 @@ def build_slate(rows: List[Dict[str, Any]], agent: str, *, limit: int,
             "mine_held_back_recent_hold": held_back_recent_hold,
             "mine_held_back_note_unchanged": held_back_note_unchanged,
             "note_unchanged_goal_ids": [gid for gid, _ in note_unchanged_rows],
+            "mine_held_back_review_requested": len(review_held_rows),
+            "review_held_goal_ids": review_held_rows,
             "by_holder": by_holder,
         },
         "hold_ttl_hours": hold_ttl_hours,
@@ -616,7 +676,11 @@ def _render(result: Dict[str, Any]) -> None:
           f"recent_hold(<{result.get('hold_ttl_hours', _DEFAULT_HOLD_TTL_HOURS):g}h)="
           f"{pop.get('mine_held_back_recent_hold', 0)} "
           f"note_unchanged={pop.get('mine_held_back_note_unchanged', 0)} "
+          f"review_requested={pop.get('mine_held_back_review_requested', 0)} "
           f"| slate={len(result['slate'])} dropped={result['dropped']}")
+    if result.get("review_hold_error"):
+        print("[cnc-slate] REVIEW VERDICTS UNREADABLE, so every row carrying a review "
+              "request is held (fail closed, g-375-143): " + result["review_hold_error"])
     if pop.get("fleet_undrainable"):
         print(f"[cnc-slate] of fleet_noted, {pop['fleet_undrainable']} row(s) are "
               "UNDRAINABLE: no claimed_by and no executed_by, so the holder-scoped "
@@ -631,6 +695,10 @@ def _render(result: Dict[str, Any]) -> None:
         print("[cnc-slate] suppressed on an UNCHANGED note (already judged not-cnc; "
               "resurfaces automatically when the note is rewritten — guard-1691): "
               + ", ".join(_nu))
+    _rh = pop.get("review_held_goal_ids") or []
+    if _rh:
+        print("[cnc-slate] waiting for a peer review (a review request no releasing verdict "
+              "answers yet; the close-review lane owns them, g-375-143): " + ", ".join(_rh))
     others = {h: v for h, v in (pop.get("by_holder") or {}).items() if h != result["agent"]}
     if others:
         parts = [f"{h}:{v['noted']}"
@@ -642,7 +710,7 @@ def _render(result: Dict[str, Any]) -> None:
               " Unclaimed rows are keyed by executed_by; '(unattributed)' has no drainer at all.")
     if not result["slate"]:
         if pop["mine_noted"]:
-            # guard-4719: this branch is reachable by FOUR independent suppressors,
+            # guard-4719: this branch is reachable by FIVE independent suppressors,
             # so naming one of them unconditionally misreports the cause. Measured
             # 2026-09-11 (zeta, cc-02): held_back_fresh=0 and note_unchanged=17,
             # and the line still blamed the age gate — sending a reader to inspect
@@ -653,6 +721,8 @@ def _render(result: Dict[str, Any]) -> None:
                 ("a recent hold (< hold TTL)", "mine_held_back_recent_hold"),
                 ("an UNCHANGED note (already judged not-cnc)",
                  "mine_held_back_note_unchanged"),
+                ("a review request no releasing verdict answers yet",
+                 "mine_held_back_review_requested"),
             ) if pop.get(key, 0)]
             _why = ("; ".join(f"{label}: {n}" for label, n in _sup) if _sup
                     else "NO suppressor counter is non-zero — that is itself a "
@@ -794,9 +864,23 @@ def main() -> int:
     min_age = (args.min_age_hours if args.min_age_hours is not None
                else cfg["min_claim_age_hours"])
     rows = _load_rows(args.timeout)
+    # The review hold fails CLOSED (). If the verdicts cannot be read, every row
+    # carrying a request is held: holding a finished goal costs one more iteration, while
+    # draining one that waits for its review closes it unreviewed.
+    review_error = ""
+    try:
+        review_held = review_held_ids(rows)
+    except Exception as e:  # noqa: BLE001 - any reader fault holds, it never drains
+        review_held = {g.get("goal_id") or g.get("id") for g in rows
+                       if g.get("review_requested") and (g.get("goal_id") or g.get("id"))
+                       and is_drain_candidate(g)}
+        review_error = f"{type(e).__name__}: {e}"
     result = build_slate(rows, args.agent, limit=limit, min_age_hours=min_age,
                          now=datetime.now(), own_sid=os.environ.get("MIND_SID", ""),
-                         holds=load_holds(hpath), hold_ttl_hours=cfg["hold_ttl_hours"])
+                         holds=load_holds(hpath), hold_ttl_hours=cfg["hold_ttl_hours"],
+                         review_held=review_held)
+    if review_error:
+        result["review_hold_error"] = review_error
     if args.json:
         json.dump(result, sys.stdout, indent=2, ensure_ascii=False)
         print()

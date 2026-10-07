@@ -67,11 +67,11 @@ and `meta/` prefixes only) — agent paths in shell commands fall through unchec
 `core/scripts/path-resolution-hook.py` refuses Write/Edit/MultiEdit creating a
 NEW top-level entry under `WORLD_PATH`, `META_PATH`, or the bound agent's dir.
 Does NOT fire on writes into existing dirs, edits to existing files, writes
-under `agents/<agent>/sessions/<SID>/` for a bound session, shell mkdir/cp/touch,
-or `AGENT_WRITE_PATH`. Cross-agent writes: advisory only (g-375-04).
+under `agents/<agent>/sessions/<SID>/` for a bound session, or `AGENT_WRITE_PATH`.
+Cross-agent writes: advisory (g-375-04). Shell mkdir/cp/touch: unseen, NOT exempt.
 
 **No agent-side override.** To add a top-level entry: ask the user, or update
-an `init-*.sh` script; once the directory exists on disk, writes pass.
+an `init-*.sh` script; once it exists, writes pass.
 
 ## Cross-references
 

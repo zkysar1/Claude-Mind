@@ -93,8 +93,11 @@ class EfsSshPathWarning(unittest.TestCase):
         # stray repo-root ssm-stub.sh byte-equal to _STUB exists, but its
         # provenance is unproven. The guard stands on the hazard, not on that
         # file. Skip rather than proceed on an unusable temp dir.
-        _tmp = subprocess.run([BASH, "-c", "mktemp -d"], capture_output=True,
-                              text=True, timeout=60).stdout.strip()
+        # cygpath -m: the MSYS path `mktemp -d` prints (/tmp/tmp.X) is not one native Python can
+        # open; the mixed form (C:/...) is, and both sides accept it (guard-581: -m, never -w).
+        _tmp = subprocess.run(
+            [BASH, "-c", 'd=$(mktemp -d) && { cygpath -m "$d" 2>/dev/null || echo "$d"; }'],
+            capture_output=True, text=True, timeout=60).stdout.strip()
         if not _tmp or _tmp in (".", "/"):
             raise unittest.SkipTest(f"mktemp -d gave no usable path: {_tmp!r}")
         cls._tmp = Path(_tmp)

@@ -232,7 +232,7 @@ Still open before any environment is named, in either flag:
 - Who prunes the archive and when. It keeps what the collector removes, so it bounds the
   standing set in the segment directory but does not shrink the bucket until a pruning
   rule exists; that rule is a deletion and owes its own archive-before-delete.
-  Decided in U28 ("The archive pruning rule (U28)" below): the rule and its planner exist, its executor is still owed.
+  Decided in U28 ("The archive pruning rule (U28)" below): the rule and its planner exist; its executor is in the tree, landed dark, and is verified in U31 ("The archive prune executor, verified (U31)" below).
 - The 412 window is narrowed by U6 (next section) and U8, not closed: the gaps that remain are listed
   there and in the U8 section.
 
@@ -972,6 +972,10 @@ Item 6 follows 5. Item 7 follows 6 and is one commit.
    derivation (alpha b3601ef26, bravo ff5b834da, echo 5d5fa93ab, foxtrot 722010c34, zeta 92a0ffeb3; ages 0.0 to 0.1 d), `unattested` and
    `stale` empty, `seam_symbols.ok` complete with `missing` empty, the local box (zc-02) carries the seam. The U20/U21 cause cleared
    exactly the way it was predicted to: the merge landed and the three unattested agents each made an iteration commit after pulling it.
+   **Re-read at U30 (2026-10-05T10:08Z): rc 0, SAFE again, now with the per-Body lane complete** — per_body 18 of 18 proven,
+   `all_proven` true, `enumeration_complete` true, `distinct_bases` 6; the UNSAFE `per_body_reader_unproven` of 2026-10-04 (12 of 18 at
+   20:51Z, 14 of 18 at 21:35Z) cleared when the boxes pulled the merge and their ticks published `main_base`. Item 5's writer flag is
+   committed on an alpha worker ref ("The writer flag (U30)"); the rollout read-backs are per box.
 2. **The tick's code is in the reducer's tree.**
    ```
    git fetch -q origin; git cat-file -e origin/main:core/scripts/composite-gc-tick.sh; echo "tick rc=$?"     # 0 present, 128 absent
@@ -1065,10 +1069,12 @@ limb stops. The alarm's dedup holds only while an Investigate for the key is ope
 whether the alarm learns the composite head (it already holds date-rotated streams to a designed envelope on the versions limb) or an open
 Investigate stays as the tracker. Decided in U20: the alarm learns the head, and this prediction was replayed there.
 
-**Still open, unchanged from U14 except outcome 6 (U25) and the pruning rule (U28: decided and planned, so what is open is its executor).** The archive prune executor
-(it must skip `_state/` and `_pruned/`, owes its own archive-before-delete and lands dark; "The archive pruning rule (U28)"); outcome 5's
-fresh listing (item 4); the U2e residue listing on or after 2026-10-10T00:00Z; and the optional head diet. The
-goal is not closed: the flip has not happened.
+**Still open, updated at U30 (2026-10-05).** The archive prune executor
+(it must skip `_state/` and `_pruned/`, owes its own archive-before-delete and lands dark; "The archive pruning rule (U28)"); item 5's
+per-box flag read-backs (the flag is committed on an alpha worker ref; "The writer flag (U30)"); item 6's observe passes, which start
+once the flag has reached the reducer's box and one productivity-check has run; item 7's arming commit; outcome 5's fresh listing, whose
+window opens after the LAST box restarts with the flag; the U2e residue listing on or after 2026-10-10T00:00Z; and the optional head diet.
+The goal is not closed: the flip is committed but has reached no box's running process yet.
 
 **Not established.** A delete pass at the cap was timed in U24 on a throwaway store (19.57 s at 500, 3.25 s to observe 40,149 orphans), not on
 the real queue: the real runner has still not run against the real composite head, so the first real observe pass is the first live specimen of
@@ -1856,7 +1862,7 @@ the head names and the store lacks) is None, because without it nothing shows th
 so it matches none of the four prefixes, and nothing expires a current version. That is why the archive only grows until a rule removes runs. It is a reading of the MinIO
 bucket (the live store since 2026-09-14); the older store's config is still unreadable.
 
-**What the executor owes (the next unit; its tests need a box where moto imports).** The plan says a run MAY go, not that its objects are still there and still what
+**What the executor owes (delivered: see "The archive prune executor, verified (U31)" below).** The plan says a run MAY go, not that its objects are still there and still what
 the receipt says. The executor is a deletion and runs the archive-before-delete protocol in its own right:
 - INPUTS: one delimiter listing of the archive directory (`composite_gc_runs` already does it and keeps only run ids); the receipts of the runs at least 14 d old (a
   younger run needs none); `needed` = the names the head names minus the store's listing, from the head and listing one delete pass already reads.
@@ -1891,6 +1897,40 @@ a principal that can read it (its unit decides). No store was read this unit, so
 code on this box: moto is not installed here, so 10 of the 15 test files the fast tier selected were skipped at module level, and the other five, the planner's among them, ran green. The
 planner has read no real receipt: the shape it reads is the one `composite_gc_apply` builds (`owncloud_backend.py`, the `receipt = {"kind": "composite-gc-archive", "format": 1` block
 and the closing `receipt.update(status=...)`), read from the code and not from a run, because the collector has never run against production. The 14 d window and the cap of 12 are choices.
+
+## The writer flag (U30)
+
+Committed on an alpha worker ref 2026-10-05 (zc-07): `OWNCLOUD_COMPOSITE_STORES=ayoai-mind` added to the `env` object of
+`.claude/settings.json`, beside `OWNCLOUD_GZIP_STORES`. The flag reaches a box when the reducer merges the ref and that box pulls it, and
+a process takes it at its next start, so the rollout is per box and takes days (U21: a commit that touches only settings.json restarts no
+daemon). The per-box rollout is the rest of item 5; this box carries the flag locally from the commit.
+
+**Why it is landed now.** Item 1's gate has read `UNSAFE per_body_reader_unproven` since U23 (12 of 18 live Bodies proven at 20:51Z, 14 of 18 at
+21:35Z). Re-read at 2026-10-05T10:08Z it reads **rc 0, SAFE**: per_body 18 of 18 proven, `all_proven` true, `enumeration_complete` true,
+`distinct_bases` 6, 142 carriers scanned, 123 stale skipped, 1 closed skipped, local box (zc-07) seam present, all five agents attested by
+derivation with commits of 2026-10-05. U23's lane filled exactly as its prediction said it would ("per_body.bodies_proven should climb toward
+bodies_live over the next merge-and-pull cycle"): the merge of U23's ref landed, the boxes pulled, and their ticks published `main_base`. Item 2
+was re-checked for this flip: `composite-gc-tick.sh` and `composite_gc_runner.py` are both present on origin/main (both `git cat-file -e`
+exits 0). Item 3's lifecycle read stands as U25's (2026-10-04T19:15:08Z; the re-read is owed at item 7, not before the flip).
+
+**The pre-flip reading (item 4, owed "before the first box carries the flag").** `s3-store-churn.sh --window-hours 24 --top 8` at
+2026-10-05T10:2xZ: rc 0, `control=PASS`, structural control PASS (8 non-empty pages for 8 prefixes). The head key took **2,201 versions,
+24.1 GiB** in the 24 h window; the whole enumeration holds 19,892 versions and 215.2 GiB for the key (33.8% of the 635.9 GiB bucket; current
+108,061 objects / 52.6 GiB, noncurrent 161,124 / 583.3 GiB, delete markers 45,596; oldest retained head version 2026-09-27). This is the
+companion reading outcome 5's bar is read against (1,757,775,353 B in a fresh 24 h window): the window opens after the LAST box restarts with
+the flag, because a window containing a process without the flag measures the mixed fleet and about 70 whole-object writes a day fail it (U21).
+At the head's stored size, the bytes limb is far from the bar and the versions limb (>500/24 h) will keep firing (U20's decision stands).
+
+**Not established.** The rollout itself: no box has restarted with the flag yet as of this commit, so item 5's pass (the composite line in the
+daemon and the shell of every box, the reducer's included) and item 6's observe passes are future readings, and the per-box read-backs are
+per-box evidence read with item 5's names-only commands. The churn figure is one reading; the 24 h rate moves 1.9x between days (U25's caveat),
+so outcome 5's window is read beside this one, not against a trend. The arming commit (item 7) is still gated on item 6's first real read-backs
+and the T0 + 14 d reading, unchanged.
+
+**Check.** Per-box read-back of the flag (item 5's commands, the gzip line the positive control); item 6's read at the first read and T0 + 1 d
+and T0 + 14 d; outcome 5's fresh listing after the last box restarts with the flag.
+
+**State at 2026-10-05T21:2xZ (alpha, cc-04), and a corrected premise.** The flag did not stay on a worker ref: the reducer merged it as M1 (4afe5df478a0, 11:21Z) and it reached origin/main at 21:01Z while item 1 read UNSAFE (per_body 17 of 19 proven; unproven alpha 64d80ba1 and bravo 1d2e91a2 on DESKTOP-O91DLK2, `no_main_base`). "A process takes it at its next start, so the rollout takes days" did not hold for a box whose daemon respawns on HEAD moves: `daemon_overlay_settings_env` (g-358-183) fills a respawned daemon from the working tree's committed settings.json, so this box's daemon carried the flag from its first respawn after the merge, with composite heads in the store from 11:37:07Z (83 of the newest 1,000 versions of the goal-queue object by 21:01:09Z, none a small non-head version). Commit 4b18c2f80c sets the value to the empty string (off), and this box's daemon was respawned with it off at 21:16:25Z. Item 5 is therefore OPEN again: set `ayoai-mind` back only after item 1 reads SAFE, re-read in the same command as the commit. Record: rb-12875, msg-20261005-212330-alpha-606, and the g-358-202 progress_note marker `m1-flag-armed-disarmed-alpha-20261005`.
 
 ## Outcome 3 under design (b): no segment handler, and the seam is pinned (U3b)
 
@@ -1991,6 +2031,68 @@ the 172 files was run, and the census that sorts them is a regex plus reading. T
 hold for a file added tomorrow is the registry-wide invariant test for STORES entries (relayed as sq-013 after U4a, not
 filed here). The goal owners should confirm this reading of outcome 4, as the fork section above already asks.
 
+## The archive prune executor, verified (U31)
+
+Verified 2026-10-05. The code and a 116-case test file were already in the tree; this unit measured them under moto, found three pins missing and added them, and ran the
+executor's control and its read-only enumeration once each on the live store. Evidence: `audit-reports/g-358-202/u31-prune-executor-verified/`.
+
+**What was found.** The executor U28 listed as owed has been in the tree since commit 8230d2afee (2026-10-05T06:38Z). That commit is a `chore(worker-stop)` commit: a worker Body
+that was stopped mid-unit had its uncommitted work swept into it, so no section, note or evidence recorded it, and its code comments call it U30, a number the writer-flag unit took
+later. The NOT CLOSED lists of the two units after it (router, writer flag) therefore still said the executor was owed. This unit found it by listing the test directory, not by
+reading this record. Nothing calls it: a search of `core`, `mind_api` and `.claude` finds the definitions and their documentation only, and `OWNCLOUD_COMPOSITE_GC_PRUNE` is set
+in `.claude/settings.json`, in that box's agent `local-paths.conf` or in its environment.
+
+**What it is.** `OwnCloudBackend` in `owncloud_backend.py`, with the pure parts in `_owncloud_composite.py`:
+- `composite_gc_prune_enumerate(path, now)`: read-only, no flag. It lists the archive's top-level names, reads the receipt of every run at least 14 d old, reads the head and the
+  segment directory for `needed` (the head is read again after the listing: a head that moved is not an answer), plans with `plan_archive_prune`, and for each planned run lists its
+  prefix and scopes the removal by the receipt (`plan_run_removal`): the receipt's `archive_key`s, each at the receipt's size. A key outside the run's `objects/`, a key the receipt
+  does not name, a missing receipt or a size that differs keeps the whole run, with the reason.
+- `composite_gc_prune_control(now)`: no flag. It PUTs a sentinel under `_state/_prune-control/<token>` (the response must carry a real `VersionId`), reads it back, plain-deletes it,
+  requires the key absent with exactly one delete marker (the newest entry) and exactly one noncurrent version, the PUT's, at the sentinel's size, restores from that version and
+  compares its md5, puts the restored bytes back and reads them, then removes every version it made. A key that already has any entry is refused before the PUT. Any miss stops the pass.
+- `composite_gc_prune_apply(path, now)`: inert (`prune-not-enabled`, no S3 call) unless `OWNCLOUD_COMPOSITE_GC_PRUNE` names this environment and the store is on the allowlist; the flag
+  is its own, never implied by `OWNCLOUD_COMPOSITE_GC` or the writer flag. It enumerates (a refusal stops it), runs the control (a miss removes nothing), then goes run by run, oldest
+  first, re-reading the head's `needed`, the run's receipt and its listing and re-planning that run (guard-5952). Per run the order is the protocol: HEAD each object (size equals the
+  receipt's), plain delete (never by version id), read it back absent; then the tombstone `_pruned/<run id>/RECEIPT.json` (status `pruned`, the objects kept, `removed` as key to version
+  id, `gone`, the control's evidence, the restore text), read back equal; and only then the run's own RECEIPT.json, deleted and read back absent. A pass that dies anywhere leaves that
+  receipt reading `done`; the next pass finishes the run and keeps the version ids an earlier tombstone recorded.
+
+**Measured.** All under moto 5.2.3 and pytest 9.1.1, installed with `pip install --target` into the session's scratch directory (nothing system-wide changed); `STORAGE_BACKEND=local`.
+- The planner file and the executor file together: 186 passed (70 and 116) in 16 s. Every moto-backed test the earlier units had to skip now runs.
+- The whole own-cloud and composite family (47 files, `test_owncloud_*` and `test_composite_*`): the first run read 1735 passed, 6 failed, 18 skipped. All six failures are in
+  `test_owncloud_integration.py` and none touches the executor. The cause is the shell's `STORAGE_S3_ENDPOINT_URL`, which that file's fixture does not clear (it sets credentials and
+  the bucket only): with the variable unset the file passes 7 of 7, and with it pointed at a dead local port the same test fails with `EndpointConnectionError` naming that address, so
+  the client built from the variable is not intercepted by moto. Against the real endpoint the calls carried the fixture's fake credentials and its bucket name (`zds-data`, not the
+  store's) and came back 403. With the variable unset the family reads 1741 passed, 18 skipped, 0 failed; after the three pins below, 1745 passed, 18 skipped, 0 failed (264 s, HEAD
+  unchanged throughout). All 18 skips are ones the tests declare for a property of a double (moto stamps `last_modified` at PUT so an object cannot be aged, the in-memory double pages at 2) or for Windows.
+- A mutation matrix over the executor, 53 single-site mutants on isolated copies of the two modules (the live files were byte-identical before and after): flag ignored, each of the
+  control's checks neutralised, the size check, delete by version id, the receipt deleted before the tombstone or before the objects, the re-plan skipped, a stop turned into a continue,
+  the receipt scope widened to the directory, a run prefix widened to the archive, the prune flag aliased to the orphan flag, and so on. 50 died when first run; three survived and
+  were pinned: the control's read-back right after its PUT, a second noncurrent version in the chain, and a clock or window that is not a number reading receipts. All 53 now die, each
+  with its red tests named. Isolation needed care: a copy under the repo root picked up the repo-root `conftest.py` and `pytest.ini`, and the first matrix read
+  every mutant as surviving; a module that raises at import left the file green (116 passed) until pytest was given `--confcutdir`, `--rootdir` and `-c` for the copy, after which it
+  turned the file red. That probe (a mutant that raises at import) is part of the matrix.
+- On the live store (2026-10-05T14:34:08Z), the control once, with its planned key written before its first PUT: ok, 0.043 s. The PUT carried a real `VersionId`; the plain delete left
+  one delete marker and one noncurrent version at the sentinel's 81 bytes; a read by version id matched the md5; the restored copy read back; and the cleanup by version id was
+  permitted and complete. An independent listing in a separate process found 0 versions, 0 delete markers and 0 current objects under the key and under `_prune-control/`.
+- On the live store, the read-only enumeration (0.24 s): the archive prefix holds two top-level names, `_state` and `probe-g358202-20261002T231009Z`, the U2e probe's directory, which is
+  not a run id and so is reported `unknown` and left alone. The plan refuses with `needed-unknown: head-not-composite`, because the store is still the legacy layout. No archive run exists.
+
+**Review (by reading, and by the matrix above).** Read against U28's list item by item (inputs, enumeration scoped by the receipt, the recovery layer, the control before the batch, `needed` recomputed per run, single plain
+deletes read back absent, tombstone before the receipt, land dark), the code does what the list says, and reading found no defect. The limits that stay, none fixed here (mine; override if you disagree):
+- A pass that dies after deleting some objects and before writing any tombstone leaves their version ids unrecorded: the finishing pass lists those keys under `gone` without ids. The
+  objects stay recoverable from the bucket's own version listing for the noncurrent window; only the map in the tombstone is short. Closing it means writing a tombstone before the
+  deletes, which changes the order U28 fixed.
+- An object that vanishes between a run's listing and its HEAD is in neither `removed` nor `gone` (the tombstone's `objects` still names it). Audit completeness only.
+- The caller's clock is trusted. Nothing compares `now` with the store's own time, and the planner takes `now` as an argument so tests can age runs. A wrong clock could prune a run
+  younger than 14 d; the noncurrent window still holds what a plain delete removed. The caller that is written later should pass the store's time or check the skew.
+
+**Still owed (executor side).** The arming-time reading of the bucket's lifecycle configuration by the storage host, with its `updatedAt`, recorded in the arming commit (U28's
+recommendation (a); the control proves the undo exists now, not how long it lasts); the control run again at arming, because U31's run is a specimen and not the arming reading; a
+caller, which observes first (the enumeration against a live archive, once the collector has produced a real run) and has its own cadence and lease, one pass a day keeping pace; the first
+real receipt read by the planner; and U28's check, two readings of the archive prefix 7 d apart. This section sits here and not after U28's because the writer-flag unit's unmerged edit
+inserts there.
+
 ## Staged plan
 
 1. Names, key function and the segment merge handler, registered and dark (outcome
@@ -2032,4 +2134,4 @@ with the split layer on, which the goal owners should confirm.
 
 Lock contention: a naive grep of the
 contention message is contaminated, 15 hits in one corpus dump that merely quotes
-it, so count events in lane logs, not strings. The head PUT rate is every write (U2d; U9). The router's de-duplication and episode end with the real runner (U26). The archive prune executor, and the lifecycle config on the day it runs (U28).
+it, so count events in lane logs, not strings. The head PUT rate is every write (U2d; U9). The router's de-duplication and episode end with the real runner (U26). The archive prune executor against a live archive, and the lifecycle config on the day it runs (U28, U31): U31 ran the executor's control and its enumeration on the live store, not a pass, and no archive run exists to prune.

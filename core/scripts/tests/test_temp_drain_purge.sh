@@ -10,6 +10,10 @@
 # Also unit-tests the two extracted lane functions (gc_drained_archive,
 # cleanup_stray_dirs) against a synthetic temp/: age-gating, dir preservation,
 # fresh-item survival, and the empty-temp_dir no-delete guard.
+# Since 2026-10-05 Lanes 1 and 3 delete ONLY what a review decided to discard
+# (temp_decisions.py); the "decision-gated" blocks below pin that an undecided
+# item is never deleted, whatever its suffix or age, and that every deletion is
+# logged.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -40,6 +44,12 @@ check() {
     fails=$((fails+1))
   fi
 }
+# Defined BEFORE first use. Until 2026-10-05 it was defined below a block that
+# called it, so under `set -uo pipefail` (no -e) every call there failed with
+# "command not found", never incremented `fails`, and that block could not fail.
+lcheck() {  # lcheck <desc> <expected> <actual>
+  if [ "$3" = "$2" ]; then echo "  [PASS] $1"; else echo "  [FAIL] $1 — expected '$2', got '$3'"; fails=$((fails+1)); fi
+}
 
 echo "assert_safe_temp_dir guard cases:"
 check "empty agent_dir REFUSED"           1 "$GOOD" "$PR" ""
@@ -60,7 +70,7 @@ else
 fi
 # : main() must emit the new lane fields (else a downstream JSON
 # consumer of drained_gc_*/stray_* silently sees nulls).
-for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"drained_gc_files"' '"stray_preserved_git"' '"stray_preserved_git_dirs"' '"watermark_source"'; do
+for k in '"drained_gc_would_purge"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"drained_gc_files"' '"stray_preserved_git"' '"stray_preserved_git_dirs"' '"decisions_lookup"' '"stray_dirs"' '"deletions_logged"' '"deletion_log"'; do
   if printf '%s' "$out" | grep -q "$k"; then
     echo "  [PASS] dry-run JSON carries $k"
   else
@@ -119,7 +129,7 @@ else
 fi
 # All 5 lane fields the fresh-eyes finding flagged as omitted from THIS branch MUST
 # be present so both exit paths share ONE schema ().
-for k in '"drained_gc_purged"' '"drained_gc_would_purge"' '"stray_purged"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"stray_preserved_git"' '"stray_preserved_git_dirs"' '"watermark_source"'; do
+for k in '"drained_gc_purged"' '"drained_gc_would_purge"' '"stray_purged"' '"stray_would_purge"' '"drained_age_days"' '"citation_lookup"' '"stray_preserved_git"' '"stray_preserved_git_dirs"' '"decisions_lookup"' '"stray_dirs"' '"unmanaged_dotfiles"' '"deletion_log"'; do
   if printf '%s' "$nt_out" | grep -q "$k"; then
     echo "  [PASS] no-temp-dir JSON carries $k"
   else
@@ -127,41 +137,88 @@ for k in '"drained_gc_purged"' '"drained_gc_would_purge"' '"stray_purged"' '"str
   fi
 done
 
-echo "main() third-class watermark wiring (file default + flag override — guard-1482):"
-# The predicate-level watermark pins below prove the SSOT function; they cannot
-# prove main() actually RESOLVES the file/flag precedence (guard-1482: an
-# always-passed test argument leaves the code's DEFAULT untested — the default
-# here is reading temp/.drain-watermark, which is what every production caller
-# uses). Same MIND_AGENT_DIR fixture idiom as the lane-2 wiretest above.
-WT="$(cd "$SCRIPT_DIR/../../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.wmtest-$$"
-mkdir -p "$WT/temp"
-printf 'x\n' > "$WT/temp/wmtest-orphan.jsonl"
-touch -d '200 minutes ago' "$WT/temp/wmtest-orphan.jsonl"
-# (a) no watermark file, no flag → absent; third class exempt (fail-closed)
-wm1="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run 2>/dev/null)"
-lcheck "wm absent: watermark_source=absent"      yes "$(printf '%s' "$wm1" | grep -q '"watermark_source":"absent"' && echo yes || echo no)"
-lcheck "wm absent: third-class file exempt"      no  "$(printf '%s' "$wm1" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
-# (b) THE DEFAULT PATH: watermark FILE present → source=file, third class purgeable
-date +%Y-%m-%dT%H:%M:%S > "$WT/temp/.drain-watermark"
-wm2="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run 2>/dev/null)"
-lcheck "wm file: watermark_source=file"          yes "$(printf '%s' "$wm2" | grep -q '"watermark_source":"file"' && echo yes || echo no)"
-lcheck "wm file: third-class file purgeable"     yes "$(printf '%s' "$wm2" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
-lcheck "wm file: marker NOT reported unmanaged"  no  "$(printf '%s' "$wm2" | grep -qF '".drain-watermark"' && echo yes || echo no)"
-# (c) flag 'none' overrides the file → disabled, exempt again
-wm3="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run --third-class-watermark none 2>/dev/null)"
-lcheck "wm none: watermark_source=disabled"      yes "$(printf '%s' "$wm3" | grep -q '"watermark_source":"disabled"' && echo yes || echo no)"
-lcheck "wm none: third-class file exempt again"  no  "$(printf '%s' "$wm3" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
-# (d) garbage in the marker file → invalid, fail-closed exempt
-echo garbage-not-a-timestamp > "$WT/temp/.drain-watermark"
-wm4="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run 2>/dev/null)"
-lcheck "wm invalid: watermark_source=invalid"    yes "$(printf '%s' "$wm4" | grep -q '"watermark_source":"invalid"' && echo yes || echo no)"
-lcheck "wm invalid: third-class file exempt"     no  "$(printf '%s' "$wm4" | grep -qF 'wmtest-orphan.jsonl' && echo yes || echo no)"
+echo "main() decision-gated wiring (2026-10-05) — only reviewed discards go, every deletion is logged:"
+# The function-level blocks below pin each guard; only a main() run proves the
+# candidates really come from the decision log and the deletions really reach
+# it. Same MIND_AGENT_DIR fixture idiom as the lane-2 wiretest above (a dotdir,
+# so the live temp/'s own review never sees it).
+WT="$(cd "$SCRIPT_DIR/../../.." && pwd)/agents/${MIND_AGENT:-alpha}/temp/.dgtest-$$"
+W="$WT/temp"
+td() { bash "$SCRIPT_DIR/../temp-decisions.sh" --temp-dir "$W" "$@"; }
+mkdir -p "$W/old-undecided-dir" "$W/gone-dir/sub" "$W/fresh-nested/sub"
+printf 'echo hi\n' > "$W/old-undecided.sh"      # undecided script: NEVER deleted
+printf 'x\n'       > "$W/old-undecided-dir/f"   # undecided folder: NEVER deleted
+printf 'run\n'     > "$W/junk.log"              # decided discard, aged: deleted
+printf 'y\n'       > "$W/gone-dir/sub/f"        # decided discard folder, aged: deleted
+printf 'z\n'       > "$W/fresh-nested/sub/f"    # decided discard folder, nested entry fresh: kept
+printf 'k\n'       > "$W/kept.md"               # decided keep: kept
+printf 'v1\n'      > "$W/changed.txt"           # decided discard, then edited: kept
+printf '2026-09-01T00:00:00\n' > "$W/.drain-watermark"   # retired marker: removed once, logged
+# Age everything BEFORE the review, except the one nested entry that must stay
+# fresh; the folder holding it is aged too, so only an any-depth check can see
+# it. Order matters: a folder's fingerprint covers its entries' mtimes, so
+# aging it AFTER the decision would (correctly) put it back up for review.
+find "$W" -mindepth 1 ! -path "$W/fresh-nested/sub/f" -exec touch -d '3 hours ago' {} + 2>/dev/null
+dg_dec="$(printf '%s' '[{"item":"junk.log","decision":"discard","why":"test: run output"},
+ {"item":"gone-dir","decision":"discard","why":"test: scratch folder"},
+ {"item":"fresh-nested","decision":"discard","why":"test: scratch folder"},
+ {"item":"kept.md","decision":"keep","why":"test: in use"},
+ {"item":"changed.txt","decision":"discard","why":"test: will change"}]' | td decide 2>&1)"
+if printf '%s' "$dg_dec" | grep -q 'cited set is unknown'; then
+  echo "  [SKIP] cited set unreadable on this box — a discard cannot be checked, so none was recorded (fail-closed path pinned below)"
+else
+  lcheck "decision-gated: decide recorded the batch" yes "$(printf '%s' "$dg_dec" | grep -q '"recorded": 5' && echo yes || echo no)"
+  # Edited after its review, then aged again: it must survive on the content
+  # mismatch alone, not on the in-flight guard.
+  printf 'v2-edited\n' > "$W/changed.txt"; touch -d '3 hours ago' "$W/changed.txt"
+  dg1="$(MIND_AGENT_DIR="$WT" bash "$HELPER" --dry-run 2>/dev/null)"
+  lcheck "decision-gated dry-run: files = the decided aged file only" '"files":["junk.log"]' \
+    "$(printf '%s' "$dg1" | grep -o '"files":\[[^]]*\]')"
+  lcheck "decision-gated dry-run: stray_dirs = the decided aged folder only" '"stray_dirs":["gone-dir"]' \
+    "$(printf '%s' "$dg1" | grep -o '"stray_dirs":\[[^]]*\]')"
+  lcheck "decision-gated dry-run: nested-fresh folder age-skipped" yes \
+    "$(printf '%s' "$dg1" | grep -qF '"stray_age_skipped_dirs":["fresh-nested"]' && echo yes || echo no)"
+  lcheck "decision-gated dry-run: decisions_lookup ok" yes \
+    "$(printf '%s' "$dg1" | grep -qF '"decisions_lookup":"ok"' && echo yes || echo no)"
+  lcheck "decision-gated dry-run: retired .drain-watermark reported unmanaged" yes \
+    "$(printf '%s' "$dg1" | grep -qF '".drain-watermark"' && echo yes || echo no)"
+  lcheck "decision-gated dry-run: the decision log is NOT reported unmanaged" no \
+    "$(printf '%s' "$dg1" | grep -qF '".temp-decisions.jsonl"' && echo yes || echo no)"
+  dg2="$(MIND_AGENT_DIR="$WT" bash "$HELPER" 2>/dev/null)"
+  lcheck "decision-gated real: junk.log deleted"                  no  "$([ -e "$W/junk.log" ] && echo yes || echo no)"
+  lcheck "decision-gated real: gone-dir deleted"                  no  "$([ -e "$W/gone-dir" ] && echo yes || echo no)"
+  lcheck "decision-gated real: undecided aged script SURVIVED"    yes "$([ -f "$W/old-undecided.sh" ] && echo yes || echo no)"
+  lcheck "decision-gated real: undecided aged folder SURVIVED"    yes "$([ -d "$W/old-undecided-dir" ] && echo yes || echo no)"
+  lcheck "decision-gated real: kept file SURVIVED"                yes "$([ -f "$W/kept.md" ] && echo yes || echo no)"
+  lcheck "decision-gated real: file edited after review SURVIVED" yes "$([ -f "$W/changed.txt" ] && echo yes || echo no)"
+  lcheck "decision-gated real: nested-fresh folder SURVIVED"      yes "$([ -d "$W/fresh-nested" ] && echo yes || echo no)"
+  lcheck "decision-gated real: retired watermark marker removed"  no  "$([ -e "$W/.drain-watermark" ] && echo yes || echo no)"
+  lcheck "decision-gated real: 3 deletions logged" yes \
+    "$(printf '%s' "$dg2" | grep -qF '"deletions_logged":3,"deletion_log":"ok"' && echo yes || echo no)"
+  dl="$(td show --deleted 2>/dev/null)"
+  lcheck "decision-gated log: junk.log deletion carries its review reason" yes \
+    "$(printf '%s' "$dl" | grep -qF 'junk.log [decided]  -- test: run output' && echo yes || echo no)"
+  lcheck "decision-gated log: gone-dir deletion recorded" yes \
+    "$(printf '%s' "$dl" | grep -qF 'gone-dir [decided]' && echo yes || echo no)"
+  lcheck "decision-gated log: marker retirement recorded" yes \
+    "$(printf '%s' "$dl" | grep -qF '.drain-watermark [migration]' && echo yes || echo no)"
+fi
 rm -rf "$WT"
 
+echo "decision lookup contract (2026-10-05):"
+# Lanes 1 and 3 must delete NOTHING when the decisions cannot be read. The
+# missing-script case is the hermetic proxy, as for _cited_basenames below.
+if _decided_items "/nonexistent-dir-for-temp-drain-test-zzz" "/nonexistent/temp" >/dev/null 2>&1; then
+  echo "  [FAIL] _decided_items returned 0 with no decision source — the caller would read 'no failure' as a licence"; fails=$((fails+1))
+else
+  echo "  [PASS] _decided_items returns non-zero when the decisions are UNKNOWN"
+fi
+lcheck "_json_names escapes quote and backslash" '["a\"b","c\\d","e"]' "$(_json_names "$(printf '/x/a"b\n/x/c\\d\n/x/e/\n')")"
+lcheck "_json_names on an empty list" '[]' "$(_json_names "")"
+lcheck "_kind_lines prefixes and strips paths" "$(printf 'file\tdrained/a.md\nfile\tdrained/b')" \
+  "$(_kind_lines file 'drained/' "$(printf '/t/drained/a.md\n/t/drained/b\n')")"
+
 echo "lane functions (g-115-2948) — drained/ GC + stray-dir cleanup:"
-lcheck() {  # lcheck <desc> <expected> <actual>
-  if [ "$3" = "$2" ]; then echo "  [PASS] $1"; else echo "  [FAIL] $1 — expected '$2', got '$3'"; fails=$((fails+1)); fi
-}
 T2="$(mktemp -d)"
 mkdir -p "$T2/temp/drained" "$T2/temp/stale-dir" "$T2/temp/fresh-dir"
 : > "$T2/temp/drained/old.md";    touch -d '40 days ago' "$T2/temp/drained/old.md"
@@ -285,14 +342,19 @@ lcheck "gc_drained arity: cited '30' SURVIVED the real run"         yes \
   "$([ -f "$TA/temp/drained/30" ] && echo yes || echo no)"
 rm -rf "$TA"
 
-# Lane 3 — stray-dir cleanup (>120min, NOT drained/)
-lcheck "cleanup_stray dry-run counts 1"           1          "$(cleanup_stray_dirs "$T2/temp" 120 1)"
+# Lane 3 — decided-dir cleanup. With NO names it deletes nothing (until
+# 2026-10-05 it took every dir untouched for 120 min); named, it takes the
+# aged ones only.
+lcheck "cleanup_stray with no decided names deletes NOTHING" 0 "$(cleanup_stray_dirs "$T2/temp" 120 0)"
+lcheck "cleanup_stray no-names kept the aged stale-dir" yes  "$([ -d "$T2/temp/stale-dir" ] && echo yes || echo no)"
+lcheck "cleanup_stray dry-run counts 1"           1          "$(cleanup_stray_dirs "$T2/temp" 120 1 stale-dir fresh-dir)"
 lcheck "cleanup_stray dry-run kept stale-dir"     yes        "$([ -d "$T2/temp/stale-dir" ] && echo yes || echo no)"
-lcheck "cleanup_stray real purges 1"              1          "$(cleanup_stray_dirs "$T2/temp" 120 0)"
+lcheck "cleanup_stray real purges 1"              1          "$(cleanup_stray_dirs "$T2/temp" 120 0 stale-dir fresh-dir)"
 lcheck "cleanup_stray removed stale-dir w/content" no        "$([ -d "$T2/temp/stale-dir" ] && echo yes || echo no)"
 lcheck "cleanup_stray kept fresh-dir"             yes        "$([ -d "$T2/temp/fresh-dir" ] && echo yes || echo no)"
+lcheck "cleanup_stray refuses drained/ and path names" 0     "$(cleanup_stray_dirs "$T2/temp" 0 1 drained ../temp)"
 lcheck "cleanup_stray never removed drained/"     yes        "$([ -d "$T2/temp/drained" ] && echo yes || echo no)"
-lcheck "cleanup_stray empty temp_dir -> 0"        0          "$(cleanup_stray_dirs "" 120 0)"
+lcheck "cleanup_stray empty temp_dir -> 0"        0          "$(cleanup_stray_dirs "" 120 0 stale-dir)"
 
 # Lane 3 archive-before-delete preservation (): a stray dir carrying a
 # top-level RECEIPT.md OR a .archive-marker sentinel is an archive-before-delete
@@ -310,9 +372,9 @@ touch -d '3 hours ago' \
   "$T2/temp/arc-marker/.archive-marker" "$T2/temp/arc-marker" \
   "$T2/temp/plain-stale/leftover.txt" "$T2/temp/plain-stale"
 # dry-run: only the 1 plain-stale dir would purge; both archives excluded
-lcheck "cleanup_stray dry-run counts 1 (archives excluded)" 1 "$(cleanup_stray_dirs "$T2/temp" 120 1 2>/dev/null)"
+lcheck "cleanup_stray dry-run counts 1 (archives excluded)" 1 "$(cleanup_stray_dirs "$T2/temp" 120 1 arc-receipt arc-marker plain-stale 2>/dev/null)"
 # real: purges the 1 plain-stale, preserves both archives
-lcheck "cleanup_stray real purges 1 (archives preserved)"   1 "$(cleanup_stray_dirs "$T2/temp" 120 0 2>/dev/null)"
+lcheck "cleanup_stray real purges 1 (archives preserved)"   1 "$(cleanup_stray_dirs "$T2/temp" 120 0 arc-receipt arc-marker plain-stale 2>/dev/null)"
 lcheck "cleanup_stray preserved RECEIPT.md archive dir"     yes "$([ -d "$T2/temp/arc-receipt" ] && echo yes || echo no)"
 lcheck "cleanup_stray preserved RECEIPT bodies/ + object"   yes "$([ -f "$T2/temp/arc-receipt/bodies/obj-1.json" ] && echo yes || echo no)"
 lcheck "cleanup_stray preserved .archive-marker dir"        yes "$([ -d "$T2/temp/arc-marker" ] && echo yes || echo no)"
@@ -348,8 +410,9 @@ lcheck "_has_archive_receipt: NEG nested receipt is not top-level" 1 "$(_has_arc
 lcheck "_has_archive_receipt: NEG empty arg"                     1 "$(_has_archive_receipt ""; echo $?)"
 
 # Lane-3 integration: only the 2 decoys purge; the 3 real receipts survive.
-lcheck "cleanup_stray dry-run counts 2 (3 receipts excluded)" 2 "$(cleanup_stray_dirs "$T3/temp" 120 1 2>/dev/null)"
-lcheck "cleanup_stray real purges 2 (3 receipts preserved)"   2 "$(cleanup_stray_dirs "$T3/temp" 120 0 2>/dev/null)"
+T3N=(arc-json arc-lower arc-bare decoy-substring decoy-nested)
+lcheck "cleanup_stray dry-run counts 2 (3 receipts excluded)" 2 "$(cleanup_stray_dirs "$T3/temp" 120 1 "${T3N[@]}" 2>/dev/null)"
+lcheck "cleanup_stray real purges 2 (3 receipts preserved)"   2 "$(cleanup_stray_dirs "$T3/temp" 120 0 "${T3N[@]}" 2>/dev/null)"
 lcheck "preserved RECEIPT.json dir"          yes "$([ -d "$T3/temp/arc-json" ] && echo yes || echo no)"
 lcheck "preserved RECEIPT.json payload"      yes "$([ -f "$T3/temp/arc-json/bodies/obj-1.json" ] && echo yes || echo no)"
 lcheck "preserved lowercase receipt.json dir" yes "$([ -d "$T3/temp/arc-lower" ] && echo yes || echo no)"
@@ -370,14 +433,18 @@ mkdir -p "$T4/temp" "$T4/temp/.hidden-dir"
 : > "$T4/temp/.fresh-eyes-last-ts"      # live cadence marker — must be reported, NOT deleted
 : > "$T4/temp/.gitkeep"                 # allowlisted lifecycle marker
 : > "$T4/temp/.archive-marker"          # allowlisted lifecycle marker
+: > "$T4/temp/.temp-decisions.jsonl"    # allowlisted: the decision log (2026-10-05)
+: > "$T4/temp/.drain-watermark"         # RETIRED marker (2026-10-05) — reported now
 : > "$T4/temp/plain.txt"                # NEGATIVE: not a dotfile, must not be reported
-lcheck "report_unmanaged_dotfiles counts only non-allowlisted" 2 \
+lcheck "report_unmanaged_dotfiles counts only non-allowlisted" 3 \
   "$(report_unmanaged_dotfiles "$T4/temp" 2>/dev/null)"
 report_unmanaged_dotfiles "$T4/temp" >/dev/null 2>&1
 lcheck "reported .launch-payload.json"   yes "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.launch-payload.json' && echo yes || echo no)"
 lcheck "reported .fresh-eyes-last-ts"    yes "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.fresh-eyes-last-ts' && echo yes || echo no)"
+lcheck "reported retired .drain-watermark" yes "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.drain-watermark' && echo yes || echo no)"
 lcheck "did NOT report .gitkeep"         no  "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.gitkeep' && echo yes || echo no)"
 lcheck "did NOT report .archive-marker"  no  "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.archive-marker' && echo yes || echo no)"
+lcheck "did NOT report .temp-decisions.jsonl" no "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.temp-decisions.jsonl' && echo yes || echo no)"
 lcheck "did NOT report plain.txt (non-dotfile)" no "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx 'plain.txt' && echo yes || echo no)"
 lcheck "did NOT report .hidden-dir (-type f only)" no "$(printf '%s' "$UNMANAGED_DOTFILES" | grep -Fqx '.hidden-dir' && echo yes || echo no)"
 # REPORT, NOT PURGE — every reported file MUST still be on disk afterwards.
@@ -397,164 +464,57 @@ lcheck "report emits a name on stderr"   yes \
   "$(printf '%s' "$_dot_stderr" | grep -Fq 'UNMANAGED DOTFILE' && echo yes || echo no)"
 lcheck "report on a missing temp_dir -> 0" 0 "$(report_unmanaged_dotfiles "$T4/nonexistent" 2>/dev/null)"
 lcheck "DOTFILE_ALLOWLIST override honored"  1 \
-  "$(DOTFILE_ALLOWLIST='.gitkeep .archive-marker .fresh-eyes-last-ts' report_unmanaged_dotfiles "$T4/temp" 2>/dev/null)"
+  "$(DOTFILE_ALLOWLIST='.gitkeep .archive-marker .fresh-eyes-last-ts .temp-decisions.jsonl .drain-watermark' report_unmanaged_dotfiles "$T4/temp" 2>/dev/null)"
 rm -rf "$T4"
 
-echo "purge-lane behavior (via _purge_find_predicate SSOT function, g-115-2947):"
-# Run the SSOT predicate against a synthetic temp dir. We assert the MATCHED set
-# WITHOUT -delete, so the test is hermetic — it never deletes and never touches
-# the live agent temp/. This locks in the two lanes (ephemera extensions +
-# 0-byte empties) and the two exclusions (age guard, maxdepth/drained/).
+echo "Lane-1 per-path predicate (_purge_find_predicate SSOT, 2026-10-05):"
+# The predicate no longer CHOOSES candidates (the decision log does); it is the
+# guard layer the delete evaluates on ONE decided path. So the suffix no longer
+# matters — a decided .md, .py or invented suffix is deletable alike — while a
+# dotfile, a directory, a fresh file and a cited name never are. Hermetic: it
+# lists, never deletes.
+_pmatch() {  # _pmatch <dir> — sorted basenames under <dir> the predicate accepts
+  local f
+  for f in "$1"/* "$1"/.[!.]*; do
+    [ -e "$f" ] || continue
+    find "$f" "${PURGE_FIND_PRED[@]}" -print 2>/dev/null
+  done | sed 's#.*/##' | sort | tr '\n' ' '
+}
 SYNTH="$(mktemp -d)"
-mkdir -p "$SYNTH/drained"
-# aged (>120 min) purgeable — one per ephemera extension
-for f in suite.log dump.txt build.py restart.sh gs.err selector.raw probe.out config.bak; do
-  printf 'x\n' > "$SYNTH/$f"
+mkdir -p "$SYNTH/a-dir"
+for f in notes.md data.json build.py restart.sh census.jsonl weird.premutation extensionless; do
+  printf 'content\n' > "$SYNTH/$f"
 done
-: > "$SYNTH/empty-scratch.json"          # 0-byte empty — any-name -empty lane
-: > "$SYNTH/empty-note.md"               # 0-byte empty .md — any-name -empty lane
-# aged NON-purgeable — real working docs WITH content (must be drained, not purged)
-printf '# design\n' > "$SYNTH/design-notes.md"
-printf '{"k":1}\n'   > "$SYNTH/realdata.json"
-touch -d '200 minutes ago' "$SYNTH"/*.log "$SYNTH"/*.txt "$SYNTH"/*.py "$SYNTH"/*.sh \
-  "$SYNTH"/*.err "$SYNTH"/*.raw "$SYNTH"/*.out "$SYNTH"/*.bak "$SYNTH"/*.json "$SYNTH"/*.md 2>/dev/null
-# NEGATIVE: fresh purgeable-extension file — age guard must EXCLUDE it
-printf 'fresh\n' > "$SYNTH/fresh.raw"
-# NEGATIVE: archived file under drained/ — maxdepth must EXCLUDE it
-printf 'archived\n' > "$SYNTH/drained/old.md"; touch -d '200 minutes ago' "$SYNTH/drained/old.md"
-# NEGATIVE: git-tracked 0-byte .gitkeep + a 0-byte dotfile marker (aged) — the
-# dotfile exclusion (! -name '.*') MUST protect them from the -empty lane
-# ( fresh-eyes catch: temp/'s tracked .gitkeep was being deleted, and
-# iteration-commit would have committed the deletion, breaking the fresh-clone
-# dir guarantee in temp-store.md).
-: > "$SYNTH/.gitkeep"; touch -d '200 minutes ago' "$SYNTH/.gitkeep"
-: > "$SYNTH/.hidden-marker"; touch -d '200 minutes ago' "$SYNTH/.hidden-marker"
-
+: > "$SYNTH/empty.txt"
+: > "$SYNTH/.gitkeep"
+printf 'cited\n' > "$SYNTH/cited-evidence.jsonl"
+touch -d '200 minutes ago' "$SYNTH"/* "$SYNTH/.gitkeep"
+printf 'fresh\n' > "$SYNTH/fresh.raw"     # NEGATIVE: inside the age guard
 PURGE_FIND_PRED=()
-_purge_find_predicate 120
-got="$(find "$SYNTH" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
-want="build.py config.bak dump.txt empty-note.md empty-scratch.json gs.err probe.out restart.sh selector.raw suite.log "
-if [ "$got" = "$want" ]; then
-  echo "  [PASS] 8 ephemera extensions + 2 empties purge; content-docs/fresh/drained excluded"
-else
-  echo "  [FAIL] matched set mismatch"; echo "         got:  $got"; echo "         want: $want"; fails=$((fails+1))
-fi
-# Explicit negative assertions — each MUST be absent from the matched set
-# (fixed-string, no -w: dotfile names like .gitkeep have a leading non-word char
-# that makes -w boundary matching unreliable; these basenames are distinct
-# enough that plain -F substring is unambiguous)
-for neg in design-notes.md realdata.json fresh.raw old.md .gitkeep .hidden-marker; do
-  if printf '%s' "$got" | grep -qF "$neg"; then
-    echo "  [FAIL] $neg must NOT be purged but matched"; fails=$((fails+1))
-  else
-    echo "  [PASS] $neg correctly excluded"
-  fi
+_purge_find_predicate 120 cited-evidence.jsonl
+lcheck "predicate is per-path (-maxdepth 0), never a directory sweep" "-maxdepth 0" \
+  "${PURGE_FIND_PRED[0]} ${PURGE_FIND_PRED[1]}"
+lcheck "applied to the temp dir itself it matches NOTHING" "" \
+  "$(find "$SYNTH" "${PURGE_FIND_PRED[@]}" -print 2>/dev/null)"
+lcheck "every aged regular file passes, whatever its suffix (the decision is the class)" \
+  "build.py census.jsonl data.json empty.txt extensionless notes.md restart.sh weird.premutation " \
+  "$(_pmatch "$SYNTH")"
+for neg in .gitkeep a-dir cited-evidence.jsonl fresh.raw; do
+  lcheck "$neg never passes" no "$(_pmatch "$SYNTH" | grep -qF "$neg" && echo yes || echo no)"
 done
 rm -rf "$SYNTH"
-
-echo "third-class inversion (g-306-111) — purge-by-default with exemptions:"
-# Every assertion below FAILS against the pre-inversion allow-list, which is the
-# point: the block above passes identically before and after  (it only
-# covers behavior the inversion preserves), so it proves nothing about the new
-# predicate. One distinct mutation per constraint (guard-1861).
-SYNTH2="$(mktemp -d)"
-mkdir -p "$SYNTH2/drained"
-# THIRD CLASS — the complement of drain (.md/.json) and the old 8-extension
-# purge list. Unreachable by BOTH lanes before the inversion, which is why it
-# accrued without bound. Suffixes drawn from the cc-02 2026-07-31 census,
-# including a one-off a single goal invented (.premutation) and an
-# extensionless file, to pin that the predicate keys on the COMPLEMENT rather
-# than on any enumerated list.
-for f in census.jsonl config.yaml rows.tsv archive.gz notes.eml sum.sha256 patch.patch weird.premutation extensionless; do
-  printf 'content\n' > "$SYNTH2/$f"
-done
-# EXEMPTION (ii) — non-empty .md/.json still drain, never purge
-printf '# doc\n'   > "$SYNTH2/keep-doc.md"
-printf '{"k":1}\n' > "$SYNTH2/keep-data.json"
-# EXEMPTION (iii) — a THIRD-CLASS file cited by a durable record. Without the
-# cited-set exemption this is indistinguishable from the purgeable files above,
-# so it is the one case that proves the exemption is wired, not just declared.
-printf 'cited\n'   > "$SYNTH2/cited-evidence.jsonl"
-touch -d '200 minutes ago' "$SYNTH2"/*
-# EXEMPTION (i) — dotfile, aged past the guard
-: > "$SYNTH2/.gitkeep"; touch -d '200 minutes ago' "$SYNTH2/.gitkeep"
-# NEGATIVE: under drained/ — maxdepth must still exclude it
-printf 'archived\n' > "$SYNTH2/drained/old.jsonl"; touch -d '200 minutes ago' "$SYNTH2/drained/old.jsonl"
-
-# ENCODE-BEFORE-DELETE watermark (2026-08-21): the third class is additionally
-# gated on a completed-drain watermark. Three states pinned before the original
-# inversion assertions run:
-#   absent → EXEMPT (fail-closed default — what every pre-watermark caller and
-#            every box that has never completed a drain inherits)
-#   stale  → files NEWER than the last drain keep their encode chance
-#   fresh  → files the drain provably saw purge exactly as  specified
-unset PURGE_THIRD_CLASS_WATERMARK 2>/dev/null || true
-PURGE_FIND_PRED=()
-_purge_find_predicate 120 cited-evidence.jsonl
-got2a="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
-if [ -z "$got2a" ]; then
-  echo "  [PASS] no watermark → third class EXEMPT (encode-before-delete fail-closed default)"
-else
-  echo "  [FAIL] no watermark must exempt the third class, matched: $got2a"; fails=$((fails+1))
-fi
-# stale: last drain completed 300 min ago; fixtures are 200 min old → they
-# postdate that drain (never classified) and must keep their encode chance.
-PURGE_THIRD_CLASS_WATERMARK="$(date -d '300 minutes ago' +%Y-%m-%dT%H:%M:%S)"
-PURGE_FIND_PRED=()
-_purge_find_predicate 120 cited-evidence.jsonl
-got2b="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
-if [ -z "$got2b" ]; then
-  echo "  [PASS] stale watermark → post-drain files stay exempt"
-else
-  echo "  [FAIL] stale watermark must exempt post-drain files, matched: $got2b"; fails=$((fails+1))
-fi
-# fresh: every fixture predates the watermark — the drain provably saw them —
-# so the original  inversion assertions below apply unchanged.
-PURGE_THIRD_CLASS_WATERMARK="$(date +%Y-%m-%dT%H:%M:%S)"
-PURGE_FIND_PRED=()
-_purge_find_predicate 120 cited-evidence.jsonl
-got2="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
-want2="archive.gz census.jsonl config.yaml extensionless notes.eml patch.patch rows.tsv sum.sha256 weird.premutation "
-if [ "$got2" = "$want2" ]; then
-  echo "  [PASS] 9 third-class files purge (9 suffix shapes incl. one-off + extensionless)"
-else
-  echo "  [FAIL] third-class matched set mismatch"; echo "         got:  $got2"; echo "         want: $want2"; fails=$((fails+1))
-fi
-for neg in keep-doc.md keep-data.json cited-evidence.jsonl .gitkeep old.jsonl; do
-  if printf '%s' "$got2" | grep -qF "$neg"; then
-    echo "  [FAIL] $neg must NOT be purged but matched"; fails=$((fails+1))
-  else
-    echo "  [PASS] $neg correctly exempt"
-  fi
-done
-
-# The FAIL-CLOSED fallback. When the cited set is unknown, main() uses the
-# legacy allow-list — which must reach NONE of the third class, or the
-# degradation would still delete files it cannot prove are uncited.
-PURGE_FIND_PRED=()
-_purge_find_predicate_legacy 120
-got3="$(find "$SYNTH2" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
-if [ -z "$got3" ]; then
-  echo "  [PASS] legacy fallback matches NO third-class file (fail-closed degrade)"
-else
-  echo "  [FAIL] legacy fallback matched: $got3"; fails=$((fails+1))
-fi
-rm -rf "$SYNTH2"
 
 echo "cited-pattern breadth guard (g-306-111):"
 # Wildcards in cited paths are REAL and must be honored (measured: 4 of 64 live
 # cited paths carry one). But a pattern matching ANY name would exempt every
-# file and silently revert the inversion — the failure that looks like success.
+# decided file and silently disable Lane 1 — the failure that looks like success.
 SYNTH3="$(mktemp -d)"
-# Watermark set fresh: these blocks pin CITATION-SHAPE behavior on an ACTIVE
-# third class (unrelated.jsonl is third-class and appears in expected sets).
-PURGE_THIRD_CLASS_WATERMARK="$(date +%Y-%m-%dT%H:%M:%S)"
 printf 'x\n' > "$SYNTH3/g-335-531-residue.py"
 printf 'x\n' > "$SYNTH3/unrelated.jsonl"
 touch -d '200 minutes ago' "$SYNTH3"/*
 # A family wildcard exempts its family and NOTHING else.
 PURGE_FIND_PRED=(); _purge_find_predicate 120 'g-335-531-*'
-g4="$(find "$SYNTH3" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+g4="$(_pmatch "$SYNTH3")"
 if [ "$g4" = "unrelated.jsonl " ]; then
   echo "  [PASS] family wildcard 'g-335-531-*' exempts its family only"
 else
@@ -562,7 +522,7 @@ else
 fi
 # An over-broad pattern must be DROPPED, not honored — else the lane empties.
 PURGE_FIND_PRED=(); _purge_find_predicate 120 '*' 2>/dev/null
-g5="$(find "$SYNTH3" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+g5="$(_pmatch "$SYNTH3")"
 if [ "$g5" = "g-335-531-residue.py unrelated.jsonl " ]; then
   echo "  [PASS] over-broad '*' dropped — lane still purges (cannot silently self-disable)"
 else
@@ -583,15 +543,13 @@ echo "class-wide cited exemption (g-001-84):"
 # a stemless pattern names a whole file CLASS. Both directions are asserted here:
 # rejecting every glob would delete the 7 legitimately-cited families.
 SYNTH4="$(mktemp -d)"
-# Watermark fresh here too (unrelated.jsonl is third-class in every expected set).
-PURGE_THIRD_CLASS_WATERMARK="$(date +%Y-%m-%dT%H:%M:%S)"
 printf 'x\n' > "$SYNTH4/dump.raw"
 printf 'x\n' > "$SYNTH4/mergeback-a.raw"
 printf 'x\n' > "$SYNTH4/unrelated.jsonl"
 touch -d '200 minutes ago' "$SYNTH4"/*
 # NEGATIVE: a stemless class pattern is dropped — the whole extension still purges.
 PURGE_FIND_PRED=(); _purge_find_predicate 120 '*.raw' 2>/dev/null
-g6="$(find "$SYNTH4" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+g6="$(_pmatch "$SYNTH4")"
 if [ "$g6" = "dump.raw mergeback-a.raw unrelated.jsonl " ]; then
   echo "  [PASS] class-wide '*.raw' dropped — the .raw class still purges"
 else
@@ -599,7 +557,7 @@ else
 fi
 # POSITIVE CONTROL: a stem-bearing family wildcard over the SAME extension is honored.
 PURGE_FIND_PRED=(); _purge_find_predicate 120 'mergeback-*' 2>/dev/null
-g7="$(find "$SYNTH4" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+g7="$(_pmatch "$SYNTH4")"
 if [ "$g7" = "dump.raw unrelated.jsonl " ]; then
   echo "  [PASS] stem-bearing 'mergeback-*' still exempts its family (not a blanket glob ban)"
 else
@@ -614,15 +572,13 @@ fi
 # so '*.*' never matched it and was honored outright before the stem test existed.
 # Pinned separately from '*' because they take different branches ( review).
 PURGE_FIND_PRED=(); _purge_find_predicate 120 '*.*' 2>/dev/null
-g8="$(find "$SYNTH4" "${PURGE_FIND_PRED[@]}" 2>/dev/null | sed 's#.*/##' | sort | tr '\n' ' ')"
+g8="$(_pmatch "$SYNTH4")"
 if [ "$g8" = "dump.raw mergeback-a.raw unrelated.jsonl " ]; then
   echo "  [PASS] '*.*' dropped — the sentinel never covered it, the stem test does"
 else
   echo "  [FAIL] '*.*' honored, lane shielded: got '$g8'"; fails=$((fails+1))
 fi
 rm -rf "$SYNTH4"
-# Don't leak the citation-shape watermark into blocks added below this line.
-unset PURGE_THIRD_CLASS_WATERMARK 2>/dev/null || true
 
 echo "stray git-repo preservation (g-115-3648) — sole-copy git content survives Lane 3:"
 # A stray git repo with a clean worktree looks maximally safe by every signal
@@ -656,11 +612,17 @@ mkdir -p "$TG3/temp/repo-empty"; git -C "$TG3/temp/repo-empty" init -q 2>/dev/nu
 mkdir -p "$TG3/temp/plain"; echo x > "$TG3/temp/plain/junk.txt"
 find "$TG3/temp" -mindepth 1 -exec touch -d '3 hours ago' {} + 2>/dev/null || true
 touch -d '3 hours ago' "$TG3/temp"/* 2>/dev/null
-lcheck "git-guard dry-run counts 3 (pushed+empty+plain)" 3 "$(cleanup_stray_dirs "$TG3/temp" 120 1 2>/dev/null)"
-cleanup_stray_dirs "$TG3/temp" 120 1 >/dev/null 2>&1
+TG3N=(repo-unpushed repo-pushed repo-dirty repo-empty plain)
+lcheck "git-guard dry-run counts 3 (pushed+empty+plain)" 3 "$(cleanup_stray_dirs "$TG3/temp" 120 1 "${TG3N[@]}" 2>/dev/null)"
+cleanup_stray_dirs "$TG3/temp" 120 1 "${TG3N[@]}" >/dev/null 2>&1
+# Two probes have now run over every repo. A plain `git status` would have
+# rewritten each stale .git/index, making the repo look touched to the
+# in-flight guard (and shifting its review fingerprint) — measured 2026-10-05.
+lcheck "git probe is a pure read (nothing under temp freshened)" no \
+  "$([ -n "$(find "$TG3/temp" -mindepth 1 -mmin -120 -print -quit 2>/dev/null)" ] && echo yes || echo no)"
 lcheck "git-guard preserved list names repo-unpushed"    yes "$(printf '%s' "$STRAY_PRESERVED_GIT" | grep -qFx 'repo-unpushed' && echo yes || echo no)"
 lcheck "git-guard preserved list names repo-dirty"       yes "$(printf '%s' "$STRAY_PRESERVED_GIT" | grep -qFx 'repo-dirty' && echo yes || echo no)"
-lcheck "git-guard real run purges 3"                     3   "$(cleanup_stray_dirs "$TG3/temp" 120 0 2>/dev/null)"
+lcheck "git-guard real run purges 3"                     3   "$(cleanup_stray_dirs "$TG3/temp" 120 0 "${TG3N[@]}" 2>/dev/null)"
 lcheck "repo-unpushed SURVIVED (sole-copy commit)"       yes "$([ -d "$TG3/temp/repo-unpushed" ] && echo yes || echo no)"
 lcheck "repo-dirty SURVIVED (dirty tracked file)"        yes "$([ -d "$TG3/temp/repo-dirty" ] && echo yes || echo no)"
 lcheck "repo-pushed purged (fully pushed + clean)"       no  "$([ -d "$TG3/temp/repo-pushed" ] && echo yes || echo no)"
@@ -710,7 +672,7 @@ echo x > "$TG4/temp/just-touched/f.txt"
 touch -d '3 hours ago' "$TG4/temp/aged-dir/f.txt" "$TG4/temp/aged-dir"
 # just-touched keeps its now-mtime: inside the 120-min window, so never evaluated.
 
-cleanup_stray_dirs "$TG4/temp" 120 1 >"$TG4/n" 2>/dev/null; _n="$(cat "$TG4/n")"
+cleanup_stray_dirs "$TG4/temp" 120 1 aged-dir just-touched >"$TG4/n" 2>/dev/null; _n="$(cat "$TG4/n")"
 lcheck "aged dir is evaluated (counted)"                 1   "$_n"
 lcheck "fresh dir is reported as age-skipped"            1   "${STRAY_AGE_SKIPPED:-0}"
 lcheck "age-skipped list NAMES the fresh dir"            yes "$(printf '%s' "${STRAY_AGE_SKIPPED_DIRS:-}" | grep -q 'just-touched' && echo yes || echo no)"
@@ -718,7 +680,7 @@ lcheck "age-skipped dir is NOT folded into the count"    no  "$(printf '%s' "$_n
 
 # Neutralized guard: the same dir must now report a REAL lane verdict, and the
 # skip tally must fall to zero — the operator's escape hatch actually works.
-cleanup_stray_dirs "$TG4/temp" 0 1 >"$TG4/n0" 2>/dev/null; _n0="$(cat "$TG4/n0")"
+cleanup_stray_dirs "$TG4/temp" 0 1 aged-dir just-touched >"$TG4/n0" 2>/dev/null; _n0="$(cat "$TG4/n0")"
 lcheck "--age-min 0 evaluates both dirs"                 2   "$_n0"
 lcheck "--age-min 0 leaves nothing age-skipped"          0   "${STRAY_AGE_SKIPPED:-0}"
 
@@ -727,10 +689,21 @@ lcheck "--age-min 0 leaves nothing age-skipped"          0   "${STRAY_AGE_SKIPPE
 TG5="$(mktemp -d)"
 mkdir -p "$TG5/temp/only-fresh"
 echo x > "$TG5/temp/only-fresh/f.txt"
-cleanup_stray_dirs "$TG5/temp" 120 1 >"$TG5/n1" 2>/dev/null; _n1="$(cat "$TG5/n1")"
+cleanup_stray_dirs "$TG5/temp" 120 1 only-fresh >"$TG5/n1" 2>/dev/null; _n1="$(cat "$TG5/n1")"
 lcheck "no evaluable dirs -> count 0"                    0   "$_n1"
 lcheck "...but the skipped dir is STILL reported"        1   "${STRAY_AGE_SKIPPED:-0}"
-rm -rf "$TG4" "$TG5"
+# ANY-DEPTH freshness (2026-10-05): the folder and its subfolder are aged, one
+# file three levels down is not. A folder-mtime check (the pre-2026-10-05 rule)
+# would delete it; the decided-dir lane must hold it back.
+TG6="$(mktemp -d)"
+mkdir -p "$TG6/temp/deep/a/b"
+echo x > "$TG6/temp/deep/a/b/live.txt"
+touch -d '3 hours ago' "$TG6/temp/deep/a/b" "$TG6/temp/deep/a" "$TG6/temp/deep"
+cleanup_stray_dirs "$TG6/temp" 120 0 deep >"$TG6/n2" 2>/dev/null; _n2="$(cat "$TG6/n2")"
+lcheck "nested fresh file holds back an aged folder (count 0)" 0 "$_n2"
+lcheck "...the folder is reported as age-skipped"        1   "${STRAY_AGE_SKIPPED:-0}"
+lcheck "...and it is still on disk"                      yes "$([ -f "$TG6/temp/deep/a/b/live.txt" ] && echo yes || echo no)"
+rm -rf "$TG4" "$TG5" "$TG6"
 
 if [ "$fails" -gt 0 ]; then echo ""; echo "$fails failure(s)"; exit 1; fi
 echo ""

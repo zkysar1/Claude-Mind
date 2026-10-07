@@ -261,14 +261,15 @@ accuracy_min_sample: 5                  # require at least 5 resolved hypotheses
 tree_encoding_drift_threshold: 3
 
 # temp/ accumulation pressure (file-model normalization Phase 5).
-# precheck-eval.py cmd_temp_pressure counts UNDRAINED working docs directly under
-# the bound agent's temp/ (excluding the drained/ audit subdir) and flags
+# precheck-eval.py cmd_temp_pressure counts the items awaiting review directly
+# under the bound agent's temp/ — any kind, not in flight, no decision in force
+# (temp_decisions.pressure_counts; never the drained/ audit subdir) — and flags
 # accumulation so temp/ never becomes the new slush directory. warn = visible
 # nudge; drain = orchestrator files a HIGH /drain-temp goal (deduped against any
-# open drain goal). temp/ is a staging SSOT that drains to the knowledge tree —
-# see core/config/conventions/temp-store.md.
+# open drain goal). temp/ is a staging SSOT whose every item gets a recorded
+# review decision — see core/config/conventions/temp-store.md.
 temp_pressure:
-  warn_threshold: 10          # >= this many undrained docs -> visible warn (no goal)
+  warn_threshold: 10          # >= this many items awaiting review -> visible warn (no goal)
   drain_goal_threshold: 20    # >= this many -> file a HIGH /drain-temp goal
   drain_goal_max_age_hours: 48  # open drain goal older than this with pressure still
                                 # >= drain threshold -> temp_drain_stalled: the precheck
@@ -461,9 +462,35 @@ close_review_gate:
   # superseded path for a week while the gate resolved the new one. Corrected 2026-09-09.
   # HAZARD: repairing the CODE back to the old closer-keyed path would let the closer write
   # their own approval — reintroducing exactly the self-review defect this gate prevents.
-  # PRECONDITION TO ENABLE: the fresh-eyes close reviewer (the verdict PRODUCER,
-  # sibling goal ) exists and is invocable. Until then the refusal text
-  # names a remedy nobody can run.
+  # PRECONDITION TO ENABLE, AS FIRST WRITTEN: the fresh-eyes close reviewer (the verdict
+  # PRODUCER, sibling goal ) exists and is invocable. MET 2026-09-02 (fdb7ebbd0);
+  # it had written 257 verdicts by 2026-10-06. The flag STAYS OFF anyway, for measured
+  # reasons that replace that one (guard-3503). This block is their one home: the gate
+  # docstring, iteration-close.sh, coordination.md and gates.yaml point here.
+  # MEASURED 2026-10-06 (alpha, hostname cc-14, ) over the live queue's 209
+  # non-recurring closes of 10-03..10-06: 178 were tier 2, and 165 of those had no
+  # independent APPROVE when they closed, so enabling now would refuse about 93% of
+  # tier-2 closes. Four things must land first:
+  #   1. FIXED 2026-10-06 (). The gate was ROLE-BLIND: it never read
+  #      review_closer_roles/review_sampled_roles below, so it would have refused the
+  #      post-hoc worker lane too (81 worker tier-2 closes in those 3 days). Check A now
+  #      passes a closer whose BODY_ROLE is in either list. Those 81 pass, which leaves
+  #      84 of the 178 refused, about 47%.
+  #   2. A refusal had no reachable remedy except the override. Any closer could pass
+  #      --override-close-review, and a Body did exactly that on another gate
+  #      (2026-09-23, see POST-HOC below). PARTLY FIXED 2026-10-06 (): a refusal
+  #      now stamps review_requested itself, so the queue offers the goal to a reviewer,
+  #      and the override is honored only where team-state lists no other mind. Still
+  #      open, as step 4b (): a refused LOOP close is released and can be
+  #      picked again before its verdict lands, instead of waiting parked, and its
+  #      outcome note is not yet written for the reviewer. Workers stay post-hoc.
+  #   3. The completed-not-closed drain closes through the complete-by wrapper, outside
+  #      do_verify, so it would bypass this check. PARTLY FIXED 2026-10-06 (,
+  #      ea86cd6edf): the drain holds a goal whose review request no releasing verdict
+  #      answers. It still closes through complete-by ().
+  #   4. Capacity. Peers wrote about 26 verdicts a day (09-27..10-05) against about 57
+  #      tier-2 closes a day: about 26 from worker Bodies, about 31 from minds' sessions.
+  # The plan that lands them is tracked under the arming goal .
   enabled: false
   # Refuse a close whose own outcome_note/progress_note carries a HIGH-confidence
   # not-done marker (reuses the closed_against_own_note detector, precheck 0.5b.22).
@@ -477,16 +504,22 @@ close_review_gate:
   # longer flags). Precondition (measure the rate first) is now SATISFIED green
   # (0 false positives), so check B is ELIGIBLE to enable and its override
   # --override-note-marker is reachable (guard-1532 unreachable-remedy does NOT
-  # apply to B). LEFT DORMANT: enabling changes fleet-wide close behaviour + the
-  # shipped-dormant posture guarded by test_gate_is_DORMANT_by_default, a separate
-  # decision beyond 's scope (which was to record the rate).
-  note_marker_enabled: false
+  # apply to B). It stayed off only because the enable decision was outside
+  # 's scope, which was to record the rate.
+  # ENABLED 2026-10-06 (), on the user's directive that day to turn the gate on.
+  # Re-measured that day with the gate's own detector and call shape: 0 of 209 completed
+  # goals in the live queue reach HIGH (58 low, 10 medium), and a real not-done note
+  # scores HIGH, so the zero is a reading. Each evaluation now logs a firing, `pass` when
+  # no HIGH marker is found, so a quiet window reads as ran-and-passed, not as silence.
+  # It covers do_verify closes only; the drain's complete-by closes skip it ().
+  note_marker_enabled: true
   # Env overrides for tests / a deliberate one-run enable:
   #   CLOSE_REVIEW_GATE_ENABLED=1  CLOSE_REVIEW_NOTE_MARKER_ENABLED=1
+  # They can only switch a flag ON. The off-ramp is this file.
   # POST-HOC lane (, 2026-09-24): closures by these CLOSER ROLES are reviewed
-  # AFTER the close by an independent mind through /fresh-eyes-close — the gate above
-  # stays dormant for them. Read by core/scripts/close-review-queue.py (`list` ranks the
-  # unreviewed ones, `stats` gives the pass rate per role); the reviewer is the recurring
+  # AFTER the close by an independent mind through /fresh-eyes-close — check A above
+  # skips them, reading the closer's BODY_ROLE (). Read by core/scripts/close-review-queue.py
+  # (`list` ranks the unreviewed ones, `stats` gives the pass rate per role); the reviewer is the recurring
   # world goal that drains the queue. Why after and not blocking: a lesser-model Body
   # handles a refused close by passing the override (measured 2026-09-23, zc-02 on the
   # uncommitted-work gate), and a refusal it cannot override stalls it on a branch the

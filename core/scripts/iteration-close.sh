@@ -1375,51 +1375,14 @@ do_verify() {
         fi
     fi
 
-    # ── Close-review gate (g-357-40) ─────────────────────────────────────────
-    # Definition of Done. Two independent checks, BOTH DORMANT BY DEFAULT:
-    #   A. a tier-2 goal refuses to close without an APPROVE close-review verdict
-    #      artifact  (core/config/aspirations.yaml close_review_gate.enabled)
-    #   B. a goal whose OWN outcome_note/progress_note carries a HIGH-confidence
-    #      not-done marker refuses, printing the match
-    #      (close_review_gate.note_marker_enabled)
-    # Placed here for the same reasons as the domain-suite gate directly above:
-    # BEFORE the status write, so a refusal leaves the goal OPEN and the EXIT
-    # trap's verify branch prints the retry line carrying the override flags; and
-    # both roles close through here, so it is the one place enforcement lands.
-    #
-    # WHY DORMANT ON SHIP, and why that is the correct posture rather than a hedge
-    # (guard-1532): check A's refusal text names "run the close review", whose
-    # PRODUCER is the sibling goal g-357-41 and does not exist yet. A gate whose
-    # named remedy is unreachable forces every caller onto --override, which
-    # manufactures false records in the very ledger the gate exists to fill — and
-    # those records are not self-correcting. Check B's own filing requires
-    # measuring the refusal rate over the live completed population first (the
-    # high tier is known to flag at least one legitimate close, g-115-5085). Flip
-    # each flag when its own precondition lands, independently.
-    # Only the gate's OWN verdict refuses: rc 1 is a block; rc 0 is
-    # pass/noop/override/error; anything else is a gate fault and fails OPEN.
-    if [[ "$GOAL_STATUS" == "completed" && -f "$SCRIPT_DIR/close-review-gate.py" ]]; then
-        _crg_args=(--goal "$GOAL_ID" --source "$SOURCE")
-        [[ -n "$OVERRIDE_CLOSE_REVIEW" ]] && _crg_args+=(--override-close-review "$OVERRIDE_CLOSE_REVIEW")
-        [[ -n "$OVERRIDE_NOTE_MARKER" ]] && _crg_args+=(--override-note-marker "$OVERRIDE_NOTE_MARKER")
-        _crg_rc=0
-        python3 "$(_winpath "$SCRIPT_DIR/close-review-gate.py")" "${_crg_args[@]}" \
-            >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _crg_rc=$?
-        if [[ $_crg_rc -eq 1 ]]; then
-            echo "[iteration-close] ✖ REFUSED — CLOSE REVIEW (g-357-40): goal $GOAL_ID stays open. See the reason above, then re-run this close." >&2
-            return 1
-        elif [[ $_crg_rc -ne 0 ]]; then
-            echo "[iteration-close] WARN close-review-gate rc=$_crg_rc (gate fault, fail-open) — close review was NOT checked for $GOAL_ID" >&2
-        fi
-    fi
-
     # ── Closure-evidence gate (g-375-05) ─────────────────────────────────────
     # A completed close must show a measured value for each verification
     # outcome: one "OUTCOME <n>: MET — <value>. Source: ..." row per outcome,
     # whose paths resolve, whose store claims the store backs, and whose
     # intervals cite two timestamps. Format and the measured incident live in
-    # gates/closure_evidence.py. Same place as the two gates above: before the
-    # status write, for both roles. Unlike them it refuses on rc 3, not 1: Python
+    # gates/closure_evidence.py. Same place as the domain-suite gate above: before
+    # the status write, for both roles. Unlike the domain-suite gate and the
+    # close-review gate below, this gate refuses on rc 3, not 1: Python
     # exits 1 on any uncaught exception, so a crashed or unimportable gate would
     # refuse every close (guard-5430). Any other non-zero rc fails open with the
     # WARN below. It reads the note that will LAND: --outcome-note-file, else
@@ -1437,6 +1400,44 @@ do_verify() {
             return 1
         elif [[ $_ceg_rc -ne 0 ]]; then
             echo "[iteration-close] WARN closure-evidence-gate rc=$_ceg_rc (gate fault, fail-open) — closure evidence was NOT checked for $GOAL_ID" >&2
+        fi
+    fi
+
+    # ── Close-review gate (g-357-40) ─────────────────────────────────────────
+    # Definition of Done. Two independent checks; A ships off, B is on since 2026-10-06:
+    #   A. a tier-2 goal refuses to close without an APPROVE close-review verdict
+    #      artifact  (core/config/aspirations.yaml close_review_gate.enabled)
+    #   B. a goal whose OWN outcome_note/progress_note carries a HIGH-confidence
+    #      not-done marker refuses, printing the match
+    #      (close_review_gate.note_marker_enabled)
+    # Placed BEFORE the status write for the same reasons as the domain-suite gate
+    # above: a refusal leaves the goal OPEN and the EXIT trap's verify branch
+    # prints the retry line carrying the override flags; and both roles close
+    # through here, so it is the one place enforcement lands. It runs AFTER the
+    # closure-evidence gate because a check-A refusal now requests the review
+    # itself (g-375-147), so a reviewer is asked only about a close whose
+    # evidence rows already pass.
+    #
+    # WHY A IS STILL OFF, and why that is the correct posture rather than a hedge
+    # (guard-1532): a gate whose named remedy is unreachable forces every caller
+    # onto --override, which manufactures false records in the very ledger the gate
+    # exists to fill — and those records are not self-correcting. A's measured
+    # blockers live in one place, the close_review_gate block of
+    # core/config/aspirations.yaml. Flip each flag when its own precondition lands.
+    # Only the gate's OWN verdict refuses: rc 1 is a block; rc 0 is
+    # pass/noop/override/error; anything else is a gate fault and fails OPEN.
+    if [[ "$GOAL_STATUS" == "completed" && -f "$SCRIPT_DIR/close-review-gate.py" ]]; then
+        _crg_args=(--goal "$GOAL_ID" --source "$SOURCE")
+        [[ -n "$OVERRIDE_CLOSE_REVIEW" ]] && _crg_args+=(--override-close-review "$OVERRIDE_CLOSE_REVIEW")
+        [[ -n "$OVERRIDE_NOTE_MARKER" ]] && _crg_args+=(--override-note-marker "$OVERRIDE_NOTE_MARKER")
+        _crg_rc=0
+        python3 "$(_winpath "$SCRIPT_DIR/close-review-gate.py")" "${_crg_args[@]}" \
+            >>"$CORE_ROOT/logs/iteration-close-stderr.log" || _crg_rc=$?
+        if [[ $_crg_rc -eq 1 ]]; then
+            echo "[iteration-close] ✖ REFUSED — CLOSE REVIEW (g-357-40): goal $GOAL_ID stays open. See the reason above, then re-run this close." >&2
+            return 1
+        elif [[ $_crg_rc -ne 0 ]]; then
+            echo "[iteration-close] WARN close-review-gate rc=$_crg_rc (gate fault, fail-open) — close review was NOT checked for $GOAL_ID" >&2
         fi
     fi
 

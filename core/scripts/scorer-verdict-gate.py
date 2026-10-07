@@ -22,6 +22,19 @@ wedge claiming — the worst case of a verdict-write failure is that the gate
 simply does not run this iteration. Only a FRESH verdict carrying a known
 top_goal_id can produce a deny.
 
+THE WALK'S OWN RECORD CAN SANCTION A DIVERGENCE (g-375-133). A worker Body
+claims the first row its select-walk kept, and the walk drops, before its cut,
+every row a worker can never take (a reducer-only skill, a structural
+no_claim). When the scorer's top pick is one of those, the kept row is not the
+top, so this gate refused the worker's first claim, and its deny said to claim
+the top instead. Measured on the zc Bodies over 2026-10-03..05: the Body then
+read that top in full, tried to claim it (refused no_claim), reloaded
+aspirations-select and re-claimed its own pick with a code, 8 to 26 minutes per
+block. So when NO code is given and this session's fresh select census names
+this same top as dropped and the claimed goal as kept, the claim is a
+sanctioned self-abstention, logged as an override like any other. Every other
+divergence is refused exactly as before.
+
 Verdict schema (written by goal-selector.write_scorer_verdict):
   {"top_goal_id": str, "top_score": float, "ts": "YYYY-MM-DDTHH:MM:SS",
    "top_5": [{"goal_id": str, "score": float}, ...]}
@@ -31,7 +44,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Closed set of sanctioned deviation codes. A claim of a goal OTHER than the
@@ -59,6 +72,12 @@ TS_FMT = "%Y-%m-%dT%H:%M:%S"
 # gate's firings (see _gate_log.log's docstring, and the `instrumented` field).
 GATE_ID = "scorer-sovereignty-claim-gate"
 
+# : the walk record this gate may read, and the code it sanctions. The
+# name is worker_execute.SELECT_CENSUS_FILENAME, pinned equal by a test; the gate
+# does not import that module on the claim path.
+SELECT_CENSUS_FILENAME = "select-census.json"
+WALK_DROPPED_CODE = "self-abstention"
+
 # Every branch of _classify maps to exactly one _gate_log decision, chosen by
 # the branch's OBSERVABLE CONTROL-FLOW EFFECT AT THE CALLER (guard-1743), not
 # by local intent. The caller is aspirations-claim.sh: `exit 2` aborts the
@@ -85,6 +104,7 @@ DECISION_BY_PATH = {
     "top_pick_match":         "pass",
     "unsanctioned_deviation": "block",
     "sanctioned_deviation":   "override",
+    "walk_dropped_top":       "override",   # the walk's census is the named bypass
 }
 
 
@@ -119,8 +139,34 @@ def _deny_message(claimed, top, code):
     )
 
 
+def _walk_dropped_top(census, top, claimed, now, freshness_minutes=FRESHNESS_MINUTES):
+    """True when this session's select census shows its walk DROPPED `top` (the
+    verdict's top pick) before the cut and KEPT `claimed` (g-375-133).
+
+    Every condition must hold, or the ordinary deny stands. The census must name
+    the same top as the verdict: a later bare selector run that moved the top is
+    a different ranking from the one the walk judged. It must record that top as
+    dropped, list `claimed` among its kept rows, and be no older than the
+    verdict's own freshness window. `now` is naive UTC, the census's clock.
+
+    Any kept row passes, not only the first: the worker loop has the Body take
+    the first kept row it can, skipping one a partner already holds, and this
+    gate cannot see a partner's in-flight set.
+    """
+    if not isinstance(census, dict) or census.get("scorer_top") != top:
+        return False
+    if census.get("scorer_top_dropped") is not True:
+        return False
+    rows = census.get("rows")
+    if not isinstance(rows, list) or claimed not in {
+            r.get("goal_id") for r in rows if isinstance(r, dict)}:
+        return False
+    ts = _parse_ts(census.get("ts"))
+    return ts is not None and (now - ts) <= timedelta(minutes=freshness_minutes)
+
+
 def _classify(verdict, claimed_goal_id, deviation_code, now,
-              freshness_minutes=FRESHNESS_MINUTES):
+              freshness_minutes=FRESHNESS_MINUTES, census=None, census_now=None):
     """Pure branch classifier (no I/O) — the SINGLE source of branch truth.
 
     Returns (decision_path, exit_code, message, override_event):
@@ -136,6 +182,12 @@ def _classify(verdict, claimed_goal_id, deviation_code, now,
     FAIL-OPEN: a non-dict/missing verdict, a verdict with no top_goal_id, or a
     stale/unparseable-timestamp verdict all allow. Only a FRESH verdict with a
     known top pick can deny.
+
+    `census` is this session's select-walk census and `census_now` the naive
+    UTC time it is aged against (g-375-133). With no census, or no `census_now`
+    to age it by, the walk check never passes and every branch decides as it
+    did before the census existed: the census is never aged on `now`, the
+    verdict's local clock.
 
     `evaluate` below is a 3-tuple facade over this function; the branch logic
     lives here ONCE so the telemetry label and the decision cannot drift apart.
@@ -158,6 +210,12 @@ def _classify(verdict, claimed_goal_id, deviation_code, now,
         return "top_pick_match", 0, "", None
 
     code = str(deviation_code or "").strip()
+    if not code and census_now is not None and _walk_dropped_top(
+            census, top, claimed, census_now, freshness_minutes):
+        # The walk dropped the top as a row this worker can never take and kept
+        # this one: a sanctioned self-abstention, with the walk as its evidence.
+        return ("walk_dropped_top", 0, "",
+                {"claimed": claimed, "scorer_top": top, "code": WALK_DROPPED_CODE})
     if not code or code not in VALID_DEVIATION_CODES:
         return "unsanctioned_deviation", 2, _deny_message(claimed, top, code), None
 
@@ -168,7 +226,7 @@ def _classify(verdict, claimed_goal_id, deviation_code, now,
 
 
 def evaluate(verdict, claimed_goal_id, deviation_code, now,
-             freshness_minutes=FRESHNESS_MINUTES):
+             freshness_minutes=FRESHNESS_MINUTES, census=None, census_now=None):
     """Pure decision core (no I/O) — 3-tuple facade over `_classify`.
 
     Returns (exit_code, message, override_event). Kept at three elements
@@ -177,7 +235,8 @@ def evaluate(verdict, claimed_goal_id, deviation_code, now,
     Callers that need the telemetry label call `_classify` directly.
     """
     _path, exit_code, message, override_event = _classify(
-        verdict, claimed_goal_id, deviation_code, now, freshness_minutes)
+        verdict, claimed_goal_id, deviation_code, now, freshness_minutes,
+        census=census, census_now=census_now)
     return exit_code, message, override_event
 
 
@@ -187,6 +246,30 @@ def _load_verdict(path):
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except (OSError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def _load_census(explicit_path, agent):
+    """This session's select-walk census (), or None.
+
+    Anything missing or unreadable is simply no walk evidence: the gate then
+    decides exactly as it did before the census existed, so a failure here can
+    never allow a claim the gate used to refuse."""
+    try:
+        if explicit_path:
+            path = Path(explicit_path)
+        else:
+            sid = os.environ.get("MIND_SID", "")
+            if not sid:
+                return None
+            os.environ.setdefault("MIND_AGENT", agent)
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from _paths import agent_session_dir
+            path = agent_session_dir(agent, sid) / SELECT_CENSUS_FILENAME
+        with open(path, "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return doc if isinstance(doc, dict) else None
+    except Exception:
         return None
 
 
@@ -249,7 +332,7 @@ def _log_gate_firing(decision_path, agent, claimed, top, code):
                 "deviation": code or None,
             },
             override_reason=(
-                code or None) if decision_path == "sanctioned_deviation" else None,
+                code or None) if DECISION_BY_PATH.get(decision_path) == "override" else None,
             agent_name=agent or None,
         )
     except Exception:
@@ -264,6 +347,9 @@ def main(argv=None):
     ap.add_argument("--deviation", default="")
     ap.add_argument("--verdict-file", default="",
                     help="explicit verdict path (tests); default resolves via _paths")
+    ap.add_argument("--census-file", default="",
+                    help="explicit select census path (tests); default resolves "
+                         "this session's via _paths and MIND_SID")
     args = ap.parse_args(argv)
 
     # Resolve the verdict sidecar. --agent is authoritative for path resolution:
@@ -286,12 +372,15 @@ def main(argv=None):
 
     verdict = _load_verdict(verdict_path)
     decision_path, exit_code, message, override_event = _classify(
-        verdict, args.goal_id, args.deviation, datetime.now())
+        verdict, args.goal_id, args.deviation, datetime.now(),
+        census=_load_census(args.census_file, args.agent),
+        census_now=datetime.now(timezone.utc).replace(tzinfo=None))
 
+    # The code actually used: the walk branch names one the caller never passed.
     _log_gate_firing(
         decision_path, args.agent, args.goal_id,
         verdict.get("top_goal_id") if isinstance(verdict, dict) else None,
-        args.deviation)
+        override_event["code"] if override_event else args.deviation)
 
     if exit_code == 2:
         print(message, file=sys.stderr)

@@ -285,9 +285,8 @@ def evicted_summary(removed):
 
 
 # Append-only sink, one JSON row per evicted capture entry. Sits beside the
-# agent's other durable archives rather than under temp/, which
-# temp-drain-purge deletes recursively after 120 minutes — staging is never
-# archiving.
+# agent's other durable archives rather than under temp/, a staging area whose
+# items are reviewed and then routed or deleted — staging is never archiving.
 CAPTURE_EVICTION_ARCHIVE = "capture-evictions-archive.jsonl"
 
 
@@ -418,6 +417,21 @@ def archive_evicted_captures(agent_dir, slot_name, removed_list, reason):
 # limit * this ratio a victim that still cannot be archived is popped anyway, and
 # the caller reports it as an eviction with no archived copy.
 EVICTION_ARCHIVE_CEILING = 2
+
+
+#  - the warning an UNFLAGGED sq-013 relay gets on a Body WM. The
+# DAEMON copy in wm_write.py (UNFLAGGED_RELAY_WARNING, the same bytes) is the live
+# one: wm-append.sh is daemon-only. This copy prints it to stderr for parity and
+# test_wm_append_unflagged_relay_warning.py pins the two byte-identical (the text
+# names the field, never a transport-specific flag, so both can carry it).
+UNFLAGGED_RELAY_WARNING = (
+    "this sq-013 relay is UNFLAGGED, so it stays in the working memory of this "
+    "Body until the Body closes: only entries with load_bearing set to true are "
+    "mirrored to the carrier the reducer reads before then (guard-6181). If the "
+    "reducer needs it sooner (a defect another Body could hit, a correction to "
+    "an encoded belief, a blocking dependency), append it again with load_bearing "
+    "set to true; if delivery at close is soon enough, ignore this line."
+)
 
 
 def archive_evicted_capture_local(archive_file, slot_name, removed, reason):
@@ -1711,6 +1725,18 @@ def cmd_append(args):
               "entry is in the local carrier only and will reach the reducer "
               "at the close-time full merge, not through the priority lane.",
               file=sys.stderr)
+    # : TWIN of the daemon's `warning` (wm_write.py::append_slot, the
+    # LIVE path). An unflagged sq-013 relay on a Body WM waits for the Body to
+    # close; say so while the writer can still flag it.
+    if (root_slot_for_validation == "spark_capture" and isinstance(item, dict)
+            and item.get("sq_trigger") == "sq-013" and not item.get("load_bearing")):
+        try:
+            import body_capture_carrier as _bcc
+            _warn_body = _bcc.split_body_wm_path(wm_path())[0] is not None
+        except Exception:  # noqa: BLE001 - classification never fails an append
+            _warn_body = False
+        if _warn_body:
+            print(f"[wm] {UNFLAGGED_RELAY_WARNING}", file=sys.stderr)
 
 def cmd_clear(args):
     """Clear (null out) a slot. RMW protected by wm_lock — see ."""

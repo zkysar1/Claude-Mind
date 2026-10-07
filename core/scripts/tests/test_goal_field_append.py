@@ -1011,3 +1011,121 @@ def test_the_read_finds_a_goal_in_every_status(monkeypatch, status):
 
     monkeypatch.setattr(GFA, "_run", fake_query)
     assert GFA.read_goal("g-1-1", "world")["status"] == status
+
+
+# ── 11. The idempotency key is a whole LINE, not a substring () ──────
+# compose() writes the sentinel alone on the last line of its block. A note that
+# only MENTIONS a sentinel inside a sentence is text, not a landed write. A
+# substring test let such a mention swallow a later append with that marker:
+# changed:false, nothing stored, and success for the caller. Measured 2026-10-06:
+# 163 (field, marker) pairs in the world's active goals held their sentinel only
+# inside a longer line. Every check of "did my sentinel land?" moved together, and
+# the tests below pin them one by one: a check left on `in` takes the mention for
+# the write. The description field is used because it is never signed.
+
+def _mention(marker="m1", where="mid"):
+    s = GFA.sentinel_for(marker)
+    return {"mid": "a note that mentions " + s + " inside a sentence",
+            "end": "the earlier write is recorded as " + s,
+            "start": "an earlier line\n" + s + " is how that write was recorded"}[where]
+
+
+def test_has_sentinel_line_matches_a_whole_line_only():
+    s = GFA.sentinel_for("m1")
+    assert GFA.has_sentinel_line(GFA.compose("", "text", "m1"), s)
+    assert GFA.has_sentinel_line("text\n" + s + " \r\n\nlater block", s), \
+        "a trailing space or CR still matches"
+    for where in ("mid", "end", "start"):
+        assert not GFA.has_sentinel_line(_mention("m1", where), s), where
+    assert not GFA.has_sentinel_line("text\n  " + s, s), "an indented copy is not a boundary either"
+    assert not GFA.has_sentinel_line("text\n" + GFA.sentinel_for("m10"), s), "m10 is not m1"
+
+
+@pytest.mark.parametrize("where", ["mid", "end", "start"])
+def test_a_mention_of_the_marker_does_not_swallow_the_append(monkeypatch, where):
+    """The goal's check: append with marker M to a field whose prose mentions [appended:M]."""
+    pre = _mention("m1", where)
+    store, state = _concurrent_store(monkeypatch, pre=pre, peer_text=None, field="description")
+    assert GFA.main(["g-1", "description", "m1", "MY-TEXT"]) == GFA.RC_OK
+    assert len(state["writes"]) == 1, "a mention of the marker swallowed the append"
+    assert store["description"].startswith(pre), "the mention stays, as text"
+    assert store["description"].endswith("MY-TEXT\n" + GFA.sentinel_for("m1"))
+
+
+def test_a_genuine_rerun_with_the_same_marker_is_still_a_no_op(monkeypatch):
+    """Positive control (guard-4166): the line test still sees the sentinel compose()
+    wrote, in a field that ALSO mentions it inside a sentence."""
+    pre = GFA.compose(_mention("m1", "mid"), "MY-TEXT", "m1")
+    store, state = _concurrent_store(monkeypatch, pre=pre, peer_text=None, field="description")
+    assert GFA.main(["g-1", "description", "m1", "MY-TEXT"]) == GFA.RC_OK
+    assert state["writes"] == [], "a genuine re-run must still write nothing"
+    assert store["description"] == pre
+
+
+def test_a_mention_arriving_between_read_and_write_is_a_conflict(monkeypatch):
+    """The pre-write re-read. A peer's text that mentions our sentinel is a concurrent
+    change; reading it as our own write having landed would drop our append unreported."""
+    store, state = _concurrent_store(monkeypatch, pre="ORIGINAL", peer_text=_mention("mA"),
+                                     field="description")
+    with pytest.raises(SystemExit) as exc:
+        GFA.main(["g-1", "description", "mA", "MY-TEXT"])
+    assert exc.value.code == GFA.RC_CONCURRENT_MODIFICATION
+    assert state["writes"] == []
+
+
+def _store_that_drops_the_write(monkeypatch, pre, echo, write_rc):
+    """Every read returns `pre`; the write never lands and answers `echo` with `write_rc`."""
+    def fake_run(argv, input=None, **kw):
+        joined = " ".join(str(a) for a in argv)
+        if "aspirations-query.sh" in joined:
+            return _Res(stdout=json.dumps([{"goal_id": "g-1", "priority": "MEDIUM",
+                                            "description": pre}]))
+        if "aspirations-update-goal.sh" in joined:
+            return _Res(stdout=echo, returncode=write_rc)
+        raise AssertionError(f"unexpected call: {joined}")
+    monkeypatch.setattr(GFA, "_run", fake_run)
+
+
+def test_a_failed_write_is_not_recovered_by_a_mention(monkeypatch):
+    """The rc!=0 recovery read. With the first check moved, a mention now reaches the
+    write, and a recovery read still testing `in` would take the mention for the landed
+    write and report success for a write that never landed."""
+    _store_that_drops_the_write(monkeypatch, "earlier\n\n" + _mention("m1"),
+                                echo="noise", write_rc=1)
+    with pytest.raises(SystemExit) as exc:
+        GFA.main(["g-1", "description", "m1", "MY-TEXT"])
+    assert exc.value.code == GFA.RC_WRITE_FAILED
+
+
+def test_a_write_the_store_does_not_show_is_not_reported_agreed(monkeypatch, capsys):
+    """The final confirmation read. The wrapper answers rc=0 but the store still holds
+    PRE. This script reports a re-read without its sentinel as LAGGING (guard-1122), and
+    a mention must not turn that into 'agreed'."""
+    pre = "earlier\n\n" + _mention("m1")
+    _store_that_drops_the_write(monkeypatch, pre, write_rc=0,
+                                echo=json.dumps({"goal_id": "g-1", "description": pre}))
+    assert GFA.main(["g-1", "description", "m1", "MY-TEXT"]) == GFA.RC_OK
+    out = json.loads(capsys.readouterr().out)
+    assert out["confirm_read"].startswith("LAGGING"), out["confirm_read"]
+
+
+def test_verify_post_does_not_take_a_mention_for_the_sentinel():
+    s = GFA.sentinel_for("m1")
+    post = "earlier\n\n" + _mention("m1") + "\nMY-TEXT"
+    assert "marker sentinel absent from the stored value" in GFA.verify_post("earlier", post, s)
+
+
+def test_a_marker_with_a_line_break_is_refused_before_any_read(monkeypatch):
+    """A newline splits the sentinel over two lines, which the whole-line test never
+    finds, so every re-run would append again. The refusal sits in the marker check
+    store-field-append imports, so both writers refuse it."""
+    assert "line break" in (GFA.wrapped_marker_refusal("m\n1") or "")
+    assert GFA.wrapped_marker_refusal("m1") is None
+
+    def fake_run(argv, **kw):
+        raise AssertionError("nothing may be read or written for a refused marker")
+
+    monkeypatch.setattr(GFA, "_run", fake_run)
+    with pytest.raises(SystemExit) as exc:
+        GFA.main(["g-1", "description", "m\n1", "MY-TEXT"])
+    assert exc.value.code == GFA.RC_USAGE
