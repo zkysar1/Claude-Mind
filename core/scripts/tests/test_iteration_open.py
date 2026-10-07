@@ -137,16 +137,13 @@ def test_dry_run_marks_unwired_lanes_rather_than_hiding_them(table, capsys):
     io_mod.dry_run(as_json=True, md_path=table)
     d = json.loads(capsys.readouterr().out)
     assert d["lane_count"] == 11
-    # 10, not 9:  wired the medium tier, and this fixture's medium row
-    # is precheck-eval. (The same change also added world-script-crlf-check to the
-    # always-run stage's `covers` — a real under-report the coverage arithmetic had
-    # been carrying since  — but that lane is not in this fixture table,
-    # so it is not what moved this number. Attribute counts to the lane that
-    # actually moved them.)
-    assert d["wired_count"] == 10, "always-run + the medium tier are dispatched"
-    unwired = [l["sweep"] for l in d["lanes"] if not l["wired"]]
-    # Only the deferrable row remains — that tier is strangler step 3.
-    assert set(unwired) == {"pending-questions-sweep"}
+    # 11 of 11 since  (strangler step 3): the fixture's one deferrable row is
+    # pending-questions-sweep, which the deferrable-battery stage now covers. (It was
+    # 10 after  wired the medium tier -- precheck-eval -- and the same change
+    # added world-script-crlf-check to the always-run `covers`, a lane this fixture
+    # table does not contain. Attribute counts to the lane that actually moved them.)
+    assert d["wired_count"] == 11, "always-run + medium + deferrable are dispatched"
+    assert [l["sweep"] for l in d["lanes"] if not l["wired"]] == []
 
 
 # --- a non-zero rc is PRINTED, never swallowed (the goal's explicit check) ----
@@ -308,6 +305,198 @@ def test_imperative_routes_through_select_before_execute(table, capsys):
     assert sel != -1 and exe != -1, last
     assert sel < exe, last
     assert "claim from SELECTION" not in last
+
+
+# --- the precheck SKILL load is a verdict, not a habit () --------------
+#
+# Every table lane runs in the entry, so Skill(aspirations-precheck) (~34k tokens a
+# load) is due only for the residue the table does not hold. `skip` must be EARNED:
+# a clean complete entry AND a recent stamp left by the skill itself. Every other
+# state, every doubt included, is `required` -- the digest's old unconditional
+# behaviour -- so these pins are mostly the many ways to be wrong toward `skip`.
+
+def _wired_table(tmp_path, extra=()):
+    """A tier table whose every row some stage covers, so not_yet_wired_count is 0.
+    The shared `table` fixture carries rows no stage dispatches, which is itself a
+    reason for `required`."""
+    names = sorted({n for s in io_mod.STAGES for n in s["covers"]}) + list(extra)
+    rows = "\n".join("| 0-t | %s | always-run | via battery |" % n for n in names)
+    p = tmp_path / "SKILL-wired.md"
+    p.write_text("| Phase | Sweep | Tier | Invocation |\n|---|---|---|---|\n" + rows + "\n",
+                 encoding="utf-8")
+    return str(p)
+
+
+def _stamp(minutes_ago):
+    """wm-read.sh's answer for a consolidation_health slot written `minutes_ago`."""
+    t = io_mod._dt.datetime.now() - io_mod._dt.timedelta(minutes=minutes_ago)
+    return {"wm-read.sh": (0, json.dumps({"computed_at": t.isoformat(timespec="seconds")}), None)}
+
+
+def _precheck_verdict(tmp_path, responses, capsys, extra_lanes=()):
+    io_mod.run(as_json=True, runner=make_runner(responses),
+               md_path=_wired_table(tmp_path, extra_lanes))
+    return json.loads(capsys.readouterr().out)["precheck_skill"]
+
+
+def test_a_clean_complete_entry_with_a_fresh_stamp_skips_the_precheck_skill(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    v = _precheck_verdict(tmp_path, _stamp(5), capsys)
+    assert v["verdict"] == "skip", v
+    assert set(v) == {"verdict", "reasons", "stamp_age_min", "max_age_min"}
+    assert v["stamp_age_min"] == pytest.approx(5, abs=1)
+    assert v["max_age_min"] == io_mod._PRECHECK_SKILL_MAX_AGE_MIN
+    assert v["reasons"] and "entry clean and complete" in v["reasons"][0]
+
+
+@pytest.mark.parametrize("responses, fragment", [
+    (_stamp(io_mod._PRECHECK_SKILL_MAX_AGE_MIN + 15), "the skill last ran"),
+    ({"wm-read.sh": (0, "null\n", None)}, "empty or carries no computed_at"),
+    ({"wm-read.sh": (0, json.dumps({"active_count": 3}), None)}, "no computed_at"),
+    (_stamp(-10), "in the future"),
+    ({"wm-read.sh": (3, "", None)}, "rc=3"),
+    ({"wm-read.sh": (124, "", "wm-read.sh: timeout after 30s")}, "stamp unreadable"),
+    ({"wm-read.sh": (0, "no daemon\n", None)}, "not JSON"),
+    ({"wm-read.sh": (0, json.dumps({"computed_at": "yesterday"}), None)}, "unparseable"),
+], ids=["stale", "absent-slot", "no-timestamp-key", "future", "reader-rc",
+        "reader-timeout", "reader-prose", "garbled-timestamp"])
+def test_every_doubt_about_the_stamp_falls_toward_loading_the_skill(
+        tmp_path, capsys, monkeypatch, responses, fragment):
+    """The stamp is the ONLY evidence the residue ran lately. An absent, stale,
+    future-dated or unreadable one is a skill that may never have run -- the entry
+    must then say `required`, and say which doubt it was."""
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    v = _precheck_verdict(tmp_path, responses, capsys)
+    assert v["verdict"] == "required", v
+    assert any(fragment in r for r in v["reasons"]), (fragment, v)
+    assert v["stamp_age_min"] is None or v["stamp_age_min"] > 0
+
+
+def test_a_finding_makes_the_precheck_skill_required_despite_a_fresh_stamp(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    found = {"findings": [{"name": "x-gate", "detail": "sentinel set"}], "blind": []}
+    v = _precheck_verdict(
+        tmp_path, {**_stamp(1), "precheck-sentinel-battery.sh": (0, json.dumps(found), None)},
+        capsys)
+    assert v["verdict"] == "required" and any("finding" in r for r in v["reasons"]), v
+
+
+def test_a_blind_stage_makes_the_precheck_skill_required_despite_a_fresh_stamp(
+        tmp_path, capsys, monkeypatch):
+    """completeness, not status: a stage that could not be read is not a clean one
+    (guard-4093), and the skill is the only reader left for what it would have shown."""
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    v = _precheck_verdict(
+        tmp_path, {**_stamp(1), "precheck-medium-battery.sh": (2, "", None)}, capsys)
+    assert v["verdict"] == "required" and any("not read" in r for r in v["reasons"]), v
+
+
+def test_an_undispatched_tier_table_lane_makes_the_precheck_skill_required(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    v = _precheck_verdict(tmp_path, _stamp(1), capsys, extra_lanes=("a-lane-no-stage-runs",))
+    assert v["verdict"] == "required" and any("not dispatched" in r for r in v["reasons"]), v
+
+
+def test_an_all_blocked_queue_makes_the_precheck_skill_required(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    v = _precheck_verdict(
+        tmp_path,
+        {**_stamp(1), "goal-selector.sh": (0, json.dumps(ALL_BLOCKED_PAYLOAD), None)}, capsys)
+    assert v["verdict"] == "required" and any("blocked" in r for r in v["reasons"]), v
+
+
+def test_a_verdict_that_raises_is_required_and_names_the_exception(
+        tmp_path, capsys, monkeypatch):
+    """Fail-open AND loud (guard-1977). A silent pass here would be a skip by default."""
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+
+    def boom(report, runner, now=None):
+        raise RuntimeError("stamp reader exploded")
+
+    monkeypatch.setattr(io_mod, "_precheck_skill_verdict", boom)
+    v = _precheck_verdict(tmp_path, _stamp(1), capsys)
+    assert v["verdict"] == "required"
+    assert any("RuntimeError" in r and "stamp reader exploded" in r for r in v["reasons"]), v
+
+
+def test_a_skip_verdict_is_printed_above_an_imperative_that_forbids_the_load(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    io_mod.run(runner=make_runner(_stamp(5)), md_path=_wired_table(tmp_path))
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+    last = lines[-1]
+    assert last.startswith("[iteration-open] NEXT ACTION REQUIRED:"), last
+    verdict_at = [i for i, l in enumerate(lines)
+                  if l.startswith("[iteration-open] PRECHECK-SKILL: skip")]
+    assert verdict_at and verdict_at[0] < len(lines) - 1, "the verdict sits ABOVE the imperative"
+    assert "do NOT load Skill(aspirations-precheck)" in last, last
+    assert last.find("Skill(aspirations-select)") < last.find("Skill(aspirations-execute)"), last
+
+
+def test_a_required_verdict_puts_the_precheck_skill_before_select_before_execute(
+        tmp_path, capsys, monkeypatch):
+    """The chain the reducer follows is the printed one (rb-10068): when the skill is
+    due, the imperative must name it, and in order."""
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    io_mod.run(runner=make_runner(_stamp(120)), md_path=_wired_table(tmp_path))
+    out = capsys.readouterr().out
+    last = [l for l in out.splitlines() if l.strip()][-1]
+    pre = last.find("Skill(aspirations-precheck)")
+    sel = last.find("Skill(aspirations-select)")
+    exe = last.find("Skill(aspirations-execute)")
+    assert -1 not in (pre, sel, exe) and pre < sel < exe, last
+    assert "do NOT load" not in last, last
+    assert "[iteration-open] PRECHECK-SKILL: required" in out
+
+
+def test_a_worker_body_gets_no_verdict_and_makes_no_stamp_read(tmp_path, capsys, monkeypatch):
+    """A worker runs no precheck (its imperative already says so). A verdict would
+    be an instruction to a Body that has no precheck leg."""
+    monkeypatch.setenv("BODY_ROLE", "worker")
+    calls = []
+    io_mod.run(as_json=True, runner=make_runner(_stamp(1), record=calls),
+               md_path=_wired_table(tmp_path))
+    assert "precheck_skill" not in json.loads(capsys.readouterr().out)
+    assert not any(a[0] == "wm-read.sh" for a in calls), calls
+
+
+def test_the_digest_defers_the_precheck_skill_to_the_printed_verdict():
+    """Two surfaces naming one chain must name the SAME chain (rb-10068): the script
+    now decides whether the skill is in it, so the digest may not say `always`."""
+    digest = (SCRIPTS.parent / "config" / "aspirations-loop-digest.md").read_text(encoding="utf-8")
+    line = next(l for l in digest.splitlines() if "Skill(aspirations-precheck)" in l)
+    assert "NEXT ACTION" in line, line
+
+
+def test_the_stamp_slot_has_exactly_one_writer_and_it_is_the_skill():
+    """The whole verdict rests on `consolidation_health.computed_at` meaning "the skill
+    reached Phase 0.5". A second writer (a battery, a hook, a cadence script) would
+    keep the stamp fresh while the residue never ran -- `skip` forever, silently. So
+    the writer set is pinned: the precheck SKILL.md and nothing else."""
+    root = SCRIPTS.parent.parent
+    needle = ("consolidation-health.sh --write", "consolidation-health.py --write")
+    hits = set()
+    for pattern in ("core/scripts/*.sh", "core/scripts/*.py", "core/config/*.md",
+                    "core/config/conventions/*.md", ".claude/skills/*/SKILL.md"):
+        for f in root.glob(pattern):
+            if f.name.startswith("consolidation-health."):
+                continue
+            if any(n in f.read_text(encoding="utf-8", errors="replace") for n in needle):
+                hits.add(str(f.relative_to(root)).replace("\\", "/"))
+    assert hits == {".claude/skills/aspirations-precheck/SKILL.md"}, hits
+
+
+def test_the_stamp_is_read_from_the_slot_the_skill_writes(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    calls = []
+    io_mod.run(as_json=True, runner=make_runner(_stamp(1), record=calls),
+               md_path=_wired_table(tmp_path))
+    capsys.readouterr()
+    reads = [a for a in calls if a[0] == "wm-read.sh"]
+    assert reads == [["wm-read.sh", "consolidation_health", "--json"]], reads
 
 
 def test_selector_error_surfaces_rather_than_reading_as_zero_candidates(table, capsys):
@@ -781,7 +970,10 @@ def _battery_lane_names(filename):
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return {lane["name"] for lane in mod.LANES}
+    # A battery whose one lane stands for several tier-table rows (the deferrable
+    # battery's cadence lane covers seven) exposes covered_names(); the rest are 1:1.
+    covered = getattr(mod, "covered_names", None)
+    return set(covered()) if covered else {lane["name"] for lane in mod.LANES}
 
 
 def test_iteration_open_stage_registry_parity():
@@ -804,6 +996,7 @@ def test_iteration_open_stage_registry_parity():
     registries = {
         "always-run-battery": "precheck-always-run-battery.py",
         "medium-battery": "precheck-medium-battery.py",
+        "deferrable-battery": "precheck-deferrable-battery.py",
     }
     checked = 0
     for stage in io_mod.STAGES:
@@ -839,6 +1032,80 @@ def test_the_medium_tier_is_dispatched_by_a_stage():
     for lane in ("defer-recheck", "precondition-defer-recheck", "blocker-recheck",
                  "precheck-eval", "recurring-starvation-check"):
         assert lane in wired, f"{lane} is no longer dispatched from loop entry"
+
+
+def test_the_deferrable_tier_is_dispatched_by_a_stage():
+    """The regression pin for : the deferrable tier ran in 4 of 14 iterations
+    that reached it on one box, because it ran only when a model remembered to."""
+    wired = {c for s in io_mod.STAGES for c in s["covers"]}
+    for lane in ("pending-questions-sweep", "reclaim-user-participant-audit",
+                 "credential-defer-recheck", "dropped-field-audit", "felt-sense-cadence"):
+        assert lane in wired, f"{lane} is no longer dispatched from loop entry"
+    keys = [s["key"] for s in io_mod.STAGES]
+    assert keys.index("deferrable-battery") > keys.index("medium-battery"), \
+        "protocol order: always-run, then medium, then deferrable"
+
+
+def test_the_deferrable_stage_runs_inside_the_meter_window(table, monkeypatch):
+    """The second half of : the stage must sit BEFORE `end --keep-state`, or
+    every deferrable `meter check` it makes would hit the no-state-file fail-open."""
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    calls = []
+    io_mod.run(apply=True, runner=make_runner({}, record=calls), md_path=table)
+    names = [c[0] for c in calls]
+    i_stage = names.index("precheck-deferrable-battery.sh")
+    i_end = max(i for i, c in enumerate(calls) if c[0] == io_mod._METER and c[1] == "end")
+    assert i_stage < i_end
+    assert "--apply" in calls[i_stage], "the loop-entry path applies"
+
+
+def test_a_skipped_stage_is_noted_in_its_row_and_is_not_a_clean_report(table, capsys):
+    """A worker Body's battery REFUSES to run. Its row must say SKIPPED, not look like a
+    stage that ran and found nothing."""
+    skipped = {"findings": [], "blind": [], "skipped": "worker Body - reducer-side tier"}
+    io_mod.run(runner=make_runner({"precheck-deferrable-battery.sh": (0, json.dumps(skipped), None)}),
+               md_path=table)
+    line = [l for l in capsys.readouterr().out.splitlines() if l.startswith("deferrable-battery")]
+    assert line and "SKIPPED" in line[0], line
+
+
+def test_held_lanes_are_printed_but_a_standing_hold_does_not_degrade_completeness(table, capsys):
+    payload = {"findings": [], "blind": [], "held": [
+        {"name": "repo-hygiene-sweep", "reason": "held until g-115-8556", "standing": True}]}
+    runner = make_runner({"precheck-deferrable-battery.sh": (0, json.dumps(payload), None)})
+    io_mod.run(runner=runner, md_path=table)
+    out = capsys.readouterr().out
+    assert "HELD BY DECISION" in out and "repo-hygiene-sweep" in out
+    io_mod.run(as_json=True, runner=runner, md_path=table)
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["completeness"] == "complete" and rep["blind"] == []
+
+
+def test_a_dead_deferrable_stage_is_a_blind_row_with_its_rc_in_the_table(table, capsys):
+    """Outcome 3 of : a deferrable stage that could not run is BLIND and its rc
+    is printed, never folded into a clean zero."""
+    runner = make_runner({"precheck-deferrable-battery.sh":
+                          (124, "", "precheck-deferrable-battery.sh: timeout after 180s")})
+    io_mod.run(runner=runner, md_path=table)
+    out = capsys.readouterr().out
+    line = [l for l in out.splitlines() if l.startswith("deferrable-battery")]
+    assert line and " 124 " in line[0], line
+    assert "BLIND deferrable-battery/precheck-deferrable-battery.sh" in out
+    assert "NOT clean" in out or "UNREACHABLE" in out
+
+
+def test_a_mode_held_or_uninterpreted_lane_makes_the_run_partial(table, capsys):
+    """Neither a lane that ran but was never READ (no finding spec) nor one held by a run
+    mode may read as clean (guard-4093)."""
+    payload = {"findings": [], "blind": [],
+               "held": [{"name": "domain-term-ratchet", "reason": "apply-only", "standing": False}],
+               "uninterpreted": [{"name": "new-lane", "sig": "x=1"}]}
+    io_mod.run(as_json=True, md_path=table, runner=make_runner(
+        {"precheck-deferrable-battery.sh": (0, json.dumps(payload), None)}))
+    rep = json.loads(capsys.readouterr().out)
+    assert rep["completeness"] == "partial"
+    reasons = " | ".join(b["reason"] for b in rep["blind"])
+    assert "no finding spec" in reasons and "held: apply-only" in reasons
 
 
 # --- both legitimate selector shapes () -----------------------------

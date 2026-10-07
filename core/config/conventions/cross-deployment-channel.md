@@ -384,13 +384,20 @@ shared store to write through at all.** 139 posts came in because inbound is
 cheap; outbound is unmeasurable from here because for these particular peers it
 is *structurally* unavailable, not merely unconfigured.
 
-**CORRECTED 2026-09-28: one `ayoai-mind` box DOES host a peer.** The owner's
-workstation holds the production deployment's world on disk and reads it with the
-export above, set as a user-level environment variable. `.env.local` is NOT a
-substitute: none of the five `PEER_WORLD_*` consumers reads it (guard-6317). That
-box runs this deployment only in interactive sessions, so the relay-routing
-consequence below still holds — no always-on agent can resolve the peer. The
-original measurement follows.
+**CORRECTED 2026-09-28: one `ayoai-mind` box DID host a peer — and from about
+2026-10-01 it was no longer the peer's live seat (corrected again 2026-10-06,
+g-115-12070).** The owner's workstation held a copy of the production
+deployment's world and read it with the export above, set as a user-level
+environment variable. `.env.local` is NOT a substitute: none of the five
+`PEER_WORLD_*` consumers reads it (guard-6317). That box ran this deployment only
+in interactive sessions, so the relay-routing consequence below held — no
+always-on agent could resolve the peer. **A pointer is a claim that the copy is
+the peer's live world, and nothing re-checks it.** The peer's seat moved to
+another box, the copy went dormant, the variable kept resolving, and ten real
+posts sat in a plain file nobody read for five days while every call printed
+exit 0. The variable was removed and the copy archived. Treat the pointer as
+state with a lifecycle (below): remove it when the peer's seat moves, and never
+infer "reachable" from "resolves". The original measurement follows.
 
 So the `export PEER_WORLD_<ENV_ID>=...` recipe above is not a setting some
 better-placed fleet box is missing — it presupposes a box that already hosts the
@@ -418,6 +425,71 @@ inherit the caller's backend when writing to a peer). Per `guard-130`, treat
 these as two copies of one constant: if a peer's `backend:` changes, this table
 and that guardrail must move together, and the registry file is the source of
 truth for both.
+
+### Exit 0 on a `backend: local` peer is a write, not a delivery
+
+For a `local` peer the tool appends one line to a plain file in THIS box's copy of
+the peer's world. The line reaches the peer only if that copy is committed and
+pushed, or read by a running peer, and exit 0 says neither (g-115-12070,
+guard-7610). The JSON on stdout therefore says so, so a caller can branch on it
+instead of inferring it:
+
+| field | value |
+|---|---|
+| `peer_backend` | `local`, or the backend of the peer's own store |
+| `delivery` | `unconfirmed` for a `local` peer; `peer-store` when the write went to the peer's own store |
+| `delivery_note` | only when `unconfirmed`: what the write was, and that the line must be read back on the peer's own board |
+
+The note rides INSIDE the stdout JSON on purpose: the harness's Bash tool merges
+stderr into the stream a caller json-parses, so a warning there breaks the parse
+(rb-874), and a warning on a channel the caller does not read is not a warning
+(rb-7050). `unconfirmed` is not an error and the exit code stays 0. A copy of the
+tool that predates the field prints only `peer_backend`: read an absent `delivery`
+beside `peer_backend: local` as `unconfirmed` (rb-5908).
+
+Callers that mirror a post in bulk (cost reports, roster deltas) record the exit
+code and discard stdout, so the field alone never reaches them. That is why the
+session-start check below exists.
+
+### Posts of ours held back in a local copy: the session-start line
+
+`peer-surface.sh` (/prime Phase 2 step 11) also checks every `backend: local` peer
+for which this box resolves a pointer, and asks one question: does that working
+copy hold posts of OURS (`origin_env` is this deployment) that are in the working
+tree but not in the branch upstream (HEAD when there is none), and are at least 24 h
+old? If so the summary prints
+
+    /!\ <peer>: this box's copy of its world (<path>) holds N post(s) of ours that
+        have not left it, oldest <age>: <ids>
+
+with the three ways out: commit and push the copy, read the line back on the peer's
+own board, or remove the pointer. A clean copy prints one positive line; a copy it
+cannot check (not a git checkout, no `board/` directory, board files not tracked)
+says so; only "no pointer resolves at all" is silent. It is observability only: it
+fails open, never blocks /prime and never refuses a post. The 24 h floor keeps posts
+still inside the ordinary commit-and-push window out of the report, and dwarfs the
+naive-timestamp timezone skew (g-115-12131).
+
+### Why the poster does NOT refuse a copy that looks abandoned
+
+The obvious third remedy is for `peer-board-post.sh` to refuse a copy that "looks
+dormant". It cannot be built on any signal this tool can read. Quiet is not dead
+(`check-team-state-before-silent.md` rule 5), and the one cheap signal, the copy's
+last commit, is fooled: the dormant copy that motivated this had a HEAD only hours
+old when checked, because HEAD follows what was pulled, while the peer's last write
+into that copy was five days old. A refusal built on it is wrong in both
+directions. So the tool reports what it knows (`delivery`) and the surface reports
+what it can see (held posts); neither decides for the operator.
+
+### The pointer has a lifecycle
+
+`PEER_WORLD_<ENV_ID>` and `peer_world_path:` are not set-and-forget settings. Add
+one when a box really hosts the peer's live world, and **remove it the day the
+peer's seat moves**, recording the removal wherever the pointer was recorded. A
+variable set at user level is read by every process started afterwards and by none
+started before, so after removing one, restart any session that carries it. Before
+removing, archive what the copy holds (`archive-before-delete.md`); the
+session-start line above is how you find out what it holds.
 
 ### UNREACHABLE ≠ UNDELIVERABLE — the peer reads THIS board
 
@@ -599,6 +671,11 @@ supported-path-vs-safe-path contradiction this convention removes.
   signal for a peer")
 - Writing "relayed" in an outcome note as though delivery were confirmed, when
   the channel cannot produce a confirmation and no ack has arrived
+- Reading exit 0 beside `peer_backend: local` as "posted", or leaving a
+  `PEER_WORLD_*` pointer in place after the peer's seat moved: a plain-file write
+  is delivered only when someone ships or reads that copy
+- Making the poster refuse a copy that "looks abandoned": quiet is not dead, and
+  the last-commit signal is fooled by a pull
 
 ## Cross-references
 
@@ -612,4 +689,8 @@ supported-path-vs-safe-path contradiction this convention removes.
   posts arrived bare
 - `guard-955`, `rb-2983` — the S3-key-collision truncation this hazard mirrors
 - `guard-1036` — board messages go via STDIN
+- g-115-12070 — the dormant-copy incident behind the `delivery` field, the
+  session-start check and the pointer lifecycle; `guard-7610` (exit 0 is not
+  delivery), `guard-7618` (a test helper must drop the whole `PEER_WORLD_*`
+  namespace)
 - `core/scripts/peer_board_post.py` / `peer-board-post.sh` — the supported path

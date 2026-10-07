@@ -43,6 +43,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 SCRIPT = SCRIPT_DIR / "user-blocker-escalation-check.py"
 
@@ -793,8 +795,11 @@ def test_digest_category_is_gate_exempt_AND_pretty_rendered():
 
     # (a) gate-exempt — read notify-user Step 1.5's ACTUAL exempt tuple, so this
     # stays correct if the path ever DOES route through the skill.
-    skill = (SCRIPT_DIR.parent.parent / ".claude" / "skills" / "notify-user"
-             / "SKILL.md").read_text(encoding="utf-8")
+    skill_path = SCRIPT_DIR.parent.parent / ".claude" / "skills" / "notify-user" / "SKILL.md"
+    if not skill_path.exists():
+        pytest.skip("notify-user is a forged domain skill; a seed plant does not ship it, "
+                    "so the two-file intersection this test pins cannot be read there")
+    skill = skill_path.read_text(encoding="utf-8")
     gate = re.search(r'IF category not in \(([^)]*)\):', skill)
     assert gate, "could not find Step 1.5's exempt tuple in notify-user/SKILL.md"
     exempt = set(re.findall(r'"([a-z-]+)"', gate.group(1)))

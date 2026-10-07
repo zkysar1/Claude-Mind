@@ -7,7 +7,7 @@ sub-skill should fire at which phase.
 
 | Skill | Called When | Returns |
 |---|---|---|
-| `/aspirations-precheck` | Every iteration (Phases 0-1) | Updated blockers, auto-completions |
+| `/aspirations-precheck` | Phases 0-1, only when `iteration-open.sh`'s NEXT ACTION names it (`PRECHECK-SKILL: required`; g-374-504) | Updated blockers, auto-completions |
 | `/aspirations-select` | Every iteration (Phases 2-2.9) | goal, effort_level, batch |
 | `/aspirations-execute` | Phase 4: via digest (load-execute-protocol.sh), full SKILL.md only for edge cases | result, outcome_class, infrastructure_failure |
 | `/aspirations-verify` | Phase 5: verification | goal_completed, aspiration_complete |

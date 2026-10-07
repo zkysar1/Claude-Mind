@@ -231,6 +231,16 @@ The override is honored only where team-state lists no other mind, a solo deploy
 anywhere else an independent review is available, and the attempt is logged on the
 block as `override_refused`.
 
+**A refused close waits for its verdict (g-375-149).** The refusal also writes the
+close's outcome note (`--outcome-note-file`, else the summary) when the goal carries
+none, so the reviewer reads the closure evidence and the completed-not-closed drain can
+close the goal once a releasing verdict lands. A note already there is never
+overwritten. While check A is on, `goal-selector.py` holds a goal whose request no
+verdict answers yet (`block_reason: awaiting_review`), so the loop does not pick a
+released refused close again. Any verdict lifts the hold, a REJECT included, which
+returns the goal for rework. The review queue lists requests whether or not a goal is
+held.
+
 **Ship state** (`close_review_gate` in `core/config/aspirations.yaml`): check B,
 `.note_marker_enabled`, is ON since 2026-10-06 (g-375-144). Check A, `.enabled`, is
 OFF. Its first precondition, the verdict producer g-357-41, landed 2026-09-02; what

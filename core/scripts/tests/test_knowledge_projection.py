@@ -177,7 +177,9 @@ def test_redact_strips_unterminated_pem_block() -> None:
 def test_redact_paths_posix_and_windows() -> None:
     assert "[path]" in redact("see /home/ec2-user/mind-workspace/world/x.md")
     assert "/home/ec2-user" not in redact("see /home/ec2-user/mind-workspace/world/x.md")
-    assert "[path]" in redact(r"open <PROJECT_ROOT>\core")
+    # A neutral Windows path: the seed plant rewrites the dev box's workspace and project
+    # names inside string literals, leaving `<PROJECT_ROOT>\core`, which has no drive.
+    assert "[path]" in redact(r"open C:\Work\GitHub\Acme-Project\core")
     # An explicit workspace path is also collapsed.
     out = redact("under /srv/tricks-ws/research", workspace_paths=["/srv/tricks-ws"])
     assert "/srv/tricks-ws" not in out

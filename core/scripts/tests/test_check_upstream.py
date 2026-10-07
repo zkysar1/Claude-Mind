@@ -6,7 +6,7 @@ Two layers, mirroring test_release.py:
      _release_lib.py (releases_above, classify_update chain-walk, upstream_role)
      + the classify-chain CLI (env-driven, parse-or-fail exit 2).
   2. Black-box subprocess tests of check-upstream.sh in SAFE modes only:
-       - frontier short-circuit against the REAL overlay (read-only, no network),
+       - frontier short-circuit against a tmp frontier overlay (read-only, no network),
        - MIND_WORLD-redirected downstream overlays + a file:// feed (curl reads a
          local tmp RELEASES.json) exercising every exit code (0/2/4/5) and the
          config-error paths.
@@ -238,18 +238,22 @@ def test_cli_classify_missing_file_exit2(tmp_path):
 
 
 # ===========================================================================
-# 5. check-upstream.sh — frontier short-circuit + arg handling (REAL overlay)
+# 5. check-upstream.sh — frontier short-circuit + arg handling (tmp frontier overlay)
 # ===========================================================================
-def test_shell_frontier_short_circuit():
-    """The real deployment overlay is self_role: frontier — no upstream, exit 0,
-    and NO network fetch is attempted (the short-circuit precedes the curl)."""
-    r = run_check()
+def test_shell_frontier_short_circuit(tmp_path):
+    """A self_role: frontier overlay — no upstream, exit 0, and NO network fetch is
+    attempted (the short-circuit precedes the curl). The overlay is built here, not read
+    from the deployment: its role is frontier in the dev repo and seed or downstream
+    wherever the framework is planted, so asserting on the real one held only in dev."""
+    _write_overlay(tmp_path, self_role="frontier")
+    r = run_check(world=tmp_path)
     assert r.returncode == 0, r.stderr
     assert "frontier" in (r.stdout + r.stderr).lower()
 
 
-def test_shell_diagnose_frontier():
-    r = run_check("--diagnose")
+def test_shell_diagnose_frontier(tmp_path):
+    _write_overlay(tmp_path, self_role="frontier")
+    r = run_check("--diagnose", world=tmp_path)
     assert r.returncode == 0, r.stderr
 
 

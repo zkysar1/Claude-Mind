@@ -156,7 +156,10 @@ def test_cli_check_record_roundtrip(world):
 def test_wrapper_script_exists_and_is_wired_into_notify_user_skill():
     root = SCRIPTS.parent.parent
     assert (SCRIPTS / "notification-outreach-gate.sh").exists()
-    skill = (root / ".claude" / "skills" / "notify-user" / "SKILL.md").read_text(encoding="utf-8")
+    skill_path = root / ".claude" / "skills" / "notify-user" / "SKILL.md"
+    if not skill_path.exists():
+        pytest.skip("notify-user is a forged domain skill; a seed plant does not ship it")
+    skill = skill_path.read_text(encoding="utf-8")
     # the skill delegates to the framework dispatcher, which runs this gate
     assert "core/scripts/notify-user.sh" in skill
     assert "notification-outreach-gate.sh list" in skill

@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,19 @@ def _git(repo, *args):
 
 def _consume(repo, *args, env=None):
     return _run([BASH, CONSUME.as_posix(), "--repo", str(repo), *args], env=env)
+
+
+@pytest.fixture(autouse=True)
+def _permit_stub_retire_gate(tmp_path_factory, monkeypatch):
+    """The retire tests in this file are about the OTHER gates: reachability, the live row, the
+    schema probe and the receipts. The independent-signal gate (g-306-506 unit (d)) refuses a
+    fresh tip, and every fixture tip here is fresh, so for this file it is stubbed to permit.
+    The REAL gate is run through the same shell path by the test_retire_gate_* tests below, which
+    clear the seam; test_retire_gate_seam_default_is_the_real_sibling pins that production
+    resolves to the real helper (guard-920: a stub must not be able to hide a regression)."""
+    stub = tmp_path_factory.mktemp("gate-stub") / "permit-gate.py"
+    stub.write_text("print('RETIRE: stubbed by the test file')\n")
+    monkeypatch.setenv("WORKER_REF_RETIRE_GATE_PY", str(stub))
 
 
 @pytest.fixture()
@@ -510,6 +524,212 @@ def test_liveness_seam_default_is_the_real_sibling():
     src = CONSUME.read_text(encoding="utf-8", errors="replace")
     assert 'TEAM_STATE_READER="${WORKER_REF_TEAM_STATE_READER:-$SCRIPT_DIR/team-state-read.sh}"' in src
     assert (SCRIPTS / "team-state-read.sh").exists()
+
+
+# ---  unit (d): the independent-signal gate on an ABSENT row (guard-3660) ----------
+# An ABSENT in_flight_bodies row is the normal state of a live Body BETWEEN two units, because
+# the row is written per claim. Measured while this was written: all 11 outstanding carrier refs
+# belonged to Bodies with a fresh heartbeat carrier, with tips up to 4.7 days old, so the old
+# "absent -> retire" fall-through would have deleted live Bodies' push targets. These run the REAL
+# gate through the real shell path: the autouse permit stub is cleared with an empty env value
+# (the script reads empty as unset), the carrier read is hermetic through
+# WORKER_REF_CARRIER_READER, and the commit clock is set with GIT_COMMITTER_DATE, so no store is
+# read and nothing outside the tmp repos is written.
+
+GATE_PY = SCRIPTS / "worker_ref_retire_gate.py"
+DAY = 24 * 60
+
+
+def _carrier_seam(tmp_path, verdict, age=400):
+    p = tmp_path / ("carrier-%s.py" % verdict)
+    p.write_text("import json\nprint(json.dumps({'verdict': %r, 'evidence': {'carrier_age_minutes': %r}}))\n"
+                 % (verdict, age))
+    return str(p)
+
+
+def _real_gate_env(tmp_path, verdict):
+    return {"WORKER_REF_RETIRE_GATE_PY": "",
+            "WORKER_REF_CARRIER_READER": _carrier_seam(tmp_path, verdict),
+            "WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, "null")}
+
+
+@pytest.fixture()
+def aged(tmp_path):
+    """origin + work clone; `make(age_min, sid)` lands one worker commit dated `age_min` ago on
+    main and pushes it as refs/workers/alpha/<sid>, so its tip is reachable from origin/main."""
+    origin, work = tmp_path / "origin.git", tmp_path / "work"
+    assert _run(["git", "init", "--bare", "--initial-branch=main", str(origin)]).returncode == 0
+    assert _run(["git", "clone", str(origin), str(work)]).returncode == 0
+    _git(work, "config", "user.email", "t@t")
+    _git(work, "config", "user.name", "t")
+    _git(work, "checkout", "-b", "main")
+    (work / "f.txt").write_text("base\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "base")
+    _git(work, "push", "origin", "main")
+
+    def make(age_min, sid):
+        when = int(time.time() - age_min * 60)
+        (work / (sid + ".txt")).write_text(sid + "\n")
+        _git(work, "add", ".")
+        r = _run(["git", "-C", str(work), "commit", "-q", "-m", "worker " + sid],
+                 env={"GIT_AUTHOR_DATE": "%d +0000" % when, "GIT_COMMITTER_DATE": "%d +0000" % when})
+        assert r.returncode == 0, r.stderr
+        sha = _git(work, "rev-parse", "HEAD")
+        _git(work, "push", "origin", "%s:refs/workers/alpha/%s" % (sha, sid))
+        _git(work, "push", "origin", "main")
+        return sha
+
+    return {"work": work, "origin": origin, "make": make}
+
+
+def _ledger(work):
+    path = work / "core" / "logs" / "worker-ref-retirements.jsonl"
+    return [json.loads(l) for l in path.read_text().strip().splitlines()] if path.exists() else []
+
+
+def _remote_refs(work):
+    return _git(work, "ls-remote", "origin", "refs/workers/*")
+
+
+def test_retire_gate_permits_an_old_tip_with_a_dead_carrier_and_records_the_signals(aged, tmp_path):
+    aged["make"](3 * DAY, "sid-dead")
+    r = _consume(aged["work"], "--retire", "refs/workers/alpha/sid-dead",
+                 env=_real_gate_env(tmp_path, "stale"))
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "sid-dead" not in _remote_refs(aged["work"])
+    rec = next(x for x in _ledger(aged["work"]) if x.get("outcome") == "attempted")
+    assert rec["body_row"] == "absent" and rec["forced"] is False
+    assert rec["retire_gate"].startswith("RETIRE: ") and "heartbeat carrier stale" in rec["retire_gate"]
+
+
+def test_retire_gate_refuses_a_live_carrier_whatever_the_tip_age(aged, tmp_path):
+    """THE MEASURED CASE, one variable off the test above (the carrier): tip 3 days old, row
+    absent, carrier fresh-correct. Before this gate the script deleted this ref."""
+    aged["make"](3 * DAY, "sid-live")
+    r = _consume(aged["work"], "--retire", "refs/workers/alpha/sid-live",
+                 env=_real_gate_env(tmp_path, "fresh-correct"))
+    assert r.returncode == 1, r.stderr + r.stdout
+    assert "REFUSED" in r.stderr and "CARRY carrier-alive" in r.stderr and "guard-3660" in r.stderr
+    assert "sid-live" in _remote_refs(aged["work"]), "the ref must survive the refusal"
+    assert _ledger(aged["work"]) == [], "a refused retire writes no receipt"
+
+
+def test_retire_gate_refuses_a_recent_tip_even_when_the_carrier_reads_dead(aged, tmp_path):
+    aged["make"](5, "sid-just-pushed")
+    r = _consume(aged["work"], "--retire", "refs/workers/alpha/sid-just-pushed",
+                 env=_real_gate_env(tmp_path, "stale"))
+    assert r.returncode == 1 and "CARRY tip-recent" in r.stderr, r.stderr
+    assert "sid-just-pushed" in _remote_refs(aged["work"])
+    assert _ledger(aged["work"]) == []
+
+
+def test_force_retire_live_overrides_the_gate_and_the_receipt_names_what_was_overridden(aged, tmp_path):
+    aged["make"](5, "sid-forced")
+    r = _consume(aged["work"], "--retire", "refs/workers/alpha/sid-forced",
+                 "--force-retire-live", "operator confirmed the Body is dead",
+                 env=_real_gate_env(tmp_path, "fresh-correct"))
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert "sid-forced" not in _remote_refs(aged["work"])
+    ledger = _ledger(aged["work"])
+    rec = next(x for x in ledger if x.get("outcome") == "attempted")
+    assert rec["forced"] is True and rec["liveness_override"] == "operator confirmed the Body is dead"
+    assert rec["body_row"].startswith("ABSENT-ROW-GATE-OVERRIDDEN CARRY tip-recent"), rec["body_row"]
+    assert rec["retire_gate"].startswith("CARRY tip-recent"), rec["retire_gate"]
+    assert all(x["forced"] is True for x in ledger), "every line of a forced retire carries forced:true"
+
+
+@pytest.mark.parametrize("name,body", [
+    ("exits-1-after-printing-retire", "print('RETIRE: but the exit code says no')\nraise SystemExit(1)\n"),
+    ("exits-0-without-deciding", "raise SystemExit(0)\n"),
+    ("exits-0-printing-carry", "print('CARRY tip-recent: x')\nraise SystemExit(0)\n"),
+    ("crashes", "raise RuntimeError('boom \"quoted\" back\\\\slash')\n"),
+    ("usage-error", "raise SystemExit(2)\n"),
+])
+def test_a_helper_that_does_not_say_retire_refuses_whatever_else_it_does(aged, tmp_path, name, body):
+    """Two keys permit (rc 0 AND a RETIRE line). Each stub below turns exactly one off, and the
+    positive control is the permit stub every other test in this file runs under."""
+    aged["make"](3 * DAY, "sid-x")
+    stub = tmp_path / (name + ".py")
+    stub.write_text(body)
+    r = _consume(aged["work"], "--retire", "refs/workers/alpha/sid-x",
+                 env={"WORKER_REF_RETIRE_GATE_PY": str(stub),
+                      "WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, "null")})
+    assert r.returncode == 1 and "REFUSED" in r.stderr and "Independent signals" in r.stderr, r.stderr
+    assert "sid-x" in _remote_refs(aged["work"])
+    assert _ledger(aged["work"]) == []
+
+
+def test_a_missing_helper_refuses(aged, tmp_path):
+    aged["make"](3 * DAY, "sid-x")
+    r = _consume(aged["work"], "--retire", "refs/workers/alpha/sid-x",
+                 env={"WORKER_REF_RETIRE_GATE_PY": str(tmp_path / "no-such-helper.py"),
+                      "WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, "null")})
+    assert r.returncode == 1 and "REFUSED" in r.stderr, r.stderr
+    assert "sid-x" in _remote_refs(aged["work"]) and _ledger(aged["work"]) == []
+
+
+def test_a_crashing_helper_under_force_still_writes_a_parseable_receipt(aged, tmp_path):
+    """The helper's text is printf-composed into a JSON receipt: a quote, a backslash or a tab in
+    a traceback must not make the receipt line unparseable (_ledger json-loads every line)."""
+    aged["make"](3 * DAY, "sid-x")
+    stub = tmp_path / "crash.py"
+    stub.write_text("raise RuntimeError('boom \"quoted\" back\\\\slash\\ttab')\n")
+    r = _consume(aged["work"], "--retire", "refs/workers/alpha/sid-x", "--force-retire-live", "drill",
+                 env={"WORKER_REF_RETIRE_GATE_PY": str(stub),
+                      "WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, "null")})
+    assert r.returncode == 0, r.stderr + r.stdout
+    rec = next(x for x in _ledger(aged["work"]) if x.get("outcome") == "attempted")
+    assert rec["body_row"].startswith("ABSENT-ROW-GATE-OVERRIDDEN") and "RuntimeError" in rec["retire_gate"]
+    assert not any(c in rec["retire_gate"] for c in '"\\\t\n')
+
+
+def _recording_gate(tmp_path, rc=0, line="RETIRE: recorded"):
+    log = tmp_path / "gate-calls.jsonl"
+    stub = tmp_path / "recording-gate.py"
+    stub.write_text("import json, sys\nopen(%r, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                    "print(%r)\nraise SystemExit(%d)\n" % (str(log), line, rc))
+    return str(stub), log
+
+
+def test_the_gate_is_asked_once_with_the_repo_ref_agent_and_sid_for_an_absent_row(repo, tmp_path):
+    work = _merge_and_push_a(repo)
+    stub, log = _recording_gate(tmp_path)
+    r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
+                 env={"WORKER_REF_RETIRE_GATE_PY": stub,
+                      "WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, "null")})
+    assert r.returncode == 0, r.stderr + r.stdout
+    calls = [json.loads(l) for l in log.read_text().splitlines()]
+    assert len(calls) == 1, calls
+    argv = calls[0]
+    assert argv[0] == "check"
+    assert argv[argv.index("--repo") + 1] == str(work)
+    assert argv[argv.index("--ref") + 1] == "refs/workers/alpha/sid-aaaa"
+    assert argv[argv.index("--agent") + 1] == "alpha" and argv[argv.index("--sid") + 1] == "sid-aaaa"
+
+
+@pytest.mark.parametrize("payload,reader_rc,status", [
+    (LIVE_ROW, 0, INTACT_STATUS),          # a live row refuses first
+    ("", 1, INTACT_STATUS),                # an unreadable liveness source refuses first
+    ("null", 0, "null"),                   # a drifted schema refuses first
+])
+def test_the_gate_is_not_asked_when_an_earlier_check_already_refuses(repo, tmp_path, payload, reader_rc, status):
+    work = _merge_and_push_a(repo)
+    stub, log = _recording_gate(tmp_path)
+    r = _consume(work, "--retire", "refs/workers/alpha/sid-aaaa",
+                 env={"WORKER_REF_RETIRE_GATE_PY": stub,
+                      "WORKER_REF_TEAM_STATE_READER": _stub_reader(tmp_path, payload, rc=reader_rc,
+                                                                   status_payload=status)})
+    assert r.returncode == 1, r.stderr
+    assert not log.exists(), "those refusals come first and are not the gate's business"
+
+
+def test_retire_gate_seam_default_is_the_real_sibling():
+    """guard-920: the autouse permit stub above must not be able to hide a production path that
+    reads a renamed or moved helper."""
+    src = CONSUME.read_text(encoding="utf-8", errors="replace")
+    assert 'RETIRE_GATE_PY="${WORKER_REF_RETIRE_GATE_PY:-$SCRIPT_DIR/worker_ref_retire_gate.py}"' in src
+    assert GATE_PY.exists()
 
 
 def test_zero_refs_is_exit_zero_not_all_clear(tmp_path):

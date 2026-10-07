@@ -44,6 +44,7 @@ sibling cascade this one sits beside in both files.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import sys
@@ -202,8 +203,27 @@ def test_skipped_does_not_stamp_completed_date():
                 f"got {g.get('completed_date')!r}")
 
 
+def _has_date_shaped_completion_stamp(src: str) -> bool:
+    """True when an `if` naming value == "completed" and the completed_date guard assigns the date-shaped stamp.
+
+    Read from the AST, not from text: the seed plant scrubs "(g-NNN-NN)" from source
+    comments, so a goal-id marker grep passes here and fails at every plant.
+    """
+    want = "goal['completed_date'] = datetime.now().strftime('%Y-%m-%d')"
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.If):
+            continue
+        test = ast.unparse(node.test)
+        if "value == 'completed'" not in test or "completed_date" not in test:
+            continue
+        if any(isinstance(sub, ast.Assign) and ast.unparse(sub) == want
+               for stmt in node.body for sub in ast.walk(stmt)):
+            return True
+    return False
+
+
 def test_cli_daemon_completed_date_parity():
-    """Both write-path implementations carry the  completion stamp.
+    """Both write-path implementations carry the completed_date completion stamp.
 
     guard-2323 / guard-547: under daemon-only architecture the daemon is the ONLY
     live path, so a CLI-side-only fix is inert from the moment it lands. When
@@ -217,16 +237,10 @@ def test_cli_daemon_completed_date_parity():
     assert DAEMON_FILE.is_file(), f"daemon aspirations_write missing: {DAEMON_FILE}"
     cli = CLI_FILE.read_text(encoding="utf-8")
     daemon = DAEMON_FILE.read_text(encoding="utf-8")
-    # the  completion-stamp marker present on both sides
-    assert "g-115-5069" in cli, "CLI lost the g-115-5069 completed_date stamp"
-    assert "g-115-5069" in daemon, "daemon lost the g-115-5069 completed_date stamp"
-    # the date-shaped assignment present on both sides
-    stamp = 'goal["completed_date"] = datetime.now().strftime("%Y-%m-%d")'
-    assert stamp in cli, f"CLI missing the date-shaped stamp: {stamp}"
-    assert stamp in daemon, f"daemon missing the date-shaped stamp: {stamp}"
-    # scoped to value==completed on both sides (not all terminal statuses)
-    assert 'value == "completed"' in cli
-    assert 'value == "completed"' in daemon
+    # one structural check per side: the stamp, its date-shaped assignment and its
+    # value==completed scoping (not all terminal statuses) are a single `if` + assignment
+    assert _has_date_shaped_completion_stamp(cli), "CLI lost the date-shaped completed_date stamp scoped to value==completed"
+    assert _has_date_shaped_completion_stamp(daemon), "daemon lost the date-shaped completed_date stamp scoped to value==completed"
 
 
 if __name__ == "__main__":

@@ -394,8 +394,14 @@ non-trivial diagnosis) that future readers would benefit from re-reading:
        handoff_to set to <agent>, carrying the FULL add payload inline in its
        description (guard-3670), the pull-first precondition, the grep -c
        confirm, and an idempotency note (the store is append-only; a second
-       add duplicates silently). A board post naming the goal is optional
-       visibility, never the delivery.
+       add duplicates silently). FILE IT WITH origin_signal "user_directive":
+       a maintain:/investigate:/idea: head routes a new goal to status
+       `candidate` (gates/intake_route.py, candidate_tier in
+       core/config/aspirations.yaml), which the selector never collects
+       (goal-selector.py skips status != pending) and which cannot be completed
+       without a promote, so the relay would wait on grooming and never reach
+       the holder (measured 2026-10-06, g-115-12132). A board post naming the
+       goal is optional visibility, never the delivery.
        Print: RELAYED experience:<experience_id> as <goal-id>
   World-store lanes (tree, reasoning bank, guardrails, patterns, world goals,
   board) are NOT fenced: continue the pass. One refused agent-dir write never

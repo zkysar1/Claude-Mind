@@ -40,13 +40,20 @@ from _bash_helpers import BASH  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "core" / "scripts" / "provision-from-vault.sh"
 
+# The script derives its vault prefix at run time: the first segment of ENVIRONMENT_ID,
+# uppercased. The fixture keys are built from that same derivation and not spelled with the
+# literal prefix token, because the seed plant rewrites that token inside this file but cannot
+# see the script computing it, so a spelled-out fixture stops matching at a plant.
+ENVIRONMENT_ID = "ayoai-mind"
+PFX = ENVIRONMENT_ID.split("-")[0].upper() + "_"
+
 # Obviously-fake placeholders, deliberately not AKIA-/token-shaped so the
 # commit-time secret scan does not false-positive. The mapper treats values as
 # opaque, so any distinctive string exercises the leak checks identically.
 VAULT_BODY = (
-    "MIND_MIND_AWS_ACCESS_KEY_ID=VAULT_AKID_VALUE\n"
-    "MIND_STORAGE_BACKEND=own-cloud\n"
-    "MIND_LODESTAR_CONTRIBUTE_KEY=VAULT_LODESTAR_VALUE\n"
+    f"{PFX}MIND_AWS_ACCESS_KEY_ID=VAULT_AKID_VALUE\n"
+    f"{PFX}STORAGE_BACKEND=own-cloud\n"
+    f"{PFX}LODESTAR_CONTRIBUTE_KEY=VAULT_LODESTAR_VALUE\n"
 )
 VAULT_VALUES = ["VAULT_AKID_VALUE", "VAULT_LODESTAR_VALUE"]
 
@@ -84,7 +91,7 @@ def _run(tmp_path, args, *, live=ACCRETED, name="env", agent="alpha"):
     env["BOOTSTRAP_KEY_PATH"] = str(bootstrap)
     env["VAULT_SSH_HOST"] = "stub.invalid"
     env["VAULT_REMOTE_PATH"] = "/stub/vault"
-    env["ENVIRONMENT_ID"] = "ayoai-mind"
+    env["ENVIRONMENT_ID"] = ENVIRONMENT_ID
     # Clear every override further down the resolution chain, or an ambient
     # value wins outright and the pin above is never consulted (guard-1484).
     env.pop("VAULT_KEY_PREFIX", None)

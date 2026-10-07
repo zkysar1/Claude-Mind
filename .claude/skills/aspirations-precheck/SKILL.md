@@ -25,29 +25,27 @@ guardrails are checked, blockers are resolved, and recurring goals are tracked.
 **Step 0: Load Conventions** — `Bash: load-conventions.sh` with each name from the `conventions:` front matter.
 
 **Step 0-open: RUN THE ENTRY BATTERY FIRST (g-115-6468)** — one call that IS the
-executor for Step 0a's meter start, the entry checks, and every **always-run** and
-**medium** lane, then prints a per-stage rc table, FINDINGS ONLY, selection
-candidates, and a `NEXT ACTION REQUIRED:` imperative. Lane counts are DERIVED —
+executor for Step 0a's meter start, the entry checks, and every tier-table lane,
+then prints a per-stage rc table, FINDINGS ONLY, selection candidates, and a `NEXT ACTION REQUIRED:` imperative. Lane counts are DERIVED —
 never re-type one here.
 
 ```
-Bash: bash core/scripts/iteration-open.sh --apply
+Bash: bash core/scripts/iteration-open.sh --apply   # timeout 480000 (g-115-7844)
 ```
 
-It SUBSUMES Step 0a and both the always-run AND medium phase bodies below — do
-NOT also run them, or the `--apply` lanes escalate twice. Dispose what it prints,
-then resume at the first `deferrable` sweep. Run the standalone fallback
-(tier table) on `wrapper_failed` or a BLIND stage. NEVER judge a KILLED run by
+It SUBSUMES Step 0a and the always-run, medium AND deferrable phase bodies below —
+do NOT also run them, or the `--apply` lanes escalate twice. Dispose what it prints,
+then go to selection. Run the standalone fallback (tier table) on `wrapper_failed`
+or a BLIND lane. NEVER judge a KILLED run by
 rc+bytes — a severed capture reads identical; a `precheck-end` in
 `precheck-drops.jsonl` at/after its `start_ms` means it FINISHED, so
 re-running double-applies (guard-6634). Empty stdout at rc≠0 is BLIND
 (g-115-7844). `--dry-run` lists lanes and wiring status; an undispatched one
-prints `not-yet-wired`, not nothing. The **deferrable** tier is NOT yet
-wired (strangler step 3).
+prints `not-yet-wired`, not nothing. The **deferrable** tier is the
+`deferrable-battery` stage (g-115-8001); a cadence FIRE finding is dispatched by the
+cadence loop below — never re-run that battery (FIRE counters).
 
-⚠ That sentence does not MAKE anything run — its twin said "medium" while that
-tier sat dark 94-208h on two boxes (g-115-7847). Tiers run by being STAGES in
-iteration-open.sh.
+⚠ Tiers run by being STAGES in iteration-open.sh, never by a sentence here (g-115-7847).
 
 Rationale, composition contract, worker-vs-reducer meter split: the
 `core/scripts/iteration-open.py` docstring; dark-window trace and
@@ -98,8 +96,7 @@ Bash: bash core/scripts/load-precheck-digest.sh → IF path returned: Read it
 Every `## Phase` header, `meter check`, and `IF decision == "drop"` line stays
 INLINE below — those are control flow, not prose.
 
-**always-run** and **medium** rows are DISPATCHED by `iteration-open.sh`; their
-Invocation is the FALLBACK for a blind stage. Only **deferrable** rows are yours.
+Every row is DISPATCHED by `iteration-open.sh`; Invocation is its FALLBACK for a blind lane.
 
 | Phase | Sweep name (for `meter check`) | Tier | Invocation (exact) |
 |---|---|---|---|
@@ -1903,7 +1900,7 @@ Bash: bash core/scripts/completed-not-closed-slate.sh
 # carried a note (guard-1802: predicate narrower than the creating path).
 # Each slate row prints `<status>/via-<claim|executed_by>`: a `pending/via-
 # executed_by` row is one you executed and released — dispose it the same way;
-# complete-by needs no live claim. Deferred rows are deliberately absent: the
+# the close needs no live claim. Deferred rows are deliberately absent: the
 # defer/precondition lanes own and re-probe them.
 
 IF slate is EMPTY: continue to Phase 0.5h. (An empty slate with a non-zero
@@ -1939,17 +1936,21 @@ not sufficient):
        HOLD.
     3. DISPOSITION — exactly one of:
        CLOSE   — the note states completion AND the verification outcomes are
-                 met on the evidence it cites (and step 2 passed):
-                 Bash: bash core/scripts/aspirations-complete-by.sh --source <world|agent> <goal-id> \
-                         --key-finding "<one line, <=200 chars, from the note's own head>"
-                 Bash: bash core/scripts/aspirations-update-goal.sh --source <world|agent> <goal-id> outcome_class <deep|routine>
-                 # complete-by is the canonical attribution writer: status
-                 # completed (or a recurring cycle bump), completed_by=you,
-                 # completed_date/at, claim fields popped, key_finding persisted
-                 # ON THE RECORD (2026-08-16), and the team-state
-                 # recent_completions row — that append is gated on
-                 # --key-finding, so ALWAYS pass it (one team-state writer per
-                 # close path; this call IS the close of record here).
+                 met on the evidence it cites (and step 2 passed). Close through
+                 verify, so every close gate sees a drained close (g-375-146):
+                 Bash: bash core/scripts/iteration-close.sh --phase verify --drain --goal <goal-id> \
+                         --status completed --source <world|agent> --outcome <deep|routine> \
+                         --key-finding "<one line, <=200 chars, from the note's own head>" \
+                         [--outcome-note-file <copy of the note + your OUTCOME rows>]
+                 # Your judgment is per outcome, so write it: a note without one
+                 # "OUTCOME <n>: MET — <value>. Source: ..." row per outcome is
+                 # refused by the closure-evidence gate. Append the rows to a copy
+                 # of the note; an outcome you cannot source from here is a HOLD.
+                 # rc 1 = REFUSED: the row stays open. Name the gate in the
+                 # conservation line and --hold it, except a CLOSE REVIEW refusal,
+                 # which the slate already holds until a verdict answers. rc 2 is
+                 # a malformed call: fix it per its usage line and retry.
+                 # Rationale (WHY the drain closes through verify): core/config/rationale/completed-not-closed-drain.md
        RELEASE — the note says work REMAINS against a future gate (elapsed
                  time, a deploy, a partner's leg) — release the claim AND write
                  the structured defer in the SAME step, never a bare release
@@ -2003,17 +2004,8 @@ than 48h:
         (`agents/<you>/session/cnc-drain-holds.jsonl`) on EVERY lane including
         this one, and the slate reads the file it wrote (g-115-6494). A hold is
         a decision YOU made about a row, not a property of the row's holder.
-        This paragraph previously said the opposite — "a peer's `--hold` writes
-        to THAT peer's ledger ... the hold belongs to the goal's holder" — which
-        was never true of the command prescribed four lines up: that `--hold`
-        carries no `--agent`, so it always landed in the acting agent's ledger
-        while the peer slate read the peer's. The hold therefore suppressed
-        nothing on any lane but your own, silently, while still incrementing
-        hold_count toward the third-hold Investigate escalation.
-        Do NOT pass `--agent` to `--hold` to "match" the read. It no longer
-        changes the ledger, and on the `(unattributed)` lane it used to create
-        `agents/(unattributed)/session/` — a directory for a bucket key that is
-        not an agent (.claude/rules/path-resolution.md L1 cruft). Consequence to
+        Do NOT pass `--agent` to `--hold` to "match" the read (history:
+        core/config/rationale/completed-not-closed-drain.md). Consequence to
         expect: a hold you take on a peer lane suppresses that row for YOU only;
         another agent draining the same lane holds it independently.
     ELSE: leave them; state the verdict in the conservation line.
@@ -2025,9 +2017,10 @@ than 48h:
 
 CONSERVATION LINE (guard-990) — one line in the turn, always:
     "▸ cnc-drain: population=<mine_noted> slate=<n> consumed=<n> = closed <a> +
-     released <b> + held <c> + skipped-moved <d>; dropped=<dropped>
-     recent_hold=<mine_held_back_recent_hold>; peers=<peer:verdict:consumed …>"
-    consumed MUST equal closed + released + held + skipped-moved. A run whose
+     released <b> + held <c> + refused <e> [<goal>:<gate> …] + skipped-moved <d>;
+     dropped=<dropped> recent_hold=<mine_held_back_recent_hold>; peers=<peer:verdict:consumed …>"
+    consumed MUST equal closed + released + held + refused + skipped-moved (a
+    refused row counts once, as refused, even when you --hold it). A run whose
     numbers do not add up has dropped an item; find it before continuing.
 
 Then continue to Phase 0.5h.

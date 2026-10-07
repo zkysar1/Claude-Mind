@@ -79,9 +79,9 @@
 #                (defer-scope-coverage is medium rather than deferrable
 #                because it is the ONLY consumer of the population
 #                precondition-defer-recheck skips — ~76% of that lane's
-#                eligible rows — and the deferrable tier is not dispatched
-#                by anything, which is how its .py sat call-site-less from
-#                2026-08-09 to 2026-09-22; . It is also the cheapest
+#                eligible rows — and the deferrable tier was not dispatched
+#                by anything until , which is how its .py sat
+#                call-site-less from 2026-08-09 to 2026-09-22; . It is also the cheapest
 #                lane in the battery: 0.14s over three runs)
 #                (recurring-starvation-check is deliberately NOT deferrable
 #                despite sitting among the deferrable sweeps: it exists because
@@ -673,10 +673,11 @@ else:
             print('[precheck-meter] TAIL NEVER INVOKED: %d always-run sweeps '
                   'reached the meter and ZERO medium/deferrable ones did. '
                   'sweeps_dropped=%d does NOT mean the budget was fine -- it '
-                  'means nothing asked. The medium tier is wired into loop entry '
-                  'via precheck-medium-battery; if this fires, that battery did '
-                  'not run either. Check it, then resume aspirations-precheck at '
-                  'its first deferrable sweep (g-115-7847).'
+                  'means nothing asked. The medium and deferrable tiers are wired '
+                  'into loop entry via precheck-medium-battery and '
+                  'precheck-deferrable-battery; if this fires, neither ran. '
+                  'Check them, then run the tier-table Invocation of what is '
+                  'missing (g-115-7847, g-115-8001).'
                   % (always_checked, dropped))
         try:
             os.makedirs(os.path.dirname(drop_log), exist_ok=True)

@@ -26,6 +26,10 @@ REGION = "us-east-2"
 
 # Load the non-package provisioner script by path.
 _PROV_PATH = Path(__file__).resolve().parents[1] / "scripts" / "provision_aws.py"
+# A planted checkout carries this test without mind_api/scripts/. Skip the module:
+# exec_module would raise FileNotFoundError, which aborts collection of the whole chunk.
+if not _PROV_PATH.is_file():
+    pytest.skip(f"{_PROV_PATH.name} is absent from this checkout", allow_module_level=True)
 _spec = importlib.util.spec_from_file_location("provision_aws", _PROV_PATH)
 provision_aws = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(provision_aws)

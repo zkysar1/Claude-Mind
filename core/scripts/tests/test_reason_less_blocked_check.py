@@ -113,6 +113,17 @@ def test_find_open_audit_detects_open():
     assert mod._find_open_audit(goals) == "g-115-audit"
 
 
+def test_find_open_audit_detects_candidate_tier():
+    """The lane's own filing lands in the candidate tier until groomed; the
+    report surface must count it, the same as the filing predicate does."""
+    goals = [
+        _blocked(),
+        {"id": "g-115-audit", "status": "candidate",
+         "origin_signal": mod.AUDIT_ORIGIN_SIGNAL},
+    ]
+    assert mod._find_open_audit(goals) == "g-115-audit"
+
+
 def test_find_open_audit_ignores_resolved():
     goals = [
         {"id": "g-115-audit", "status": "completed",
@@ -221,6 +232,27 @@ def test_main_apply_unreadable_audit_surface_fail_closed(monkeypatch, capsys):
     assert res["uncovered_ids"] == []  # unreadable surface covers
     assert res["investigate_filed"] is None
     assert calls == []  # no second audit filed
+
+
+def test_main_apply_candidate_audit_covers_and_files_nothing(monkeypatch, capsys):
+    """The lane's own earlier filing sits in the candidate tier until it is
+    groomed. It names the flagged id, so it covers it: the next run files
+    nothing instead of a duplicate audit beside it."""
+    goals = [
+        _blocked(id="g-350-04"),
+        {"id": "g-115-audit", "status": "candidate",
+         "origin_signal": mod.AUDIT_ORIGIN_SIGNAL,
+         "title": "Investigate: reconcile reason-less blocked goal(s) g-350-04"},
+    ]
+    _patch_reads(monkeypatch, goals)
+    calls = []
+    _patch_add_goal(monkeypatch, calls)
+    rc, res = _run_main(monkeypatch, ["--apply"], capsys)
+    assert rc == 0
+    assert res["open_audit_exists"] is True
+    assert res["uncovered_ids"] == []
+    assert res["investigate_filed"] is None
+    assert calls == []
 
 
 def test_main_apply_files_nothing_when_clean(monkeypatch, capsys):

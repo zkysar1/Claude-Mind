@@ -24,8 +24,8 @@ the reason-less lane (g-115-3068, opened ~67 days, unclaimed, no appends).
 
 THE RULE (one function, both lanes)
 -----------------------------------
-An open audit (origin_signal == the lane's key, status pending/in-progress)
-COVERS a flagged goal IFF the goal's id appears in the audit's NAMING
+An open audit (origin_signal == the lane's key, status pending/in-progress/
+candidate) COVERS a flagged goal IFF the goal's id appears in the audit's NAMING
 SURFACE — its title or description (the two surfaces every filer in this
 family writes the ids into; both lanes name each affected id there by
 construction). Coverage is PER MEMBER, so:
@@ -72,10 +72,14 @@ from __future__ import annotations
 
 import re
 
-# A goal is "open" (able to hold a lane's dedup) when non-terminal — the
-# same set both lanes already used (reason-less-blocked-check.NON_TERMINAL_OPEN
-# predates this module; kept identical).
-OPEN_STATUSES = ("pending", "in-progress")
+# A goal is "open" (able to hold a lane's dedup) when it is live in the queue.
+# That INCLUDES `candidate`: Investigate/Idea/Maintain filings land in the
+# candidate tier until groomed, so a lane's own earlier filing sits there, and a
+# set that stops at pending/in-progress cannot see it — the lane then refiles a
+# duplicate audit on every run (measured 2026-10-06: 13 candidate audits for 3
+# drift events, 0 pending). reason-less-blocked-check.NON_TERMINAL_OPEN is this
+# constant, imported, so the two lanes cannot drift apart.
+OPEN_STATUSES = ("pending", "in-progress", "candidate")
 
 
 def open_audits(all_goals, origin_signal):

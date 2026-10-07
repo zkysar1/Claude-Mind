@@ -105,14 +105,14 @@ re-introduces the clobber class g-115-1561 fixed.
   # On early-return (LOOP_CONTINUE or RETURN) emit phase-end before returning;
   # unmatched starts show as `in_flight` in the report (detectable, not fatal).
   Phase 0-1.  Bash: execution-diary.sh phase-start phase-0-precheck
-              Bash: bash core/scripts/iteration-open.sh --apply
-              # g-115-6468. THIS line is the amnesia-proof half: it writes the meter
-              # start/end stamps, runs the entry checks + all 9 always-run lanes, and
+              Bash: bash core/scripts/iteration-open.sh --apply   # timeout 480000
+              # g-115-6468. This is the amnesia-proof half: it writes the meter
+              # start/end stamps, runs the entry checks + every tier-table lane, and
               # prints a per-stage rc table, FINDINGS ONLY, candidates, and its own
               # NEXT ACTION imperative — so a post-compaction resume re-derives the
               # entry from disk instead of from a summary. Run it BEFORE the Skill and
               # do NOT re-run what it already ran (the --apply lanes escalate twice).
-              Skill(aspirations-precheck)   # medium/deferrable + the LLM-judgment lanes
+              Skill(aspirations-precheck)   # only if NEXT ACTION names it
               Bash: execution-diary.sh phase-end phase-0-precheck
   Phase 1.5.  Strategic scan — IF scan_due (goal_cadence, recurring_settling, OR time_cadence)
               THEN Bash: execution-diary.sh phase-start phase-1-strategic-scan;

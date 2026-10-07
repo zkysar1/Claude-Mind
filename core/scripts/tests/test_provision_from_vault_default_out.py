@@ -43,7 +43,14 @@ from _bash_helpers import BASH  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = REPO_ROOT / "core" / "scripts" / "provision-from-vault.sh"
 
-VAULT_BODY = "MIND_MIND_AWS_ACCESS_KEY_ID=PLACEHOLDER_AKID\nMIND_STORAGE_BACKEND=own-cloud\n"
+# The script derives its vault prefix at run time: the first segment of ENVIRONMENT_ID,
+# uppercased. The fixture keys are built from that same derivation and not spelled with the
+# literal prefix token, because the seed plant rewrites that token inside this file but cannot
+# see the script computing it, so a spelled-out fixture stops matching at a plant.
+ENVIRONMENT_ID = "ayoai-mind"
+PFX = ENVIRONMENT_ID.split("-")[0].upper() + "_"
+
+VAULT_BODY = f"{PFX}MIND_AWS_ACCESS_KEY_ID=PLACEHOLDER_AKID\n{PFX}STORAGE_BACKEND=own-cloud\n"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 
@@ -96,7 +103,7 @@ def _run_with_default_out(tmp_path):
     # guard-1484: clear the value when the run must MEASURE resolution rather
     # than dictate it. Measured before this fix (): baseline 2 passed,
     # VAULT_KEY_PREFIX=BOGUS 2 FAILED.
-    env["ENVIRONMENT_ID"] = "ayoai-mind"
+    env["ENVIRONMENT_ID"] = ENVIRONMENT_ID
     env.pop("VAULT_KEY_PREFIX", None)
     env.pop("OUT", None)  # the default is the whole point
     # VAULT_SSH_USER (:106, used at :145/:148) is the one remaining override this

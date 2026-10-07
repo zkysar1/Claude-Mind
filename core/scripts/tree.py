@@ -2745,23 +2745,27 @@ def cmd_set(args):
 
 
 def _read_in_flight_goal_id():
-    """Read the EXECUTING goal id from world/team-state.yaml in_flight (,
-    Gate D spillover provenance). Fail-open: any error — no bound agent, missing
-    file, parse error, no in_flight — returns None. Mirrors store_registry.py
-    _rb_inject_source_goal so a tree-node write records the SAME executing goal an
-    rb write does, giving the SPILL-1 analysis a uniform origin signal across both
-    encoding stores."""
+    """Resolve the goal the CALLING SESSION is executing, for the ambient
+    origin_goal_id stamp (g-325-06, Gate D spillover provenance; per-session since
+    g-306-544). Fail-open: any error — no bound agent, missing file, parse error,
+    no goal for this session — returns None, which means "stamp nothing".
+
+    The agent-keyed in_flight row names the REDUCER's goal, so it answers only when
+    the caller IS the reducer; a worker Body's own goal lives in its
+    in_flight_bodies.<sid> row. _executing_goal.py holds the rule and MIND_SID names
+    the caller. This no longer mirrors store_registry.py _rb_inject_source_goal,
+    which still reads the agent-keyed row (rb writes are reducer-side by design)."""
     try:
         from _fileops import _agent_name
         agent_name = _agent_name()
         if not agent_name or WORLD_DIR is None:
             return None
-        #  sharding: row-first read (world/team-state/agents/<agent>.yaml)
-        # with core-file residual fallback for un-migrated deployments.
-        from _team_state import read_agent_row
-        status = read_agent_row(WORLD_DIR, agent_name,
-                                core_path=WORLD_DIR / "team-state.yaml") or {}
-        return (status.get("in_flight") or {}).get("goal_id") or None
+        from _executing_goal import read_reducer_sid, resolve_executing_goal_id
+        from _paths import AGENT_DIR, SESSION_DIRNAME
+        state_dir = (AGENT_DIR / SESSION_DIRNAME) if AGENT_DIR else None
+        return resolve_executing_goal_id(
+            WORLD_DIR, agent_name, os.environ.get("MIND_SID", ""),
+            read_reducer_sid(state_dir), core_path=WORLD_DIR / "team-state.yaml")
     except Exception:
         return None
 

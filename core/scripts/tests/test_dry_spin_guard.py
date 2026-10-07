@@ -379,14 +379,19 @@ def test_cheap_gates_run_before_any_probe(monkeypatch, capsys):
 # --- wiring anchors ----------------------------------------------------------
 
 def test_config_key_present_on_both_surfaces():
-    """goal check 3: the key must exist with a default AND a comment naming the
-    goal, in the fallback DEFAULTS and in the live config."""
+    """goal check 3: the key must exist with a default AND a comment documenting
+    it, in the fallback DEFAULTS and in the live config. The comment is checked
+    structurally, not for the goal id it cites: the seed plant scrubs "(g-NNN-NN)"
+    from source comments, so a goal-id grep passes here and fails at every plant."""
     dry_idle = (CORE_SCRIPTS / "_dry_idle.py").read_text(encoding="utf-8")
     asp = (CORE_SCRIPTS.parent / "config" / "aspirations.yaml").read_text(encoding="utf-8")
     assert "min_reentry_gap_s" in dry_idle
     assert "min_reentry_gap_s" in asp
-    assert "g-357-88" in dry_idle
-    assert "g-357-88" in asp
+    idle_lines = dry_idle.splitlines()
+    key_at = next(i for i, ln in enumerate(idle_lines) if '"min_reentry_gap_s"' in ln)
+    assert idle_lines[key_at - 1].lstrip().startswith("#"), "DEFAULTS key lost its comment"
+    asp_key = next(ln for ln in asp.splitlines() if ln.lstrip().startswith("min_reentry_gap_s:"))
+    assert "#" in asp_key, "live config key lost its inline comment"
     import _dry_idle as di
     assert di.DEFAULTS["min_reentry_gap_s"] == 120
 

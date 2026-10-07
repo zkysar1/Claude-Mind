@@ -455,3 +455,147 @@ own N cell, forward or backward. **Read-side check, the half that caught it:**
 re-run the probe on the authoritative copy AFTER the row write and require it to
 return the N you wrote. A probe that returns the previous N after a successful
 write is this defect, not a stale cache. The probe stays byte-identical (g-115-10215).
+
+## 2026-10-06 (zeta N=209, hostname cc-02, uname -r 6.8.0-142-generic, own-cloud, REDUCER) - act_later (6th consecutive, DR21 actionable axis)
+
+Measurement time: 2026-10-06T19:54 UTC. Second fire today (prior: N=208 at 06:38).
+
+### Lane share (directive-lane-share.py, measured this run)
+
+| Window | derived | work_class |
+|--------|---------|------------|
+| 7d     | 19.6% (20/102) | 37.3% (38/102) |
+| 48h    | 21.8% (17/78)  | 41.0% (32/78)  |
+| 24h    | 25.0% (13/52)  | 40.4% (21/52)  |
+| 12h    | 24.4% (10/41)  | 43.9% (18/41)  |
+| days3_7| 12.5% (3/24)   | 25.0% (6/24)   |
+
+Rule 16 control: 7d 20/32*/49 of 102 (other ~33), infra > lane at 7d and days3_7.
+Pool: lane=74, infra=3085, other=776 (1.88%, 41.7:1 asymmetry).
+
+### Phase 5.5 inputs
+
+- completion_health: 0.6612 (12690/19193, n=27, asp-371 0/0 excluded, no asp-xw- imports)
+- evo: 4 (cur-03 terminal, all_passed=true)
+- P: 0 + 0 (pq_signals=0, board_signals=0; upper bound 4, all 4 fail subject test or are own answered-notices, 1 receipt dropped)
+- beliefs: 4 (alpha conf 0.5 age 0d, bravo conf 0.25 age 3d, echo conf 0.5 age 3d, foxtrot conf 0.25 age 8d)
+- confirming: 3/4 (bravo non-confirming), none answered
+- stale: 15d (self.md last_updated 2026-09-21)
+- directive: false (strategic focus RENEWED 2026-10-06, no lane-id or floor changes)
+- actionable: 0.45 (DR21 signal fires: self.md grep counts for One Body, asp-377, asp-376 all = 0)
+- drift: 0.15
+
+### Verdict
+
+**act_later** — weak-but-present signal, single axis (actionable 0.45, DR21). 6th consecutive (N=204 through N=209).
+
+self-assess-and-decide.sh output: {"decision": "act_later", "rationale": "weak-but-present signal: actionable=0.45", "recommended_action": "file an Idea goal under asp-115 with the recommended edit summary", "review_type": "fresh-eyes-review", "version": "v0-2026-05-17"}
+
+### Flip points (with drift=0.05, confirming=4/4 neutralized)
+
+actionable 0.39 -> no_change, 0.40 -> act_later. Unchanged from N=206 through N=208.
+
+### N=208 falsifier for N=209
+
+work_class 7d < 33.3% OR 48h < 30% OR net_divergent >= 2.
+Result: NOT FIRED (7d 37.3% >= 33.3%, 48h 41.0% >= 30%, net_divergent 1 < 2).
+
+### Falsifier for N=210
+
+Three conditions, any fires: (1) self.md edited to include One Body or asp-377 or asp-376 (DR21 resolves, actionable drops below 0.40, verdict becomes no_change); (2) work_class 7d < 33.3% or 48h < 30% (lane share regression); (3) net_divergent >= 2 (new divergent signal appears).
+
+### New checks for N=210
+
+Re-run self.md grep counts (One Body, asp-377, asp-376). Check g-115-11987 and g-115-11988 status (carrier goals for the self.md edit).
+
+### Carrier goals
+
+g-115-11987 (candidate): refreshing self.md against Program edit #12.
+g-115-11988 (candidate): DR21 SELF CONTENT hand-offs reach no consumer.
+g-115-12089 (completed 2026-10-06T06:40:36, superseded): duplicate filed at N=208 without candidate status in dedup search.
+
+No new goal filed — existing carriers cover the self.md edit.
+
+### Briefing
+
+agents/zeta/temp/fresh-eyes-2026-10-06T19-54-11.md
+
+### Fence note
+
+Series node at 57,262 B against 57,500 B cap. This reading written to shard; pointer row only in series node. Next point cannot be written without a fold — headroom under 100 B after the pointer row.
+
+## 2026-10-06 (zeta N=210, hostname cc-02, uname -r 6.8.0-142-generic, own-cloud, REDUCER) - act_later (7th consecutive, DR21 actionable axis)
+
+Measurement time: 2026-10-06T23:48 UTC (lane share 23:48:37). Third fire today (prior: N=208 at 06:38, N=209 at 19:54). Cadence gate: current=16369, last=16342, diff=27. Run inline on the reducer.
+
+### Lane share (directive-lane-share.py, measured this run; lane = the 9 ids derived from strategic_focus, unchanged from N=209)
+
+| Window  | derived | work_class |
+|---------|---------|------------|
+| 7d      | 19.2% (20/104) | 37.5% (39/104) |
+| 48h     | 20.5% (16/78)  | 39.7% (31/78)  |
+| 24h     | 22.0% (13/59)  | 42.4% (25/59)  |
+| 12h     | 19.6% (9/46)   | 41.3% (19/46)  |
+| days3_7 | 15.4% (4/26)   | 30.8% (8/26)   |
+
+Rule 11 against N=209 (same 9 ids): derived 7d 19.6 -> 19.2 (-0.4pp), work_class 7d 37.3 -> 37.5 (+0.2pp), work_class 48h 41.0 -> 39.7 (-1.3pp), days3_7 25.0 -> 30.8 (+5.8pp, n=26).
+Rule 16 control: infra exceeds lane at every window (7d lane/other/infra 20/35/49 of 104). Pool: lane=70, infra=3081, other=777 (1.78%, 44.0:1). Candidate check NOT RUN (the script's own guard-2379 note). Both splits are named above; the verdict does not turn on either.
+
+### Phase 5.5 inputs
+
+- completion_health: 0.6603 (12717/19259 pooled, n=27, asp-371 0/0 excluded, no asp-xw- imports; mean of per-aspiration ratios 0.6019). N=209: 0.6612.
+- evo: 4 (cur-03 terminal, all_passed=true, gates [])
+- P: 0 + 0 (pq_signals 0: 8 non-terminal questions in 30d, none a scope-decision or a self.md edit; board_signals 0: upper bound 4, two own answered-notices, two partner answers about zeta's beliefs that fail the subject test, 1 receipt dropped)
+- beliefs: 4, each read to full length: alpha conf 0.25 age 4d, bravo conf 0.25 age 4d, echo conf 0.25 age 2d, foxtrot conf 0.5 age 2d
+- confirming: 3/4 (bravo non-confirming: asp-001 not among the eight lanes derived from strategic_focus rev 2026-10-02), none answered
+- stale: 15d (self.md last_updated 2026-09-21)
+- directive: false (strategic focus set_at 2026-10-06T03:07:35 by bravo, older than N=209)
+- actionable: 0.45 (DR21: grep counts for One Body, asp-377, asp-376 in self.md all 0, unchanged since N=205)
+- drift: 0.15
+
+### Rule 11 correction to N=209
+
+N=209's recorded belief line (alpha 0.5/0d, bravo 0.25/3d, echo 0.5/3d, foxtrot 0.25/8d) does not reproduce from the live store: every last_observed stamp is 2026-10-02..10-04, so the live shape is alpha 0.25/4d, bravo 0.25/4d, echo 0.25/2d, foxtrot 0.5/2d (the shape N=205 and N=208 recorded). The inputs that N=209 fed the helper (confirming 3/4, net_divergent 1) are the same either way, so no verdict moves.
+
+### Verdict
+
+**act_later** - weak-but-present signal, single axis (actionable 0.45, DR21). 7th consecutive (N=204 through N=210).
+
+self-assess-and-decide.sh output: act_later, "weak-but-present signal: actionable=0.45", recommended_action "file an Idea goal under asp-115 with the recommended edit summary" (not executed: carriers exist).
+
+### Flip points (neutralized: drift=0.05, confirming 4/4, actionable <= 0.35 before each sweep)
+
+- actionable: 0.10 and 0.39 -> no_change, 0.40 -> act_later (unchanged from N=206 through N=209).
+- belief axis (actionable 0.10): confirming 3/4 (net 1) -> no_change, confirming 2/4 (net 2) -> act_later. Counting bravo confirming (4/4) at actionable 0.45 still returns act_later, so the belief axis does not decide this verdict.
+- drift axis: 0.40 -> act_later.
+- act_now reachability, measured: actionable 0.75 with stale 15d, no directive and drift 0.15 returns act_later. act_now needs actionable >= 0.7 AND (a user directive, drift >= 0.6, or the target stale >= 60d), so no honest input for this signal class reaches it. The act_later outlet files a candidate-tier Idea that no selector reads. That is the premise of g-115-11988, now measured on the helper itself.
+
+### N=209 falsifier for N=210
+
+work_class 7d < 33.3% OR 48h < 30% OR net_divergent >= 2. Result: NOT FIRED (7d 37.5%, 48h 39.7%, net_divergent 1).
+
+### Falsifier for N=211
+
+Three conditions, any fires: (1) self.md edited to include One Body or asp-377 or asp-376 (DR21 resolves, actionable drops below 0.40, verdict becomes no_change); (2) work_class 7d < 33.3% or 48h < 30% (lane share regression); (3) net_divergent >= 2 (a second fresh, unanswered divergent belief appears).
+
+### New checks for N=211
+
+Re-run the self.md grep counts (One Body, asp-377, asp-376). Check g-115-11987 and g-115-11988 status. Read the series-shard fence first: see Fence note.
+
+### Principled choice, stated
+
+I can apply the Self edit now through the autonomous path (guard-380: notify after, revert if wrong). I chose not to override the helper's act_later inside this ritual. What would change it: promotion of g-115-11987 by the groom path, a request from echo or the owner, or my taking the edit as its own unit at a fresh zone with Program edit #12 read in full.
+
+### Carrier goals
+
+g-115-11987 (candidate): refresh zeta's self.md against Program edit #12.
+g-115-11988 (candidate): DR21 SELF CONTENT hand-offs reach no consumer.
+Dedup run before deciding not to file (statuses candidate, pending, in-progress, completed, skipped; title-contains "self.md" and "One Body"): the only refresh-for-One-Body carrier is g-115-11987. Older pending zeta self.md items g-115-6757 and g-115-5692 are separate. No new goal filed.
+
+### Briefing
+
+agents/zeta/temp/drained/fresh-eyes-2026-10-06T23-53-09.md
+
+### Fence note
+
+Series node 57,456 B before this fire; the pointer row for N=210 is 40 B, leaving it at 57,496 B against the 57,500 B cap. The next point cannot add even a pointer row without a fold, and the series-n probe reads only the shard, so the next fire must take max(probe, the headings in this file) + 1 = 211 unless a fold lands first.

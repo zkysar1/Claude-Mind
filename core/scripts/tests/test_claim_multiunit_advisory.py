@@ -176,7 +176,8 @@ class TestTheAdvisoryIsWiredWhereBothOrchestratorsReachIt:
         multi-unit goal — the failure would look like a JSON parse error far
         from here.
         """
-        block = SRC.split("--- multi-unit claim advisory (g-306-323) ---", 1)[1]
+        # The anchor stops BEFORE the goal id: the seed plant scrubs it from the comment.
+        block = SRC.split("--- multi-unit claim advisory (", 1)[1]
         block = block.split("\n    fi\n", 1)[0]
         printfs = [ln for ln in block.splitlines() if "printf" in ln]
         assert printfs, "the advisory no longer prints anything"

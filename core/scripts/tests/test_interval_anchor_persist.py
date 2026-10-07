@@ -180,8 +180,9 @@ def test_cli_daemon_anchor_parity():
     """
     cli = CLI_FILE.read_text(encoding="utf-8")
     daemon = DAEMON_FILE.read_text(encoding="utf-8")
+    # code anchors only: the seed plant scrubs "(g-NNN-NN)" from source comments, so a
+    # goal-id marker grep passes here and fails at every plant
     for label, src in (("CLI", cli), ("daemon", daemon)):
-        assert "g-115-2049" in src, f"{label} lost the g-115-2049 anchor-persist marker"
         assert 'goal["original_interval_hours"] = _prev_interval_hours' in src, (
             f"{label} lost the anchor-persist assignment")
         assert 'field == "interval_hours"' in src, f"{label} lost the interval_hours guard"
@@ -325,8 +326,8 @@ def test_cli_daemon_rebase_parity():
     """
     cli = CLI_FILE.read_text(encoding="utf-8")
     daemon = DAEMON_FILE.read_text(encoding="utf-8")
+    # code anchors only: see test_cli_daemon_anchor_parity
     for label, src in (("CLI", cli), ("daemon", daemon)):
-        assert "g-115-6104" in src, f"{label} lost the g-115-6104 re-base marker"
         assert "_is_deliberate_raise(_anchor, _new_interval)" in src, (
             f"{label} lost the deliberate-raise call")
         assert "from _cadence_anchor import is_deliberate_raise" in src, (

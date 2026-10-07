@@ -22,6 +22,7 @@ g-115-1563 fresh-eyes spark (static parity guards confirm presence, not behavior
 
 from __future__ import annotations
 
+import ast
 import json
 import sys
 import tempfile
@@ -148,28 +149,46 @@ def test_skipped_does_not_stamp_completed_by():
                 f"got {g.get('completed_by')!r}")
 
 
+def _has_scoped_completed_by_stamp(src: str) -> bool:
+    """True when an `if` naming value == "completed" and the completed_by guard assigns goal["completed_by"].
+
+    Read from the AST, not from text. The seed plant scrubs "(g-NNN-NN)" from source
+    comments, so a goal-id marker grep passes here and fails at every plant. A bare
+    `goal["completed_by"] =` match is also satisfied by the unrelated assignment
+    further down the daemon file, so the assignment must sit under that `if`.
+    """
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.If):
+            continue
+        test = ast.unparse(node.test)
+        if "value == 'completed'" not in test or "completed_by" not in test:
+            continue
+        for stmt in node.body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Assign) and any(
+                        isinstance(t, ast.Subscript) and ast.unparse(t) == "goal['completed_by']"
+                        for t in sub.targets):
+                    return True
+    return False
+
+
 def test_cli_daemon_completed_by_parity():
-    """Both write-path implementations carry the  completion stamp (guard-742).
+    """Both write-path implementations carry the completion completed_by stamp (guard-742).
 
     The CLI (core/scripts/aspirations.py cmd_update_goal) and the daemon mirror
     (mind_api/src/endpoints/aspirations_write.py update_goal) were patched as
     byte-parallel copies. A fix to only one side is half a fix (guard-742). This
-    guard fails if either side loses the g-115-1562 completion stamp, its
-    value==completed scoping, or the completed_by assignment.
+    guard fails if either side loses the completion stamp, its value==completed
+    scoping, or the completed_by assignment.
     """
     assert CLI_FILE.is_file(), f"CLI aspirations missing: {CLI_FILE}"
     assert DAEMON_FILE.is_file(), f"daemon aspirations_write missing: {DAEMON_FILE}"
     cli = CLI_FILE.read_text(encoding="utf-8")
     daemon = DAEMON_FILE.read_text(encoding="utf-8")
-    # the  completion-stamp marker present on both sides
-    assert "g-115-1562" in cli
-    assert "g-115-1562" in daemon
-    # scoped to value==completed on both sides (not all terminal statuses)
-    assert 'value == "completed"' in cli
-    assert 'value == "completed"' in daemon
-    # the completed_by assignment present on both sides
-    assert 'goal["completed_by"]' in cli
-    assert 'goal["completed_by"]' in daemon
+    # one structural check per side: the stamp, its value==completed scoping (not all
+    # terminal statuses) and the completed_by assignment are a single `if` + assignment
+    assert _has_scoped_completed_by_stamp(cli), "CLI lost the completion completed_by stamp"
+    assert _has_scoped_completed_by_stamp(daemon), "daemon lost the completion completed_by stamp"
 
 
 if __name__ == "__main__":

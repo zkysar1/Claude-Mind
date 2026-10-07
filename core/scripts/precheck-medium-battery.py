@@ -316,10 +316,11 @@ LANES = (
 # 'five lanes' claims went stale the moment a sixth was registered ... no test can
 # pin a sentence"). `iteration-open.sh --dry-run` prints the live number.
 _NOT_COVERED = (
-    ("deferrable tier", "not yet wired — see `iteration-open.sh --dry-run` for the live count"),
+    ("deferrable tier", "dispatched by precheck-deferrable-battery.sh (g-115-8001), not by this battery"),
     (
         "0.5b.6 / 0.5b.7 / 0.5b.8",
-        "outcome_note clobber risk under unconditional dispatch (guard-4033); "
+        "outcome_note clobber risk under unconditional dispatch (guard-4033; the "
+        "deferrable battery dispatches them DRY, never --apply); "
         "they bare-REPLACE outcome_note with no `_compose_note` "
         "preservation (measured 0/0/0, 2026-08-26). The lost-update half "
         "shipped under g-115-6332; the preservation half has no owner yet",

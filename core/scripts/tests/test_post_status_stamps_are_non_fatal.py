@@ -42,7 +42,10 @@ CLOSE_SH = CORE_ROOT / "scripts" / "iteration-close.sh"
 # since ~2026-09-01 looking for a writer that no longer exists by design. Do NOT restore
 # it here; `test_completed_date_rides_the_status_write_not_a_separate_stamp` below pins
 # the  design so a future re-addition is caught.
-NON_FATAL_STAMPS = ("outcome_class", "completed_by_role")
+#
+# `key_finding` joined on 2026-10-06 (): a drained close stamps the drain's
+# finding after the status write, as the complete-by close it replaced did.
+NON_FATAL_STAMPS = ("outcome_class", "completed_by_role", "key_finding")
 
 WRITER = "aspirations-update-goal.sh"
 STATUS_WRITE = '"$GOAL_ID" status "$GOAL_STATUS"'

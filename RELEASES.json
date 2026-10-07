@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.95",
+    "previous_version": "2.12.94",
+    "date": "2026-10-07",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "v2.12.95: planted-seed test fixes -- two tests no longer abort pytest collection on a planted seed (g-115-12159); 67 plant-only test failures in 26 test files removed, 63 now passing as a plant holds them and 4 skipping because the plant does not ship the file they read: anchors that stop before a goal id, path-scrub literals, fixtures built inside the test (g-360-31); the daemon restart pathspec names peer_board_post, outbound_data_class and env, which the daemon has loaded since df44ec5270 (g-306-587); promotion runbook Phase 5 item 8 collects the planted tree first and initializes the clone (g-115-12159); ledger entries for the full runs at 88cd17ecef and at the v2.12.94 plant (g-115-12138, g-360-31); the deferrable precheck tier is dispatched from iteration-open as a bounded stage and the precheck-skill load is gated on an iteration-open verdict (g-115-8001, g-374-504); the completed-not-closed drain closes through verify and a refused close waits for its verdict (g-375-146, -149); the worker-ref retire gate no longer reads an absent in_flight row as license (g-306-506); tree origin_goal_id is stamped from the requesting session's own goal (g-306-544); guardrail records gain enforced_by and a census lists owner directives that name no gate (g-306-572); the candidate tier files hypothesis-resolve goals pending (g-353-185) and audit lanes' dedup sees candidate audits (g-115-12158); a local-peer post says delivery is unconfirmed and /prime names posts held back in a local peer copy (g-115-12070); the three archive wrappers refuse an unknown argument instead of running a destructive sweep on --help (g-115-6318); encode-session relay goals file as user_directive (g-115-12175); 36 framework commits since v2.12.94",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.94",
     "previous_version": "2.12.93",
     "date": "2026-10-06",

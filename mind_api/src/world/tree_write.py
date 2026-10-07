@@ -120,6 +120,10 @@ from ..agent_paths import assert_not_cruft
 
 from _fileops import _atomic_write_with_fallback  # noqa: E402
 from _l1_pick import log_l1_pick  # noqa: E402  # S9 SSOT, 
+from _executing_goal import (  # noqa: E402  # per-session origin resolver, 
+    read_reducer_sid as _read_reducer_sid,
+    resolve_executing_goal_id as _resolve_executing_goal_id,
+)
 from _growth_log import (  # noqa: E402  # tree_growth_log SSOT, 
     record_batch as _growth_record_batch,
     record_reparent as _growth_record_reparent,
@@ -831,32 +835,35 @@ def _write_tree_locked(path: Path, data: Dict[str, Any], base_dir: Path,
 # Mutation helpers (mirror core/scripts/tree.py cmd_* _do_* closures exactly)
 # ---------------------------------------------------------------------------
 
-def _read_in_flight_goal_id(world_path: Path, agent: str):
-    """Daemon mirror of core/scripts/tree.py _read_in_flight_goal_id ().
-    Reads the EXECUTING goal id from world/team-state.yaml in_flight for the
-    per-request agent, producing the SAME origin signal the CLI records. Fail-open:
-    any error (no agent, missing file, parse error, no in_flight) returns None.
+def _resolve_origin_goal_id(ctx, world_path: Path, agent: str):
+    """Daemon mirror of core/scripts/tree.py _read_in_flight_goal_id (,
+    per-session since g-306-544). Resolves the goal the REQUESTING SESSION is
+    executing, for the ambient origin_goal_id stamp. Fail-open: any error returns
+    None, which means "stamp nothing".
 
-    Unlike the CLI helper (which uses the _fileops._agent_name()/WORLD_DIR module
-    globals), the daemon is a shared multi-agent process — agent identity is
-    per-request, so it is passed explicitly alongside world_path. The OUTPUT is
-    byte-identical to the CLI for the same (agent, team-state) pair."""
+    The agent-keyed in_flight row names the REDUCER's goal, so reading it for a
+    worker Body's request mis-stamps the node with a goal that Body never held.
+    The requester is identified by the x-mind-sid header (rt_call forwards it);
+    the shared resolver (_executing_goal.py) reads that Body's own in_flight_bodies
+    row, or the agent-keyed row only when the requester IS the reducer. The daemon
+    is a shared multi-agent process, so agent and state dir come from the request,
+    never from process state."""
     try:
         if not agent or world_path is None:
             return None
-        #  sharding: row-first read (world/team-state/agents/<agent>.yaml)
-        # with core-file residual fallback for un-migrated deployments.
-        from _team_state import read_agent_row
-        status = read_agent_row(world_path, agent,
-                                core_path=world_path / "team-state.yaml") or {}
-        return (status.get("in_flight") or {}).get("goal_id") or None
+        sid = (ctx.headers.get("x-mind-sid") or "").strip()
+        return _resolve_executing_goal_id(
+            world_path, agent, sid,
+            _read_reducer_sid(getattr(ctx.paths, "state_dir", None)),
+            core_path=world_path / "team-state.yaml")
     except Exception:
         return None
 
 
 def _apply_add_child(tree: Dict[str, Any], parent_key: str,
                      child_data: Dict[str, Any], world_path: Path,
-                     agent: str) -> Dict[str, Any]:
+                     agent: str, origin_goal_id: Optional[str] = None
+                     ) -> Dict[str, Any]:
     nodes = tree["nodes"]
     parent = nodes[parent_key]
     parent_depth = parent.get("depth", 0)
@@ -888,14 +895,14 @@ def _apply_add_child(tree: Dict[str, Any], parent_key: str,
     child_node["last_updated"] = date.today().isoformat()
     # origin_goal_id (): record the EXECUTING goal that created this
     # node, for the Gate D SPILL-1 spillover analysis. Caller-wins (an explicit
-    # value copied above is preserved); otherwise auto-inject from team-state
-    # in_flight. Mirrors tree.py cmd_add_child:1849-1852 ( / ).
-    # Absent when no goal is executing (a manual add) — pre- readers
-    # ignore the unknown field, so existing consumers parse unchanged.
-    if "origin_goal_id" not in child_node:
-        _origin = _read_in_flight_goal_id(world_path, agent)
-        if _origin:
-            child_node["origin_goal_id"] = _origin
+    # value copied above is preserved); otherwise stamp the goal the REQUESTING
+    # SESSION is executing (`origin_goal_id`, resolved per request by
+    # _resolve_origin_goal_id — ). Mirrors tree.py cmd_add_child
+    # ( / ). Absent when that session's goal cannot be told
+    # (a manual add, an observer, a released Body) — pre- readers ignore
+    # the unknown field, so existing consumers parse unchanged.
+    if "origin_goal_id" not in child_node and origin_goal_id:
+        child_node["origin_goal_id"] = origin_goal_id
 
     nodes[child_key] = child_node
     if child_key not in parent.get("children", []):
@@ -1458,7 +1465,9 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                 if cl is not None:
                     return Response.error(409, "child_limit_reject", f"{cl}")
 
-                child_node = _apply_add_child(tree, parent_key, child, world_path, agent)
+                child_node = _apply_add_child(
+                    tree, parent_key, child, world_path, agent,
+                    origin_goal_id=_resolve_origin_goal_id(ctx, world_path, agent))
 
                 # Optional .md body (daemon-only; CLI add-child writes no .md).
                 md_written = False
@@ -2027,7 +2036,10 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                             if cl is not None:
                                 return Response.error(
                                     409, "child_limit_reject", f"{cl}")
-                            _apply_add_child(tree, key, child, world_path, agent)
+                            _apply_add_child(
+                                tree, key, child, world_path, agent,
+                                origin_goal_id=_resolve_origin_goal_id(
+                                    ctx, world_path, agent))
                             updated_keys.add(child_key)
                             updated_keys.add(key)
                             batch_added_child_keys.append(child_key)

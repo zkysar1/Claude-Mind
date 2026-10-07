@@ -563,7 +563,7 @@ def test_add_child_duplicate_key_409(running_daemon):
 
 class _FakePaths:
     def __init__(self, world: Path, project_root: Path = REPO_ROOT,
-                 meta: Path | None = None):
+                 meta: Path | None = None, state_dir: Path | None = None):
         self.world = world
         # project_root drives _load_competence_config (reads
         # core/config/tree.yaml). Pointing it at the real repo makes the
@@ -574,14 +574,21 @@ class _FakePaths:
         # as the CLI does when MIND_META has no config-overrides.yaml — both
         # sides then read D_max from the same real core/config/tree.yaml.
         self.meta = meta
+        # state_dir is the agent's session/ dir (): where the daemon
+        # looks for running-session-id to tell the reducer from a worker Body.
+        self.state_dir = state_dir
 
 
 class _FakeCtx:
     def __init__(self, world: Path, body: dict, agent: str = "alpha",
-                 project_root: Path = REPO_ROOT, meta: Path | None = None):
-        self.paths = _FakePaths(world, project_root, meta)
+                 project_root: Path = REPO_ROOT, meta: Path | None = None,
+                 sid: str | None = None, state_dir: Path | None = None):
+        self.paths = _FakePaths(world, project_root, meta, state_dir)
         self.body = json.dumps(body).encode("utf-8")
         self.headers = {"x-mind-agent": agent}
+        if sid:
+            # rt_call forwards MIND_SID as x-mind-sid; server.py lowercases keys.
+            self.headers["x-mind-sid"] = sid
         self.query = {}
 
 
@@ -593,11 +600,45 @@ def _seed_world(base: Path, name: str) -> Path:
     return world
 
 
-def _run_cli(world: Path, meta: Path, args: list, stdin_text: str | None):
+def _write_team_state(world: Path, in_flight_goal: str | None = None,
+                      bodies: dict | None = None) -> None:
+    """Seed world/team-state.yaml for agent 'alpha' (): the agent-keyed
+    in_flight goal (the REDUCER's row) and per-Body in_flight_bodies rows
+    {sid: goal_id} (a worker Body's claim). Outside knowledge/tree, so it is an
+    inject INPUT and never part of the compared _tree.yaml bytes."""
+    row: dict = {}
+    if in_flight_goal:
+        row["in_flight"] = {"goal_id": in_flight_goal}
+    if bodies:
+        row["in_flight_bodies"] = {sid: {"goal_id": g} for sid, g in bodies.items()}
+    (world / "team-state.yaml").write_text(
+        yaml.safe_dump({"agent_status": {"alpha": row}}), encoding="utf-8")
+
+
+def _agent_state_dir(base: Path, reducer_sid: str | None):
+    """A tmp agent dir whose session/ holds running-session-id (the reducer's SID),
+    or nothing, as on a worker box. Returns (agent_dir, state_dir)."""
+    agent_dir = base / "alpha"
+    state_dir = agent_dir / "session"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if reducer_sid:
+        (state_dir / "running-session-id").write_text(reducer_sid + "\n",
+                                                      encoding="utf-8")
+    return agent_dir, state_dir
+
+
+def _run_cli(world: Path, meta: Path, args: list, stdin_text: str | None,
+             env_extra: dict | None = None):
     env = dict(os.environ)
     env["MIND_WORLD"] = str(world)
     env["MIND_META"] = str(meta)
     env["MIND_AGENT"] = "alpha"
+    # The caller's session identity decides the origin_goal_id stamp (),
+    # so the ambient one must never leak in: a Body running this suite exports its
+    # own MIND_SID. Tests that need a session pass it through env_extra.
+    env.pop("MIND_SID", None)
+    env.pop("MIND_AGENT_DIR", None)
+    env.update(env_extra or {})
     meta.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
         [sys.executable, str(TREE_PY), "update", *args],
@@ -744,12 +785,12 @@ def test_byte_compat_add_child_flips_leaf_parent(tmp_path):
                     reason="libyaml (CSafeDumper) required for byte-compat")
 @pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
 def test_byte_compat_add_child_injects_origin_goal_id(tmp_path):
-    """: add-child with NO explicit origin_goal_id auto-injects the
-    EXECUTING goal id from world/team-state.yaml in_flight (g-325-06 / g-115-1463)
-    in the daemon exactly as the CLI does. The pre-fix daemon dropped the inject;
-    seeding BOTH worlds with an identical in_flight goal proves the daemon now
-    records the same origin signal, and the explicit assertion pins origin_goal_id
-    on the child."""
+    """ + : add-child with NO explicit origin_goal_id stamps the
+    goal the REQUESTING SESSION is executing, in the daemon exactly as the CLI does.
+    The session here is the REDUCER (its SID equals running-session-id), so that
+    goal is the agent-keyed in_flight one. The pre-g-115-1485 daemon dropped the
+    inject; seeding BOTH sides identically proves the daemon records the same origin
+    signal, and the explicit assertion pins origin_goal_id on the child."""
     from mind_api.src.world import tree_write
 
     cli_world = _seed_world(tmp_path, "cli")
@@ -759,23 +800,112 @@ def test_byte_compat_add_child_injects_origin_goal_id(tmp_path):
     # daemon reads world_path/team-state.yaml with the per-request agent. The
     # file lives at the world ROOT, outside knowledge/tree, so _tree_bytes is
     # unaffected by its presence — it is purely an inject INPUT.
-    team_state = ("agent_status:\n"
-                  "  alpha:\n"
-                  "    in_flight:\n"
-                  "      goal_id: g-999-42\n")
-    (cli_world / "team-state.yaml").write_text(team_state, encoding="utf-8")
-    (dae_world / "team-state.yaml").write_text(team_state, encoding="utf-8")
+    _write_team_state(cli_world, "g-999-42")
+    _write_team_state(dae_world, "g-999-42")
+    cli_agent, _ = _agent_state_dir(tmp_path / "cli-agent", "sid-reducer-1")
+    _, dae_state = _agent_state_dir(tmp_path / "dae-agent", "sid-reducer-1")
 
     child = {"key": "test-child", "summary": "a freshly added child node"}
     _run_cli(cli_world, tmp_path / "cli-meta",
-             ["--add-child", "intelligence"], json.dumps(child))
+             ["--add-child", "intelligence"], json.dumps(child),
+             env_extra={"MIND_SID": "sid-reducer-1",
+                        "MIND_AGENT_DIR": str(cli_agent)})
     tree_write.write(_FakeCtx(dae_world, {
         "op": "add-child", "parent": "intelligence", "child": child},
-        agent="alpha"))
+        agent="alpha", sid="sid-reducer-1", state_dir=dae_state))
 
     assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
     # Explicit: the child carries the in_flight goal id as origin_goal_id.
     assert _read_tree(dae_world)["nodes"]["test-child"]["origin_goal_id"] == "g-999-42"
+
+
+@pytest.mark.skipif(not _HAS_LIBYAML,
+                    reason="libyaml (CSafeDumper) required for byte-compat")
+@pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
+def test_byte_compat_add_child_origin_is_the_workers_own_goal(tmp_path):
+    """ — the defect itself. The agent-keyed in_flight row is the REDUCER's
+    (a worker Body's claim writes in_flight_bodies.<sid> instead), so stamping from it
+    put the reducer's goal on a node a worker wrote. Here the in_flight row names
+    g-999-42, the worker holds g-777-07, and BOTH the CLI and the daemon must stamp
+    the worker's own goal — with identical bytes."""
+    from mind_api.src.world import tree_write
+
+    cli_world = _seed_world(tmp_path, "cli")
+    dae_world = _seed_world(tmp_path, "dae")
+    bodies = {"sid-worker-1": "g-777-07", "sid-worker-2": "g-888-08"}
+    _write_team_state(cli_world, "g-999-42", bodies)
+    _write_team_state(dae_world, "g-999-42", bodies)
+    # The reducer is a DIFFERENT session; the workers' SIDs are not running-session-id.
+    cli_agent, _ = _agent_state_dir(tmp_path / "cli-agent", "sid-reducer-1")
+    _, dae_state = _agent_state_dir(tmp_path / "dae-agent", "sid-reducer-1")
+
+    child = {"key": "test-child", "summary": "a node a worker wrote"}
+    _run_cli(cli_world, tmp_path / "cli-meta",
+             ["--add-child", "intelligence"], json.dumps(child),
+             env_extra={"MIND_SID": "sid-worker-1",
+                        "MIND_AGENT_DIR": str(cli_agent)})
+    tree_write.write(_FakeCtx(dae_world, {
+        "op": "add-child", "parent": "intelligence", "child": child},
+        agent="alpha", sid="sid-worker-1", state_dir=dae_state))
+
+    assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
+    origin = _read_tree(dae_world)["nodes"]["test-child"]["origin_goal_id"]
+    assert origin == "g-777-07", f"stamped {origin!r}; the worker holds g-777-07 and the reducer g-999-42"
+
+
+@pytest.mark.skipif(not _HAS_LIBYAML,
+                    reason="libyaml (CSafeDumper) required for byte-compat")
+@pytest.mark.skipif(not TREE_PY.exists(), reason="core/scripts/tree.py missing")
+def test_byte_compat_add_child_origin_omitted_for_unrecognised_session(tmp_path):
+    """: a session that is neither the reducer nor a Body with a claim row
+    (an observer, a Body whose row was released or reaped) cannot be told from a
+    sibling, so NOTHING is stamped — absent, not the agent-keyed goal and not null —
+    identically in the CLI and the daemon."""
+    from mind_api.src.world import tree_write
+
+    cli_world = _seed_world(tmp_path, "cli")
+    dae_world = _seed_world(tmp_path, "dae")
+    _write_team_state(cli_world, "g-999-42", {"sid-worker-1": "g-777-07"})
+    _write_team_state(dae_world, "g-999-42", {"sid-worker-1": "g-777-07"})
+    cli_agent, _ = _agent_state_dir(tmp_path / "cli-agent", "sid-reducer-1")
+    _, dae_state = _agent_state_dir(tmp_path / "dae-agent", "sid-reducer-1")
+
+    child = {"key": "test-child", "summary": "a node an observer wrote"}
+    _run_cli(cli_world, tmp_path / "cli-meta",
+             ["--add-child", "intelligence"], json.dumps(child),
+             env_extra={"MIND_SID": "sid-observer-1",
+                        "MIND_AGENT_DIR": str(cli_agent)})
+    tree_write.write(_FakeCtx(dae_world, {
+        "op": "add-child", "parent": "intelligence", "child": child},
+        agent="alpha", sid="sid-observer-1", state_dir=dae_state))
+
+    assert _tree_bytes(dae_world) == _tree_bytes(cli_world)
+    assert "origin_goal_id" not in _read_tree(dae_world)["nodes"]["test-child"]
+
+
+@pytest.mark.skipif(not _HAS_LIBYAML,
+                    reason="libyaml (CSafeDumper) required for byte-compat")
+def test_batch_add_child_origin_is_the_workers_own_goal(tmp_path):
+    """: the daemon's BATCH add-child is a second call site of the same
+    stamp (g-115-1463 class: a fix landed in the single path and not the batch).
+    Two add-child ops in one batch from a worker Body both carry ITS goal."""
+    from mind_api.src.world import tree_write
+
+    world = _seed_world(tmp_path, "dae")
+    _write_team_state(world, "g-999-42", {"sid-worker-1": "g-777-07"})
+    _, state = _agent_state_dir(tmp_path / "agent", "sid-reducer-1")
+
+    resp = tree_write.write(_FakeCtx(world, {"op": "batch", "operations": [
+        {"op": "add-child", "key": "intelligence",
+         "child": {"key": "batch-c1", "summary": "first"}},
+        {"op": "add-child", "key": "intelligence",
+         "child": {"key": "batch-c2", "summary": "second"}},
+    ]}, agent="alpha", sid="sid-worker-1", state_dir=state))
+
+    assert resp.status == 200, resp.body
+    nodes = _read_tree(world)["nodes"]
+    assert nodes["batch-c1"]["origin_goal_id"] == "g-777-07"
+    assert nodes["batch-c2"]["origin_goal_id"] == "g-777-07"
 
 
 @pytest.mark.skipif(not _HAS_LIBYAML,

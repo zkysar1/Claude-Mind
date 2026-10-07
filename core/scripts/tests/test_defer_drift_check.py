@@ -450,6 +450,28 @@ def test_main_apply_terminal_audit_does_not_cover(monkeypatch, capsys):
     assert len(calls) == 1
 
 
+def test_main_apply_candidate_audit_covers_and_files_nothing(monkeypatch, capsys):
+    """The lane's own earlier filing sits in the candidate tier until it is
+    groomed, and it must hold the dedup. Counting only pending/in-progress made
+    every run file an identical audit next to the last one (measured
+    2026-10-06: 13 candidate audits for 3 drift events, 0 pending)."""
+    mod = _import()
+    goals = [
+        _goal(),
+        _audit("g-115-audit", status="candidate",
+               title="Investigate: re-gate 1 drifted defer(s) g-304-11"),
+    ]
+    _patch_main(monkeypatch, mod, goals)
+    calls = []
+    _patch_add(monkeypatch, mod, calls)
+    rc, res = _run_main(monkeypatch, mod, ["--apply", "--metrics-log", ""], capsys)
+    assert rc == 0
+    assert res["open_audit_goal_ids"] == ["g-115-audit"]
+    assert res["uncovered_ids"] == []
+    assert res["investigate_filed"] is None
+    assert calls == []
+
+
 def test_main_apply_dup_retry_with_override(monkeypatch, capsys):
     """ (mirrors 's sibling retry): a
     goal_duplication_blocked refusal on the first attempt triggers ONE

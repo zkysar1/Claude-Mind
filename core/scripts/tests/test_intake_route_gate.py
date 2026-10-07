@@ -5,7 +5,9 @@ origin_signal, and §8 ships the flag dark. WHAT THIS SUITE PINS:
 
   1. THE ROUTING TABLE, one test per §3 row: flag off, world-source user
      context, every exempt origin, every candidate origin, maintain filed
-     completed, and the unknown head that FAILS OPEN to pending (I1).
+     completed, a resolve goal (hypothesis_id, or skill /review-hypotheses as
+     its first token) filed pending whatever its head (g-353-185), and the
+     unknown head that FAILS OPEN to pending (I1).
   2. ONLY `candidate` CHANGES A GOAL: apply() leaves every other verdict's
      goal exactly as it arrived, and with the flag off it changes nothing for
      any head or status (the flag-off byte-identity the goal asks for).
@@ -22,7 +24,8 @@ origin_signal, and §8 ships the flag dark. WHAT THIS SUITE PINS:
   6. BOTH PRODUCTION DOORS (add-goal, and a whole aspiration through add): a
      fixture daemon files an investigate goal as `candidate` and an
      alert-email goal as `pending` with the flag on, and the investigate goal
-     as `pending` with the flag off.
+     as `pending` with the flag off. A resolve goal under an `idea` head files
+     `pending` in both states (g-353-185).
 
 Run: py -3 -m pytest core/scripts/tests/test_intake_route_gate.py -q
 """
@@ -65,9 +68,12 @@ SPEC_EXEMPT = {"unblock", "alert-email", "failing_test", "drift_detected",
 ON = {"enabled": True, "candidate_origins": frozenset(SPEC_CANDIDATE),
       "exempt_origins": frozenset(SPEC_EXEMPT)}
 
+# The shape the sq-009 handler files (aspirations-spark SKILL.md): `skill` WITH args.
+RESOLVE_SKILL = "/review-hypotheses --hypothesis 2026-10-02_x"
 
-def _route(origin_signal, status=None, *, config=ON, user_context=False):
-    goal = {"title": "t", "origin_signal": origin_signal}
+
+def _route(origin_signal, status=None, *, config=ON, user_context=False, **fields):
+    goal = {"title": "t", "origin_signal": origin_signal, **fields}
     if status is not None:
         goal["status"] = status
     return ir.route_intake(goal, config=config, user_context=user_context)
@@ -108,6 +114,31 @@ def test_maintain_filed_completed_stays_completed():
     assert _route("maintain:z", "completed") == "completed"
 
 
+@pytest.mark.parametrize("head", sorted(SPEC_CANDIDATE))
+@pytest.mark.parametrize("fields", [{"hypothesis_id": "2026-10-02_x"},
+                                    {"skill": RESOLVE_SKILL},
+                                    {"skill": "/review-hypotheses"},
+                                    {"hypothesis_id": "2026-10-02_x",
+                                     "skill": RESOLVE_SKILL}])
+def test_resolve_goals_file_pending_whatever_their_candidate_head(head, fields):
+    """: the sq-009 handler must file `idea:sq-009-<slug>`, so the head alone
+    parked every resolve goal as a candidate (21 stranded, 3 past resolves_by)."""
+    assert _route(f"{head}:sq-009-x", **fields) == "pending"
+
+
+@pytest.mark.parametrize("fields", [{}, {"hypothesis_id": ""}, {"hypothesis_id": None},
+                                    {"skill": ""}, {"skill": None},
+                                    {"skill": "/forge-skill"},
+                                    {"skill": "/review-hypotheses-x"},
+                                    {"skill": "run /review-hypotheses"}])
+def test_a_goal_without_the_resolve_markers_still_files_candidate(fields):
+    assert _route("idea:x", **fields) == "candidate"
+
+
+def test_a_completed_maintain_goal_stays_completed_with_a_hypothesis_id():
+    assert _route("maintain:z", "completed", hypothesis_id="2026-10-02_x") == "completed"
+
+
 @pytest.mark.parametrize("signal", ["spark:x", "investigatex:y", "Idea:x", "",
                                     None])
 def test_unknown_heads_fail_open_to_pending(signal):
@@ -122,6 +153,14 @@ def test_apply_writes_candidate():
     goal = {"title": "t", "origin_signal": "idea:x"}
     assert ir.apply(goal, config=ON, source="world", agent_name=AGENT) == "candidate"
     assert goal["status"] == "candidate"
+
+
+def test_apply_leaves_a_resolve_goal_exactly_as_it_arrived():
+    goal = {"title": "t", "origin_signal": "idea:sq-009-x",
+            "hypothesis_id": "2026-10-02_x", "skill": RESOLVE_SKILL}
+    before = copy.deepcopy(goal)
+    assert ir.apply(goal, config=ON, source="world", agent_name=AGENT) == "pending"
+    assert goal == before
 
 
 @pytest.mark.parametrize("signal,status", [("unblock:g-1-1", None),
@@ -293,12 +332,13 @@ def _make_world(tmp: Path) -> Path:
     return world
 
 
-def _add_goal(port: int, title: str, origin_signal: str) -> int:
+def _add_goal(port: int, title: str, origin_signal: str, **extra) -> int:
     body = {"title": title,
             "description": "seeded by test_intake_route_gate (g-353-64)",
             "priority": "MEDIUM", "participants": ["agent"],
             "origin_signal": origin_signal,
-            "verification": {"outcomes": ["x"], "checks": [], "preconditions": []}}
+            "verification": {"outcomes": ["x"], "checks": [], "preconditions": []},
+            **extra}
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/aspirations/add-goal?asp_id=asp-994&source=world",
         data=json.dumps(body).encode("utf-8"), method="POST")
@@ -338,11 +378,12 @@ def _add_aspiration(port: int, goals: list) -> int:
         return e.code
 
 
-def _embedded(title: str, origin_signal: str) -> dict:
+def _embedded(title: str, origin_signal: str, **extra) -> dict:
     return {"title": title, "description": "embedded by test_intake_route_gate",
             "status": "pending", "priority": "MEDIUM", "blocked_by": [],
             "participants": ["agent"], "origin_signal": origin_signal,
-            "verification": {"outcomes": ["x"], "checks": [], "preconditions": []}}
+            "verification": {"outcomes": ["x"], "checks": [], "preconditions": []},
+            **extra}
 
 
 def _write_config(df, flag_on: bool) -> None:
@@ -375,9 +416,13 @@ def test_fixture_daemon_routes_by_origin(local_backend, flag_on):
                              "investigate:fixture") == 200
             assert _add_goal(df.port, "intake fixture alert",
                              "alert-email:fixture") == 200
+            assert _add_goal(df.port, "intake fixture resolve", "idea:sq-009-fixture",
+                             hypothesis_id="2026-10-02_fixture",
+                             skill=RESOLVE_SKILL) == 200
         assert _status_of(world, "intake fixture investigate") == (
             "candidate" if flag_on else "pending")
         assert _status_of(world, "intake fixture alert") == "pending"
+        assert _status_of(world, "intake fixture resolve") == "pending"
 
 
 @pytest.mark.parametrize("flag_on", [True, False])
@@ -388,7 +433,11 @@ def test_fixture_daemon_routes_a_whole_aspiration_by_origin(local_backend, flag_
             _write_config(df, flag_on)
             assert _add_aspiration(df.port, [
                 _embedded("intake batch investigate", "investigate:fixture"),
-                _embedded("intake batch alert", "alert-email:fixture")]) == 200
+                _embedded("intake batch alert", "alert-email:fixture"),
+                _embedded("intake batch resolve", "idea:sq-009-fixture",
+                          hypothesis_id="2026-10-02_fixture",
+                          skill=RESOLVE_SKILL)]) == 200
         assert _status_of(world, "intake batch investigate") == (
             "candidate" if flag_on else "pending")
         assert _status_of(world, "intake batch alert") == "pending"
+        assert _status_of(world, "intake batch resolve") == "pending"

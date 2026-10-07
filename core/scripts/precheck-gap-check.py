@@ -225,13 +225,16 @@ def _partial_line(skill_md=PRECHECK_SKILL_MD) -> str:
         "exceed what is left before compaction (g-353-118 measured 170-200% of a 30,000-token "
         "remainder). Read the zone with `bash core/scripts/context-budget-banner.sh`. If it says "
         "tight, run the AFFORDABLE PARTIAL instead: `bash core/scripts/iteration-open.sh --apply`. "
-        "That is the entry battery the precheck's own Step 0-open runs (always-run + medium lanes, "
-        "findings only): a sanctioned executor, not the remembered fragments above. On the reducer it "
-        "writes the same meter stamp, so it clears this line, and after that this line says nothing "
-        "about what it skipped. It still OWES: every deferrable-tier lane (not wired into it; "
-        "`bash core/scripts/iteration-open.sh --dry-run` lists them), every lane it reports as "
-        "`dropped:`, and every finding you leave undisposed. Those run only inside the full "
-        "`Skill(aspirations-precheck)`: invoke it at the first iteration that is not tight.")
+        "That is the entry battery the precheck's own Step 0-open runs (always-run, medium and "
+        "deferrable lanes, findings only): a sanctioned executor, not the remembered fragments "
+        "above. On the reducer it writes the same meter stamp, so it clears this line, and after "
+        "that this line says nothing about what it skipped. It still OWES: every lane it reports as "
+        "`dropped:` (at zone tight the meter drops each deferrable-tier lane, so expect those rows; "
+        "`bash core/scripts/iteration-open.sh --dry-run` lists every lane and its wiring), and every "
+        "finding you leave undisposed. A deferrable lane with no `dropped:` row was already applied "
+        "by the stage: do not hand-run it (guard-6634, the double-apply). The next iteration that is "
+        "not tight re-dispatches the dropped lanes through its own `iteration-open.sh --apply`; a "
+        "lane that cannot wait runs by its tier-table Invocation.")
 
 
 def main() -> int:

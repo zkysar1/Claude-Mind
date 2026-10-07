@@ -231,6 +231,14 @@ GUARD_KNOWN_FIELDS = (
                                 # No production caller reaches this validator
                                 # today (daemon-only architecture); the mirror
                                 # is what keeps that still true if one returns.
+        "enforced_by",          # g-306-572. The gate(s) that mechanically check
+                                # the rule: a string or a list of strings; null /
+                                # absent / "" / [] = honor-system. Allowlisted
+                                # WITHOUT a default, as encoded_by is (a default
+                                # would backfill a null onto every old record).
+                                # Mirror of the daemon allowlist in
+                                # mind_api/src/store_registry.py; read by
+                                # guardrail_enforcement_census.py.
     }
 )
 
@@ -625,6 +633,18 @@ def validate_guard_record(rec, *, skip_id_check=False):
     exp_ref = rec.get("experience_ref")
     if exp_ref is not None and not EXPERIENCE_REF_RE.match(exp_ref):
         raise ValueError(f"Invalid experience_ref format: {exp_ref!r} (expected exp-SLUG)")
+    # enforced_by (g-306-572): optional. Every CLEARED shape (null, "", []) and the
+    # never-set one are valid (rb-10037: presence-gating this check would make a
+    # deliberately cleared field invalid); only a wrong TYPE is refused, loudly
+    # (guard-3433). Kept verbatim in mind_api/src/store_registry.py.
+    enforced_by = rec.get("enforced_by")
+    if enforced_by is not None and not (
+            isinstance(enforced_by, str)
+            or (isinstance(enforced_by, list)
+                and all(isinstance(g, str) for g in enforced_by))):
+        raise ValueError(
+            f"Invalid enforced_by: {enforced_by!r} (expected null, a string naming "
+            f"the enforcing gate, or a list of such strings)")
     _validate_bitemporal(rec)
 
     # Tag canonicalization — same rule as validate_rb_record. Mutates in place.

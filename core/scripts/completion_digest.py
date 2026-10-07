@@ -111,9 +111,11 @@ def _load_jsonl_checked(path: Path, *, count_lines: bool = True) -> tuple[list, 
     The distinction rb-2073 requires is between FAILED-TO-READ and legitimately
     empty, NOT between empty and non-empty: a file that exists and parses cleanly is
     `ok` even when it yields zero rows. That is deliberate -- a genuinely empty world
-    must still be able to render its all-clear. It also means the one case this flag
+    must still be able to render its all-clear. It also means the first case this flag
     CANNOT catch is a present-but-transiently-empty read on the synced mount
     (rb-2970); nothing readable from the file alone separates that from a new world.
+    The second is a concurrent append masking a corrupt line (see the count-then-read
+    note in the body).
     """
     if not path.exists():
         return [], False
@@ -137,16 +139,24 @@ def _load_jsonl_checked(path: Path, *, count_lines: bool = True) -> tuple[list, 
         # about a store that read perfectly -- on ordinary fleet activity, i.e. the
         # one thing guaranteed to keep happening.
         #
-        # Count-then-read leans safe on BOTH concurrent mutations:
-        #   append between -> n_lines old+small, rows new+big  -> passes. Correct:
-        #                     growth is healthy, and it is the common case.
-        #   shrink between -> n_lines old+big, rows new+small  -> alarms. Correct,
-        #                     and read-then-count was SILENT here -- so this reorder
-        #                     also closes a false PASS; it does not trade one error
-        #                     for another. (guard-2496: do not assume a long file is
-        #                     append-only in every region.)
-        # The detection the flag exists for is untouched: a recovery read that DROPS
-        # lines still yields len(rows) < n_lines and still alarms.
+        # Count-then-read leans safe on a concurrent SHRINK and TRADES a false ALARM
+        # for a bounded false PASS on a concurrent APPEND:
+        #   append between -> n_lines old+small, rows new+big  -> passes. Right on an
+        #                     intact store: growth is healthy, and it is the common case.
+        #   shrink between -> n_lines old+big, rows new+small  -> alarms. Right, and
+        #                     read-then-count was SILENT here. (guard-2496: do not
+        #                     assume a long file is append-only in every region.)
+        # THE TRADE (). rows = lines + appended - dropped, so
+        # `rows >= n_lines` holds whenever appended >= dropped: ONE append between the
+        # count and the read masks ONE corrupt line (measured: 3 lines, one corrupt, one
+        # append -> n_lines=3, rows=3, ok=True). The detection the flag exists for holds
+        # in a run where fewer lines land in that window than were dropped. Accepted over
+        # read-then-count, which false-alarmed on every ordinary append, because the
+        # miss is per RUN and a corrupt line persists in the store: the next run with a
+        # quiet window flags it. Closing it outright means retrying a run whose file
+        # grew mid-read, or counting from the buffer the reader parsed; neither is
+        # built. Pinned by
+        # test_a_corrupt_line_masked_by_a_concurrent_append_is_a_known_limit.
         #
         # The count keeps its OWN try (): it is a second open() of a file
         # on the synced mount that rb-2970 records as transiently misbehaving, and a
@@ -163,8 +173,17 @@ def _load_jsonl_checked(path: Path, *, count_lines: bool = True) -> tuple[list, 
             try:
                 with path.open("r", encoding="utf-8", errors="replace") as fh:
                     n_lines = sum(1 for ln in fh if ln.strip())
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                # Keep the swallow (a failed count degrades only the flag, )
+                # but not the evidence: this branch returned the same silent value as a
+                # missing file and as an opted-out caller, so the one cause the flag
+                # exists for -- store fine, MEASUREMENT broke (rb-2970, expected in
+                # production) -- left no trace (, guard-1893). The text
+                # differs from the fallback's below on purpose (guard-2586).
                 n_lines = None
+                print(f"[completion-digest] line count of {path.name} failed: "
+                      f"{type(exc).__name__} -- store was read but cannot be verified, "
+                      f"reporting it as unread", file=sys.stderr)
 
         # The recovery reader does NOT raise on corruption -- it WARNs to stderr and
         # returns the parseable SUBSET -- so the except-branch below is never reached

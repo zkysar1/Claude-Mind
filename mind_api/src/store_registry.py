@@ -444,6 +444,17 @@ GUARD_KNOWN_FIELDS = (
         # goal's contract is that pre-existing rows stay byte-identical, so the
         # field must be ALLOWED without being DEFAULTED.
         "encoded_by",
+        # enforced_by (): SOURCE WRITER is an agent through
+        # guardrails-update-field.sh / guardrails-add.sh; nothing stamps it. The
+        # gate(s) that mechanically check this rule: a string or a list of
+        # strings, each a repo-relative path or a hook name. null / absent / "" /
+        # [] = honor-system (nothing but a reader's memory of the rule enforces
+        # it). Allowlisted WITHOUT a default, exactly as encoded_by is: a default
+        # would backfill a null onto every historical guardrail rewritten by any
+        # later path. Type-checked in validate_guard_record; READER is
+        # core/scripts/guardrail_enforcement_census.py. Mirror of the CLI
+        # allowlist in core/scripts/reasoning-bank.py.
+        "enforced_by",
     }
 )
 
@@ -671,6 +682,18 @@ def validate_guard_record(ctx, rec, *, skip_id: bool = False) -> None:
     exp_ref = rec.get("experience_ref")
     if exp_ref is not None and not EXPERIENCE_REF_RE.match(exp_ref):
         raise ValueError(f"Invalid experience_ref format: {exp_ref!r} (expected exp-SLUG)")
+    # enforced_by (): optional. Every CLEARED shape (null, "", []) and the
+    # never-set one are valid (rb-10037: presence-gating this check would make a
+    # deliberately cleared field invalid); only a wrong TYPE is refused, loudly
+    # (guard-3433). Kept verbatim in core/scripts/reasoning-bank.py.
+    enforced_by = rec.get("enforced_by")
+    if enforced_by is not None and not (
+            isinstance(enforced_by, str)
+            or (isinstance(enforced_by, list)
+                and all(isinstance(g, str) for g in enforced_by))):
+        raise ValueError(
+            f"Invalid enforced_by: {enforced_by!r} (expected null, a string naming "
+            f"the enforcing gate, or a list of such strings)")
     _validate_bitemporal(rec)
     _normalize_tags(rec)
     # . Placed beside _normalize_tags because this validator ALREADY

@@ -87,13 +87,16 @@ def test_wrappers_use_cygpath_conversion() -> None:
 
 
 def test_wrappers_have_documentation_comment() -> None:
-    """The cygpath block must carry a comment naming  so the next
-    reader can find the rationale without git-archaeology."""
+    """The cygpath block must carry a comment so the next reader can find the
+    rationale without git-archaeology. Checked as a comment on the line directly
+    above the block, not as a goal id inside it: the seed plant scrubs goal ids
+    from source comments, so an id grep passes in dev and fails at every plant."""
     for wrapper in WRAPPERS_NEEDING_CYGPATH:
         path = CORE_SCRIPTS / wrapper
-        src = path.read_text(encoding="utf-8")
-        assert "g-115-892" in src, (
-            f"{wrapper}: cygpath block missing g-115-892 comment anchor"
+        lines = path.read_text(encoding="utf-8").splitlines()
+        probe = next((i for i, ln in enumerate(lines) if "command -v cygpath" in ln), None)
+        assert probe is not None and probe > 0 and lines[probe - 1].lstrip().startswith("#"), (
+            f"{wrapper}: cygpath block has no comment directly above it"
         )
 
 

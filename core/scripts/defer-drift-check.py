@@ -105,7 +105,7 @@ JSON output:
                                        # names in its title/description — the
                                        # filing predicate (non-empty -> file)
     "open_audit_goal_ids": [...],      #   the open class-keyed audits (pending /
-    "open_audit_exists": bool,         #   in-progress), for the human report
+    "open_audit_exists": bool,         #   in-progress / candidate), for the human report
     "investigate_filed": str | None,   #   goal_id filed this run (--apply only)
     "actions_taken": "dry-run" | "apply",
     "now": iso,

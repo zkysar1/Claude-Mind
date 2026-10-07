@@ -50,13 +50,29 @@ PYTHON = sys.executable
 # Helpers
 # ===========================================================================
 
-def _seed_team_state(world: Path, agent: str, goal_id):
+def _seed_team_state(world: Path, agent: str, goal_id, bodies=None):
     """Write team-state.yaml with agent_status.<agent>.in_flight[.goal_id].
-    goal_id=None writes an in_flight block WITHOUT a goal_id (absent-goal case)."""
+    goal_id=None writes an in_flight block WITHOUT a goal_id (absent-goal case).
+    bodies={sid: goal_id} adds per-Body in_flight_bodies rows — a worker Body's claim
+    (g-306-544). The agent-keyed in_flight row is the REDUCER's."""
     world.mkdir(parents=True, exist_ok=True)
     in_flight = {} if goal_id is None else {"goal_id": goal_id}
-    ts = {"agent_status": {agent: {"in_flight": in_flight}}}
+    row = {"in_flight": in_flight}
+    if bodies:
+        row["in_flight_bodies"] = {sid: {"goal_id": g} for sid, g in bodies.items()}
+    ts = {"agent_status": {agent: row}}
     (world / "team-state.yaml").write_text(yaml.safe_dump(ts), encoding="utf-8")
+
+
+def _reducer_agent_dir(tmp_path: Path, reducer_sid: str) -> Path:
+    """A tmp agent dir whose session/running-session-id names the reducer — the file
+    the stamp compares the caller's MIND_SID against (g-306-544). Passed to tree.py
+    as MIND_AGENT_DIR, the isolation seam `_paths.AGENT_DIR` honours."""
+    agent_dir = tmp_path / "agent"
+    (agent_dir / "session").mkdir(parents=True, exist_ok=True)
+    (agent_dir / "session" / "running-session-id").write_text(
+        reducer_sid + "\n", encoding="utf-8")
+    return agent_dir
 
 
 class _MockPaths:
@@ -181,13 +197,23 @@ def _seed_tree(world: Path):
     return tree_dir / "_tree.yaml"
 
 
-def _run_tree(args, stdin_text, world: Path, meta: Path, agent=None):
+def _run_tree(args, stdin_text, world: Path, meta: Path, agent=None,
+              sid=None, agent_dir=None):
     """Invoke tree.py with WORLD_DIR/META isolated to tmp. Setting MIND_AGENT
     is what makes _read_in_flight_goal_id resolve our seeded in_flight (the
-    sibling field-prevention test POPS it because it needs no agent context)."""
+    sibling field-prevention test POPS it because it needs no agent context).
+
+    The caller's SESSION decides the stamp (g-306-544), so it is set explicitly or
+    removed — never inherited: a Body running this suite exports its own MIND_SID."""
     env = dict(os.environ)
     env["MIND_WORLD"] = str(world)
     env["MIND_META"] = str(meta)
+    env.pop("MIND_SID", None)
+    env.pop("MIND_AGENT_DIR", None)
+    if sid:
+        env["MIND_SID"] = sid
+    if agent_dir is not None:
+        env["MIND_AGENT_DIR"] = str(agent_dir)
     if agent is None:
         env.pop("MIND_AGENT", None)
     else:
@@ -200,13 +226,15 @@ def _run_tree(args, stdin_text, world: Path, meta: Path, agent=None):
 
 def test_tree_add_child_injects_origin_from_in_flight(tmp_path):
     """One tree add carries the field: cmd_add_child auto-injects origin_goal_id
-    from team-state in_flight via _read_in_flight_goal_id."""
+    from team-state in_flight via _read_in_flight_goal_id — for the REDUCER session
+    (g-306-544: its SID equals running-session-id, so the agent-keyed row is its own)."""
     world = tmp_path / "world"
     meta = tmp_path / "meta"
     tree_path = _seed_tree(world)
     _seed_team_state(world, "zeta", "g-325-06")
     payload = json.dumps({"key": "child-a", "summary": "a test child node"})
-    r = _run_tree(["update", "--add-child", "root"], payload, world, meta, agent="zeta")
+    r = _run_tree(["update", "--add-child", "root"], payload, world, meta, agent="zeta",
+                  sid="sid-reducer", agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
     assert r.returncode == 0, f"stderr={r.stderr}"
     tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
     assert tree["nodes"]["child-a"]["origin_goal_id"] == "g-325-06"
@@ -220,7 +248,8 @@ def test_tree_add_child_caller_origin_wins(tmp_path):
     _seed_team_state(world, "zeta", "g-325-06")
     payload = json.dumps({"key": "child-b", "summary": "child",
                           "origin_goal_id": "g-explicit-11"})
-    r = _run_tree(["update", "--add-child", "root"], payload, world, meta, agent="zeta")
+    r = _run_tree(["update", "--add-child", "root"], payload, world, meta, agent="zeta",
+                  sid="sid-reducer", agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
     assert r.returncode == 0, f"stderr={r.stderr}"
     tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
     assert tree["nodes"]["child-b"]["origin_goal_id"] == "g-explicit-11"
@@ -236,7 +265,8 @@ def test_tree_add_child_absent_when_no_in_flight(tmp_path):
     tree_path = _seed_tree(world)
     _seed_team_state(world, "zeta", None)  # in_flight present, no goal_id
     payload = json.dumps({"key": "child-c", "summary": "manual child"})
-    r = _run_tree(["update", "--add-child", "root"], payload, world, meta, agent="zeta")
+    r = _run_tree(["update", "--add-child", "root"], payload, world, meta, agent="zeta",
+                  sid="sid-reducer", agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
     assert r.returncode == 0, f"stderr={r.stderr}"
     tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
     assert "origin_goal_id" not in tree["nodes"]["child-c"]
@@ -261,7 +291,8 @@ def test_tree_batch_add_child_injects_origin_from_in_flight(tmp_path):
     payload = json.dumps({"operations": [
         {"op": "add-child", "key": "root",
          "child": {"key": "bchild-a", "summary": "a batch child node"}}]})
-    r = _run_tree(["update", "--batch"], payload, world, meta, agent="zeta")
+    r = _run_tree(["update", "--batch"], payload, world, meta, agent="zeta",
+                  sid="sid-reducer", agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
     assert r.returncode == 0, f"stderr={r.stderr}"
     tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
     assert tree["nodes"]["bchild-a"]["origin_goal_id"] == "g-325-06"
@@ -277,7 +308,8 @@ def test_tree_batch_add_child_caller_origin_wins(tmp_path):
         {"op": "add-child", "key": "root",
          "child": {"key": "bchild-b", "summary": "child",
                    "origin_goal_id": "g-explicit-11"}}]})
-    r = _run_tree(["update", "--batch"], payload, world, meta, agent="zeta")
+    r = _run_tree(["update", "--batch"], payload, world, meta, agent="zeta",
+                  sid="sid-reducer", agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
     assert r.returncode == 0, f"stderr={r.stderr}"
     tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
     assert tree["nodes"]["bchild-b"]["origin_goal_id"] == "g-explicit-11"
@@ -293,7 +325,90 @@ def test_tree_batch_add_child_absent_when_no_in_flight(tmp_path):
     payload = json.dumps({"operations": [
         {"op": "add-child", "key": "root",
          "child": {"key": "bchild-c", "summary": "manual batch child"}}]})
-    r = _run_tree(["update", "--batch"], payload, world, meta, agent="zeta")
+    r = _run_tree(["update", "--batch"], payload, world, meta, agent="zeta",
+                  sid="sid-reducer", agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
     assert r.returncode == 0, f"stderr={r.stderr}"
     tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
     assert "origin_goal_id" not in tree["nodes"]["bchild-c"]
+
+
+# ── : the stamp is PER-SESSION ─────────────────────────────────────
+# The agent-keyed in_flight row belongs to the REDUCER (a worker Body's claim writes
+# in_flight_bodies.<sid> instead), so stamping a worker's node from it named a goal
+# that Body never held — well-formed, schema-valid, wrong. Each test below runs the
+# real CLI as one session against the SAME team-state: in_flight = the reducer's
+# goal, plus per-Body rows for the workers.
+
+def _add_child_as(tmp_path, sid, bodies, extra=None, key="child-s"):
+    world = tmp_path / "world"
+    meta = tmp_path / "meta"
+    tree_path = _seed_tree(world)
+    _seed_team_state(world, "zeta", "g-reducer-1", bodies=bodies)
+    child = {"key": key, "summary": "a node written by one session"}
+    child.update(extra or {})
+    r = _run_tree(["update", "--add-child", "root"], json.dumps(child), world, meta,
+                  agent="zeta", sid=sid,
+                  agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    return yaml.safe_load(tree_path.read_text(encoding="utf-8"))["nodes"][key]
+
+
+_BODIES = {"sid-worker-1": "g-worker-1", "sid-worker-2": "g-worker-2"}
+
+
+def test_tree_add_child_worker_gets_its_own_goal_not_the_reducers(tmp_path):
+    """The defect: a worker's add-child was stamped with the reducer's goal. It must
+    carry the goal in the WORKER'S OWN in_flight_bodies row, and each of two sibling
+    Bodies must get its own — neither the reducer's goal nor the other's."""
+    for sid, goal in _BODIES.items():
+        node = _add_child_as(tmp_path / sid, sid, _BODIES)
+        assert node["origin_goal_id"] == goal, (
+            f"{sid} holds {goal}, node stamped {node.get('origin_goal_id')!r}")
+
+
+def test_tree_add_child_omitted_when_session_unrecognised(tmp_path):
+    """A session that is neither the reducer nor a Body with a claim row (an observer,
+    a Body whose row was reaped) cannot be told from a sibling: nothing is stamped —
+    not the reducer's goal, and not null (the field stays ABSENT)."""
+    node = _add_child_as(tmp_path, "sid-observer", _BODIES)
+    assert "origin_goal_id" not in node
+
+
+def test_tree_add_child_omitted_without_a_session(tmp_path):
+    """No MIND_SID means no identity to resolve: omit rather than guess the reducer's
+    goal. (An observer or manual add is the only caller that reaches this.)"""
+    node = _add_child_as(tmp_path, None, _BODIES)
+    assert "origin_goal_id" not in node
+
+
+def test_tree_add_child_omitted_when_workers_row_was_released(tmp_path):
+    """A Body that released its claim keeps a row whose goal_id is null; it holds no
+    goal now, so nothing is stamped (and certainly not the reducer's)."""
+    node = _add_child_as(tmp_path, "sid-worker-1", {"sid-worker-1": None})
+    assert "origin_goal_id" not in node
+
+
+def test_tree_add_child_worker_explicit_origin_still_wins(tmp_path):
+    """Caller-wins is unchanged for a worker: an explicit origin_goal_id in the child
+    JSON beats the resolved one (the documented workaround of g-306-544)."""
+    node = _add_child_as(tmp_path, "sid-worker-1", _BODIES,
+                         extra={"origin_goal_id": "g-explicit-11"})
+    assert node["origin_goal_id"] == "g-explicit-11"
+
+
+def test_tree_batch_add_child_worker_gets_its_own_goal(tmp_path):
+    """cmd_batch is the second CLI call site of the stamp (): a worker's
+    batched add-child carries the worker's own goal as well."""
+    world = tmp_path / "world"
+    meta = tmp_path / "meta"
+    tree_path = _seed_tree(world)
+    _seed_team_state(world, "zeta", "g-reducer-1", bodies=_BODIES)
+    payload = json.dumps({"operations": [
+        {"op": "add-child", "key": "root",
+         "child": {"key": "bchild-w", "summary": "a batch child a worker wrote"}}]})
+    r = _run_tree(["update", "--batch"], payload, world, meta, agent="zeta",
+                  sid="sid-worker-2",
+                  agent_dir=_reducer_agent_dir(tmp_path, "sid-reducer"))
+    assert r.returncode == 0, f"stderr={r.stderr}"
+    tree = yaml.safe_load(tree_path.read_text(encoding="utf-8"))
+    assert tree["nodes"]["bchild-w"]["origin_goal_id"] == "g-worker-2"
