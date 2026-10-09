@@ -79,6 +79,37 @@ def test_experience_meta_counter_max():
     assert out["total_archived"] == 10
 
 
+# ── a merge writes the store writers' bytes (2026-10-07) ─────────────────────
+# Every writer of these ledgers dumps json.dumps(rec, ensure_ascii=True). A merge
+# that dumped raw UTF-8 flipped each non-ASCII record on every merge and back on
+# the next store write, so real changes reached git inside whole-file diffs.
+
+def _writer_bytes(*records):
+    """What experience_write.py and _fileops write: one escaped line per record."""
+    return "".join(json.dumps(r, ensure_ascii=True) + "\n" for r in records).encode("utf-8")
+
+
+@pytest.mark.parametrize("basename", sorted(drv._JSONL_ID_UNION))
+def test_a_merge_keeps_each_record_in_the_writers_bytes(basename):
+    a = {"id": "exp-A", "summary": "café — résumé → done"}
+    b = {"id": "exp-B", "summary": "plain"}
+    c = {"id": "exp-C", "summary": "naïve · mid-dot"}
+    ours = _writer_bytes(a, b)
+    out = drv.merge_bytes(f"agents/x/{basename}", ours, _writer_bytes(a, b, c), ours)
+    assert out.isascii(), out.decode("utf-8")
+    assert sorted(out.decode("utf-8").splitlines()) == sorted(
+        _writer_bytes(a, b, c).decode("utf-8").splitlines())
+
+
+def test_a_merged_experience_meta_is_the_writers_bytes():
+    ours = b'{"total_live": 100, "caf\\u00e9": 1}'
+    theirs = b'{"total_live": 105, "caf\\u00e9": 2}'
+    out = drv.merge_bytes("agents/x/experience-meta.json", ours, theirs)
+    merged = json.loads(out)
+    assert merged == {"total_live": 105, "café": 2}
+    assert out == (json.dumps(merged, indent=2, ensure_ascii=True) + "\n").encode("utf-8")
+
+
 def test_changelog_routes_to_registry():
     # changelog.jsonl IS registered in coordination_merge._HANDLERS
     # (merge_append_only_jsonl) — merge_bytes must fall through to it.

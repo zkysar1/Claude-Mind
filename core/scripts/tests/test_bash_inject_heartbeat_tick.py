@@ -121,6 +121,24 @@ def test_non_reducer_body_gets_body_only_on_its_own_stamp(tmp_path, monkeypatch)
     assert len(calls) == 1
 
 
+def test_a_landed_session_never_ticks(tmp_path, monkeypatch):
+    """A worker /stop's last call LANDS its session (binding mode reader or
+    assistant) and closes its Body. A carrier it kept fresh would read as a live
+    worker to the reducer's sweeps and to the worker-ref retire gate. The
+    autonomous binding is the positive control: the same Body ticks before it."""
+    calls = _capture(monkeypatch)
+    root, sess = _root(tmp_path, running=SID)
+    body = root / "agents" / AGENT / "sessions" / OTHER
+    body.mkdir(parents=True)
+    (body / "working-memory.yaml").write_text("slots: {}\n", encoding="utf-8")
+    (body / "binding.yaml").write_text("mode: assistant\n", encoding="utf-8")
+    bai._maybe_tick_heartbeat(AGENT, OTHER, root)
+    assert calls == [], f"a landed session ticked its closed Body's carrier: {calls!r}"
+    (body / "binding.yaml").write_text("mode: autonomous\n", encoding="utf-8")
+    bai._maybe_tick_heartbeat(AGENT, OTHER, root)
+    assert len(calls) == 1 and calls[0][1]["body_only"] is True, calls
+
+
 def test_missing_running_session_id_is_treated_as_non_reducer(tmp_path, monkeypatch):
     calls = _capture(monkeypatch)
     root, sess = _root(tmp_path, running=None)

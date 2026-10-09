@@ -11,6 +11,8 @@ with a single Python pass over pure string/date heuristics.
 Subcommands (individually testable):
   sweep             — full scan; emits JSON with per-entry verdicts and flags
   stats             — status / type histogram only
+  stale             — read-only: OPEN (status=pending) questions older than
+                      --max-age-days, aged by _age_days's fallback chain
 
 Output contract:
   JSON to stdout with at least `{"subcommand","summary","flags":[],...}`.
@@ -70,6 +72,8 @@ would manufacture queue noise at roughly a 2:1 wrong-to-right ratio.
 Usage:
   pending-questions-sweep.sh sweep [--pq-path PATH]
   pending-questions-sweep.sh stats [--pq-path PATH]
+  pending-questions-sweep.sh stale [--pq-path PATH] [--max-age-days N]
+    (read-only; default N=1.0d — the aspirations-all-blocked B2.5 S1 signal)
 """
 
 import argparse
@@ -121,6 +125,7 @@ from _pending_question_status import SWEEP_SETTLED as TERMINAL_STATUSES  # noqa:
 # SSOT names this exact confusion as the bug that made a blocked signal citing an
 # answered question undischargeable; do not substitute TERMINAL_STATUSES here.
 from _pending_question_status import is_closed  # noqa: F401
+from _pending_question_status import normalize as _pq_normalize  # noqa: F401
 
 # Goal statuses meaning "this goal will never act again." Deliberately NOT the
 # pending-question vocabulary (guard-1127: a constant serving two subsystems is
@@ -374,6 +379,18 @@ def _age_days(entry, now):
         if d is not None:
             return (now - d).total_seconds() / 86400.0
     return None  # unknown age
+
+
+def _age_field(entry):
+    """Name the FIRST date field _age_days would use, or None (its basis).
+
+    Mirrors _age_days's field order and _parse_date acceptance exactly, so
+    the reported basis and the computed age can never disagree.
+    """
+    for field in ("created", "created_at", "date", "asked_at", "logged_at"):
+        if _parse_date(entry.get(field)) is not None:
+            return field
+    return None
 
 
 def _is_decision_log(entry):
@@ -1157,9 +1174,69 @@ def cmd_stats(args):
     }
 
 
+def cmd_stale(args):
+    """Read-only: OPEN (status=pending) questions older than --max-age-days.
+
+    Built for the aspirations-all-blocked Step B2.5 S1 signal (g-115-11656),
+    which aged entries by `asked_at` alone — a field most entries do not carry
+    (ZDS measurement: 1 of 26 live questions). Aging here goes through
+    `_age_days`, the SAME fallback chain the sweep's own heuristics use
+    (created, created_at, date, asked_at, logged_at), so the two can never
+    drift apart: S1 counts exactly what the sweep already considers stale-age.
+
+    READ-ONLY: no --apply flag reaches here, and the function never writes.
+    Exit contract follows the script: 0 = nothing stale, 1 = stale found
+    (the LLM should act), 2 = input error. `--pq-path` names ONE file;
+    --all-agents is refused for this subcommand, because S1 acts on the
+    BOUND agent's file and a mixed population would count other agents'
+    questions as this agent's signals.
+    """
+    if getattr(args, "all_agents", False):
+        print(json.dumps({
+            "error": "stale does not support --all-agents",
+            "detail": (
+                "The S1 signal acts on the bound agent's "
+                "pending-questions.yaml only; pass --pq-path to name a file."
+            ),
+            "exit": 2,
+        }))
+        sys.exit(2)
+    path = _resolve_pq_path(args)
+    entries = _load_questions(path)
+    now = datetime.now()
+    max_days = getattr(args, "max_age_days", None) or 1.0
+    stale = []
+    for e in entries:
+        if _pq_normalize(e.get("status")) != "pending":
+            continue  # S1 is about UNANSWERED questions; settled/transition ones
+        age = _age_days(e, now)
+        if age is None:
+            continue  # no parseable date field — unknown age, not stale
+        if age > max_days:
+            stale.append({
+                "id": e.get("id"),
+                "question": (e.get("question") or "")[:60],
+                "age_days": round(age, 3),
+                "age_field": _age_field(e),
+            })
+    stale.sort(key=lambda s: s["age_days"], reverse=True)
+    return {
+        "subcommand": "stale",
+        "summary": (
+            f"{len(stale)} open question(s) older than {max_days:g}d "
+            f"out of {len(entries)} total"
+        ),
+        "flags": ["stale_pending_questions"] if stale else [],
+        "counts": {"total": len(entries), "stale": len(stale)},
+        "max_age_days": max_days,
+        "entries": stale,
+    }
+
+
 DISPATCH = {
     "sweep": cmd_sweep,
     "stats": cmd_stats,
+    "stale": cmd_stale,
 }
 
 
@@ -1175,7 +1252,7 @@ def main(argv=None):
     parser.add_argument(
         "subcommand",
         choices=list(DISPATCH.keys()),
-        help="sweep | stats",
+        help="sweep | stats | stale",
     )
     parser.add_argument(
         "--pq-path",
@@ -1201,6 +1278,18 @@ def main(argv=None):
         help=(
             "sweep only: mutate pending-questions.yaml in place — mark "
             "verdict=auto_resolve entries as status=resolved with timestamp."
+        ),
+    )
+    parser.add_argument(
+        "--max-age-days",
+        type=float,
+        default=1.0,  # 24 hours, the S1 signal threshold
+        help=(
+            "stale only: report OPEN (status=pending) questions whose age "
+            "exceeds this many days (default 1.0 = 24h). Age is computed by "
+            "_age_days, the SAME fallback chain the sweep itself uses "
+            "(created, created_at, date, asked_at, logged_at) — NOT asked_at "
+            "alone, a field most entries do not carry (g-115-11656)."
         ),
     )
     parser.add_argument(

@@ -31,7 +31,7 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 
 # ONE literal, shared by the help text and the refusal message — never two
 # copies (see argv_strict_refuse_unknown's header in _argv_strict.sh).
-_ACCEPTED_FLAGS="--node <key> | --path <key> | --ancestors <key> | --children <key> | --leaves | --leaves-under <key> | --child-path <parent> <slug> | --stats | --summary | --maintenance | --by-l1 | --find <text> | --validate | --decompose-candidates | --redistribute-candidates | --distill-candidates | --active-content <key>"
+_ACCEPTED_FLAGS="--node <key> | --path <key> | --ancestors <key> | --children <key> | --leaves | --leaves-under <key> | --child-path <parent> <slug> | --stats | --summary | --maintenance | --by-l1 | --find <text> | --validate | --decompose-candidates | --redistribute-candidates | --distill-candidates | --debt | --active-content <key>"
 
 # PASSTHROUGH IS LIVE HERE — do NOT delete it. Unlike the sibling read wrappers
 # in this rollout (pipeline-read.sh:57, aspirations-read.sh), whose PASSTHROUGH
@@ -70,7 +70,10 @@ while [[ $# -gt 0 ]]; do
             FORCE_FALLBACK=1
             shift $(( $# >= 2 ? 2 : 1 ));;
         # Computationally-heavy flags — fall through unconditionally.
-        --validate|--decompose-candidates|--redistribute-candidates|--distill-candidates)
+        # --debt () runs the same cross-file candidate scans as
+        # the *-candidates flags plus a config read, so it takes the same
+        # direct-python path.
+        --validate|--decompose-candidates|--redistribute-candidates|--distill-candidates|--debt)
             FORCE_FALLBACK=1
             PASSTHROUGH+=("$1"); shift;;
         --active-content)

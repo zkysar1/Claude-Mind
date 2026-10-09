@@ -79,7 +79,11 @@ extract_query() {
   local args=("$@")
   local trace query
   # bash -x writes to stderr; redirect 2>&1 so we can grep both streams.
-  trace=$(MIND_AGENT=zeta bash -x "$WRAPPER" "${args[@]}" \
+  # MIND_SID is pinned: the wrapper appends `&sid=<id>` only when one is present, and
+  # assert_query tolerates `&source=...` only BEHIND a sid suffix. With no session id in
+  # the ambient env (a deployment's quiesced verify, the invisible-suites runner) tests
+  # 1-3 read `...&agent=zeta&source=world` and failed (omni-382 class 6, ).
+  trace=$(MIND_AGENT=zeta MIND_SID=sid-fixture-claim-source bash -x "$WRAPPER" "${args[@]}" \
             --verdict-file "$VERDICT_FIXTURE" 2>&1 || true)
   # The wrapper sets QUERY="id=...&agent=..." on a single line. Match a `+`
   # trace line so we don't accidentally pick up the daemon's own response.

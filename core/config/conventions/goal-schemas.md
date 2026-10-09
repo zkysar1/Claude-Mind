@@ -99,7 +99,11 @@ OUTCOME 2: NOT MET — <what is missing>; deferred to <goal-id>
   `MET` or `NOT MET` (`UNMET` is read as `NOT MET`). PASS, DONE and similar words
   are refused, not ignored.
 - A row runs until the next `OUTCOME` line or the first blank line. Keep a row's
-  evidence directly under it.
+  evidence directly under it. An append sentinel (`[appended:<marker>]`) and a
+  worker Body's `Auto-signed:` line also end a row and are not part of it.
+- A row headed `OUTCOME <n> (corrected): ...` that comes LAST for `<n>` replaces
+  every earlier row for `<n>`, a malformed one included. That is how a stored note
+  is fixed in place (see "Which note it reads").
 - Narrative, tests and "not this goal" sections may follow the table. The gate
   reads only the rows.
 
@@ -124,14 +128,22 @@ It never refuses over a path it cannot resolve (a product repo, another host, an
 endpoint), nor over a governed path when it cannot open the store and the file is
 not on this box: that is unknown, not absent, so it warns. It exempts a row that
 asserts absence (removed, deleted, `exists: false`) from the path check. A NOT MET row must say
-`deferred to <goal-id>`, a residual-work marker, so `gates/residual_work.py`
-then requires that goal to be live. Recurring goals, and goals with no outcomes,
-are not checked.
+`deferred to <goal-id>`, and one goal it names from that phrase to the end of the
+line must be live (`pending` or `in-progress`, the residual-work gate's set) and
+not the goal itself. Each row is checked on its own (g-375-162), because
+`gates/residual_work.py` asks only that some carrier in the whole note be live. A
+carrier the gate cannot look up is a warning. Recurring goals, and goals with no
+outcomes, are not checked.
 
 **Which note it reads** is the one that lands: `--outcome-note-file` if given (it
 replaces the record's note), else the record's `outcome_note` (a close never
 overwrites it), else the close's `--summary`. So once a note is on the record,
-fix it by re-running the close with `--outcome-note-file <file>`. That file
+fix it in place: append one corrected row per failing outcome with
+`goal-field-append.sh`, then re-run the same close. The refusal, its JSON line
+(`remedy`) and the verify pre-flight print that command filled in, and when a
+NOT MET row has no live carrier, the `aspirations-add-goal.sh` command that files
+one as `pending` (origin `decomposition:<goal-id>`). Rewriting the whole note
+still works: re-run the close with `--outcome-note-file <file>`. That file
 REPLACES the note, and a replacement far shorter than a long note is refused
 (`field_shrink.py`), so put the rows first and keep the note's current text below
 them. A new `--summary` is never written. For a false refusal, pass
@@ -148,6 +160,12 @@ it, so a broken gate cannot refuse every close (guard-5430).
 "landed within ~5s" against a 30-second bound, but the first check ran about 115 s
 after the POST. It also called a session-scratch file "owncloud push OK", and the
 store could never have held that file. The own-unit verify passed both.
+The per-row carrier check and the in-place fix come from a worker Body on
+2026-10-08 (g-375-162): its stored note froze a NOT MET row with no carrier, and
+after one refusal it read framework source 14 times, took four tries over 85
+minutes to file a carrier, and 3.5 h later had still not rebuilt its
+3,021-character note by hand. Its outcome 3 also deferred to a completed goal,
+which passed once another row named a live one.
 
 ---
 

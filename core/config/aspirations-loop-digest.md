@@ -394,8 +394,8 @@ re-introduces the clobber class g-115-1561 fixed.
               # moved to background, wait as told; if killed, re-run ONCE with
               # run_in_background.
               Checkpoint: phase_completed=verify, started_at preserved.
-  Phase 5.3.  Attribution — IF completed: aspirations-complete-by.sh --source {source}
-              ELIF non-terminal: aspirations-release.sh --source {source}
+  Phase 5.3.  Attribution — IF completed: no call (verify already cleared the claim)
+              ELIF non-terminal: aspirations-release.sh {goal.id} --source {source}
               # RELEASED PARTIAL UNIT → SKIP Phase 8 AND Phase 12; go straight to
               # productivity-check (g-115-9994). Both call _assert_verify_landed, which
               # REFUSES a released unit — correctly, it did not close, so its counters
@@ -411,10 +411,9 @@ re-introduces the clobber class g-115-1561 fixed.
               # for claimed_by). Both wrappers accept `--source` and both daemon
               # handlers resolve paths from it (`complete_by` L3375/L3392,
               # `release` L3644/L3650) and pop `claimed_by`.
-              # ALREADY COVERED, do not duplicate: the RECURRING path closes via
-              # iteration-close.sh's own `aspirations-complete-by.sh --source
-              # "$SOURCE"` branch (do_verify, IS_RECURRING), which was source-
-              # aware before this change. This line is the NON-recurring path.
+              # COMPLETED needs no call (g-115-10090): do_verify's status write clears the
+              # claim, and a recurring goal's complete-by runs inside it (IS_RECURRING);
+              # a second complete-by only re-stamps completed_at.
               # NET, not owner: stranded-claim-sweep.py releases anything missed
               # and is already source-aware (it forwards `source` through
               # rt_call and never went through the wrapper). Do not read its
@@ -472,6 +471,8 @@ re-introduces the clobber class g-115-1561 fixed.
   Phase 8.1   IF asp.id new this session: aspirations_touched_this_session.add(asp.id); asp.sessions_active += 1.
   Phase 8.7   Every `tree_debt_check.interval_goals` AND debt>threshold: /tree maintain
               (--backlog when debt > threshold*3).
+              # g-115-5421: "debt" = the ACTIONABLE total from
+              #   Bash: tree-read.sh --debt  (raw population in its raw block)
               # Rationale (WHY the g-115-81 backstop exists):
               #   core/config/rationale/maintenance-tick.md
   Phase 8.8   MAINTENANCE TICK:
@@ -482,8 +483,10 @@ re-introduces the clobber class g-115-1561 fixed.
                 # TREE MAINTENANCE CADENCE (single-writer rule: _tree.yaml.maintenance.last_maintain_at
                 # is the sole source of truth; rb-254, guard-155). g-246-02 wired the reader.
                 Bash: tree-read.sh --maintenance
+                Bash: tree-read.sh --debt    # g-115-5421: the debt number for BOTH checks below
                 Parse last_maintain_at + read maintenance_cadence.tree_maintain.hours_cadence
                   + tree_debt_check.debt_floor from core/config/aspirations.yaml.
+                # "debt" = the --debt total (g-115-5421; see Phase 8.7 above).
                 IF (last_maintain_at older than hours_cadence) OR (debt >= debt_floor):
                   # NOTE: maintenance_cadence.tree_maintain.tight_zone_skip defaults to false —
                   # tree-debt is structurally critical; runs even in tight. Check the flag

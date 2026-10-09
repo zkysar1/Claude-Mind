@@ -67,6 +67,7 @@ SITES = [
     ]),
     ("core/scripts/session-mode-get.sh", [
         (r'^_APD="([^"]*)"', "AGENTS_PARENT_DIR"),
+        (r'^_SDN="([^"]*)"', "SESSIONS_DIRNAME"),
     ]),
     ("core/scripts/session-signal-exists.sh", [
         (r'^_APD="([^"]*)"', "AGENTS_PARENT_DIR"),

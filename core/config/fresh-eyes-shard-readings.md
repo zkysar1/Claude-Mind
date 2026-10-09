@@ -599,3 +599,204 @@ agents/zeta/temp/drained/fresh-eyes-2026-10-06T23-53-09.md
 ### Fence note
 
 Series node 57,456 B before this fire; the pointer row for N=210 is 40 B, leaving it at 57,496 B against the 57,500 B cap. The next point cannot add even a pointer row without a fold, and the series-n probe reads only the shard, so the next fire must take max(probe, the headings in this file) + 1 = 211 unless a fold lands first.
+
+## 2026-10-08 (zeta N=211, hostname cc-02, uname -r 6.8.0-142-generic, own-cloud, DELEGATE) - act_later (8th consecutive, DR21 actionable axis)
+
+Measurement time: 2026-10-08T04:48 UTC (lane share 04:48:20). Cadence gate: current=16442, last=16414, diff=28. Run as delegated ritual on cc-02.
+
+### Lane share (directive-lane-share.py, measured this run; lane = 10 ids derived from strategic_focus rev 2026-10-07, asp-382 added as non-closing)
+
+| Window  | derived | work_class |
+|---------|---------|------------|
+| 7d      | 17.5% (18/103) | 35.9% (37/103) |
+| 48h     | 18.1% (13/72)  | 36.1% (26/72)  |
+| 24h     | 17.8% (8/45)   | 31.1% (14/45)  |
+| 12h     | 13.3% (4/30)   | 26.7% (8/30)   |
+| days3_7 | 16.1% (5/31)   | 35.5% (11/31)  |
+
+Rule 11 against N=210 (lane id set now 10, asp-382 added by rev 2026-10-07): derived 7d 19.2 -> 17.5 (-1.7pp), work_class 7d 37.5 -> 35.9 (-1.6pp), work_class 48h 39.7 -> 36.1 (-3.6pp), days3_7 30.8 -> 35.5 (+4.7pp). Derived and work_class both fell at 7d and 48h but are within normal range. 24h and 12h are INVERTED (1off < share: recurring-flattered).
+Rule 16 control: infra exceeds lane at 7d (7d lane/other/infra 18/35/50 of 103). Pool: lane=91, infra=3067, other=771 (2.32%, 33.7:1). Candidate check NOT RUN (guard-2379).
+
+### Phase 5.5 inputs
+
+- completion_health: 0.6083 (mean of per-aspiration completed/total ratios, n=27, asp-371 0/0 excluded, no asp-xw- imports). N=210: 0.6603.
+- evo: 4 (cur-03 terminal, all_passed=true)
+- P: 0 + 0 (pq_signals 0: 7 non-terminal questions, 4 candidates examined and rejected as technical architecture decisions, none scope-decision or self.md edit; board_signals 0: 4 directed posts, 2 already-answered excluded by --unread-only, 2 own answered-notices)
+- beliefs: 4, each read to full length: alpha conf 0.25, bravo conf 0.25, echo conf 0.25, foxtrot conf 0.5 (all within 6 days old)
+- confirming: 4/4 (all CONFIRMING: point-in-time activity snapshots consistent with zeta's current Self focus; none fresh-unanswered-divergent). N=210 had 3/4 with bravo non-confirming.
+- stale: 17d (self.md last_updated 2026-09-21)
+- directive: false
+- actionable: 0.45 (DR21: grep counts for One Body, asp-377, asp-376 in self.md all 0, unchanged since N=205)
+- drift: 0.15
+
+### Verdict
+
+**act_later** - weak-but-present signal, single axis (actionable 0.45, DR21). 8th consecutive (N=204 through N=211).
+
+self-assess-and-decide.sh output: act_later, "weak-but-present signal: actionable=0.45", recommended_action "file an Idea goal under asp-115 with the recommended edit summary". Filed g-115-12252 (Idea: incorporate One Body initiative references into self.md).
+
+### Flip points (neutralized: drift=0.05, confirming 4/4, actionable <= 0.35 before each sweep)
+
+- actionable: 0.39 -> no_change, 0.40 -> act_later (unchanged from N=206 through N=210).
+- belief axis (actionable 0.10): confirming 4/4 (net 0) -> no_change, confirming 2/4 (net 2) -> act_later.
+- drift axis: 0.39 -> no_change, 0.40 -> act_later.
+- act_now reachability: actionable 0.75 with stale 17d, no directive and drift 0.15 returns act_later. act_now needs actionable >= 0.7 AND (a user directive, drift >= 0.6, or stale >= 60d).
+
+### N=210 falsifier for N=211
+
+work_class 7d < 33.3% OR 48h < 30% OR net_divergent >= 2. Result: NOT FIRED (7d 35.9%, 48h 36.1%, net_divergent 0).
+
+### Falsifier for N=212
+
+Three conditions, any fires: (1) self.md edited to include One Body or asp-377 or asp-376 (DR21 resolves, actionable drops below 0.40, verdict becomes no_change); (2) work_class 7d < 33.3% or 48h < 30% (lane share regression); (3) net_divergent >= 2.
+
+### Carrier goals
+
+g-115-12252 (candidate): incorporate One Body initiative references into self.md (filed this fire).
+g-115-12089 (filed N=208): no longer in active stores (candidate was resolved/archived since N=208).
+g-115-11987, g-115-11988: no longer in active stores since N=208.
+
+### Principled choice, stated
+
+I can apply the Self edit now through the autonomous path (guard-380: notify after, revert if wrong). I chose not to override the helper's act_later inside this ritual. What would change it: promotion of g-115-12252 by the groom path, a request from echo or the owner, or taking the edit as its own unit at a fresh zone with Program edit #12 read in full.
+
+### Briefing
+
+agents/zeta/temp/drained/fresh-eyes-2026-10-08T04-53-10.md
+
+### Fence note
+
+Shard at 57,496 B against 57,500 B cap. CANNOT add even a pointer row. N=211 exists ONLY in this readings file. The series-n probe reads only the shard and will return 210 until a fold lands. A fold is overdue (fifth fold needed). Filed as observation for the next fold pass.
+
+## 2026-10-08 (zeta N=212, hostname cc-02, uname -r 6.8.0-142-generic, own-cloud, INLINE in the loop) - act_later (9th consecutive, DR21 actionable axis)
+
+Measurement time: 2026-10-08T20:36 UTC (two lane-share runs at 20:36:09 and 20:36:10, identical apart from the timestamp line). Cadence gate: current=16469, last=16442, diff=27, cadence=25. Index: the series-n probe returned 210 (the shard holds no row after N=210); the headings in this file reach N=211; so N=212 per the fence note of N=211.
+
+### Lane share (directive-lane-share.py, bare call, measured this run; lane = 10 ids derived from strategic_focus set_at 2026-10-07T02:16:27 by bravo: asp-326, 335, 358, 369, 372, 376, 377, 379, 380, 382)
+
+| Window  | derived | work_class |
+|---------|---------|------------|
+| 7d      | 17.9% (19/106) | 35.8% (38/106) |
+| 48h     | 13.8% (9/65)   | 32.3% (21/65)  |
+| 24h     | 16.7% (8/48)   | 33.3% (16/48)  |
+| 12h     | 21.6% (8/37)   | 43.2% (16/37)  |
+| days3_7 | 24.4% (10/41)  | 41.5% (17/41)  |
+
+Rule 11 against N=211 (same 10-id lane, live against live): derived 7d 17.5 -> 17.9 (+0.4pp), work_class 7d 35.9 -> 35.8 (-0.1pp), work_class 48h 36.1 -> 32.3 (-3.8pp), work_class 24h 31.1 -> 33.3 (+2.2pp), work_class days3_7 35.5 -> 41.5 (+6.0pp), work_class 12h 26.7 -> 43.2 (+16.5pp, n=37). The script flags the 48h window INVERTED (derived 13.8% over one-off 10.0%, recurring-flattered); N=211 flagged 24h and 12h.
+Rule 16 control (7d, n=106): lane/other/infra 19/35/52 (N=211: 18/35/50 of 103). infra > lane + other is false at 7d (52 v 54), 48h (30 v 35), 24h (18 v 30), 12h (10 v 27) and true only at days3_7 (22 v 19, n=41). Pool: lane=92, infra=3065, other=769 (2.34%, 33.3:1; N=211 91/3067/771). Candidate check NOT RUN (guard-2331).
+
+### Phase 5.5 inputs
+
+- completion_health: 0.6088 (mean of per-aspiration completed/total, n=27, asp-371 0/0 excluded, no asp-xw- imports). N=211: 0.6083.
+- evo: 4 (cur-03 terminal, all_passed=true, gates empty; evolution-log tail 5 entries are spark events)
+- P: 0 + 0 (pq_signals 0: 8 non-terminal questions inside 30d, types decision 4, decision-review 1, product-decision 2, architecture-decision 1, none scope-decision, 0 mention self.md; board_signals 0: 4 directed posts, alpha-6117 and echo-6432 read in full and each answers MY belief about its author so the subject test excludes them, zeta-3451 and -3452 are my own answered notices)
+- beliefs: 4, each read to full length: alpha conf 0.25 (6d), bravo 0.25 (6d), echo 0.25 (4d), foxtrot 0.5 (1d); each a one-instant factual read, none states drift
+- confirming: 4/4. Reported both ways: bravo's belief (asp-001 not among the boosted lanes at that instant) is the nearest to divergent; counted divergent it is 3/4, net 1, which the helper returns no_change on. N=211 had 4/4.
+- stale: 17d (self.md last_updated 2026-09-21)
+- directive: false
+- actionable: 0.45 (DR21: grep -c -i counts for One Body, asp-377, asp-376 in agents/zeta/self.md are 0, 0, 0; positive control asp-335 returns 7; unchanged since N=205)
+- drift: 0.15
+
+### Verdict
+
+**act_later** - weak-but-present signal, single axis (actionable 0.45, DR21). 9th consecutive (N=204 through N=212).
+
+self-assess-and-decide.sh (v0-2026-05-17) output: act_later, "weak-but-present signal: actionable=0.45", recommended_action "file an Idea goal under asp-115 with the recommended edit summary". Not re-filed: g-115-12252 (Idea: incorporate One Body initiative references into self.md, status candidate, id-queried this pass) is the live carrier and a second filing would duplicate it.
+
+### Flip points (each swept with the other two axes neutralized: drift 0.05, confirming 4/4, actionable at most 0.35)
+
+- actionable: 0.39 -> no_change, 0.40 -> act_later (unchanged from N=206 through N=211).
+- belief axis (actionable 0.10): confirming 4/4 (net 0) and 3/4 (net 1) -> no_change, confirming 2/4 (net 2) -> act_later.
+- drift axis (actionable 0.10): 0.39 -> no_change, 0.40 -> act_later.
+- control: actionable 0.10, drift 0.05, confirming 4/4 -> no_change (this is the row the Self edit is predicted to reach).
+- act_now reachability: actionable 0.75 with stale 17d, no directive and drift 0.15 returns act_later.
+
+### N=211 falsifier for N=212
+
+(1) self.md edited to include One Body, asp-377 or asp-376: NOT FIRED (counts 0, 0, 0). (2) work_class 7d < 33.3% or 48h < 30%: NOT FIRED (7d 35.8%, 48h 32.3%, the 48h margin is 2.3pp). (3) net_divergent >= 2: NOT FIRED (0; 1 under the alternative classification).
+
+### Falsifier for N=213, by event
+
+Any of three: (1) the Self edit lands, then re-run the three grep counts (0, 0, 0 before) and re-score actionable without the DR21 signal, predicted no_change by the control row; if it has not landed the verdict stays act_later; (2) work_class 7d < 33.3% or 48h < 30%; (3) net_divergent >= 2.
+
+### Carrier goals
+
+g-115-12252 (candidate, filed N=211): incorporate One Body initiative references into self.md; unpromoted since N=211.
+
+### Principled choice, stated
+
+I can apply the Self edit and I choose to take it as its own unit immediately after this ritual's stamp, leaving the helper's act_later as the recorded verdict. The condition set at N=211 for acting directly (a fresh zone with Program edit #12 read in full) holds in this window: program.md (423 lines) and self.md (768 lines) were read whole at 20:30. What would stop it: a pre-edit gate refusal, or a request from echo or the owner to leave the Self as is.
+
+### Briefing
+
+agents/zeta/temp/drained/fresh-eyes-2026-10-08T20-40-57.md
+
+### Fence note
+
+Shard at 57,496 B against the 57,500 B cap, so no pointer row can be added; N=211 and N=212 exist only in this file and the series-n probe reads only the shard, so it returns 210. Take max(probe, headings in this file) + 1 until a fold lands. A fold is overdue and has no owner goal; g-115-9971 (pending Idea) covers the series-shard write procedure in general.
+
+## 2026-10-09 (zeta N=213, hostname cc-02, uname -r 6.8.0-142-generic, own-cloud, INLINE in the loop) - no_change (first after nine act_later, DR21 resolved)
+
+Measurement time: 2026-10-09T07:18 UTC (two lane-share runs at 07:18:44, identical). Cadence gate: current=16495, last=16469, diff=26, cadence=25. Index: the series-n probe returned 210 (the shard holds no row after N=210); the headings in this file reach N=212; so N=213 per the fence note of N=212.
+
+### Lane share (directive-lane-share.py, bare call, measured this run; lane = the same 10 ids derived from strategic_focus set_at 2026-10-07T02:16:27 by bravo: asp-326, 335, 358, 369, 372, 376, 377, 379, 380, 382)
+
+| Window  | derived | work_class |
+|---------|---------|------------|
+| 7d      | 18.0% (20/111) | 36.0% (40/111) |
+| 48h     | 19.4% (13/67)  | 34.3% (23/67)  |
+| 24h     | 22.8% (13/57)  | 40.4% (23/57)  |
+| 12h     | 26.3% (10/38)  | 39.5% (15/38)  |
+| days3_7 | 15.9% (7/44)   | 38.6% (17/44)  |
+
+Rule 11 against N=212 (same 10-id lane, live against live): derived 7d 17.9 -> 18.0 (+0.1pp), work_class 7d 35.8 -> 36.0 (+0.2pp), work_class 48h 32.3 -> 34.3 (+2.0pp), work_class days3_7 41.5 -> 38.6 (-2.9pp). The 24h and 12h windows are not differenced: the gap between the passes is 10.7 h, so they barely overlap the prior windows (Rule 24). The script flags every window with infra above lane (its ordering column).
+Rule 16 control (7d, n=111): lane/other/infra 20/37/54 (N=212: 19/35/52 of 106). infra > lane + other is false at 7d (54 v 57), 48h (28 v 39), 24h (21 v 36), 12h (14 v 24) and true only at days3_7 (26 v 18, n=44). Pool: lane=86, infra=3056, other=768 (2.20%, 35.5:1; N=212 92/3065/769). Candidate check NOT RUN (guard-2331).
+
+### Phase 5.5 inputs
+
+- completion_health: 0.6125 (mean of per-aspiration completed/total, n=27, asp-371 0/0 excluded, no asp-xw- imports). N=212: 0.6088.
+- evo: 4 (cur-03 terminal, all_passed=true, gates empty; the evolution-log tail of 5 entries is spark events)
+- P: 0 + 0 (pq_signals 0: the same 8 non-terminal questions inside 30d, none scope-decision, 0 mention self.md; board_signals 0: the same 4 directed posts, alpha-6117 and echo-6432 each answer MY belief about its author so the subject test excludes them, carried from N=212 and not re-read, zeta-3451 and -3452 are my own answered notices)
+- beliefs: 4, each read to full length: alpha conf 0.25 (7d), bravo 0.25 (7d), echo 0.25 (5d), foxtrot 0.5 (0d, new since N=212); each a one-instant factual read, none states drift
+- confirming: 4/4. Reported both ways: bravo's belief is the nearest to divergent; counted divergent it is 3/4, net 1, which the helper returns no_change on. At 2/4 the helper returns act_later, so the belief axis is insensitive at B=4 (Rule 23) and the verdict rests on drift and actionable.
+- stale: 1d (self.md last_updated 2026-10-08)
+- directive: false
+- actionable: 0.10 (DR21 RESOLVED: grep -c -i counts for One Body, asp-377, asp-376 in agents/zeta/self.md are now 3, 1, 1, were 0, 0, 0; positive control asp-335 returns 7; the Self stub self-20261008T204547-zeta-3e88 reads status final in the authoritative store copy; carrier g-115-12252 reads skipped)
+- drift: 0.15
+
+### Verdict
+
+**no_change** - all signals below threshold. First no_change after nine consecutive act_later (N=204 through N=212), and the direct prediction of the N=212 control row.
+
+self-assess-and-decide.sh (v0-2026-05-17) output: no_change, "all signals below threshold (actionable=0.10, drift=0.15, evo=4 net=0@100%conf, stale=1d)". No goal filed: no_change is a silent no-op and the old carrier is already skipped.
+
+### Flip points (each swept with the other two axes neutralized: drift 0.05, confirming 4/4, actionable at most 0.35)
+
+- actionable: 0.39 -> no_change, 0.40 -> act_later (unchanged from N=206 through N=212).
+- belief axis (actionable 0.10): confirming 4/4 (net 0) and 3/4 (net 1) -> no_change, confirming 2/4 (net 2) -> act_later.
+- drift axis (actionable 0.10): 0.39 -> no_change, 0.40 -> act_later.
+- act_now reachability: actionable 0.75 and 0.90 with stale 1d, no directive and drift 0.15 both return act_later.
+
+### N=212 falsifier for N=213
+
+(1) the Self edit lands, then re-run the three grep counts and re-score actionable without the DR21 signal: FIRED, as predicted (counts 3, 1, 1; verdict no_change). (2) work_class 7d < 33.3% or 48h < 30%: NOT FIRED (7d 36.0%, 48h 34.3%, the 48h margin is 4.3pp). (3) net_divergent >= 2: NOT FIRED (0; 1 under the alternative classification).
+
+### Falsifier for N=214, by event
+
+Any of three: (1) work_class 7d < 33.3% or 48h < 30%; (2) net_divergent >= 2; (3) a new Self-content signal: a Program edit dated after 2026-10-08, or a partner or owner request about the Self. If none fires, the verdict stays no_change.
+
+### Carrier goals
+
+None open. g-115-12252 (candidate, filed N=211) was closed moot after the Self edit landed (status skipped, rehomed to asp-378).
+
+### Principled choice, stated
+
+I can run the selector to count lane candidates (the guard-2379 supply check) and I choose not to inside this ritual: every invocation increments the drain-lane hoist counter (guard-2331), and the pending-pool figure is stated with its population. What would change it: a verdict that turns on lane supply.
+
+### Briefing
+
+agents/zeta/temp/drained/fresh-eyes-2026-10-09T07-23-22.md
+
+### Fence note
+
+Shard still at 57,496 B against the 57,500 B cap, so no pointer row can be added; N=211, N=212 and N=213 exist only in this file and the series-n probe reads only the shard, so it still returns 210. Take max(probe, headings in this file) + 1 until a fold lands. A fold is overdue and has no owner goal; g-115-9971 (pending Idea) covers the series-shard write procedure in general.

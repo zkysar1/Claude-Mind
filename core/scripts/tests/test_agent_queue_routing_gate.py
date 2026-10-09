@@ -40,10 +40,26 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 sys.path.insert(0, str(CORE_SCRIPTS))
 
+import pytest  # noqa: E402
 from _daemon_fixture import DaemonFixture  # noqa: E402
 
 AGENT = "alpha"
 FOREIGN = "bravo"
+
+
+@pytest.fixture(autouse=True)
+def _pinned_roster(monkeypatch):
+    """Pin the active-agent roster the Phase D.6 predicate reads (rb-3076 class 5).
+
+    `_routes_away_from` treats an OFF-roster `intended_agent` as "either", so case 1
+    only refuses when FOREIGN is on the roster. The roster resolves from the checkout
+    the suite runs in; a deployment that runs fewer agents than this file names
+    answered 200 instead of 400. Patched on `gates.capability_route`, the module
+    object the in-process daemon imported (the bare `capability_route` name sibling
+    tests import is a different object), at the accessor `_active_agents` calls.
+    """
+    import gates.capability_route as capability_route
+    monkeypatch.setattr(capability_route, "get_active_agents", lambda: (AGENT, FOREIGN))
 
 
 def _seed_aspiration(asp_id: str, title: str) -> dict:

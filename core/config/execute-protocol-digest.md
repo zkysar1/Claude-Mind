@@ -32,7 +32,7 @@ IF exists: follow pre-execution steps. IF any returns SKIP → skip goal, goto P
 
 ```
 Bash: aspirations-update-goal.sh --source {source} <goal-id> status in-progress
-Bash: aspirations-update-goal.sh --source {source} <goal-id> started <today>
+# `started` is stamped at claim time by the daemon; never write it here (g-115-10090).
 ```
 
 ## Phase 4-lw: Trivial-Goal Classification (lightweight mode — g-305-15)

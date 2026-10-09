@@ -62,7 +62,7 @@ _AGENTS_PARENT_DIR = "agents"  # Phase 2.5.C: sync with _paths.py AGENTS_PARENT_
 _AGENTS_ROOT = _PROJECT_ROOT / _AGENTS_PARENT_DIR if _AGENTS_PARENT_DIR else _PROJECT_ROOT
 
 
-def _peer_agent_names(self_agent):
+def _peer_agent_names(self_agent, agents_root=_AGENTS_ROOT):
     """Return list of non-self agent names, discovered via project-root scan.
 
     Only includes directories that look like agents (have a session/ subdir).
@@ -71,7 +71,7 @@ def _peer_agent_names(self_agent):
     """
     peers = []
     try:
-        for d in _AGENTS_ROOT.iterdir():
+        for d in agents_root.iterdir():
             if not d.is_dir():
                 continue
             if d.name.startswith(".") or d.name in _NON_AGENT_DIRS:
@@ -85,7 +85,7 @@ def _peer_agent_names(self_agent):
     return peers
 
 
-def touch_peer_signals(signal_name):
+def touch_peer_signals(signal_name, agents_root=None, self_agent=None):
     """Touch <peer>/session/<signal_name> for every non-self peer agent.
 
     'self' = MIND_AGENT env var. When MIND_AGENT is unset, every discovered
@@ -93,19 +93,38 @@ def touch_peer_signals(signal_name):
     (e.g., scheduled poller) without an agent binding still fans the signal
     to all agents.
 
+    A daemon endpoint passes `agents_root` and `self_agent` from its request's
+    ctx.paths (agents_root, agent_name). This module's location and the
+    daemon's environment name neither the tree the request is about nor the
+    agent that made it (path-resolution.md, "Daemon endpoints"). Measured
+    2026-10-07: a test daemon serving a tmp project root, in a process bound to
+    one agent, touched every OTHER agent's signal in the real repo.
+
     Returns the count of files successfully touched (informational; callers
     typically ignore the return value).
     """
-    self_agent = (_os.environ.get("MIND_AGENT") or "").strip()
-    peers = _peer_agent_names(self_agent)
+    if self_agent is None:
+        self_agent = (_os.environ.get("MIND_AGENT") or "").strip()
+    if agents_root is None:
+        # The module root is fixed at import, so no env a test sets can redirect
+        # it: under pytest it is the real repo (guard-1041). Measured 2026-10-07:
+        # test_board_write_durability posts to coordination through board.py and
+        # touched every real agent's board-activity. A caller-given root is the
+        # caller's own tree and is honoured. A test that points _AGENTS_ROOT at
+        # tmp sets WAKE_SIGNALS_ALLOW_PYTEST=1.
+        if (_os.environ.get("PYTEST_CURRENT_TEST")
+                and not _os.environ.get("WAKE_SIGNALS_ALLOW_PYTEST")):
+            return 0
+        agents_root = _AGENTS_ROOT
+    peers = _peer_agent_names(self_agent, _Path(agents_root))
     n = 0
     for peer in peers:
         try:
-            # MUST use _AGENTS_ROOT, not _PROJECT_ROOT — peer dirs live under
+            # MUST use the agents root, not _PROJECT_ROOT — peer dirs live under
             # _AGENTS_PARENT_DIR. Writing to _PROJECT_ROOT/<peer>/ silently
             # creates root cruft AND the receiver (interruptible-sleep.sh,
             # which reads from $AGENT_DIR via _paths.sh) never sees the signal.
-            target = _AGENTS_ROOT / peer / "session" / signal_name
+            target = _Path(agents_root) / peer / "session" / signal_name
             target.parent.mkdir(parents=True, exist_ok=True)
             target.touch()
             n += 1

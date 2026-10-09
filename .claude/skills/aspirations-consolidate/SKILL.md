@@ -718,10 +718,11 @@ The encoding threshold (>= 0.40) remains the quality floor. The budget is the ce
    `core/config/tree.yaml` `stop_mode_caps`) under stop_mode=true so /stop
    stays fast. Skipping this step in any context is a guardrail violation.
 
-   distill_json=$(bash core/scripts/tree-read.sh --distill-candidates)
-   decompose_json=$(bash core/scripts/tree-read.sh --decompose-candidates)
-   debt_count = length(distill_json) + length(decompose_json)
-   debt_threshold = tree_debt_check.debt_threshold from core/config/tree.yaml (default 40)
+   # g-115-5421: debt = ACTIONABLE total (bare low_utility excluded — the
+   # over-flag class that armed this predicate permanently).
+   debt_json=$(bash core/scripts/tree-read.sh --debt)
+   debt_count = debt_json.total
+   debt_threshold = debt_json.threshold   # default 40
 
    IF stop_mode == true:
      Invoke /tree maintain --stop-mode   # small caps (stop_mode_caps), fast /stop

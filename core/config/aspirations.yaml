@@ -1293,7 +1293,7 @@ maintenance_cadence:
   tree_maintain:
     hours_cadence: 8            # Fire /tree maintain every N hours of wall-clock agent-up time
     tight_zone_skip: false      # Tree maintain runs even in tight zone (too critical to defer)
-    debt_floor: 50              # Force-fire when (decompose + distill) candidates exceed this count
+    debt_floor: 50              # Force-fire when ACTIONABLE tree debt (decompose + distill excluding bare low_utility; g-115-5421, via tree-read.sh --debt) exceeds this count
   evolution:
     hours_cadence: 12           # Fire /aspirations-evolve every N hours regardless of goal count
     tight_zone_skip: true       # Skip in tight; normal+ only

@@ -212,11 +212,17 @@ def check_closure_evidence(goal_id: str, source: str, summary_file: Optional[str
         warns.append("warning: the session-scratch advisory did not run "
                      f"({d['scratch_advisory_error']}), so its silence says nothing about the note")
     if rc == 3 and d["decision"] == "block":
+        # The gate's fix commands, filled in for this goal (): the carrier
+        # filing and the stored-note append. Printed as given, since a command's
+        # here-document needs its closing word at column 0.
+        fix = d.get("remedy")
+        fix = [x for x in fix if isinstance(x, str)] if isinstance(fix, list) else []
         return verdict("closure-evidence", FAIL, f"refused. Note checked: {note}",
                        list(d.get("problems") or []) + warns,
-                       "write or correct the evidence table in the outcome note: one `OUTCOME <n>: "
-                       "MET — <measured value>. Source: <...>` row per outcome, or `NOT MET — <gap>; "
-                       "deferred to <live goal>` (goal-schemas.md § Closure Evidence Table)")
+                       "\n".join(["write or correct the evidence table in the outcome note: one "
+                                  "`OUTCOME <n>: MET — <measured value>. Source: <...>` row per "
+                                  "outcome, or `NOT MET — <gap>; deferred to <live goal>` "
+                                  "(goal-schemas.md § Closure Evidence Table)"] + fix))
     if rc == 0 and d["decision"] == "pass":
         return verdict("closure-evidence", PASS, f"every outcome row is evidenced. Note checked: {note}",
                        warns)

@@ -82,6 +82,35 @@ local tag, and a fleet box carries many that are not releases: measured 2026-09-
 sole tag creator and never pushes; an untracked file (an agent health ledger, a
 scratch note) counts as DIRTY to its dry-run — commit it as a `chore:` first.
 
+**Before the cut, run the deployment shape (g-358-244).** The dev suite is green where a
+downstream deployment is red: tests read the dev world's goal ids, capability catalog and agent
+dirs, the live meta file, and the checkout's own `.gitignore`. v2.12.95 shipped 95 such new reds
+and the first adopt rolled back rc 3. Run the candidate in the deployment's shape first, output
+to a file (never piped):
+
+    py -3 core/scripts/deployment-shaped-run.py --ref HEAD <test files or core/scripts/tests> > <log> 2>&1
+
+Read the CONTROL line first: `4/4 seeded probes red` means the run could see a deployment;
+anything else exits 3 and every other number is void. Then the `skipped` counts (a skipped
+test is coverage a deployment does not get, not a pass), then the red files. Each red is hermetized
+or marked `requires_frontier_world` (`core/scripts/tests/_frontier_world.py`) before the cut, and
+the red set is read against the standing families in `run-full-suite-baselines.md`. Named
+pytest-invisible files (`main()`-style `.py`, `.sh`) run in the same shape through
+`run-invisible-suites.sh --files`. Put the verdict on the promotion record: the CONTROL line and
+the red and skipped totals go in the `release.sh --summary` text (the tag message is the audit
+trail) and in the handoff reply. A green shaped run reproduces the ABSENT factors only; a test
+whose result depends on the ambient session id, a reachable daemon or output length can still be
+red on a verify (`test_aspirations_update_goal_source_value.sh`, g-358-244), so also run the named
+invisible files under the ambient environment. Proven on named files and on the whole-directory form: the first valid full run
+(2026-10-08, ref 3fc177d6ca, `core/scripts/tests core/tests/gates` + the 83
+pytest-invisible files) read CONTROL 4/4, 175 red of 28552 tests (607 skipped)
+in 1515 files, invisible leg 5 red of 83, harness rc=1, ~55 minutes; the red set
+was read against the standing families and every red file carried an owner goal
+or an unowned-residue goal. The probe must run as its own early leg on the
+pristine tree — as an explicit arg next to a directory that contains it, pytest
+7.4.4 collects it twice and the late pass reads a suite-dirtied tree (g-358-244,
+rerun-2 void; pinned by `test_two_leg_split_keeps_the_probe_out_of_the_directory_collection`).
+
 ### Who cuts, and WHEN (g-373-82, decided 2026-09-15 — this was previously unowned)
 
 **WHO: the fleet. Any agent. This is not a human-reserved step.** `release.sh`'s

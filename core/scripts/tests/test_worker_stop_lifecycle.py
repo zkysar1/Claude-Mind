@@ -1,29 +1,32 @@
-""" — the worker /stop branch: park, the SID-scoped obligations, and
-the agent-wide negative.
+""", revised 2026-10-07 — the worker /stop branch: release, relay, push to
+the worker ref, then CLOSE; the SID-scoped obligations; and the agent-wide negative.
 
 WHY THIS FILE EXISTS
 A user /stop on a worker Body was an UNDECLARED lifecycle stage. `worker_execute.py`
 carries LIFECYCLE_DISPOSITIONS precisely so an undeclared stage fails at import
 rather than by surprise, and it declared 16 stages with neither the user-stop path
 nor the parked state among them — so the one instrument built to catch worker
-lifecycle asymmetry was blind to the two states this change is about. The branch
-itself ran two of the five box/SID-scoped obligations the reducer's graceful stop
-performs, and left the Body `active`, which means its learning payload stages NEVER
-if nobody restarts it.
+lifecycle asymmetry was blind to the two states this change is about.
+
+The 2026-10-07 revision replaced the stop's PARK with a CLOSE. A stopped SID never
+resumes (`/start` refuses its fork file), and a stopped Body never reaches park
+expiry (Phase -0-stop stands down first), so the park staged its learning late or
+never. The stop also released no claims, pushed the shared branch from a worker, and
+ran its telemetry close after the park, where parked-body-gate.py denied it. Why each
+step sits where it does: core/config/rationale/worker-stop-close.md.
 
 WHAT THIS SUITE PINS, AND WHY THE HALVES ARE SEPARATE
 Some assertions below are FILE assertions and some are SOURCE assertions, and the
 split is deliberate rather than convenient:
 
-  * park/resume semantics and the agent-wide negative are asserted on REAL FILES in
-    a tmp project root. A prose assertion cannot catch a future edit that adds a
-    write — which is the whole point of the agent-wide negative, the most important
+  * the agent-wide negative is asserted on REAL FILES in a tmp project root, for both
+    Body-state mutations a worker can make (park, and the genuine close this branch
+    now ends on). A prose assertion cannot catch a future edit that adds a write —
+    which is the whole point of the agent-wide negative, the most important
     assertion here.
-  * the two ORDERING claims (worker-loop Phase -0-stop ahead of the park-due gate;
-    stop-hook's parked ALLOW gate) are claims ABOUT SOURCE, so source is the only
-    place they can be checked. They are asserted against the real files rather than
-    restated from the goal text, because the design rests on them: if either is
-    false, parking a stopped Body would resume its poll or trap its turn-end.
+  * the ORDERING claims (worker-loop Phase -0-stop ahead of the park-due gate; the
+    stop-hook's close branch ahead of its stop-requested valve; the branch's own step
+    order) are claims ABOUT SOURCE, so source is the only place they can be checked.
   * the WIRING assertions are separate from both. guard-1943: pinning a writer says
     nothing about whether anything calls it, and this change's entire defect class
     was a correct component nothing invoked.
@@ -32,6 +35,10 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
+import re
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,6 +48,8 @@ CORE_SCRIPTS = Path(__file__).resolve().parent.parent      # core/scripts/
 PROJECT_ROOT = CORE_SCRIPTS.parent.parent
 if str(CORE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(CORE_SCRIPTS))
+
+from _bash_helpers import BASH  # noqa: E402
 
 STOP_SKILL = PROJECT_ROOT / ".claude" / "skills" / "stop" / "SKILL.md"
 WORKER_LOOP_SKILL = PROJECT_ROOT / ".claude" / "skills" / "worker-loop" / "SKILL.md"
@@ -85,12 +94,21 @@ def _worker_branch() -> str:
     return text[start:end]
 
 
+def _command_lines() -> list:
+    """The branch's executable lines: `Bash:` commands and the `Skill:` call.
+    Prose DISCUSSES files it does not write, so only these lines are inspected."""
+    return [ln.strip() for ln in _worker_branch().splitlines()
+            if ln.strip().startswith(("Bash:", "Skill:"))]
+
+
 def _mk_worker_body(tmp_path: Path, agent: str = "alpha") -> Path:
     """A tmp project root holding a REDUCER sid on disk and a forked WORKER Body.
 
     write_manifest(role="worker") materializes the forked body-WM itself whenever a
-    running-session-id names a DIFFERENT sid — that fork file is what park_body
-    requires, so seeding the reducer sid is what makes this a worker at all.
+    running-session-id names a DIFFERENT sid — that fork file is what park_body and
+    close_body_on_genuine require, so seeding the reducer sid is what makes this a
+    worker at all. remote_body defaults to False, so the close stages locally and
+    pushes nothing.
     """
     state = tmp_path / "agents" / agent / "session"
     state.mkdir(parents=True, exist_ok=True)
@@ -98,6 +116,26 @@ def _mk_worker_body(tmp_path: Path, agent: str = "alpha") -> Path:
     (state / "working-memory.yaml").write_bytes(b"slots:\n  scratch: seeded\n")
     bm.write_manifest(SID_WORKER, agent, role="worker", project_root=tmp_path)
     return tmp_path
+
+
+def _seed_agent_wide(pr: Path) -> dict:
+    state = pr / "agents" / "alpha" / "session"
+    seeded = {}
+    for name in AGENT_WIDE_FILES:
+        if name != "running-session-id":     # already holds the reducer sid
+            (state / name).write_text(f"SEED-{name}\n", encoding="utf-8")
+        seeded[name] = hashlib.sha256((state / name).read_bytes()).hexdigest()
+    return seeded
+
+
+def _assert_agent_wide_unchanged(pr: Path, seeded: dict) -> None:
+    state = pr / "agents" / "alpha" / "session"
+    for name, digest in seeded.items():
+        after = hashlib.sha256((state / name).read_bytes()).hexdigest()
+        assert after == digest, (
+            f"worker /stop mutated the AGENT-WIDE file {name!r}. On a cross-box "
+            "fleet the reducer owning it may be on another machine, so this stops "
+            "the wrong Body while the user believes they stopped only this box.")
 
 
 # ───────────────────────── (a) the lifecycle declaration ─────────────────────────
@@ -130,6 +168,8 @@ def test_user_stop_is_a_scoped_call_carrying_its_mode():
     assert row.mode, "a scoped-call must state how it is narrowed"
     # The narrowing that matters: the agent-wide half is excluded BY NAME.
     assert "NEVER D1/D2/D3/D6/D7" in row.mode
+    # And the row describes the stop that runs, not the park it replaced.
+    assert "body-closing" in row.mode and "then park" not in row.mode
 
 
 def test_park_resume_is_worker_only():
@@ -139,7 +179,7 @@ def test_park_resume_is_worker_only():
     assert row.mode is None, "worker-only rows must not carry a mode"
 
 
-# ───────────────────────── (b) park semantics, on real files ─────────────────────
+# ──────────── (b) park semantics, on real files (the worker-loop park) ────────────
 
 def test_active_worker_parks_and_resumes(tmp_path):
     pr = _mk_worker_body(tmp_path)
@@ -153,8 +193,7 @@ def test_active_worker_parks_and_resumes(tmp_path):
 
 
 def test_park_is_idempotent(tmp_path):
-    """A second /stop on an already-parked Body must be a no-op, not an error — the
-    branch treats every non-'parked' return as a no-op and continues."""
+    """A second park of an already-parked Body must be a no-op, not an error."""
     pr = _mk_worker_body(tmp_path)
     assert bm.park_body(SID_WORKER, "alpha", project_root=pr) == "parked"
     assert bm.park_body(SID_WORKER, "alpha", project_root=pr) == "already-parked"
@@ -174,94 +213,117 @@ def test_a_closed_body_is_never_parked(tmp_path, closed):
 # ────────────── (c) THE AGENT-WIDE NEGATIVE — asserted on the FILES ──────────────
 
 def test_park_does_not_touch_any_agent_wide_file(tmp_path):
-    """The most important assertion in this file.
-
-    Seeds all five agent-wide files with known bytes, runs the one step this change
-    ADDS that mutates Body state, and asserts every one is byte-identical
-    afterwards. Asserted on file DIGESTS rather than on the skill's prose, because a
-    prose assertion cannot catch a future edit that adds a write.
-
-    running-session-id is seeded with its REAL value rather than a synthetic one: it
-    is the field that makes this Body a worker, so preserving it is the substantive
-    claim, not just an unchanged-bytes coincidence.
-    """
+    """Seeds all five agent-wide files with known bytes, parks and resumes, and
+    asserts every one is byte-identical afterwards. Asserted on file DIGESTS rather
+    than on prose, because a prose assertion cannot catch a future edit that adds a
+    write. running-session-id keeps its REAL value: it is the field that makes this
+    Body a worker, so preserving it is the substantive claim."""
     pr = _mk_worker_body(tmp_path)
-    state = pr / "agents" / "alpha" / "session"
-    seeded = {}
-    for name in AGENT_WIDE_FILES:
-        if name != "running-session-id":     # already holds the reducer sid
-            (state / name).write_text(f"SEED-{name}\n", encoding="utf-8")
-        seeded[name] = hashlib.sha256((state / name).read_bytes()).hexdigest()
-
+    seeded = _seed_agent_wide(pr)
     assert bm.park_body(SID_WORKER, "alpha", project_root=pr) == "parked"
     assert bm.resume_body(SID_WORKER, "alpha", project_root=pr) == "resumed"
+    _assert_agent_wide_unchanged(pr, seeded)
 
-    for name, digest in seeded.items():
-        after = hashlib.sha256((state / name).read_bytes()).hexdigest()
-        assert after == digest, (
-            f"worker /stop mutated the AGENT-WIDE file {name!r}. On a cross-box "
-            "fleet the reducer owning it may be on another machine, so this stops "
-            "the wrong Body while the user believes they stopped only this box.")
+
+@pytest.mark.parametrize("start_state", ["active", "parked"])
+def test_stop_close_does_not_touch_any_agent_wide_file(tmp_path, start_state):
+    """The most important assertion in this file, for the step the branch now ENDS on.
+
+    The stop writes `body-closing`; the stop-hook hands it to close_body_on_genuine.
+    Run that close on a seeded tmp root and require (1) the Body really closed and the
+    sentinel was consumed, and (2) all five agent-wide files are byte-identical.
+    `parked` is a start state because a Body parked by the worker loop can still be
+    stopped by the user."""
+    pr = _mk_worker_body(tmp_path)
+    if start_state == "parked":
+        assert bm.park_body(SID_WORKER, "alpha", project_root=pr) == "parked"
+    seeded = _seed_agent_wide(pr)
+    session_dir = pr / "agents" / "alpha" / "sessions" / SID_WORKER
+    (session_dir / "body-closing").touch()
+
+    assert bm.close_body_on_genuine(SID_WORKER, "alpha", project_root=pr) == "marked"
+    assert (bm.read_manifest(SID_WORKER, "alpha", project_root=pr)["body_state"]
+            == "closed-pending-merge")
+    assert not (session_dir / "body-closing").exists(), "the sentinel must be consumed"
+    _assert_agent_wide_unchanged(pr, seeded)
 
 
 def test_worker_branch_names_no_agent_wide_session_write():
-    """Complementary to the file assertion above, and deliberately NOT a substitute
-    for it: this one catches a newly-ADDED write that the sandbox does not exercise,
-    while the file assertion catches a behavioural change in a component the branch
-    already calls. Neither implies the other.
+    """Complementary to the file assertions above, and deliberately NOT a substitute
+    for them: this one catches a newly-ADDED write that the sandbox does not exercise.
 
     The branch legitimately writes `sessions/<SID>/stop-requested` (SID-scoped, this
     Body, this box). The forbidden object is the AGENT-WIDE `session/stop-requested`,
     which stops the reducer wherever it runs. The two differ by one path segment,
-    which is exactly why this is worth pinning — and the branch's own prose DISCUSSES
-    that distinction, so only `Bash:` command lines are inspected. A prose mention is
-    documentation; a command is a write.
-    """
-    offenders = []
-    for line in _worker_branch().splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("Bash:"):
-            continue
-        for name in AGENT_WIDE_FILES:
-            if f"session/{name}" in stripped:
-                offenders.append((name, stripped))
+    which is exactly why this is worth pinning."""
+    offenders = [(name, line) for line in _command_lines()
+                 for name in AGENT_WIDE_FILES if f"session/{name}" in line]
     assert not offenders, (
         f"worker /stop branch writes agent-wide session state: {offenders}")
 
 
-# ───────── (d)+(e) the two ordering claims this design rests on, in source ────────
+# ─────────────── (d) the ordering claims this design rests on, in source ───────────
 
 def test_phase_minus_0_stop_precedes_the_park_due_gate():
-    """The design claim: parking a STOPPED Body cannot restart its polling, because
-    worker-loop reads the session-scoped stop signal BEFORE it consults the park
-    orbit. If this inverts, park_body's orbit advance would schedule a re-poll for a
-    Body the user stopped — and the remedy would be a park variant that does not
-    advance the orbit, NOT a reorder of Phase -0-stop, which is load-bearing for a
-    different reason (g-115-9461).
-    """
+    """A wakeup armed before the stop (a park re-poll or the deadman net) must stand
+    down, not run a unit. worker-loop reads the session-scoped stop signal BEFORE it
+    consults the park orbit, and that is what makes it stand down (g-115-9461)."""
     text = WORKER_LOOP_SKILL.read_text(encoding="utf-8")
     stop_read = text.index("sessions/$MIND_SID/stop-requested")
     park_due = text.index("body-manifest.py park-due")
     assert stop_read < park_due, (
-        "worker-loop Phase -0-stop no longer precedes the park-due gate; a parked+"
-        "stopped Body would resume polling")
+        "worker-loop Phase -0-stop no longer precedes the park-due gate; a stopped "
+        "Body's armed wakeup would resume polling")
 
 
-def test_stop_hook_allows_a_parked_body_at_turn_end():
-    """Without this ALLOW gate the stop's own turn-end is BLOCKed, and the only
-    escape is hand-writing `body-closing`, which DURABLY retires the Body. Stopping
-    one box is not retiring that Body."""
-    assert "worker-net-body-parked" in STOP_HOOK.read_text(encoding="utf-8")
+def test_stop_hook_runs_the_close_before_its_stop_requested_valve():
+    """The stop arms BOTH sessions/<SID>/stop-requested and body-closing. The hook
+    must take the genuine-close branch when the sentinel is present: if the
+    stop-requested valve were checked first, the turn would end WITHOUT staging the
+    WM, and the Body's learning would wait for the 24h stale-binding sweep again."""
+    text = STOP_HOOK.read_text(encoding="utf-8")
+    sentinel = text.index('_CLOSE_SENTINEL="$HOOK_AGENT_DIR/sessions/$HOOK_SID/body-closing"')
+    close = text.index("close-body-on-genuine", sentinel)
+    valve = text.index("ALLOW gate=worker-net-stop-requested-session")
+    assert sentinel < close < valve
+
+
+def test_body_closing_is_the_last_command_and_release_precedes_the_relay():
+    """The order the rationale argues for, pinned on the branch's command lines:
+    stop signal first, release before the learning relay, the relay before the
+    commit, telemetry and the binding cleanup before the close (they used to run
+    after a park, where parked-body-gate.py denied them), and body-closing LAST
+    (the WM snapshot is taken when the turn ends, so nothing may write after it)."""
+    lines = _command_lines()
+
+    def pos(needle):
+        hits = [i for i, ln in enumerate(lines) if needle in ln]
+        assert hits, f"worker /stop branch no longer runs: {needle}"
+        return hits[0]
+
+    order = [pos("/stop-requested"), pos("body-claims-release.py"),
+             pos("encode-session"), pos("session-summary-write.sh"),
+             pos("iteration-commit.sh"), pos("iteration-push.sh"),
+             pos("owncloud-flush.sh"), pos("write_close("),
+             pos(".active-agent-"), pos("/body-closing")]
+    assert order == sorted(order), f"worker /stop step order changed: {order}"
+    assert pos("/body-closing") == len(lines) - 1, (
+        "body-closing must be the LAST command: a write after it diverges after "
+        "the WM was staged")
 
 
 # ───────────────────────── the WIRING half (guard-1943) ──────────────────────────
 
 @pytest.mark.parametrize("call", [
+    "body-claims-release.py --agent",
+    "encode-session` with args `--relay`",
     "session-summary-write.sh --sid",
     "iteration-commit.sh --goal-id worker-stop",
-    "iteration-push.sh --min-commits 0 --max-age-min 0 --fetch-interval-min 0",
+    "iteration-push.sh --push-worker-ref",
     "owncloud-flush.sh",
-    "body-manifest.py park --sid",
+    "write_close(",
+    "session-binding-write.sh --sid",
+    'sessions/$MIND_SID/body-closing"',
 ])
 def test_worker_branch_invokes_each_scoped_obligation(call):
     """A component that exists and is never called is the defect class this whole
@@ -269,6 +331,32 @@ def test_worker_branch_invokes_each_scoped_obligation(call):
     it, and its own tests stayed green throughout (guard-1943). Assert the CALL
     SITE, not the component."""
     assert call in _worker_branch(), f"worker /stop branch no longer invokes: {call}"
+
+
+def test_worker_branch_no_longer_parks():
+    """The park was replaced, not supplemented. A park after the close would be
+    refused anyway (closed is not active), but a park BEFORE it would re-arm the
+    parked-body gate and deny every later step, which is the defect that left
+    telemetry records open."""
+    assert not [ln for ln in _command_lines() if "body-manifest.py park" in ln]
+
+
+def test_release_call_as_written_is_accepted(monkeypatch):
+    """guard-920: run the skill's LITERAL flags through the real parser. The summary
+    step sat inert for five days behind a flag argparse rejected under `|| true`;
+    a substring check cannot see that. release_all is stubbed so no daemon is hit."""
+    branch = _worker_branch()
+    idx = branch.index("body-claims-release.py")
+    line = branch[branch.rindex("`", 0, idx) + 1:branch.index("\n", idx)]
+    argv = shlex.split(line.split("||")[0])[3:]       # drop `py -3 <script>`
+    argv = [{"$MIND_SID": SID_WORKER, "<agent-name>": "alpha"}.get(a, a) for a in argv]
+
+    bcr = _load("body_claims_release_wiring", "body-claims-release.py")
+    seen = {}
+    monkeypatch.setattr(bcr, "release_all", lambda agent, sid, dry_run=False:
+                        seen.update(agent=agent, sid=sid) or {"verdict": "nothing-held"})
+    assert bcr.main(argv) == 0, f"body-claims-release rejects the skill's own call: {argv}"
+    assert seen == {"agent": "alpha", "sid": SID_WORKER}
 
 
 def test_summary_call_as_written_is_accepted_and_writes(tmp_path, monkeypatch):
@@ -279,8 +367,6 @@ def test_summary_call_as_written_is_accepted_and_writes(tmp_path, monkeypatch):
     cannot see that. So run the LITERAL flags from the skill line against the real
     parser (guard-920), and require the FILE, because main() also returns 0 when it
     writes nothing (an absent session dir is a silent no-op)."""
-    import shlex
-
     branch = _worker_branch()
     idx = branch.index("session-summary-write.sh")
     line = branch[idx:branch.index("\n", idx)]
@@ -302,32 +388,113 @@ def test_summary_call_as_written_is_accepted_and_writes(tmp_path, monkeypatch):
     assert f"ended_reason: {reason}\n" in summary.read_text(encoding="utf-8")
 
 
-def test_push_call_keeps_all_three_rate_limits_zeroed():
-    """The three zeroes are one semantic unit — they convert a rate-limited batch
-    decision into 'push whatever is ahead, now'. Dropping any one silently restores
-    the stranding this step exists to prevent, and a stopped worker has no later
-    iteration to recover it."""
-    branch = _worker_branch()
-    idx = branch.index("iteration-push.sh")
-    line = branch[idx:branch.index("\n", idx)]
-    for flag in ("--min-commits 0", "--max-age-min 0", "--fetch-interval-min 0"):
-        assert flag in line, f"worker /stop push lost {flag}: {line!r}"
-    assert "--strict" not in line, (
+def test_push_goes_to_the_worker_ref_never_the_shared_branch():
+    """Merging into main is reducer-only (worker-loop Phase 3.8). The old stop pushed
+    main with the three rate limits zeroed, which made the stop the one place a
+    worker wrote the shared branch. --push-worker-ref pushes HEAD to
+    refs/workers/<agent>/<sid> before the rate limiter is consulted."""
+    pushes = [ln for ln in _command_lines() if "iteration-push.sh" in ln]
+    assert len(pushes) == 1, f"expected exactly one push call: {pushes}"
+    assert "--push-worker-ref" in pushes[0]
+    assert "--strict" not in pushes[0], (
         "--strict makes a transient network blip abort the stop; without it "
         "soft_exit returns 0 on every path (guard-775)")
 
 
-def test_output_string_tells_the_operator_what_is_durable():
+def test_output_string_tells_the_operator_what_happened():
     """guard-4282: a prose comment and the string the operator READS are two
-    artifacts, and this exact string has already gone stale once against the block
-    directly above it. Steps 3-4 now push the git-tracked half, so an unqualified
-    'local disk only' would be a false report to the operator on every worker stop.
-    """
+    artifacts, and this exact string has gone stale twice against the steps above
+    it. It must say the Body CLOSED, where the commits went, the mode the session
+    landed in, and that it never runs worker units again — the string before the
+    close promised a resume `/start` refuses."""
     branch = _worker_branch()
-    out_idx = branch.index("9. Output:")
+    out_idx = branch.index("10. Output:")
     out = branch[out_idx:branch.index("\n", out_idx)]
-    assert "PARKED" in out, "the operator is not told the Body is parked"
-    assert "committed and pushed" in out, (
-        "the operator is not told the git-tracked half is now durable off-box")
-    assert "sessions/<SID>/" in out, (
-        "the operator is not told WHICH half remains local-only")
+    assert "CLOSED" in out and "PARKED" not in out
+    assert "worker ref" in out, "the operator is not told where the commits went"
+    assert "now in <target_mode> mode" in out, "the operator is not told where it landed"
+    assert "never runs worker units again" in out, (
+        "the operator is not told this SID is finished as a worker")
+    assert "<step-2 verdict" in out, "the operator is not told what was released"
+
+
+# ──────────── the landing (2026-10-07): the session ends in target_mode ────────────
+
+def _step0_command() -> str:
+    """Step 0's Bash command, from between its backticks."""
+    branch = _worker_branch()
+    start = branch.index("Bash: `", branch.index("0. Skip what an earlier stop")) + len("Bash: `")
+    return branch[start:branch.index("`\n", start)]
+
+
+def _run_step0(pr: Path) -> str:
+    env = {**os.environ, "MIND_SID": SID_WORKER}
+    r = subprocess.run([BASH, "-c", _step0_command().replace("<agent-name>", "alpha")],
+                       cwd=pr, env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def _set_body_state(session_dir: Path, state: str) -> None:
+    manifest = session_dir / "body-manifest.yaml"
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(re.sub(r"(?m)^body_state:.*$", f"body_state: {state}", text),
+                        encoding="utf-8")
+
+
+def test_landing_shares_the_last_call_and_cannot_block_the_close():
+    """The landing is the FIRST half of the last call (rationale § Why the session
+    lands): it precedes body-closing, and `;`, never `&&`, joins them, so a failed
+    binding write still closes the Body."""
+    last = _command_lines()[-1]
+    assert "session-binding-write.sh" in last and "/body-closing" in last, last
+    land = last.index("session-binding-write.sh")
+    between = last[land:last.index("touch ", land)]
+    assert "&&" not in between, "a failed landing would skip the close"
+    assert "|| echo" in between and between.rstrip().endswith(";"), between
+
+
+@pytest.mark.parametrize("target_mode", ["assistant", "reader"])
+def test_landing_call_as_written_lands_the_session(tmp_path, monkeypatch, target_mode):
+    """guard-920: the skill's LITERAL flags through the real writer, then the real
+    predicate every consumer reads. Neither half alone proves the session lands.
+    The agent-wide files are seeded and re-hashed: the landing is this session's
+    own binding, never agent-mode."""
+    pr = _mk_worker_body(tmp_path)
+    (pr / "agents" / "alpha" / "local-paths.conf").write_text("", encoding="utf-8")
+    seeded = _seed_agent_wide(pr)
+    last = _command_lines()[-1]
+    call = last[last.index("session-binding-write.sh"):].split("||")[0]
+    argv = shlex.split(call.replace(">/dev/null", ""))[1:]       # drop the script
+    argv = [{"$MIND_SID": SID_WORKER, "<agent-name>": "alpha",
+             "<target_mode>": target_mode}.get(a, a) for a in argv]
+
+    sbw = _load("session_binding_write_wiring", "session-binding-write.py")
+    monkeypatch.setattr(sbw, "_project_root", lambda: pr)
+    assert sbw.main(argv) == 0, f"the binding writer rejects the skill's own call: {argv}"
+    from _session_binding import landed_mode_in
+    assert landed_mode_in(pr / "agents" / "alpha" / "sessions" / SID_WORKER) == target_mode
+    _assert_agent_wide_unchanged(pr, seeded)
+
+
+def test_step0_skips_to_the_landing_only_for_a_stopped_body(tmp_path):
+    """Step 0 routes a repeat /stop. Run as written through real bash: an open
+    Body (active or parked) takes the whole stop; a Body in ANY closed state, from
+    the real body-manifest set, skips to the landing; a landed session re-lands.
+    Its `landed` check is a third copy of the landed rule, so it is compared with
+    landed_mode_in on the same bindings."""
+    from _session_binding import landed_mode_in
+    pr = _mk_worker_body(tmp_path)
+    session_dir = pr / "agents" / "alpha" / "sessions" / SID_WORKER
+    assert _run_step0(pr) == "open"                  # no binding yet
+    (session_dir / "binding.yaml").write_text("mode: autonomous\n", encoding="utf-8")
+    assert _run_step0(pr) == "open"
+    _set_body_state(session_dir, "parked")
+    assert _run_step0(pr) == "open", "a parked Body is alive, not closed"
+    for state in bm.CLOSED_STATES:
+        _set_body_state(session_dir, state)
+        assert _run_step0(pr) == "closed", state
+    for raw in ("mode: assistant\n", "mode: reader\n", "mode: 'assistant'\n",
+                "mode: assistants\n", "mode: autonomous\n"):
+        (session_dir / "binding.yaml").write_text(raw, encoding="utf-8")
+        assert (_run_step0(pr) == "landed") == (landed_mode_in(session_dir) is not None), raw

@@ -40,6 +40,7 @@ SETTINGS = PROJECT_ROOT / ".zakcode" / "settings.json"
 if str(TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(TESTS_DIR))
 from _bash_helpers import BASH  # noqa: E402
+from _frontier_world import requires_frontier_world  # noqa: E402
 
 # Per process, so parallel workers (pytest-xdist) never share, or tear down, one agent dir.
 THROWAWAY = f"_orh_test_agent_{os.getpid()}_"
@@ -207,6 +208,8 @@ def test_the_tracked_settings_declare_this_hook():
     assert HOOK.is_file()
 
 
+@requires_frontier_world(
+    "asserts the checkout's own .gitignore, which promotion-preflight lists as deployment-local")
 def test_git_tracks_the_settings_and_ignores_the_runtime_files():
     git = shutil.which("git")
     if git is None:

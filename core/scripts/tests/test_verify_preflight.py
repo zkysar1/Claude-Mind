@@ -301,6 +301,28 @@ def test_advisory_entries_this_cannot_read_are_one_warning_never_a_crash(tmp_pat
             "warning: the session-scratch advisory's entries could not be read ("), bad
 
 
+def test_a_refused_close_prints_the_gate_fix_commands_as_given(tmp_path):
+    """. The real gate's fix commands ride its JSON line and close the
+    FAIL remedy unindented, since a here-document's closing word must be at
+    column 0. A remedy of a shape this cannot read costs only the commands."""
+    r = run(Harness(tmp_path, note="OUTCOME 1: NOT MET — the widget does not build."))
+    ce = r["results"]["closure-evidence"]
+    assert (ce["state"], r["rc"]) == ("FAIL", 3)
+    fix = ce["remedy"].split("\n")
+    assert fix[0].startswith("write or correct the evidence table in the outcome note")
+    assert "bash core/scripts/aspirations-add-goal.sh --source world asp-1 <<'GOAL'" in fix
+    assert ("OUTCOME 1 (corrected): NOT MET - <what is missing>; deferred to <live goal-id>"
+            in fix)
+    assert "\nGOAL\n" in vp.render(r) and "\nROWS\n" in vp.render(r)
+    line = {"gate": "closure-evidence-gate", "decision": "block", "goal_id": "g-1-1",
+            "note_source": "the record's outcome_note", "problems": ["x"], "warnings": [],
+            "reason": None, "remedy": "not-a-list"}
+    r = run(Harness(tmp_path, overrides={"closure-evidence-gate.py": (3, json.dumps(line), "")}))
+    ce = r["results"]["closure-evidence"]
+    assert (ce["state"], ce["findings"]) == ("FAIL", ["x"])
+    assert "\n" not in ce["remedy"] and ce["remedy"].startswith("write or correct")
+
+
 # ─── an artifact from before the claim is warned about (artifact currency) ──
 
 PLAIN = "Plain prose with no entity facts.\n"

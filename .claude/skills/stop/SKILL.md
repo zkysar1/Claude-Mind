@@ -43,14 +43,15 @@ switch. Pass `--reader` for the read-only safe floor when walking away.
 2. **Agent name resolution (REQUIRED)**: Take the first argument that does NOT start with `--` as `<agent-name>`. The positional argument is mandatory — there is NO fallback to current session binding.
 
    a. **No positional argument present** → REFUSE with the available-agents list, then DONE (no state mutation, no signal write):
-      Bash: `ls -d */session/agent-state 2>/dev/null | awk -F/ '{print $1}' | paste -sd ", " -`
+      Bash: `source core/scripts/_paths.sh && ls -d "$(agents_root)"/*/session/agent-state 2>/dev/null | awk -F/ '{print $(NF-2)}' | paste -sd ", " -`
+      (Agent dirs live under `agents_root`, not the repo root. The old `*/session/agent-state` glob from the repo root matched nothing, so this refusal printed an empty agent list.)
       Output: `"Error: /stop requires an explicit agent name. Usage: /stop <agent-name> [--reader]. Available agents: <list-from-bash>. (Why mandatory: the prior 'use current session binding' default silently stopped the wrong agent on 2026-04-24 when the binding had been overwritten. Explicit names also enable stops from any terminal.)"`
       DONE.
 
    b. **Positional argument present but agent directory missing** → REFUSE with the same available-agents list:
       Bash: `ls agents/<agent-name>/session/agent-state 2>/dev/null` (check existence)
       IF missing:
-          Bash: `ls -d */session/agent-state 2>/dev/null | awk -F/ '{print $1}' | paste -sd ", " -`
+          Bash: `source core/scripts/_paths.sh && ls -d "$(agents_root)"/*/session/agent-state 2>/dev/null | awk -F/ '{print $(NF-2)}' | paste -sd ", " -`
           Output: `"Error: Agent '<agent-name>' not found or has no session state. Available agents: <list-from-bash>."`
           DONE.
 
@@ -64,8 +65,9 @@ AGENT-WIDE write — `stop-target-mode`, the `stop-requested` signal, `agent-sta
 `agent-mode`, the goal claim. A `/stop` typed on a WORKER box must perform none of
 them. `stop-requested` is the sharp one: it is read by the REDUCER's Phase -1.4, so
 setting it from a worker stops the wrong Body on a different machine while the user
-believes they stopped only the box in front of them. A worker's own wind-down is
-driven by the reducer-liveness poll, never by this file.
+believes they stopped only the box in front of them. A worker winds down when its
+reducer stops (the reducer-liveness poll) or through the worker branch below, and
+never through an agent-wide file.
 
 This check sits ABOVE Step 1 rather than inside the RUNNING branch on purpose. The
 IDLE branch writes agent-wide state too (`session-mode-set.sh`, Step 2 there), and a
@@ -106,133 +108,157 @@ Bash: `if [ -z "$MIND_SID" ]; then echo "indeterminate"; elif [ -f "agents/<agen
 
 IF output is "worker":
 
-1. Arm the SESSION-SCOPED stop signal so this turn can actually end (g-115-7309).
-   FIRST, before the flush: the remaining steps are fire-and-forget, and a stop that
-   cannot end its own turn is worse than one that skipped a push.
+A worker `/stop` CLOSES this Body and LANDS this session (2026-10-07). It gives back
+every claim the Body holds, hands this session's learning to the reducer and pushes its
+commits to its own worker ref. Its last call rebinds this session to `target_mode`
+(assistant, or reader with `--reader`) and writes `body-closing`, so the stop-hook runs
+the ordinary genuine close: the working memory is staged and the Body becomes
+`closed-pending-merge`. It does NOT park. A landed session is not a worker any more: its
+Bash calls carry no worker env, its heartbeat stops, and `session-mode-get.sh` reports
+`target_mode`, so the user keeps working in it. It never runs worker units again:
+`/start` refuses a session whose fork file exists (W-pre / 0-pre2,
+`EX_WORKER_FORK_PRESENT`), so `/start <agent-name>` in a FRESH terminal starts a new
+Body. No step below writes an agent-wide session file.
+# Rationale (WHY close instead of park, WHY land, and WHY this order): core/config/rationale/worker-stop-close.md
+
+0. Skip what an earlier stop already did.
+   Bash: `grep -Eqs "^mode:[[:space:]]*'?(reader|assistant)'?([[:space:]]|$)" "agents/<agent-name>/sessions/$MIND_SID/binding.yaml" && echo "landed" || { grep -Eqs "^body_state: '?(closed-pending-merge|merged|closed-stale|closed-graceful)'?[[:space:]]*$" "agents/<agent-name>/sessions/$MIND_SID/body-manifest.yaml" && echo "closed" || echo "open"; }`
+
+   - `open`: continue with step 1.
+   - `landed` or `closed`: this Body already closed. `closed` means it closed without
+     landing: a stop from before the landing existed, or one whose landing write
+     failed. Skip steps 1-7. They act on work the close already staged, and a relay
+     written now would arrive after staging and be lost. Run steps 8-10. Step 9
+     rebinds to this run's `target_mode`, so `/stop <agent-name> --reader` moves a
+     landed session to reader mode.
+
+1. Arm the SESSION-SCOPED stop signal so this turn can end (g-115-7309).
+   FIRST: every later step is fire-and-forget, and a stop that cannot end its own
+   turn is worse than one that skipped a step.
    Bash: `mkdir -p "agents/<agent-name>/sessions/$MIND_SID" && touch "agents/<agent-name>/sessions/$MIND_SID/stop-requested"`
 
-   WHY THIS FILE AND NOT `session/stop-requested`: the stop-hook worker-net has four
-   stand-down valves, and valve #2 (`stop-hook.sh`, gate
-   `worker-net-stop-requested`) reads the AGENT-WIDE `session/stop-requested` —
-   which this very branch is forbidden to write, because the reducer's Phase -1.4 on
-   another machine reads it. So the one actor that needs valve #2 was structurally
-   barred from firing it: every worker `/stop` BLOCKed at turn-end, and the only
-   escape was hand-writing `body-closing`, which DURABLY retires the Body
-   (`closed-pending-merge`, Phase -0 then refuses every further unit on that SID, and
-   only a user-only `/start` reopens it). Stopping one box is not retiring that Body.
+   WHY THIS FILE AND NOT `session/stop-requested`: stop-hook valve #2
+   (`worker-net-stop-requested`) reads the AGENT-WIDE file. This branch must never
+   write that file, because the reducer's Phase -1.4 on another machine reads it.
    This file is read by the paired valve `worker-net-stop-requested-session`, is
-   keyed to THIS SID, and never reaches the reducer. (guard-4900 documents the trap;
-   this step is its fix.)
+   keyed to THIS SID, and never reaches the reducer (guard-4900 documents the trap;
+   this step is its fix). worker-loop Phase -0-stop reads it too, so a wakeup that
+   fires after the stop stands down instead of running a unit. This file does not
+   close the Body; step 9 does.
 
-2. Write this session's summary. Same call graceful-stop D6.5 makes, SID-scoped, so a
-   stopped Body leaves the same continuity artifact a stopped reducer does. Runs BEFORE
-   the flush in step 5 because that flush must carry it -- graceful-stop D6.7 depends on
-   every continuity file being written first.
+2. Release everything this Body holds, then read back zero.
+   Bash: `py -3 core/scripts/body-claims-release.py --agent <agent-name> --sid "$MIND_SID" || true`
+
+   Read the one-line JSON verdict:
+   - `nothing-held` or `released`: the read-back is clean.
+   - `residue` (exit 1): it lists what is still held. Name it in step 10's output and
+     do not loop on it.
+   - `error` (exit 2): the claim query could not run. Report the claims as
+     unverified, never as nothing held.
+   No verdict fails the stop. This step runs BEFORE the learning pass, because any
+   claim still held during step 3 keeps a goal locked away from the fleet for no
+   benefit. Goal claims and team-state rows are released. Unit leases are left to
+   expire; the script's docstring says why.
+
+3. Hand this session's learning to the reducer.
+   Skill: `encode-session` with args `--relay`
+
+   Relay mode writes this Body's WM capture lanes and never a shared store (a worker
+   that encodes is an Nth reducer). Step 9's close stages the WM, and the reducer
+   replays the captures at its next generalize-down. A session with nothing to encode
+   captures nothing, and that is the correct output. When the skill returns, continue
+   with step 4: the stop is not finished.
+
+4. Write this session's summary. This is the same call graceful-stop D6.5 makes, scoped
+   to this SID.
    Bash: `bash core/scripts/session-summary-write.sh --sid "$MIND_SID" --agent <agent-name> --reason worker-stop || true`
 
-3. Commit this box's agent-dir churn. Same call graceful-stop D6.62 makes.
-   Bash: `source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --goal-id worker-stop --title "worker Body stop on this box" --outcome deep --type chore --repo "$PROJECT_ROOT" || true`
+5. Commit this session's churn, then push it to THIS BODY'S WORKER REF.
+   Bash: `source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --goal-id worker-stop --title "worker Body stop on this box" --outcome deep --type chore --repo "$PROJECT_ROOT" --session-sid "$MIND_SID" || true`
+   Bash: `git status --porcelain`
+   Bash: `bash core/scripts/iteration-push.sh --push-worker-ref || true`
 
-   `source core/scripts/_paths.sh &&` IS LOAD-BEARING, not decoration: `$PROJECT_ROOT` is
-   UNSET in a bare Bash call, so `--repo` would pass EMPTY and the script exits 1 naming
-   all four flags you DID pass. That error reads as a broken script rather than a missing
-   variable, and is how D6.62 sat inert for months (rb-9907). `--outcome deep` is also
-   load-bearing: `routine` is a documented no-op that commits nothing.
-   VERDICT ON `git status --porcelain`, NEVER ON THE rc -- the `|| true` discards it.
+   `source core/scripts/_paths.sh &&` IS LOAD-BEARING. `$PROJECT_ROOT` is unset in a
+   bare Bash call, so `--repo` would pass empty, and the script would exit 1 naming
+   all four flags you did pass (rb-9907). `--outcome deep` is load-bearing too:
+   `routine` commits nothing.
 
-4. Push what step 3 committed. Same call graceful-stop D6.65 makes.
-   Bash: `bash core/scripts/iteration-push.sh --min-commits 0 --max-age-min 0 --fetch-interval-min 0 || true`
+   `--session-sid` limits the commit to this session's own edits outside
+   `agents/<agent>/` (g-115-11148). encode-session's session-close commit uses the
+   same scoping; relay mode skips that commit because this step makes it. Judge the
+   result by `git status --porcelain`, never by the rc. An `ERROR: FOREIGN anchor
+   refused` line is expected when the agent-wide `in_flight` row names the reducer's
+   goal: it only skips the claim-time filter, and the `--session-sid` scoping still
+   holds.
 
-   All three zeroes are required together: they convert iteration-push's rate-limited
-   batch decision into "push whatever is ahead, now". D6.65 exists because a session whose
-   final commits sit under both thresholds leaves them stranded with no later iteration to
-   flush them -- and a STOPPED worker has no later iteration BY DEFINITION, so the case
-   D6.65 was written for is strictly worse here than on the reducer. MEASURED 2026-09-10 on
-   cc-09 (SID a30b1a3e): after the worker stop completed, agent store churn was still
-   uncommitted and unpushed, and it took a user-invoked `/encode-session` to ship it.
-   Do NOT add `--strict`: without it soft_exit returns 0 on every path, so an rc-gated
-   branch here would be dead code (guard-775); with it a transient network blip aborts the
-   stop.
+   `--push-worker-ref` pushes HEAD to `refs/workers/<agent>/<sid>` and stops there.
+   It never pushes the shared branch, because merging into main is reducer-only
+   (worker-loop Phase 3.8); the reducer merges the ref with `worker-ref-consume.sh`.
+   This push runs before the rate limit applies, so it needs no zero flags. Do NOT
+   add `--strict`: a network blip must not abort the stop.
 
-5. Flush pending backend writes. Same call graceful-stop D6.7 makes, moved ahead of
-   the sweep thread's next tick. Fire-and-forget: a flush failure must not block the
-   stop.
+6. Flush pending backend writes. Fire-and-forget.
    Bash: `bash core/scripts/owncloud-flush.sh || true`
 
-   ⚠ **THIS STEP DOES NOT PUSH THIS WORKER'S AGENT DIR, AND CANNOT** (g-115-9319).
-   It read "stage + push this worker's own per-session state so a machine-move right
-   after the stop cannot strand it" until 2026-09-07, which is the one thing it is
-   structurally unable to do. Per guard-1579, every write under `agents/<name>/` is
-   local-only from a box holding no live RUNNING claim for that agent — and a stopping
-   worker IS exactly that box, since the reducer holds the claim elsewhere and this box
-   reads agent-state IDLE. So the scenario the step named is precisely the scenario
-   where it is inert.
-   MEASURED THREE TIMES, two boxes, two OSes: DESKTOP-O91DLK2 (Windows)
-   `pruned_agents=12` with `alpha` among them, `pushed=1`; cc-07 (Linux
-   6.8.0-138-generic) `pruned_agents=11` with `alpha` among them, `pushed=0` on
-   2026-09-07 but **`pushed=1`** on 2026-09-08 (three flushes, same box, same
-   kernel, `alpha` pruned every time). **`pushed` IS NOT THE DISCRIMINATOR, IN
-   EITHER DIRECTION.** It counts OTHER owned paths and is box- *and*
-   run-contingent, so a zero proves nothing and a non-zero does not mean the agent
-   dir moved. This sentence used to claim the cc-07 `pushed=0` "removes that
-   ambiguity" — the 2026-09-08 re-measurement on that same box falsified it. The
-   tell is `pruned_agents=N` plus the WARN line naming the pruned agents; read
-   those. (guard-6254 carries the same correction against guard-1579, whose `rule`
-   field is immutable.)
-   NOT a data-loss report: the state is on local disk and a later `/start` on THIS SAME
-   box resumes the SID. What is absent is OFF-BOX durability FOR THE PER-SESSION HALF only
-   -- narrowed by g-306-477, which added steps 3-4 above: the GIT-TRACKED half of the agent
-   dir (journal, experience, changelog) is now committed and pushed by those steps and does
-   reach the remote. `sessions/<SID>/` is carried by `**/sessions/` in .gitignore, so that
-   half is still untracked and still local-only, and a machine-move after a worker stop
-   still strands it. If an artifact must reach the fleet,
-   encode it to a `world/` or `meta/` store — those are not claim-gated. (rb-10330.)
+   ⚠ **THIS DOES NOT PUSH THIS WORKER'S AGENT DIR, AND CANNOT** (g-115-9319). On a
+   box that holds no live RUNNING claim for the agent, the flush prunes
+   `agents/<agent>/` (guard-1579). A stopping worker is exactly that box. Read
+   `pruned_agents=N` and the WARN line that names the agent. Do not read `pushed`: it
+   counts other paths and proves nothing in either direction (guard-6254). The
+   per-session state reaches the reducer through step 9 instead, because the genuine
+   close stages the WM through its own writer.
 
-6. Park this Body instead of leaving it `active` (g-306-477).
-   Bash: `py -3 core/scripts/body-manifest.py park --sid "$MIND_SID" --agent <agent-name> || true`
-
-   Returns `parked` | `already-parked` | `no-forked-wm` | `not-active`. Treat EVERY
-   non-`parked` return as a no-op and CONTINUE -- never fail the stop on it.
-
-   WHY PARK RATHER THAN LEAVE IT ACTIVE, and why this does NOT stage the WM. A /stop-ed
-   Body intends to resume by construction, so it must NOT be queued for merge -- staging
-   here would lose every turn of divergence after the reducer marks it merged, which is
-   exactly the argument park_body's own docstring makes. What parking buys over `active`
-   is the thing `active` lacks: a park clock and an EXPIRY path that runs the ORDINARY
-   genuine close, which stages and pushes through the single existing writer. An `active`
-   stopped Body that is never restarted stages its learning payload NEVER; a parked one
-   eventually does. No new state and no new staging logic.
-
-   A PARKED+STOPPED BODY DOES NOT RESUME POLLING, and both halves of that were VERIFIED
-   in source rather than inherited from this text: `park` advances the park orbit, but
-   worker-loop Phase -0-stop reads `sessions/<SID>/stop-requested` FIRST (SKILL.md:114),
-   ahead of the park-due gate (SKILL.md:145), so the stopped Body stands down instead of
-   re-polling (g-115-9461); and `stop-hook.sh:470` carries the ALLOW gate
-   `worker-net-body-parked`, so the turn-end is not trapped.
-
-7. Close this session's telemetry record. The worker got a WP1 `active` record at
-   `/start` and never reaches the IDLE branch's WP2, so without this it orphans as
-   permanently-`active` and pollutes the live-sessions query. Keyed on the WORKER's own
-   `$MIND_SID`. guard-165: SID/agent via ENV, python source single-quoted.
+7. Close this session's telemetry record, then remove the legacy SID binding.
+   The worker got a WP1 `active` record at `/start` and never reaches the IDLE branch's
+   WP2. Without this step its record stays `active` in the live-sessions query forever.
+   guard-165: the SID and agent go through ENV, and the python source is single-quoted.
    Bash: `TSID="$MIND_SID" TAGENT="$MIND_AGENT" py -3 -c 'import os,sys; sys.path.insert(0,"core/scripts"); from _session_telemetry import write_close; write_close(sid=os.environ["TSID"], agent=os.environ["TAGENT"], status="completed", ended_reason="user-stop")' >/dev/null 2>&1 || true`
-
-8. Clean this session's SID binding so PROJECT_ROOT does not accumulate one file per
-   stopped worker. Idempotent.
    Bash: `rm -f ".active-agent-$MIND_SID"`
 
-9. Output: `"Worker Body stopped and PARKED on this box. The reducer was NOT signalled — its claim, canonical working memory, and agent-wide session state are untouched. This box's git-tracked agent state was committed and pushed by steps 3-4, so that half is durable off-box; the per-session state under sessions/<SID>/ is gitignored and remains on LOCAL DISK ONLY, so a later /start on THIS box resumes the SID and a machine-move still strands that half. The Body is now body_state=parked rather than active: it stays resumable, and if it is never restarted the park expires and the ordinary genuine close stages its learning payload. To stop the whole agent, run /stop <agent-name> on the reducer box."`
+   Both run BEFORE step 9 on purpose. Until 2026-10-07 they ran after
+   `body-manifest.py park`, and parked-body-gate.py denied them, so every stopped
+   worker left its telemetry record open. Removing the legacy binding does not
+   disarm step 9, because the stop-hook resolves this SID's agent from
+   `sessions/<SID>/binding.yaml` first.
 
-   The "local disk only" wording is load-bearing and must track step 5. Until
-   2026-09-08 this string said the session state "has been staged and pushed",
-   contradicting the ⚠ block directly above it — the block was corrected by
-   g-115-9319 on 2026-09-07 and this user-facing sentence was not, so every
-   worker `/stop` reported a push that cannot happen (observed being repeated
-   verbatim to the user, alpha/cc-07, 2026-09-08). A prose warning and the
-   string the operator actually reads are two artifacts; fixing one is not
-   fixing the other (guard-4282).
+8. Load the rules of the mode this session lands in.
+   Read: `core/config/modes/<target_mode>.md`
+
+9. LAND this session, then CLOSE this Body. This must be the LAST call.
+   Bash: `bash core/scripts/session-binding-write.sh --sid "$MIND_SID" --agent <agent-name> --mode <target_mode> --started-by worker-stop >/dev/null || echo "[stop] could not land this session in <target_mode> mode; the Body still closes" >&2; touch "agents/<agent-name>/sessions/$MIND_SID/body-closing"`
+
+   The binding write lands the session: from the next call on,
+   `_session_binding.landed_mode_in` reads it as landed. It writes only this session's
+   own binding. Never call `session-mode-set.sh` here: `agent-mode` belongs to the
+   whole box. A failed write still closes the Body, and a later `/stop <agent-name>`
+   lands the session through step 0.
+
+   The stop-hook consumes `body-closing` when the turn ends:
+   - `close-body-on-genuine` stages and pushes the WM and marks the Body
+     `closed-pending-merge`.
+   - `worker_close_in_flight_clear.py` then clears this Body's team-state rows a
+     second time. That repeat is idempotent.
+
+   It goes LAST because the WM snapshot is taken when the turn ends, so a WM write
+   after it diverges after staging and is lost. It also goes last because it is the
+   only step that cannot be undone. The landing shares its call, so no stop closes a
+   Body without trying to land the session.
+
+10. Output: `"Worker Body stopped and CLOSED on this box. Claims: <step-2 verdict, plus any residue it named>. The reducer was NOT signalled: its claim, canonical working memory and agent-wide session state are untouched. This Body's working memory, including the learning step 3 captured, is staged for the reducer's next merge, and its commits are on its worker ref for the reducer to merge into main. This session is now in <target_mode> mode and you can keep working in it, but it never runs worker units again: run /start <agent-name> in a fresh terminal for a new Body. To stop the whole agent, run /stop <agent-name> on the reducer box."`
+
+    After a step-0 `landed` or `closed` run, output instead: `"This worker Body had already stopped and closed. This session is now in <target_mode> mode. For worker units, run /start <agent-name> in a fresh terminal."`
+
+    If step 9 printed `[stop] could not land`, replace "This session is now in <target_mode> mode" with "This session could not be switched to <target_mode> mode; run /stop <agent-name> again to retry".
+
+    This string must agree with steps 2, 5 and 9. The prose warning above and the
+    string the operator actually reads are two separate artifacts, and fixing one does
+    not fix the other (guard-4282). Until 2026-10-07 this string said the Body was
+    PARKED and that "a later /start on THIS box resumes the SID". `/start` refuses that
+    SID, so that claim was never true.
 
 DONE. Do NOT continue to Step 1. Do NOT write `stop-target-mode`. Do NOT set the
-AGENT-WIDE `session/stop-requested`. Do NOT chain into the aspirations loop.
+AGENT-WIDE `session/stop-requested`. Do NOT call `session-mode-set.sh`. Do NOT chain
+into the aspirations loop.
 
 The word AGENT-WIDE is load-bearing and was added with step 1 (g-115-7309): this
 clause used to read "Do NOT set `stop-requested`" unqualified, which now reads as a
@@ -447,14 +473,20 @@ Output: "Agent has not been started yet. Type `/start <name>` to begin."
 
 ## Chaining
 - Sets: `stop-target-mode` file, `stop-requested` signal
-- Sets NEITHER of the above on the **worker-Body path** (Step 0.6): a `/stop` typed on
-  a worker box arms its SESSION-SCOPED `sessions/<SID>/stop-requested` (g-115-7309),
-  does NOT push its per-session state, closes its telemetry, cleans its binding,
-  and exits without touching any agent-wide file. The reducer is not signalled and
-  keeps running (g-306-125). The session-scoped file is what lets the turn END: it
-  fires the stop-hook's `worker-net-stop-requested-session` valve. It does NOT retire
-  the Body — `body_state` stays `active`, so a later `/start` resumes this SID
-  normally instead of needing the user-only reopen a `body-closing` close would force.
+- Sets NEITHER of the above on the **worker-Body path** (Step 0.6). On a worker box,
+  `/stop` does the following in order:
+  - arms its SESSION-SCOPED `sessions/<SID>/stop-requested` (g-115-7309), which fires
+    the stop-hook's `worker-net-stop-requested-session` valve so the turn can end;
+  - releases every goal claim and team-state row the SID holds;
+  - runs `/encode-session --relay`;
+  - commits, pushes to its worker ref, and closes its telemetry;
+  - writes `body-closing` last, so the stop-hook's genuine close stages its WM and
+    marks the Body `closed-pending-merge`.
+  It never touches an agent-wide file. The reducer is not signalled and keeps running
+  (g-306-125).
+- Calls (worker path): `core/scripts/body-claims-release.py`, then `Skill: encode-session`
+  with args `--relay`, and last `core/scripts/session-binding-write.sh`, which lands the
+  session in `target_mode`.
 - Calls (RUNNING branch, runner session only): `Skill: aspirations` with args `loop` as
   the final action, so Phase -1.4 runs in the same user turn and the graceful stop
   (D1–D7) completes before the turn ends. Observer sessions skip the chain and leave

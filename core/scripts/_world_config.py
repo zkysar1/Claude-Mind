@@ -23,8 +23,11 @@ Usage:
     )
     prefixes = tuple(cfg.get("product_category_prefixes") or [])
 
-Cached per-process. Daemon endpoints that need to react to a hot world-config
-edit can call `clear_cache()` (e.g., after a post-commit reload signal).
+Cached per-process, keyed by (path, mtime_ns): a hot edit to a world-config
+file is picked up on the next read of that name without a process restart
+(g-115-11062 / guard-7253 — a daemon-read config must not behave like code).
+`clear_cache()` still drops an entry without waiting for a file change (e.g.,
+after a post-commit reload signal).
 """
 from __future__ import annotations
 
@@ -32,7 +35,9 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-_CACHE: Dict[str, Dict[str, Any]] = {}
+# Cache value shape: (path: Optional[Path], mtime_ns: int, data: dict) —
+# validated by _cache_entry_valid on every hit ().
+_CACHE: Dict[str, tuple] = {}
 
 
 # --- Agent-dir resolution (Phase 2.5.C) ---
@@ -100,6 +105,37 @@ def _resolve_world_dir() -> Optional[Path]:
     return fallback if fallback.is_dir() else None
 
 
+def _cache_entry_valid(name: str, path: Optional[Path]) -> Optional[Dict[str, Any]]:
+    """Return the cached snapshot for `name` if it is still current, else None.
+
+    The cache entry records (path, mtime_ns, data). A hit is valid only while
+    the file at the SAME path still carries the SAME mtime_ns: a hot edit
+    (new mtime) or a path swap invalidates it and the caller re-reads.
+    g-115-11062 / guard-7253: the pre-fix keyless cache made a world-overlay
+    edit invisible to every process that had already loaded it — the daemon
+    kept stamping the old value while a fresh CLI read green. Missing file at
+    hit time (deleted since store) also invalidates; the reload path
+    re-decides the safe-default outcome.
+    """
+    entry = _CACHE.get(name)
+    if entry is None:
+        return None
+    _path, _mtime, data = entry
+    if _path is None:
+        # Stored as absent: valid only while it is still absent.
+        if path is None or not path.is_file():
+            return data
+        return None
+    if path is None or str(path) != str(_path) or not path.is_file():
+        return None
+    try:
+        if path.stat().st_mtime_ns != _mtime:
+            return None
+    except OSError:
+        return None
+    return data
+
+
 def load_world_config(name: str, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Load `world/config/<name>.yaml` and return its parsed dict.
 
@@ -113,19 +149,23 @@ def load_world_config(name: str, default: Optional[Dict[str, Any]] = None) -> Di
     """
     if default is None:
         default = {}
-    if name in _CACHE:
-        # Defensive copy on cache hit — without this, the second caller
-        # would inherit the first caller's mutations. The cache holds the
-        # canonical snapshot; every caller gets a fresh shallow copy so
-        # in-process callers cannot pollute each other or the cache.
-        # rb-1050 /  (fresh-eyes-code finding 2026-05-18).
-        return dict(_CACHE[name])
-
     world = _resolve_world_dir()
+    path = None if world is None else world / "config" / f"{name}.yaml"
+
+    if name in _CACHE:
+        cached = _cache_entry_valid(name, path)
+        if cached is not None:
+            # Defensive copy on cache hit — without this, the second caller
+            # would inherit the first caller's mutations. The cache holds the
+            # canonical snapshot; every caller gets a fresh shallow copy so
+            # in-process callers cannot pollute each other or the cache.
+            # rb-1050 /  (fresh-eyes-code finding 2026-05-18).
+            return dict(cached)
+        _CACHE.pop(name, None)
+
     if world is None:
         result = dict(default)
     else:
-        path = world / "config" / f"{name}.yaml"
         # own-cloud read-path fix (2026-07-02): materialize an S3-only overlay on
         # a fresh box BEFORE the is_file() gate, else every world/config overlay
         # silently degrades to defaults (the  config-404 class). Lazy,
@@ -176,7 +216,18 @@ def load_world_config(name: str, default: Optional[Dict[str, Any]] = None) -> Di
                     pass  # never let logging crash the loader
                 result = dict(default)
 
-    _CACHE[name] = result
+    # Store (path, mtime_ns, data) so a later hit can verify currency
+    # ( / guard-7253): a hot edit changes the file's mtime_ns and
+    # the entry invalidates on the next read. Record the path as absent
+    # (None) when no file backed the read, so an absent entry stays valid
+    # while absent and re-reads on file appearance.
+    if path is not None and path.is_file():
+        try:
+            _CACHE[name] = (path, path.stat().st_mtime_ns, result)
+        except OSError:
+            _CACHE[name] = (None, -1, result)
+    else:
+        _CACHE[name] = (None, -1, result)
     # Defensive copy on first-store return — symmetric with the cache-hit
     # path above. Without this, the first caller's mutations would pollute
     # the cached snapshot for every subsequent in-process call.

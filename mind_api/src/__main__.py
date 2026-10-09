@@ -1027,6 +1027,9 @@ def main(argv=None) -> int:
             print("[runtime] server thread exited unexpectedly; shutting down",
                   file=sys.stderr)
             break
+        # : heartbeat. A launcher on another host sharing this state dir reads
+        # daemon.host's mtime to know this daemon is still serving (lifecycle.foreign_host_hold).
+        lifecycle.touch_host_marker(project_root)
         owner = lifecycle.read_pid(project_root)
         if owner is not None and owner != os.getpid() and lifecycle.is_pid_alive(owner):
             print(f"[runtime] superseded by live pid {owner} (mine {os.getpid()}); "

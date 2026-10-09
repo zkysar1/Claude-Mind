@@ -94,10 +94,16 @@ def with_sandbox(test_fn):
         # rewrites production working memory would have gone on passing.
         os.environ.pop("BODY_WM_PATH", None)
 
-        # Force re-import to pick up sandbox paths
-        for mod in list(sys.modules):
-            if mod in ("_paths", "wm", "compact-restore-slots"):
-                del sys.modules[mod]
+        # Force re-import to pick up sandbox paths. `finally` puts the originals
+        # back: a later test in the same process that patches `_paths` by
+        # attribute patches the module IT imported, so leaving the name absent
+        # lets the next `import _paths` bind the process env, which on a bound
+        # session is the REAL agent dir. Measured 2026-10-07 (scoped run, alpha):
+        # test_postcompact_restore_terminal_anchor then wrote its diary fixture
+        # over the live agent-wide execution-diary.jsonl.
+        popped = {mod: sys.modules.pop(mod)
+                  for mod in ("_paths", "wm", "compact-restore-slots")
+                  if mod in sys.modules}
 
         try:
             test_fn(sandbox, agent_dir)
@@ -127,6 +133,9 @@ def with_sandbox(test_fn):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+            for mod in ("_paths", "wm", "compact-restore-slots"):
+                sys.modules.pop(mod, None)
+            sys.modules.update(popped)
             shutil.rmtree(sandbox, ignore_errors=True)
     wrapped.__name__ = test_fn.__name__
     return wrapped
@@ -378,6 +387,18 @@ def test_compact_restore_preserves_dry_idle_signals(sandbox, agent_dir):
     for field in ("streak", "last_dry_at", "sleep_total_s", "session_start_at", "cap_cycles"):
         assert field in dry, f"signals.dry_idle missing field {field!r} after restore: {dry}"
     assert dry["streak"] == 4, f"dry_idle.streak not preserved across compaction: {dry}"
+
+
+def test_sandbox_puts_back_the_modules_it_pops():
+    """with_sandbox pops `_paths`, `wm` and compact-restore-slots so the wrapped
+    test re-imports them bound to the sandbox. It must put the originals back, or
+    a later test in the same process that patches `_paths` by attribute patches a
+    module nobody reads any more (2026-10-07, see with_sandbox). pytest-only:
+    main() runs the sandboxed tests above, and this one is not sandboxed."""
+    import _paths  # noqa: F401  (the object a later test would patch)
+    before = sys.modules["_paths"]
+    with_sandbox(lambda sandbox, agent_dir: importlib.import_module("_paths"))()
+    assert sys.modules.get("_paths") is before
 
 
 def main():

@@ -531,7 +531,20 @@ def _seed_routing_registry(project_root: Path) -> None:
     (conv / "capability-routing.md").write_text(_ROUTING_REGISTRY, encoding="utf-8")
 
 
-def test_wrapper_refuses_defer_routing_to_an_out_of_lane_agent(running_daemon):
+@pytest.fixture
+def routing_roster(monkeypatch):
+    """Pin the active-agent roster the defer-routing gates read (rb-3076 class 5).
+
+    pin-001 excludes bravo, and `defer_routing_target` / `lane_pin` recognise a routed
+    name only when it is ON the roster. The roster resolves from the checkout the suite
+    runs in, so a deployment without that agent saw no refusal (rc=0). Both gates import
+    `get_active_agents` inside the call, so the patch lands on `_agents` itself.
+    """
+    import _agents
+    monkeypatch.setattr(_agents, "get_active_agents", lambda: ("alpha", "bravo"))
+
+
+def test_wrapper_refuses_defer_routing_to_an_out_of_lane_agent(running_daemon, routing_roster):
     """A structured defer routing work a lane pin EXCLUDES is refused.
 
     STRUCTURED on purpose: `is_narrative_defer` is False for every

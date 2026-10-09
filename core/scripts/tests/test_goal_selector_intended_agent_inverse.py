@@ -51,12 +51,17 @@ SELF_AGENT = gs.AGENT_NAME
 
 # OTHER_AGENT must name a LIVE peer — an off-roster name names nobody who can
 # honor the routing and correctly falls THROUGH (), which is a
-# different case, asserted separately below. Derive from the live vocabulary so
-# a future retirement cannot silently convert one case into the other.
-from aspirations import _valid_intended_agents as _vocab  # noqa: E402
+# different case, asserted separately below. The roster is PINNED for the run
+# (run() below), not read from the world this executes in: the dev origin has a
+# fleet but a deployment can have one agent, and there the live vocabulary held no
+# peer, so the three routing cases read a routed goal as "off-roster" and failed
+# (omni-382 class 3, ). A pinned roster also means a future retirement
+# cannot silently convert one case into the other.
+import aspirations as _aspirations  # noqa: E402
 
-_LIVE_PEERS = sorted(n for n in _vocab() if n not in (SELF_AGENT, "either"))
-OTHER_AGENT = _LIVE_PEERS[0] if _LIVE_PEERS else "alpha"
+_PINNED_ROSTER = (SELF_AGENT, "alpha", "echo")
+_LIVE_PEERS = sorted(set(_PINNED_ROSTER) - {SELF_AGENT, "either"})
+OTHER_AGENT = _LIVE_PEERS[0]
 OFFROSTER_AGENT = "delta"  # retired 2026-07-07
 
 # Module-level names a caller may reference without a local binding.
@@ -160,6 +165,18 @@ def check_call_site_kwargs_are_bound() -> list[str]:
 
 
 def run() -> list[str]:
+    # Pin the roster the routing filter reads (aspirations._valid_intended_agents ->
+    # _get_active_agents) for the cases only, and restore it: pytest imports this
+    # file at collection, so a module-level patch would leak into other tests.
+    real_roster = _aspirations._get_active_agents
+    _aspirations._get_active_agents = lambda: _PINNED_ROSTER
+    try:
+        return _run_cases()
+    finally:
+        _aspirations._get_active_agents = real_roster
+
+
+def _run_cases() -> list[str]:
     failures: list[str] = []
 
     # ── Case 1 — THE FIX. Routed to a live peer, owner NOT idle (default

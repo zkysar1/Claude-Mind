@@ -116,7 +116,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from _fileops import locked_modify_json  # noqa: E402
-from gates.closure_evidence import DEFERRED_RE, parse_rows  # noqa: E402
+from gates.closure_evidence import CARRIER_ID_RE, DEFERRED_RE, parse_rows  # noqa: E402
 from gates.residual_work import ACTIVE_STATUSES  # noqa: E402
 from goal_close_risk_tier import named_entities  # noqa: E402
 from q4_provenance_sample import (  # noqa: E402
@@ -583,13 +583,6 @@ def route_only(goal_id: str, reviewer: str, source: str) -> int:
     return 0 if ok else 4
 
 
-#: The carrier id, lettered child included. DEFERRED_RE stops at the digits, but
-#: aspirations.py GOAL_ID_RE admits a `-[a-z]` child, and an id fed to a lookup
-#: must keep it (guard-2414):  is a different goal from -b.
-#: The residual-work gate's own id pattern still drops it ().
-_CARRIER_RE = re.compile(r"\bg-\d{1,4}-\d+\b(?:-[a-z]\b)?")
-
-
 def deferral_advisories(artifact_text: str) -> list:
     """guard-7517 advisories for a review that is not approving (): one per
     sanctioned deferral row, ``OUTCOME n: NOT MET — <gap>; deferred to <goal-id>``,
@@ -606,8 +599,9 @@ def deferral_advisories(artifact_text: str) -> list:
         m = DEFERRED_RE.search(text) if row["status"] == "NOT MET" else None
         if not m:
             continue
-        # The first id after "deferred to" is the one DEFERRED_RE ended on.
-        carrier = _CARRIER_RE.search(text, m.start()).group(0)
+        # The first id after "deferred to" is the one DEFERRED_RE ended on. DEFERRED_RE
+        # stops at the digits; CARRIER_ID_RE keeps a lettered child (guard-2414).
+        carrier = CARRIER_ID_RE.search(text, m.start()).group(0)
         status = _gate().load_goal(carrier, "world").get("status")
         if status in ACTIVE_STATUSES:
             out.append(

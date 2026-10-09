@@ -98,7 +98,24 @@ ANY_GOAL_ID = re.compile(r"\bg-\d+-\d+(?:-[a-z])?\b")
 DEP_VERB_BEFORE = re.compile(
     r"(?:tracked (?:on|by)|owned by|gated (?:on|by)|behind|waiting (?:for|on)|"
     r"waits on|pending|blocked by|depends upon|dependent on|needs|requires|"
-    r"contingent on|once|after)\s+(?:the\s+)?(?:goal\s+)?"
+    r"contingent on|once)\s+(?:the\s+)?(?:goal\s+)?"
+    r"(g-\d+-\d+(?:-[a-z])?)\b",
+    re.IGNORECASE)
+# `after` is split out of DEP_VERB_BEFORE (): alone it cannot tell
+# 'unblocks after g-X lands' (a future dependency) from 'RE-DERIVED ... after the
+# g-X close' (a PAST event the prose merely cites — guard-4883's missing tense
+# sense). The past shape was the false positive on ,  and
+# . The lookahead drops only the past-event continuations (the nouns
+# close/closure and the past participles), so the present-tense verbs (lands,
+# ships, closes, completes) and a bare 'after g-X' still match. It sits BEFORE the
+# id group, not after it: a lookahead after the group lets the engine backtrack
+# into the optional `-[a-z]` suffix and match a truncated id. The cost, pinned in
+# test_defer_citation_parity_patterns.py as a recorded choice: a future use of the
+# noun form ('re-run after the g-X close') is no longer flagged.
+DEP_AFTER_ID = re.compile(
+    r"after\s+(?:the\s+)?(?:goal\s+)?"
+    r"(?!g-\d+-\d+(?:-[a-z])?\s+(?:close|closed|closure|landed|shipped|merged|"
+    r"completed|resolved|finished|was|were|had)\b)"
     r"(g-\d+-\d+(?:-[a-z])?)\b",
     re.IGNORECASE)
 DEP_VERB_AFTER = re.compile(
@@ -106,6 +123,7 @@ DEP_VERB_AFTER = re.compile(
     r"(?:owns|must|ships|settles|answers|closes|clears|unblocks|is done|"
     r"is complete|arrives|returns)\b",
     re.IGNORECASE)
+DEP_PATTERNS = (DEP_VERB_BEFORE, DEP_AFTER_ID, DEP_VERB_AFTER)
 
 # `human_blocked:` NEVER auto-clears by contract (gates/defer_classifier.py),
 # so an uncaptured citation there freezes nothing that was not already frozen
@@ -184,7 +202,7 @@ def main() -> int:
         # as evidence is the common case and is not a defect (see the measured
         # note on DEP_VERB_BEFORE).
         asserted = []
-        for pat in (DEP_VERB_BEFORE, DEP_VERB_AFTER):
+        for pat in DEP_PATTERNS:
             for m in pat.finditer(reason):
                 gid = m.group(1)
                 if gid != g.get("id") and gid not in asserted:

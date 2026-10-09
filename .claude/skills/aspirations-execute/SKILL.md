@@ -408,7 +408,7 @@ IF inbound_signals is non-empty:
 
 ```
 Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> status in-progress
-Bash: ${ENV_PREFIX} aspirations-update-goal.sh --source {source} <goal-id> started <today>
+# `started` is claim-time and daemon-owned: never write it (g-115-10090).
 
 # ── Origin integrate at execute start (g-115-3262) ──────────────────
 # Origin used to be integrated ONLY at iteration close, so a long iteration

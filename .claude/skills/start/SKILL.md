@@ -203,7 +203,7 @@ IF state == "UNINITIALIZED":
         Five files inline that constant for latency (see CLAUDE.md
         "Agent-dir Resolution"):
           core/scripts/session-state-get.sh
-          core/scripts/session-mode-get.sh
+          core/scripts/session-mode-get.sh         (also inlines _SDN)
           core/scripts/session-signal-exists.sh
           core/scripts/cleanup-stale-bindings.sh   (also inlines _SDN)
           core/scripts/_wake_signals.py            (uses _AGENTS_PARENT_DIR)
@@ -413,10 +413,10 @@ DONE.
 
    "Observers never fork a WM" is true of what an observer WRITES and says
    nothing about what it INHERITS. `bash-agent-inject.py` keys `BODY_ROLE=worker`
-   + `BODY_WM_PATH` on the fork file's EXISTENCE, not on this session's role, so
-   an observer binding on an ex-worker SID is mislabeled a worker for its whole
-   lifetime and every `wm-*.sh` write it makes lands in the dead Body's fork.
-   Step 0.4 then writes `--role observer`, which RESETS that manifest to
+   + `BODY_WM_PATH` on the fork file's EXISTENCE unless a reader/assistant
+   binding marks the session LANDED (`landed_mode_in`), which only its worker
+   `/stop` may claim (it closes the Body). Step 0.4 then writes
+   `--role observer`, which RESETS that manifest to
    `role: observer` / `body_state: active` / `forked_wm_hash: null` — so the
    cleanup sweep's preserve path later stages a fork with no hash sidecar, and
    `body-merge` takes its documented degraded branch (no hash → the
@@ -546,7 +546,7 @@ DONE.
    suppressed and reducer WM writes land in the fork (measured live
    2026-08-04, alpha on DESKTOP-O91DLK2, SID 301a45f2: `BODY_ROLE=worker`
    verified in the live environment of the wound-down session). Reader/
-   assistant binds inherit the same mislabel, so the refusal is mode-wide.
+   assistant binds would claim a landing (0-pre), so the refusal is mode-wide.
    **Mode-wide is a claim about SCOPE, not about this step's reach** — THIS
    step guards only the IDLE branch. The two other binding paths carry their
    own copy of the probe, placed ahead of their own first destructive write:
@@ -579,11 +579,12 @@ DONE.
 
    Display, naming which half was handled:
    > ⚠ This terminal's session (SID `$MIND_SID`) previously ran as a WORKER
-   > Body for `<agent-name>`. Its fork file still exists, and the Bash hook
-   > keys `BODY_ROLE=worker` on that file for the lifetime of this session —
-   > so this session cannot become the reducer (or bind cleanly in any mode).
+   > Body for `<agent-name>`. Its fork file still exists, so this session can
+   > never become the reducer or bind here in any mode. `/stop <agent-name>`
+   > lands it in assistant mode (reader with `--reader`) and closes the Body
+   > if open.
    >
-   > Open a NEW terminal and run `/start <agent-name>` there — a fresh SID
+   > Or open a NEW terminal and run `/start <agent-name>` there — a fresh SID
    > has no fork file. Any unmerged divergence from the worker run is safe:
    > its `body-manifest.yaml` records the state, and a
    > `closed-pending-merge` body is merged automatically at the next

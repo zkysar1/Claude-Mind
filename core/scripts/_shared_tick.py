@@ -104,12 +104,19 @@ def maybe_tick(agent: str, sid: str, state_dir: Path, project_root: Path,
     tick's agent-wide legs were built for; the reducer then keeps its other
     cadences. A session with NO carrier is not a Body (an observer, an
     assistant) and never ticks, and this never creates the carrier: /start
-    and the tick own that. Fail-open on every path.
+    and the tick own that. Nor does a session its worker /stop LANDED
+    (_session_binding.landed_mode_in): its Body is closed, and a carrier it
+    kept fresh would read as a live worker to the reducer's sweeps and to the
+    worker-ref retire gate for as long as the session stayed open. Fail-open
+    on every path.
     """
     try:
         if not sid or any(c in sid for c in ("/", "\\", "\n", "\r", " ")) or ".." in sid:
             return
         if not (state_dir / f"body-heartbeat-{sid}.json").is_file():
+            return
+        from _session_binding import _SESSIONS_DIRNAME, landed_mode_in
+        if landed_mode_in(state_dir.parent / _SESSIONS_DIRNAME / sid):
             return
         if pytest_suppressed():
             return

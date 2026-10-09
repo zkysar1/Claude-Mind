@@ -990,7 +990,9 @@ Other differences from standard mode:
 
 **When to use**: Auto-invoked by aspirations loop Phase 8.7 and by
 consolidation Step 6 when
-`(decompose_candidates + distill_candidates) > tree_debt_check.debt_threshold * 3`.
+`total > tree_debt_check.debt_threshold * 3`, `total` = the ACTIONABLE
+tree-debt from `Bash: tree-read.sh --debt` (g-115-5421: bare low_utility
+excluded; it still feeds the steps below but never this predicate).
 Can also be run manually after deploying threshold changes.
 
 **Steps**:

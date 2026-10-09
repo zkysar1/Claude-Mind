@@ -384,9 +384,15 @@ LIFECYCLE_DISPOSITIONS = {
             "stops. The sentinel is written ONLY on a genuine close (SELECT found no work, or "
             "reducer-liveness wind-down), never at end of a work unit (g-306-70)."),
     "user-stop": LifecycleDisposition(
-        kind=SCOPED_CALL, target="aspirations-graceful-stop D6.5 / D6.62 / D6.65 / D6.7",
-        mode="the BOX- and SID-scoped half only: session-summary-write --sid, iteration-commit, "
-             "iteration-push with all three rate limits zeroed, owncloud-flush -- then park. "
+        kind=SCOPED_CALL, target="aspirations-graceful-stop D6.5 / D6.62 / D6.65 / D6.7, "
+                                 "encode-session --relay, the stop-hook genuine close",
+        mode="the BOX- and SID-scoped half only: body-claims-release (this SID's claims and "
+             "team-state rows), encode-session --relay (WM capture lanes only), "
+             "session-summary-write --sid, iteration-commit --session-sid, iteration-push "
+             "--push-worker-ref (never the shared branch), owncloud-flush, telemetry close -- "
+             "then one last call that LANDS the session (session-binding-write: this SID's own "
+             "binding, mode reader or assistant) and CLOSES via body-closing "
+             "(core/config/rationale/worker-stop-close.md). "
              "NEVER D1/D2/D3/D6/D7, which write agent-wide state (agent-state, agent-mode, "
              "stop-loop, session/stop-requested, running-session-id) the reducer owns and may be "
              "holding on another machine; NEVER D4, which is consolidate-merge below.",
@@ -400,14 +406,14 @@ LIFECYCLE_DISPOSITIONS = {
     "park-resume": LifecycleDisposition(
         kind=WORKER_ONLY, target="body-manifest.py park / resume / park-due / park-expired / rejoin-wait",
         why="The reducer has no parked state at all -- it stops or it runs. A worker parks to stay "
-            "RESUMABLE while its reducer or its work supply is gone, and now also at user /stop. "
+            "RESUMABLE while its reducer or its work supply is gone. A user /stop no longer parks: "
+            "a stopped SID can never resume, so it closes (core/config/rationale/worker-stop-close.md). "
             "Parking is deliberately NOT a close and deliberately does NOT stage the Body's WM "
             "(park_body's docstring): a Body that intends to resume must not be queued for merge, "
             "or it loses every turn of divergence after the reducer marks it merged. What park "
             "buys over leaving the Body 'active' is a park clock and an EXPIRY path that runs the "
             "ordinary genuine close -- so the learning payload gets a terminal staging guarantee "
-            "it otherwise never has, because an 'active' stopped Body that is never restarted "
-            "stages NEVER."),
+            "it otherwise never has."),
     "consolidate-merge": LifecycleDisposition(
         kind=REDUCER_ONLY_BY_DESIGN, target="aspirations-consolidate Step -1 (body-merge.py)",
         why="Generalize-down is the definition of the reducer role: one Body merges ALL "
@@ -912,6 +918,13 @@ def goal_eligibility(skill: "str | None",
     walk passes a copy memoized for that walk, so judging many rows scans the
     claim table once (eligibility_walk, g-375-53).
     """
+    # A role or source that is not text (True, a number, a list) is read as text
+    # instead of raising in .strip(): an unrecognised role then takes the fallback
+    # below and names itself, in every walk that judges ranked rows ().
+    # The skill needs no such step: normalize_skill already reads it through str().
+    executable_by_role, source = (
+        v if v is None or isinstance(v, str) else str(v)
+        for v in (executable_by_role, source))
     if (source or "").strip().lower() == "agent":
         # The owner of a source='agent' row in THIS worker's select output is
         # the worker's own agent (its queue); `agent` names it explicitly so a
@@ -1617,7 +1630,7 @@ def supply_gap_refusals(census, declines, now=None) -> "list[str]":
             for r in rows if r.get("goal_id") not in declines]
 
 
-def worker_view(rows, n, agent=None):
+def worker_view(rows, n, agent=None, pace=None):
     """The first N ranked rows a WORKER may take: filter BEFORE the cut ().
 
     `rows` is the selector's ranking in its own order. Reducer-only rows are
@@ -1633,9 +1646,19 @@ def worker_view(rows, n, agent=None):
     The claim gate reads that pair (g-375-133): a worker that claims a kept row
     over a top it was never allowed to take has not deviated from the scorer, and
     without this record the gate refused it and sent the Body chasing the top.
+
+    `pace` (g-375-152), when given, is called as pace(k) for each HIGH row, k
+    being the row's place among the rows a worker may take (1 = the next one).
+    It returns a pace_forecast.forecast verdict, and a "yield" drops the row
+    before the cut like a reducer-only row: faster sessions will finish it sooner
+    than this one would. MEDIUM and LOW rows are never forecast. The census
+    lists every HIGH verdict in walk order, counts the yields and says whether
+    the scorer's top was one, the second sanction the claim gate reads. The
+    reducer's pick applies the same forecast (pace_forecast.reducer_view).
     """
-    kept, skipped, walked = [], 0, 0
-    top_dropped = False
+    kept, skipped, walked, takeable = [], 0, 0, 0
+    top_dropped = top_yielded = False
+    forecasts = []
     for row, word in eligibility_walk(rows, agent=agent):
         walked += 1
         if word == "reducer-only":
@@ -1643,6 +1666,18 @@ def worker_view(rows, n, agent=None):
             if walked == 1:
                 top_dropped = True
             continue
+        # k counts every row a worker may take, yielded ones too: a faster worker
+        # walking the same ranking takes each of them before it reaches this row.
+        takeable += 1
+        if pace is not None and row.get("priority") == "HIGH":
+            verdict = pace(takeable)
+            forecasts.append({"goal_id": row.get("goal_id"), "k": takeable,
+                              "decision": verdict.get("decision"),
+                              "fast_finish_hours": verdict.get("fast_finish_hours")})
+            if verdict.get("decision") == "yield":
+                if walked == 1:
+                    top_yielded = True
+                continue
         kept.append(dict(row, verdict=word))
         if len(kept) >= n:
             break
@@ -1653,6 +1688,9 @@ def worker_view(rows, n, agent=None):
               "reducer_only_skipped": skipped,
               "scorer_top": rows[0].get("goal_id") if rows else None,
               "scorer_top_dropped": top_dropped,
+              "scorer_top_yielded": top_yielded,
+              "pace_yielded": sum(f["decision"] == "yield" for f in forecasts),
+              "forecasts": forecasts,
               "rows": [{"goal_id": r.get("goal_id"), "verdict": r["verdict"]} for r in kept]}
     return kept, census
 
@@ -2078,14 +2116,31 @@ def _main(argv=None) -> int:
             if not line.startswith("[goal-selector] --top "):
                 print(line, file=sys.stderr)
         agent = args.agent or os.environ.get("MIND_AGENT") or AGENT_NAME or None
-        kept, census = worker_view(rows, args.top, agent=agent)
+        sid = os.environ.get("MIND_SID") or ""
+        try:
+            # The forecast both walks share (). An import that fails costs the
+            # forecast, never the walk: every row is then shown, as before it existed.
+            import pace_forecast
+            pace = pace_forecast.WalkPace(agent, sid, caller="worker_execute.py select-walk")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[select-walk] HIGH-goal pace forecast unavailable "
+                  f"({type(exc).__name__}: {exc}); every HIGH row is shown", file=sys.stderr)
+            pace = None
+        kept, census = worker_view(rows, args.top, agent=agent, pace=pace)
         print("[\n" + ",\n".join(json.dumps(r, ensure_ascii=False) for r in kept) + "\n]")
         print(f"[select-walk] showing {len(kept)} of {len(rows)} ranked candidates in the "
               f"scorer's order: eligible {census['eligible']}, undetermined "
               f"{census['undetermined']} (yours to judge); {census['reducer_only_skipped']} "
               f"reducer-only row(s) among the first {census['walked']} dropped BEFORE the "
               f"cut (g-375-53)", file=sys.stderr)
-        sid = os.environ.get("MIND_SID") or ""
+        if pace is not None and pace.basis is not None:
+            # The walk met a HIGH row, so the forecast ran: say what it decided and why,
+            # and record the basis beside the yields it produced ().
+            census["pace"] = pace.basis
+            print(f"[select-walk] HIGH-goal pace forecast: {pace.basis.get('reason')}; "
+                  f"{census['pace_yielded']} HIGH row(s) left to faster sessions, which are "
+                  f"not shown and not yours to claim (g-375-152)", file=sys.stderr)
+            pace.record(census["forecasts"])
         if sid and agent:
             write_select_census(census, agent_session_dir(agent, sid))
         return 0

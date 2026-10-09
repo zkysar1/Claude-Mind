@@ -209,7 +209,8 @@ PARK_MAX_HOURS = 60.0
 # of 60. Env overrides: PARK_BACKOFF_BASE_SECONDS / PARK_BACKOFF_MAX_SECONDS.
 # The park cap (PARK_MAX_HOURS) still measures the WHOLE park from the original
 # parked_at (guard-4184: what resets a stamp defines its meaning; only `resume`
-# resets either).
+# resets either), or from the last `supply_seen_at` when a walk saw work it left
+# to faster workers (, park_expired).
 PARK_BACKOFF_BASE_SECONDS = 3600
 PARK_BACKOFF_MAX_SECONDS = 4 * 3600
 
@@ -716,13 +717,18 @@ def set_state(sid: str, agent: str, new_state: str,
     return manifest_path
 
 
-def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
+def park_body(sid: str, agent: str, project_root: Path | None = None,
+              supply_seen: bool = False) -> str:
     """Park a worker Body whose reducer is gone. RESUMABLE — never a close.
 
     Returns 'parked' (state transitioned, park clock started), 'already-parked'
     (idempotent re-park; the ORIGINAL parked_at is preserved so the cap measures
     the whole park, not the last re-poll), 'no-forked-wm' (not a worker), or
     'not-active' (the Body is closed/merged — a close never becomes a park).
+
+    `supply_seen` (g-375-152): this park's walk SAW work and left it to faster
+    workers, so it stamps `supply_seen_at`. The cap measures how long the Body
+    has been without work (park_expired), and seeing work ends that condition.
 
     THE ONE THING THIS DELIBERATELY DOES NOT DO IS STAGE THE WM, and the goal's
     own spec asked for the opposite ("the SAME durable handoff as today: board
@@ -759,6 +765,8 @@ def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
         # parked-body-gate.py measures an open re-poll and an operator command
         # against it, so a re-park closes the re-poll that led to it ().
         data["last_parked_at"] = _now_iso_local()
+        if supply_seen:
+            data["supply_seen_at"] = data["last_parked_at"]
         _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
         return "already-parked"
     if state != "active":
@@ -766,6 +774,8 @@ def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
     data["body_state"] = "parked"
     data["parked_at"] = _now_iso_local()
     data["last_parked_at"] = data["parked_at"]
+    if supply_seen:
+        data["supply_seen_at"] = data["parked_at"]
     data["park_count"] = 0
     _advance_park_orbit(data)
     _write_atomic(session_dir / _MANIFEST_FILENAME, _render_manifest(data))
@@ -780,13 +790,18 @@ def park_body(sid: str, agent: str, project_root: Path | None = None) -> str:
 
 def supply_gap_check(sid: str, agent: str, decline_args=(),
                      project_root: Path | None = None) -> tuple:
-    """(refusals, summary) for a Phase 1 supply-gap park ().
+    """(refusals, summary, pace_yielded) for a Phase 1 supply-gap park ().
 
     Reads the census goal-selector's --top view wrote into this session's dir and
     asks worker_execute whether every row in it was answered: claimed, or named
     in a `--decline <goal-id>=<reason>`. A Body that never asked the gate has no
     census, so it cannot park on "no eligible goal". `summary` is the census
     line the park's board post carries.
+
+    `pace_yielded` counts the HIGH rows the walk left to faster workers
+    (g-375-152). They never reach the census rows, so they need no decline, but
+    they are SUPPLY: the park they cause is a wait for faster workers to finish,
+    not a queue with nothing in it, and the caller stamps it so (park_body).
     """
     import worker_execute  # lazy: only this park needs the eligibility contract
     declines = {}
@@ -803,12 +818,19 @@ def supply_gap_check(sid: str, agent: str, decline_args=(),
         census = None
     refusals = worker_execute.supply_gap_refusals(census, declines)
     summary = ""
+    pace_yielded = 0
     if isinstance(census, dict):
         summary = (f"select census --top {census.get('top')}: eligible "
                    f"{census.get('eligible')}, undetermined {census.get('undetermined')}, "
                    f"reducer-only dropped {census.get('reducer_only_skipped')} of "
                    f"{census.get('walked')} walked; declined {len(declines)}")
-    return refusals, summary
+        try:
+            pace_yielded = max(int(census.get("pace_yielded") or 0), 0)
+        except (TypeError, ValueError):
+            pace_yielded = 0
+        if pace_yielded:
+            summary += f"; {pace_yielded} HIGH row(s) left to faster workers"
+    return refusals, summary, pace_yielded
 
 
 def resume_body(sid: str, agent: str, project_root: Path | None = None) -> str:
@@ -827,6 +849,7 @@ def resume_body(sid: str, agent: str, project_root: Path | None = None) -> str:
         return "not-parked"
     data["body_state"] = "active"
     data.pop("parked_at", None)
+    data.pop("supply_seen_at", None)   # : it belongs to the park that ends here
     # The orbit resets with the clock: a resumed Body that parks again starts
     # back at the base interval ( part 4).
     data.pop("park_count", None)
@@ -853,6 +876,14 @@ def park_expired(sid: str, agent: str, project_root: Path | None = None,
     close is the unrecoverable direction (Phase -0 then refuses every further
     unit and only a user-only /start reopens it). A park that runs long is
     visible on the board and costs nothing but an hourly poll.
+
+    The clock runs from the LATER of `parked_at` and `supply_seen_at`
+    (g-375-152). The cap bounds how long a Body may sit with no reducer or no
+    work, and a park whose walk saw HIGH work and left it to faster workers had
+    work. Without this, a slow Body waiting out a queue of HIGH goals would close
+    itself for good after 60 h while the work was still there (guard-4184: what
+    resets the stamp is what the cap means). An unreadable `supply_seen_at` also
+    returns False, the same safe direction.
     """
     data = read_manifest(sid, agent, project_root)
     if data.get("body_state") != "parked":
@@ -862,6 +893,9 @@ def park_expired(sid: str, agent: str, project_root: Path | None = None,
         return False
     try:
         parked = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%S")
+        seen = str(data.get("supply_seen_at") or "").strip()
+        if seen:
+            parked = max(parked, datetime.datetime.strptime(seen, "%Y-%m-%dT%H:%M:%S"))
     except (ValueError, TypeError):
         return False
     elapsed = (datetime.datetime.now() - parked).total_seconds() / 3600.0
@@ -1713,14 +1747,16 @@ def main(argv=None):
             summary = ""
             if args.decline and not args.supply_gap:
                 raise ValueError("--decline applies only to a --supply-gap park")
+            pace_yielded = 0
             if args.supply_gap:
-                refusals, summary = supply_gap_check(args.sid, args.agent, args.decline)
+                refusals, summary, pace_yielded = supply_gap_check(
+                    args.sid, args.agent, args.decline)
                 if refusals:
                     print("refused")
                     for reason in refusals:
                         print(f"  {reason}", file=sys.stderr)
                     return 5
-            print(park_body(args.sid, args.agent))
+            print(park_body(args.sid, args.agent, supply_seen=pace_yielded > 0))
             if summary:
                 print(summary)
         elif args.cmd == "resume":

@@ -519,6 +519,14 @@ def _worker_banner(iter_ckpt):
     the binding is a cheap guard either way. The banner does not lean on
     compact-checkpoint.yaml, which precompact-checkpoint.sh fails to refresh
     when it overruns its hook timeout (g-375-03).
+
+    It also says when the session has stopped being a worker, read from the
+    same files. Three states replace the worker ACTION: the session's /stop
+    LANDED it in reader or assistant mode, the Body CLOSED without landing, or
+    a /stop is still in progress. None of them prints the iteration anchor,
+    which a stop leaves behind naming a goal the stop released. Measured
+    2026-10-07: a Body its /stop had closed (closed-pending-merge) got the
+    worker ACTION here, under an anchor telling it to resume that goal.
     """
     agent = AGENT_DIR.name  # the hook resolved it from this SID's binding.yaml
     sid = BODY_DIR.name  # a per-session dir is named by its SID
@@ -532,8 +540,30 @@ def _worker_banner(iter_ckpt):
                       for key in ("body_state", "env_id", "reducer_sid")
                       if manifest.get(key))
     role = str(manifest.get("role") or "?") + (f" ({state})" if state else "")
+    body_state = str(manifest.get("body_state") or "")
+    try:
+        from _session_binding import landed_mode_in
+        landed = landed_mode_in(BODY_DIR)
+        stopping = (BODY_DIR / "stop-requested").exists()
+    except Exception as e:
+        log(f"stop-state read failed: {e}")
+        landed, stopping = None, False
+    try:
+        from worker_stall import CLOSED_BODY_STATES  # drift-pinned to body-manifest
+        closed = body_state in CLOSED_BODY_STATES
+    except Exception as e:
+        log(f"closed-state set unavailable: {e}")
+        closed = False
+    if landed:
+        # The Bash hook no longer exports BODY_WM_PATH, so wm-*.sh is agent-wide.
+        title = f"stopped worker Body, now {landed} mode"
+        wm = (f"{(AGENT_DIR / 'session' / 'working-memory.yaml').as_posix()}"
+              f" (agent-wide, as in any {landed} session)")
+    else:
+        title = "worker Body"
+        wm = (BODY_DIR / "working-memory.yaml").as_posix()
     lines = [
-        "=== CONTEXT RESTORED (post-compaction, worker Body) ===",
+        f"=== CONTEXT RESTORED (post-compaction, {title}) ===",
         "",
         "BINDING: who you are, read from this session's own binding and body",
         "manifest, not from the summary above. If the summary says otherwise,",
@@ -542,7 +572,7 @@ def _worker_banner(iter_ckpt):
         f"  session:        {sid}",
         f"  role:           {role}",
         f"  session dir:    {BODY_DIR.as_posix()}/",
-        f"  working memory: {(BODY_DIR / 'working-memory.yaml').as_posix()}",
+        f"  working memory: {wm}",
         f"  your Self:      {(AGENT_DIR / 'self.md').as_posix()}",
         f"You are agent '{agent}'. Your own Self, working memory, scratch and",
         f"evidence are under {AGENT_DIR.as_posix()}/. Never take another agent's",
@@ -550,16 +580,44 @@ def _worker_banner(iter_ckpt):
         "directory.",
         "",
     ]
-    if iter_ckpt is not None:
-        lines.extend(_format_iteration_ckpt_block(iter_ckpt, reselect=WORKER_RESELECT))
-    lines.extend([
-        "ACTION: continue the worker loop. If worker-loop's instructions are no",
-        "longer in your context, load them with Skill(worker-loop). Never",
-        "Skill(aspirations): that is the reducer's loop (guard-517/guard-463). Do",
-        "not re-arm the reducer's deadman net either; a worker's net is armed by",
-        "worker-loop's own terminal pair.",
-        "===========================================",
-    ])
+    if landed:
+        lines.extend([
+            f"ACTION: serve the user in {landed} mode. This session's /stop closed its",
+            "worker Body and landed the session, so it is no longer a worker: never",
+            "Skill(worker-loop) and never Skill(aspirations). If the mode's rules are",
+            f"no longer in your context, Read core/config/modes/{landed}.md. Worker or",
+            "loop work needs /start in a fresh terminal.",
+        ])
+    elif closed:
+        lines.extend([
+            f"ACTION: this worker Body is CLOSED (body_state {body_state}) and runs no",
+            "more work units: never Skill(worker-loop) and never Skill(aspirations).",
+            "The session did not land in assistant mode. Take no worker action,",
+            f"answer the user, and tell them that /stop {agent} lands this session.",
+        ])
+    elif stopping:
+        lines.extend([
+            "ACTION: a /stop of this worker Body is in progress (stop-requested is",
+            "armed in the session dir) and the Body has not closed. Never",
+            "Skill(worker-loop) and never Skill(aspirations). If you were running the",
+            "user's /stop, finish its worker branch (.claude/skills/stop/SKILL.md",
+            "Step 0.6) from the first step not yet done. Every step but the relay",
+            "(step 3) is safe to re-run, and the relay already ran if this Body's",
+            "spark_capture holds goal_id worker-stop entries. Its last call lands",
+            f"the session. Otherwise run nothing and tell the user /stop {agent}",
+            "finishes the stop.",
+        ])
+    else:
+        if iter_ckpt is not None:
+            lines.extend(_format_iteration_ckpt_block(iter_ckpt, reselect=WORKER_RESELECT))
+        lines.extend([
+            "ACTION: continue the worker loop. If worker-loop's instructions are no",
+            "longer in your context, load them with Skill(worker-loop). Never",
+            "Skill(aspirations): that is the reducer's loop (guard-517/guard-463). Do",
+            "not re-arm the reducer's deadman net either; a worker's net is armed by",
+            "worker-loop's own terminal pair.",
+        ])
+    lines.append("===========================================")
     return lines
 
 

@@ -280,6 +280,15 @@ fi
 if [ -n "$REASON_KIND_VAL" ]; then
     QUERY="${QUERY}&reason_kind=$(rt_url_encode "$REASON_KIND_VAL")"
 fi
+# : carry this Body's role so the daemon can stop a WORKER from
+# releasing a claim that another session holds (_worker_release_keeps_claim in
+# aspirations_write.py). Same header, same reason as aspirations-update-goal.sh:
+# BODY_ROLE is injected into every Bash call by bash-agent-inject.py and is
+# absent inside the daemon, so it has to travel. With it unset nothing is sent
+# and the daemon releases exactly as before, so the sweeps and every other
+# caller that is not a worker Body are unchanged.
+declare -a HEADER_ARGS=()
+[ -n "${BODY_ROLE:-}" ] && HEADER_ARGS+=(--header "X-Mind-Body-Role: $BODY_ROLE")
 
 # --- in_flight clear () -----------------------------------------
 # SYMMETRY, not a new mechanism. aspirations-claim.sh SETS the busy signal
@@ -313,9 +322,14 @@ fi
 _clear_in_flight() {
     [ -n "${MIND_AGENT:-}" ] || return 0
 
-    # Reducer surface — CAS-guarded by the wrapper itself.
-    MIND_AGENT="$MIND_AGENT" bash "$CORE_ROOT/scripts/team-state-clear-in-flight.sh" \
-        --agent "$MIND_AGENT" --if-goal "$GOAL_ID" >/dev/null 2>&1 || true
+    # Reducer surface — CAS-guarded by the wrapper itself. Skipped when the
+    # daemon KEPT the claim (: a worker releasing a goal another
+    # session holds now). The agent-keyed row naming this goal is then the
+    # holder's, not this worker's, and the CAS cannot tell the two apart.
+    if ! _release_kept_claim; then
+        MIND_AGENT="$MIND_AGENT" bash "$CORE_ROOT/scripts/team-state-clear-in-flight.sh" \
+            --agent "$MIND_AGENT" --if-goal "$GOAL_ID" >/dev/null 2>&1 || true
+    fi
 
     # Body surface — ownership tested here, because the clearer has no CAS.
     [ -n "${MIND_SID:-}" ] || return 0
@@ -327,6 +341,18 @@ _clear_in_flight() {
             --agent "$MIND_AGENT" --sid "$MIND_SID" >/dev/null 2>&1 || true
     fi
     return 0
+}
+
+# : the daemon answers `"released": false` when it kept a claim that
+# another session holds. The key is absent on every other answer, including any
+# from a daemon that predates it, and absent reads as released. RESPONSE is set
+# by the rt_call just before each caller of _clear_in_flight.
+_release_kept_claim() {
+    # shellcheck disable=SC2086
+    printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "
+import json, sys
+sys.exit(0 if json.load(sys.stdin).get('released') is False else 1)
+" 2>/dev/null
 }
 
 # --- iteration-checkpoint clear () -------------------------------
@@ -407,7 +433,8 @@ if [ -n "$_ctx_line" ]; then
 fi
 
 rc=0
-RESPONSE="$(rt_call POST /v1/aspirations/release --query "$QUERY")" || rc=$?
+RESPONSE="$(rt_call POST /v1/aspirations/release --query "$QUERY" \
+    "${HEADER_ARGS[@]+"${HEADER_ARGS[@]}"}")" || rc=$?
 
 case $rc in
     0)
@@ -434,7 +461,8 @@ if goal is not None:
         # DAEMON-ONLY (2026-05-14 cutover): no Python CLI fallback.
         if rt_try_autospawn; then
             rc=0
-            RESPONSE="$(rt_call POST /v1/aspirations/release --query "$QUERY")" || rc=$?
+            RESPONSE="$(rt_call POST /v1/aspirations/release --query "$QUERY" \
+                "${HEADER_ARGS[@]+"${HEADER_ARGS[@]}"}")" || rc=$?
             if [ "$rc" = "0" ]; then
                 # shellcheck disable=SC2086
                 printf '%s' "$RESPONSE" | $(rt_python_launcher) -c "

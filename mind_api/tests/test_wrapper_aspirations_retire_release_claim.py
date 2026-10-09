@@ -186,6 +186,36 @@ def test_wrapper_release_happy_path(running_daemon):
     assert "claimed_at" not in parsed
 
 
+def test_wrapper_release_wakes_peers_in_the_requests_own_tree(running_daemon):
+    """The release's wake signal lands under the REQUEST's agents root and skips
+    the requesting agent. Until 2026-10-07 the endpoint took both from
+    _wake_signals' module location and this process's MIND_AGENT, so this very
+    daemon (a tmp project root, in a pytest process bound to one agent) touched
+    every OTHER agent's signal in the real repo and none here."""
+    project_root, _ = running_daemon
+    agents = project_root / "agents"
+    for name in ("alpha", "bravo"):
+        (agents / name / "session").mkdir(parents=True, exist_ok=True)
+    _seed_aspiration(project_root / "world", {
+        "id": "asp-001", "title": "Test", "status": "active",
+        "priority": "LOW", "archived": False,
+        "goals": [
+            {"id": "g-001-01", "title": "Claimed", "status": "in-progress",
+             "recurring": False, "claimed_by": "alpha",
+             "claimed_at": "2026-05-10T10:00:00"},
+        ],
+        "progress": {"completed_goals": 0, "total_goals": 1, "recurring_goals": 0},
+    })
+
+    rc, _, err = _run(WRAPPER_RELEASE, ["g-001-01"], project_root=project_root)
+    assert rc == 0, f"wrapper exit {rc}: stderr={err}"
+    assert (agents / "bravo" / "session" / "goal-claim-released").exists(), (
+        "the peer in the daemon's own tree was not woken: the signal went to "
+        "another tree")
+    assert not (agents / "alpha" / "session" / "goal-claim-released").exists(), (
+        "the releasing agent woke itself")
+
+
 def test_wrapper_release_not_found(running_daemon):
     """Unknown goal -> wrapper exit 1."""
     project_root, _ = running_daemon

@@ -22,7 +22,8 @@ Defined in `world/program.md`. Each agent has a distinct role:
 World goals MUST be claimed before execution. See `aspirations.md` for full details.
 
 ```
-claim (before Phase 4) → execute → complete-by (Phase 5.3, on success)
+claim (before Phase 4) → execute → verify (Phase 5, on success: the terminal status write,
+                                    or complete-by for a recurring goal, clears the claim)
                                   → release (on failure/revert)
 ```
 

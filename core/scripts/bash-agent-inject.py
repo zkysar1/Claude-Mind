@@ -32,6 +32,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # longer imported here — the diagnostics variant supersedes it for the hook.
 from _session_binding import (
     resolve_binding_with_diagnostics,
+    landed_mode_in,
     _agent_dir,
     _SESSIONS_DIRNAME,
 )
@@ -710,6 +711,7 @@ def main():
     # MIND_GOAL_ID block below reuses the stat this branch already paid for
     # instead of re-deriving (and re-stat'ing) the same predicate.
     _body_state_dir = None
+    _landed = False
     _agent_m = (re.search(r"export MIND_AGENT=(\S+);", agent_clause)
                 or re.search(r"(?:^|[\s;&|(])MIND_AGENT=([^\s;&|)]+)", command))
     if _agent_m:
@@ -722,7 +724,19 @@ def main():
             # _SESSIONS_DIRNAME == "sessions". No new module import (hot-path safe).
             _body_wm = (_agent_dir(SCRIPT_DIR.parent.parent, _agent_m.group(1))
                         / _SESSIONS_DIRNAME / sid / "working-memory.yaml")
-            if _body_wm.exists():
+            _forked = _body_wm.exists()
+            # LANDED: the last call of a worker /stop (stop/SKILL.md Step 0.6)
+            # rebinds its own session to reader or assistant and closes the Body.
+            # From then on the session is not a worker and routes like any assistant
+            # session: no BODY_WM_PATH, no BODY_ROLE, and no MIND_GOAL_ID read from
+            # the iteration checkpoint the stop leaves behind. The 
+            # objection below to routing on state does not apply: this binding
+            # changes only at the session's own command boundary, written by its own
+            # /stop, never under it by another process, and /start refuses a
+            # reader or assistant bind on an ex-worker SID. One predicate, shared
+            # with the heartbeat tick, both mode readers and the restore banner.
+            _landed = _forked and landed_mode_in(_body_wm.parent) is not None
+            if _forked and not _landed:
                 # G3 (): BODY_ROLE=worker rides the SAME predicate, on
                 # purpose. The design brief says to read the body MANIFEST for the
                 # role; measured here, this function never reads the manifest — it
@@ -823,7 +837,7 @@ def main():
     # export clause, and every real goal id is [a-z0-9-] (g-NNN-NN / pt-NNN).
     # Fail-open on every error path, like every other clause in this hook.
     goal_clause = ""
-    if _agent_m:
+    if _agent_m and not _landed:
         try:
             _ck_dir = _body_state_dir or (
                 _agent_dir(SCRIPT_DIR.parent.parent, _agent_m.group(1)) / "session")

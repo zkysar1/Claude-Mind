@@ -245,7 +245,7 @@ be released with `--source agent` or it outlives the session.
 |------|--------|------|
 | **Claim** | `aspirations-claim.sh <goal-id>` | Before Phase 4 execution (world goals) |
 | **Release** | `aspirations-release.sh <goal-id> --source {source} --reason "<why>" --reason-kind <token>` | On execution failure, infrastructure failure, goal revert, or session end |
-| **Complete-by** | `aspirations-complete-by.sh <goal-id>` | On verified completion (Phase 5.3) |
+| **Complete-by** | `aspirations-complete-by.sh <goal-id>` | On a recurring goal's verified completion, called inside `iteration-close.sh` verify (Phase 5); a non-recurring goal's terminal status write already clears the claim, so Phase 5.3 makes no completed call |
 
 **Rules:**
 1. `goal-selector.py` skips goals claimed by another agent — claims are respected at selection time.
@@ -313,6 +313,16 @@ be released with `--source agent` or it outlives the session.
    dead, which is the original bug's shape. Both also clear `claimed_by_sid`
    along with the claim: a stamp that outlives its claim would mislabel the next
    sid-less claimer with the previous holder's session.
+
+   **The one exception is a worker Body's release** (g-115-12306). Sent with
+   `X-Mind-Body-Role: worker` (`aspirations-release.sh` forwards `BODY_ROLE`)
+   from a session that does not hold the claim, a release is SKIPPED: nothing is
+   written, the answer carries `"released": false` and a warning, and the
+   wrapper clears only the worker's own `in_flight_bodies` row and checkpoint. A
+   worker never needs to give back a claim it does not hold, and its end-of-unit
+   release used to clear the claim of the session that had taken the goal over
+   (g-335-1718, 2026-10-09). The recovery sweeps are unaffected: none of them
+   sends the worker role.
 
 #### Claim Expiry (Straggler Mitigation)
 

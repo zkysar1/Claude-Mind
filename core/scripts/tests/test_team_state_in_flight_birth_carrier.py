@@ -149,3 +149,20 @@ def test_birth_carrier_only_creates_when_absent():
     assert re.search(r'! -f "\$_IF_CARRIER"', block), (
         "birth carrier must be created only when absent -- heartbeat-tick.sh "
         "owns refreshing it")
+
+
+def test_birth_carrier_publishes_the_harness_from_the_one_resolver():
+    """(e) HARNESS (). The pace forecast counts live workers by harness,
+    so a Body must be countable from its first claim, before its first tick. The
+    value comes from rt_judge_provenance, the resolver heartbeat-tick.sh and the
+    close stamp use, never a second read of the harness variables."""
+    block = SRC.split("_IF_CARRIER=", 1)[1].split("FAIL-OPEN", 1)[0]
+    printf = next((ln for ln in block.splitlines() if "printf '{" in ln), "")
+    assert '"harness":"%s"' in printf, f"birth carrier publishes no harness: {printf!r}"
+    assert "rt_judge_provenance" in block.split("printf '{", 1)[0], (
+        "the harness must be resolved by rt_judge_provenance before the write")
+    assert "RT_JUDGE_HARNESS" in block, "the write must pass the resolved harness"
+    # The carrier is a liveness signal: a value that could break its JSON is
+    # emptied first, as heartbeat-tick.sh does with the same field.
+    assert re.search(r'\[\[ "\$\{RT_JUDGE_HARNESS:-\}" =~ \^\[a-z-\]', block), (
+        "the harness must be checked to a safe shape before it enters the JSON")

@@ -1356,6 +1356,25 @@ gates:
     tuning_notes: "Instrumented 2026-09-06 (g-115-8163). Before that the gate was UNREGISTERED and emitted no firings at all: its only record was a best-effort scorer_override row in the per-agent execution diary, written on the SANCTIONED-DEVIATION branch alone. That is the guard-2293 shape — an escape-path-only ledger — so blocks that STOOD and every ordinary pass left no trace and the FP ratio count(override)/(block+override) was unmeasurable. All seven branches now emit a unique decision_path (guard-502), each mapped to a _gate_log decision by its observable control-flow effect at aspirations-claim.sh rather than by local intent (guard-1743). The second reason to move off the diary is CARRIER, not coverage: measured 2026-09-06, read_fleet_diaries returned alpha's diary at 57,198 B with ZERO of its 70 scorer_override rows while being FRESHER (08:44:16) than the local copy (08:37:00) — a cross-Body last-writer-wins clobber, not staleness — so 82% of the fleet's abstention signal was invisible to scorer-override-audit.py, its only fleet-wide reader. The gate-firings store aggregates via gate-firings-flush.sh and does not have that failure mode. Do NOT verify a firing by reading the shared store on an own-cloud box: _gate_log routes the hot path to a machine-local spool and the direct read yields a false 'telemetry is dead' (guard-4040)."
     retirement_eligible: false
 
+  - id: pace-forecast
+    script: core/scripts/pace_forecast.py
+    embedded: false
+    instrumented: true
+    sites:
+      - { file: "core/scripts/worker_execute.py", phase: "select-walk (worker-loop Phase 1): one firing per walk that meets a HIGH row, after the walk" }
+      - { file: "core/scripts/pace_forecast.py", phase: "walk (aspirations-select Phase 2, the reducer's pick, g-375-157): one firing per walk that forecasts a HIGH row, one marked for a worker, after the walk" }
+    dominant_risk: both
+    asymmetry_magnitude: medium
+    keyword_bias: balanced
+    override_flag: null
+    fp_cost: medium
+    fp_description: "A HIGH goal is left to faster workers who do not reach it as forecast, so it waits instead of being worked. Bounded for most goals: the decision is recomputed at every walk from closes in the slower worker's own horizon, and a goal deeper than the crossover is always taken. NOT bounded for a HIGH goal only the slower class can do: the faster workers walk past it while their rate stays high. Its signature is one goal_id yielded at a small k walk after walk."
+    fn_cost: high
+    fn_description: "A slower worker claims a HIGH goal the faster workers would have finished well before it and holds it for a day (2026-10-07: zakcode Body workers 21.7 h per goal against 1.2 h for Claude Code workers, one Body 30 h without a close). Any missing input disarms the forecast and takes, the pre-g-375-152 behaviour, so the realistic FN is a blind input rather than a wrong call."
+    rb_evidence: []
+    tuning_notes: "Introduced by g-375-152; the reducer's walk and the live-session R by g-375-157. No knobs: every input is measured at each walk, paces from stamped worker closes, R from the closes in the trailing P_own hours of goals a worker may take (the goal is marked for a worker, or a worker closed it) that faster sessions live now ran (workers or the reducer, by heartbeat carrier), each close credited to the session that ran the goal (executed_by_sid), so a sweep does not raise its closer's rate. The reducer forecasts only HIGH rows marked for a worker (worker_execute judges them eligible) and takes every other HIGH row unforecast, so unmarked reducer-only work is never left to nobody. One row per walk that forecasts a HIGH row: noop = disarmed (the reason is in extra.basis), pass = armed with no yield, block = at least one yield, fail_open = the measurement raised. An armed row lists every HIGH decision as [goal_id, k, fast_finish_hours, decision] beside the basis, so each is recomputable. retirement_eligible is false because an all-noop window means no walk was armed (the fastest harness's walks and every disarmed walk log noop), which says nothing about whether the gate still works."
+    retirement_eligible: false
+
   - id: outbound-data-class-gate
     script: core/scripts/outbound_data_class.py
     embedded: false

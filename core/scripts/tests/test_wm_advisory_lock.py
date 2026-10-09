@@ -22,7 +22,6 @@ CORE_ROOT = Path(__file__).resolve().parent.parent.parent
 _SD = CORE_ROOT / "scripts"
 if str(_SD) not in sys.path:
     sys.path.insert(0, str(_SD))
-import _rt  # canonical Python -> daemon client (post-cutover)
 
 from _paths import agent_dir  # noqa: E402
 
@@ -79,30 +78,27 @@ def write_slot(slot: str, value: str) -> tuple[int, str]:
 
 
 def read_slot(slot: str) -> str:
-    """Read a WM slot via the daemon (_rt.wm_read).
+    """Read a WM slot straight from working-memory.yaml, the file the writers contend on.
 
-    The wm.py read CLI subcommand was deleted in the 2026-05-14 daemon
-    cutover; _rt.wm_read is the canonical Python->daemon replacement.
-    Env is set before the call so the daemon resolves the same agent.
+    This went through the daemon (_rt.wm_read) until g-358-244. The lock under test
+    protects that FILE's read-modify-write, so the file is what to read back; the
+    daemon route added a second precondition (a live daemon resolving the same
+    off-roster agent) that a daemon-quiesced deployment does not meet (omni-382
+    class 6).
     """
-    env = _env()
-    prev = {k: os.environ.get(k) for k in env}
-    os.environ.update(env)
-    try:
-        body = _rt.wm_read(slot=slot, as_json=False)
-        return body.strip().strip('"')
-    finally:
-        for k, v in prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+    import yaml
+
+    data = yaml.safe_load(WM_PATH.read_text(encoding="utf-8")) or {}
+    got = (data.get("slots") or {}).get(slot)
+    return "" if got is None else str(got).strip().strip('"')
 
 
 def main() -> int:
-    if not WM_PATH.exists():
-        print(f"FAIL: working memory not initialized at {WM_PATH}", file=sys.stderr)
-        return 2
+    # `wm.py set` creates a missing working-memory.yaml itself (), so an
+    # absent file is not a precondition failure. The guard that stood here returned
+    # rc=2 "not initialized" on every checkout that never ran wm-init for the
+    # off-roster agent: a fresh clone, a worktree, a deployment (omni-382, ).
+    created = not WM_PATH.exists()
 
     # Use 3 disjoint test slots to avoid corrupting any real slot. They are
     # set as top-level via wm-set.sh's slot routing — wm.py auto-creates
@@ -155,6 +151,10 @@ def main() -> int:
             capture_output=True,
             timeout=10,
         )
+    if created:
+        # No residue: the file and its lock exist only because this run made them.
+        for leftover in (WM_PATH, WM_PATH.with_suffix(".lock")):
+            leftover.unlink(missing_ok=True)
 
     if missing:
         print("FAIL: clobber detected — final state does not contain all updates:", file=sys.stderr)

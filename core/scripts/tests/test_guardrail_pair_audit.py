@@ -132,3 +132,87 @@ def test_human_output_tags_the_adjudicated_pair(tmp_path, capsys):
 def test_there_is_still_no_apply_path():
     with pytest.raises(SystemExit):
         mod.main(["--apply"])
+
+
+# ---------------------------------------------------------------------------
+# First-clause scoring (): a near-duplicate whose identity-bearing
+# FIRST clause is identical used to hide as the members' elaborations diverge
+# in length (whole-rule Jaccard 0.140 vs floor 0.6, first-clause Jaccard 1.000
+# — measured by echo on guard-7131/guard-7149, recorded in 's
+# progress_note). A pair is now reported when EITHER score clears the floor.
+# ---------------------------------------------------------------------------
+
+# Fixture pair modelled on guard-7131/guard-7149: verbatim-identical first
+# clause, diverging elaborations. Whole-rule subject Jaccard is ~0.11
+# (6 shared head tokens / 53 union) — the old gate would discard it.
+E = {"id": "guard-7131", "category": "ops", "status": "active",
+     "rule": ("Never probe a live daemon before confirming its identity. "
+              "The measured failure was the probe returning exit 49 from a "
+              "store stub while the daemon had been healthy all along, and "
+              "the retry storm that followed consumed the entire billing "
+              "window, so the identity check must come first and every probe "
+              "must be bounded by a cost ceiling.")}
+F = {"id": "guard-7149", "category": "ops", "status": "active",
+     "rule": ("Never probe a live daemon before confirming its identity "
+              "-- the rule was added after the incident where the operator "
+              "box and the vessel box were mistaken for each other and the "
+              "probe hit the wrong machine entirely; keep the allowlist "
+              "explicit and re-verify the target after every restart.")}
+
+
+def test_head_identical_pair_fails_old_scorer_passes_new(tmp_path, capsys, monkeypatch):
+    world = _world(tmp_path, [E, F])
+
+    # NEW scorer: the pair is reported via the first-clause score even though
+    # the whole-rule score is far under the floor.
+    new = _run_json(capsys, world)
+    row = _pair(new, "guard-7131", "guard-7149")
+    assert row["class"] == "near-duplicate"
+    assert row["first_clause_similarity"] == 1.0
+    assert row["similarity"] < 0.6  # the old gate (whole-rule only) discards it
+
+    # OLD scorer, emulated: first-clause scoring removed (empty head subject
+    # for every rule -> fc score 0.0) reduces the gate to whole-rule Jaccard,
+    # and the pair disappears.
+    monkeypatch.setattr(mod, "first_clause_subject_tokens", lambda rule: set())
+    old = _run_json(capsys, world)
+    assert old["findings_total"] == 0, old["findings"]
+
+
+def test_first_clause_score_is_polarity_stripped(tmp_path, capsys):
+    # Identical heads except the polarity word: the head score is about
+    # identity, never polarity, and the polarity split still separates them.
+    g = {"id": "guard-7001", "category": "ops", "status": "active",
+         "rule": "Never verify the relay ledger before pruning the relay queue"}
+    h = {"id": "guard-7002", "category": "ops", "status": "active",
+         "rule": "Always verify the relay ledger before pruning the relay queue"}
+    res = _run_json(capsys, _world(tmp_path, [g, h]))
+    row = _pair(res, "guard-7001", "guard-7002")
+    assert row["first_clause_similarity"] == 1.0
+    assert row["class"] == "contradiction"
+
+
+def test_skipped_pairs_reported_beside_skipped_buckets(tmp_path, capsys):
+    # Five members of one category sharing a template: every shared
+    # discriminative token (len>=4, non-stopword, non-polarity) becomes its
+    # own oversized bucket at --max-bucket 2. The template below shares seven
+    # (widget, surface, variant, quirk, before, touching, state), so the
+    # skip is 7 buckets / 70 pairs — 5*4/2 per bucket. The PAIR count must
+    # grow quadratically and be printed beside the bucket count.
+    recs = [
+        {"id": f"guard-{7100 + n}", "category": "ops", "status": "active",
+         "rule": (f"Always inspect the widget surface variant {n} for its own "
+                  f"quirk {n} before touching surface variant {n} state")}
+        for n in range(5)
+    ]
+    world = _world(tmp_path, recs)
+    res = _run_json(capsys, world, "--max-bucket", "2")
+    assert res["oversized_buckets_skipped"] == 7
+    assert res["pairs_skipped"] == 7 * (5 * 4 // 2) == 70
+    assert res["pairs_compared"] == 0
+    assert res["findings_total"] == 0
+
+    assert mod.main(["--world", str(world), "--max-bucket", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "skipped_pairs=70" in out
+    assert "70 pair(s) live in those buckets" in out

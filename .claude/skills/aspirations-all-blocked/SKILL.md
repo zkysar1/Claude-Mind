@@ -84,10 +84,10 @@ See coordination convention for full scan protocol.
 
 ```
 # g-357-94: directives are the ONE board input that can steer GENERATION (B1/B2). ACK here
-# too (dedup via --unread-only/--mark-read; iteration-open routes all_blocked straight here,
+# too (dedup via --unhandled-only; iteration-open routes all_blocked straight here,
 # bypassing aspirations-select). veto = out of scope.
-Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
-FOR EACH directive in new_directives: ack as select 2.07 (skip moot targets; else
+Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unhandled-only --mark-read --json
+FOR EACH directive in new_directives: ack as select 2.07 (moot: mark handled; else
     echo "Acknowledged directive {directive.id}" | board-post.sh --channel coordination --type status --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}")
 active_directives = selection_context.active_directives or board-read.sh --channel coordination --type directive --since 96h --json
 active_directives = [d for d in active_directives if not past(d.tags expires:) and "directive_type:veto" not in d.tags]
@@ -265,8 +265,15 @@ IF "create-aspiration: no viable aspirations found" in blocked_idle_attempts:
     signals = []
 
     # S1. Pending-questions the user hasn't answered in >24h
+    # (g-115-11656: the pre-fix text aged by `asked_at` alone — a field most
+    # entries do not carry, so S1 counted at most 1 of 26 live questions on
+    # ZDS. Age now comes from the sweep's OWN fallback chain via its `stale`
+    # subcommand: created, created_at, date, asked_at, logged_at — the same
+    # _age_days its staleness heuristics use, so the two can't drift.)
     IF file exists agents/<agent>/session/pending-questions.yaml:
-        Read it. For each entry with status="pending" AND asked_at older than 24h:
+        Bash: core/scripts/pending-questions-sweep.sh stale --pq-path agents/<agent>/session/pending-questions.yaml
+        For each entry in the returned JSON `entries` (status=pending, aged by
+        the fallback chain, older than 24h):
             signals.append({
                 "kind": "pending_question",
                 "id": entry["id"],
@@ -392,7 +399,7 @@ IF evolutions_this_session < max_evolutions_per_session:
     # Do NOT increment in-context here (would double-count vs the bash write). The
     # `evolutions_this_session < max` cap check above reads the bash-restored value.
     # Check if evolution created new executable goals
-    Bash: goal-selector.sh
+    Bash: goal-selector.sh | py -3 core/scripts/pace_forecast.py walk
     IF parsed_output is a JSON array with length > 0:
         blocked_idle_attempts.append("evolve: SUCCESS — new executable goals")
         Output: "▸ Evolution created new executable goals"
@@ -431,7 +438,7 @@ blocked_idle_attempts.append("reflect: completed")
 B4 and B5 may have produced new work via spark/findings.
 
 ```
-Bash: goal-selector.sh
+Bash: goal-selector.sh | py -3 core/scripts/pace_forecast.py walk
 IF parsed_output is a JSON array with length > 0:
     Output: "▸ Research/reflection produced new executable goals"
     LOOP_CONTINUE
@@ -678,7 +685,7 @@ IF B6.5 returned rc=1 (quiescence denied):
         invoke /reflect --on-hypothesis with: hypothesis_id=freshest.id
         blocked_idle_attempts.append("MW#5 Target 2: reflected on " + freshest.id)
         # Re-check the queue; reflection may have produced new executable goals
-        Bash: goal-selector.sh
+        Bash: goal-selector.sh | py -3 core/scripts/pace_forecast.py walk
         IF parsed_output is a JSON array with length > 0:
             LOOP_CONTINUE
         # else fall through to Target 3
@@ -703,7 +710,7 @@ IF B6.5 returned rc=1 (quiescence denied):
         invoke /tree decompose with: node_path=acute.path
         blocked_idle_attempts.append("MW#5 Target 4: decomposed " + acute.path)
         # Re-check; decomposition often produces new sub-goals
-        Bash: goal-selector.sh
+        Bash: goal-selector.sh | py -3 core/scripts/pace_forecast.py walk
         IF parsed_output is a JSON array with length > 0:
             LOOP_CONTINUE
         # else fall through to B7
@@ -963,17 +970,7 @@ BEFORE the sleep Bash call.
 # over-inclusion attribution audit.
 # `--outcome deep` is REQUIRED: the script skips outright on `routine`
 # ("skip: outcome=routine (no commit by design)" — verified).
-# WHAT IT COSTS ON A CYCLE THAT WROTE NOTHING SUBSTANTIVE, stated honestly
-# because the obvious claim is wrong: it does NOT no-op. `world/changelog.jsonl`
-# is appended by the loop's OWN script-mediated reads and writes, so a truly
-# clean tree is rare here — three consecutive attempts to reach that branch all
-# found 1-2 dirty files and committed them (measured on downstream prod). Expect
-# a small `chore(all-blocked)` commit carrying a changelog delta on most idle
-# cycles. That is bounded and harmless, and it is much cheaper than the failure
-# it replaces (stranding a guardrail or a tree-node section through an idle
-# stretch). Do not "fix" the noise by gating on cleanliness without
-# re-measuring — the gate would rarely fire and would reintroduce the
-# stranding risk for the cycles that matter.
+# Rationale (WHY it commits on most idle cycles, and why not gate it): core/config/rationale/idle-path-commit-cost.md
 # NEVER BLOCK THE SLEEP: on any non-zero rc, log it and continue to the sleep
 # below. A failed commit must not strand the loop awake.
 Bash: source core/scripts/_paths.sh && bash core/scripts/iteration-commit.sh --goal-id all-blocked \

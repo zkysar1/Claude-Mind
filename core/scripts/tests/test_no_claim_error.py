@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import owncloud_backend  # noqa: E402
+from _frontier_world import requires_frontier_world  # noqa: E402
 
 
 def test_no_claim_error_type_exists_and_is_distinct():
@@ -36,6 +37,7 @@ def test_backend_exposes_no_claim_error_attribute():
         owncloud_backend.NoClaimError)
 
 
+@requires_frontier_world("it reads agents/bravo, a dir only the frontier origin's fleet holds")
 def test_agent_name_derivation_agrees_with_predicate():
     """The consult derives the agent name and the under-agent-dir predicate
     from one consistent reading; they must not drift apart."""

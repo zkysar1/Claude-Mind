@@ -367,8 +367,10 @@ if [ ! -f "$RUNNER_FILE" ] || { [ -n "$RUNNER_SID" ] && [ "$HOOK_SID" != "$RUNNE
         #      another machine — so until the session-scoped file existed, the one
         #      actor that needed this valve was structurally barred from firing
         #      it and EVERY worker /stop BLOCKed at turn-end. The only escape was
-        #      hand-writing body-closing, which DURABLY retires the Body; stopping
-        #      one box is not retiring that Body (guard-4900).
+        #      hand-writing body-closing, which closed the Body as a side effect
+        #      of ending the turn (guard-4900). Since 2026-10-07 /stop closes the
+        #      worker on purpose, as its LAST step after releasing its claims
+        #      (core/config/rationale/worker-stop-close.md).
         #   3. no per-Body WM        -> not a worker; reducer/observer untouched
         #   4. manifest body_state already closed -> ALLOW (the Body closed in
         #      a PRIOR turn; see the worker-net-body-closed branch below)

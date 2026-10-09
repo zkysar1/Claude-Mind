@@ -402,6 +402,22 @@ rt_spawn() {
         return 0
     fi
 
+    # ─── Foreign-host hold gate () ──────────────────────────────────
+    # Sibling of the gate in mind-api-start.sh: ONE predicate (_daemon_host_hold.sh),
+    # two callers. The pid in RT_PID_FILE can belong to a daemon on ANOTHER host that
+    # shares this state dir; `kill -0` here reads it as dead and rt_daemon_kill below
+    # would remove its files. Refuse while that host's heartbeat is fresh. Sourced HERE,
+    # in the cold path, like _daemon_env_scrub.sh below. Returns 0 (not 1) per the
+    # rt_spawn contract documented under the launcher ABORT: not spawning is sufficient,
+    # rt_wait_for_ready is the single source of truth and the caller reports daemon-down.
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/core/scripts/_daemon_host_hold.sh"
+    daemon_host_hold "$RT_PID_FILE"
+    if [ "$_dhh_state" = "held" ]; then
+        echo "[$stamp] rt_spawn — REFUSED: $RT_PID_FILE was published by host $_dhh_host, not this host; heartbeat ${_dhh_age}s old, held for ${_DHH_HOLD_SECONDS}s. Not removing its files, killing its pid or spawning over it. Give this host its own RT_DIR, or wait for the heartbeat to pass ${_DHH_HOLD_SECONDS}s if that host is gone." >> "$RT_SPAWN_LOG"
+        return 0
+    fi
+
     # Resolve the launcher BEFORE the destructive rt_daemon_kill / the
     # "attempting" log — never kill a predecessor we cannot replace.
     local py_cmd
@@ -706,6 +722,17 @@ rt_sweep_orphan_daemons() {
 # regression). Fail-open at every step.
 rt_daemon_kill() {
     [ -f "$RT_PID_FILE" ] || return 0
+    # : a pid published by ANOTHER host is not this host's to signal (a
+    # same-numbered local process is unrelated). rt_spawn refuses a live ("held") one
+    # before it gets here, but this function has other callers (framework_pull), so it
+    # declines too: held -> touch nothing; stale -> the pid files only, no signals.
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/core/scripts/_daemon_host_hold.sh"
+    daemon_host_hold "$RT_PID_FILE"
+    case "$_dhh_state" in
+        held)  return 0 ;;
+        stale) rm -f "$RT_PID_FILE" "$RT_PARENT_PID_FILE" 2>/dev/null || true; return 0 ;;
+    esac
     local pid parent_pid port
     pid="$(cat "$RT_PID_FILE" 2>/dev/null | tr -d '[:space:]')"
     [ -n "$pid" ] || return 0

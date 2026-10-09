@@ -259,9 +259,19 @@ def cmd_persona_set(args):
 # ---------------------------------------------------------------------------
 
 def cmd_mode_get(args):
-    """Read agent-mode: prints reader, assistant, autonomous, or reader (default)."""
+    """Read agent-mode: prints reader, assistant, autonomous, or reader (default).
+
+    A session its worker /stop LANDED prints its own binding's mode instead,
+    because the agent-wide file belongs to the box. Parity with session-mode-get.sh.
+    """
     if SESSION_DIR is None:
         print("NO_AGENT")
+        return
+    sid = os.environ.get("MIND_SID", "")
+    from _session_binding import _valid_sid_shape, landed_mode_in
+    landed = landed_mode_in(AGENT_DIR / SESSIONS_DIRNAME / sid) if _valid_sid_shape(sid) else None
+    if landed:
+        print(landed)
         return
     val = read_file(SESSION_DIR / "agent-mode")
     if val is None:

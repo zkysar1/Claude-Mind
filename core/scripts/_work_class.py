@@ -1,6 +1,6 @@
 """Work-class resolver. Loads core/config/work-class-mapping.yaml AND
-world/config/work-class-mapping.yaml (overlay) once per process and returns
-the work_class for a given category string.
+world/config/work-class-mapping.yaml (overlay) once per (path, mtime)
+signature and returns the work_class for a given category string.
 
 Consumed by aspirations.py (new-goal writer), backfill-work-class.py
 (one-shot), and iteration-close.sh (session_completions append via a
@@ -35,11 +35,53 @@ _CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "work-class-m
 # Use _world_config helper for the overlay — same pattern as Phase 2.5 tables.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _world_config import load_world_config as _load_world_config  # noqa: E402
+from _world_config import _resolve_world_dir as _resolve_wc_world_dir  # noqa: E402
 
 
-@lru_cache(maxsize=1)
-def _load() -> tuple[dict, str]:
-    """Return (merged_mapping, default). Fail-open on any error.
+def _overlay_path() -> Optional[Path]:
+    """Absolute path of the world overlay if it resolves, else None.
+
+    Same world-resolution as `_load_world_config`'s own read: MIND_WORLD,
+    then the bound agent's local-paths.conf, then PROJECT_ROOT/world. Used
+    by `_load_signature` — the overlay stat must address the SAME file the
+    overlay loader reads, or the key is wrong.
+    """
+    world = _resolve_wc_world_dir()
+    if world is None:
+        return None
+    p = world / "config" / "work-class-mapping.yaml"
+    return p if p.is_file() else None
+
+
+def _load_signature() -> tuple:
+    """Cache signature: (core_path, core_mtime_ns, overlay_path, overlay_mtime_ns).
+
+    g-115-11062 / guard-7253: the pre-fix `lru_cache(maxsize=1)` keyed on
+    nothing, so a mapping edit was invisible to every process that had
+    already called `resolve()` until that process restarted — a daemon-read
+    config behaving like code, while a fresh CLI process read green. A
+    missing file is the constant signature part `(None, -1)`, so appearance
+    and deletion both change the key.
+    """
+    try:
+        core_ns = _CONFIG_PATH.stat().st_mtime_ns
+    except OSError:
+        core_ns = -1
+    overlay = _overlay_path()
+    overlay_ns = -1
+    if overlay is not None:
+        try:
+            overlay_ns = overlay.stat().st_mtime_ns
+        except OSError:
+            overlay_ns = -1
+    return (str(_CONFIG_PATH), core_ns,
+            None if overlay is None else str(overlay), overlay_ns)
+
+
+@lru_cache(maxsize=8)
+def _load_keyed(sig: tuple) -> tuple[dict, str]:
+    """Return (merged_mapping, default) for the signature `sig`. Fail-open
+    on any error.
 
     Merge order: core first (framework-universal); world overlay second
     (per-key override). Caller never sees the split — `mapping[k]` returns
@@ -61,6 +103,10 @@ def _load() -> tuple[dict, str]:
         except Exception:
             pass
 
+    # The overlay's own per-process cache is mtime-aware (): a
+    # changed overlay invalidates its entry before this read, so it sees the
+    # same file state that `_load_signature`'s stat keyed on. No explicit
+    # invalidation is needed here.
     overlay = _load_world_config("work-class-mapping", default={"mapping": {}})
     world_mapping = overlay.get("mapping") or {}
     if not isinstance(world_mapping, dict):
@@ -69,6 +115,15 @@ def _load() -> tuple[dict, str]:
     merged = dict(core_mapping)
     merged.update(world_mapping)
     return merged, default
+
+
+def _load() -> tuple[dict, str]:
+    """Public loader: compute the (path, mtime) signature, then memoize.
+
+    The first `resolve()` after a mapping edit sees the new values in the
+    SAME process; the parse stays once per signature.
+    """
+    return _load_keyed(_load_signature())
 
 
 def resolve(category: Optional[str]) -> str:
