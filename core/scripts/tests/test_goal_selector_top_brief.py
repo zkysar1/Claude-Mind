@@ -20,6 +20,8 @@ THE CONTRACT PINNED HERE (g-375-06 outcome 2):
      sprint-planning) are unaffected.
   4. `why` names the hoist, then the largest breakdown terms by magnitude.
   5. The CLI wiring works: --top reaches cmd_select, and --top 0 is refused.
+  6. Each brief row names the priority score_goal resolved, which a Body's walk
+     reads to find its HIGH rows (g-375-152).
 
 Hermetic: no store is read and the 142-second scorer never runs.
 """
@@ -88,7 +90,9 @@ def _row(i, score, title_len=127, **extra):
         "recurring_interval_hours": 0.0,
         "score": score,
         "breakdown": breakdown,
-        "raw": {k: v / 2 for k, v in breakdown.items()},
+        # raw["priority"] is score_goal's PRIORITY_MAP int. MEDIUM is the longest
+        # name the brief can carry for it, so the 4 KB pin measures the widest brief.
+        "raw": dict({k: v / 2 for k, v in breakdown.items()}, priority=2),
         "exploration_params": {"epsilon": 0.85, "noise_scale": 3.0, "noise_weight": 0.35},
     }
     row.update(extra)
@@ -146,6 +150,21 @@ def test_why_names_the_hoist_then_the_largest_terms_by_magnitude():
     (brief,) = gs._brief_rows([row], 1)
     assert brief["why"] == ("hoisted by strategic_focus; per_goal_saturation -3.5, "
                             "priority +2, completion_pressure +1.25")
+
+
+@pytest.mark.parametrize("raw_priority, want", [
+    (3, "HIGH"), (2, "MEDIUM"), (1, "LOW"), (None, None), (2.5, None), ("HIGH", None)])
+def test_the_brief_names_the_priority_score_goal_resolved(raw_priority, want):
+    """A Body's walk forecasts only HIGH rows (), so the brief carries the
+    priority score_goal resolved into raw["priority"]. A value that is not one of
+    PRIORITY_MAP's ints names no priority rather than a guessed one."""
+    row = _row(1, 9.0)
+    row["raw"]["priority"] = raw_priority
+    (brief,) = gs._brief_rows([row], 1)
+    assert brief["priority"] == want
+    no_raw = _row(2, 9.0)
+    no_raw.pop("raw")
+    assert gs._brief_rows([no_raw], 1)[0]["priority"] is None
 
 
 def test_long_titles_are_cut_to_the_cap():

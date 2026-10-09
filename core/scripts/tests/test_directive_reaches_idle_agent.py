@@ -18,11 +18,14 @@ SELECT = REPO / ".claude/skills/aspirations-select/SKILL.md"
 ALL_BLOCKED = REPO / ".claude/skills/aspirations-all-blocked/SKILL.md"
 COORD = REPO / "core/config/conventions/coordination.md"
 
-ACK_READ = "--type directive --since 24h --unread-only --mark-read --json"
+# --unhandled-only, not --unread-only (): the ACK read must filter on the HANDLED
+# receipt (an ack posted with --reply-to, or an explicit handled mark), because --mark-read
+# alone only records that a directive was SHOWN, and a shown-but-unacked directive must come back.
+ACK_READ = "--type directive --since 24h --unhandled-only --mark-read --json"
 # 96h, NOT 24h (). A directive declares its own lifetime in an `expires:` tag
 # (observed to 72h), so an honor read bounded at 24h goes blind for most of that life while
 # reporting a clean empty set. The ACK read above stays at 24h on purpose — it asks "have I
-# seen this?", and widening it re-acks old directives (the 5x-spam  fixed). The
+# answered this?", and widening it re-acks old directives (the 5x-spam  fixed). The
 # asymmetry is the contract; test_honor_and_ack_windows_stay_asymmetric pins it.
 HONOR_READ = "board-read.sh --channel coordination --type directive --since 96h --json"
 ALL_BLOCKED_RETURN = 'RETURN (goal = None, selection_reason = "all_blocked", selection_context = parsed_output)'

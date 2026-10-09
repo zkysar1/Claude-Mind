@@ -86,6 +86,13 @@ GOAL_KNOWN_FIELDS = frozenset({
     # "an absent value beats a wrong one" rule the completed_by_sid stamp
     # already follows.
     'completed_by_role',                 # 0 (new)
+    # g-375-152: the HARNESS the closing worker ran in ("claude-code" or
+    # "zakcode", from _runtime.sh rt_judge_provenance), stamped beside
+    # completed_by_role under the same guard. The HIGH-goal pace forecast
+    # groups worker closes by it: a worker's pace is set by its harness and
+    # model, not its role, and nothing else on a closed goal records either.
+    # 0 at introduction, a going-forward stamp; ABSENT means unknown.
+    'completed_by_harness',              # 0 (new)
     'completed_by_sid',                  # 792
     'completed_date',                    # 762
     'consecutive_deep',                  # 79

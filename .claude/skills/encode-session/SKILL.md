@@ -70,7 +70,22 @@ were correct; the only failure was the scratch-location choice.
 /encode-session              — Full pass (Lanes 1-7)
 /encode-session --quick      — Encoding lanes only (Lanes 1, 2, 3)
                                Skips Discovery, Verify-Learning, Meta, Self lanes
+/encode-session --relay      — Worker-Body mode (/stop's worker branch): Lane 1 + 4.1
+                               judgment, every output to this Body's WM capture lanes.
+                               Writes no shared store, files nothing, commits nothing
 ```
+
+## Relay Mode (`--relay`, worker Body)
+
+`/stop`'s worker branch runs this as its step 3. A worker that writes the shared
+stores is an Nth reducer, so `--relay` keeps every lane's JUDGMENT and writes each
+output to this Body's WM capture lanes instead.
+- **Runs:** Phase 0; Phase 1, where step 2 reads the Body WM; Lane 1.0; and the
+  judgment of 1.1-1.5 and 4.1.
+- **Skips:** 1.6, Lanes 2-3, 4.2-7 and Final.5.
+
+Before the first write, Read `core/config/conventions/worker-relay.md`. It gives
+the lane each output goes to, the entry shape and the summary line.
 
 ## Phase 0: Load Conventions
 
@@ -1055,8 +1070,8 @@ the runner claim by construction, so its experience add is never refused
 ## Chaining
 
 - **Called by**: User (`/encode-session`); agent (rare — only at end of complex
-  chat-mode work-blocks). NOT called by `/aspirations` loop directly — that path
-  uses `/aspirations-spark` per goal.
+  chat-mode work-blocks); `/stop`'s worker branch with `--relay` (step 3). NOT
+  called by `/aspirations` loop directly — that path uses `/aspirations-spark` per goal.
 - **Calls**: `tree-update.sh`, `tree-find-node.sh`, `reasoning-bank-add.sh`,
   `reasoning-bank-increment.sh`, `reasoning-bank-update-field.sh`,
   `guardrails-add.sh`, `guardrails-increment.sh`, `experience-add.sh`,

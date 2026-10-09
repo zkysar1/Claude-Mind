@@ -1079,7 +1079,7 @@ Verifies the agent confronts infrastructure errors instead of retreating to self
 30. Phase 0.5a exists in aspirations/SKILL.md between Phase 0.5 and Phase 0.5b
 31. Phase 0.5a uses `guardrail-check.sh --context any --phase pre-selection` for deterministic matching
 32. Phase 0.5a is generic — no domain-specific content in the skill pseudocode
-33. **Runtime**: Error emails are checked before every goal selection (via guard-017 pre-selection trigger)
+33. **Runtime**: Error emails are checked before every goal selection (via the always-run `inbox-alert-age-check` lane, Phase 0.5b.1b; Phase 0.5a counts the matched rules and runs only the infra streak report)
 
 ---
 

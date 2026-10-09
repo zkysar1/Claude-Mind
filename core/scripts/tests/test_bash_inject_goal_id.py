@@ -201,3 +201,28 @@ def test_forked_body_prefers_per_session_checkpoint(monkeypatch, tmp_path):
         "sanity: this fixture is the worker shape, so the body clause must fire "
         "too -- if it does not, the fork predicate never ran and contract 5 is "
         "vacuous")
+
+
+def test_landed_session_drops_worker_routing_and_goal_id(monkeypatch, tmp_path):
+    """A worker /stop's last call rebinds its session to reader or assistant (the
+    landing, stop/SKILL.md Step 0.6). From then on it routes like any assistant
+    session: no BODY_WM_PATH, no BODY_ROLE, and no MIND_GOAL_ID, neither from the
+    checkpoint the stop leaves behind nor from the agent-wide mirror, whose goal
+    is the reducer's. The autonomous row is the positive control on the same
+    fixture: before the landing, the Body routes and exports as a worker."""
+    sess = tmp_path / AGENT / "sessions" / SID
+    sess.mkdir(parents=True, exist_ok=True)
+    (sess / "working-memory.yaml").write_text("slots: {}\n", encoding="utf-8")
+    _write_ckpt(sess, "g-115-6003", _stamp(60))
+    _write_ckpt(tmp_path / AGENT / "session", "g-999-99", _stamp(60))
+    for mode, landed in (("autonomous", False), ("assistant", True), ("reader", True)):
+        (sess / "binding.yaml").write_text(
+            f"session_id: {SID}\nagent: {AGENT}\nmode: {mode}\n", encoding="utf-8")
+        cmd = _run_hook(monkeypatch, tmp_path)
+        if landed:
+            assert "BODY_WM_PATH" not in cmd and "BODY_ROLE" not in cmd, (mode, cmd)
+            assert "MIND_GOAL_ID" not in cmd, (mode, cmd)
+            assert f"export MIND_SID={SID};" in cmd, (mode, cmd)
+        else:
+            assert "export BODY_ROLE=worker; " in cmd, cmd
+            assert "export MIND_GOAL_ID=g-115-6003; " in cmd, cmd

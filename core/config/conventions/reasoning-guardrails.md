@@ -237,7 +237,7 @@ using keyword matching on guardrail text fields. Replaces manual LLM matching.
 | `guardrail-check.sh --context <infrastructure\|local\|any> [--outcome <succeeded\|failed\|any>] [--phase <post-execution\|pre-selection>] [--dry-run]` | Match guardrails against filters | — |
 
 Output: JSON with `matched` array (each entry: `id`, `rule`, `category`, `action_hint`) and `matched_count`.
-`action_hint` extracts executable script commands from rule text (e.g., `domain-check.sh check --since 30`).
+`action_hint` is the FIRST `*.sh` token in the rule's prose plus an optional subcommand word and one numeric flag (`extract_action_hint`, `ACTION_HINT_RE`; e.g., `domain-check.sh check --since 30`). It is a lead to a script the rule MENTIONS, not a vetted command: it can name a script the rule forbids and never carries a key or component argument, so read it and do not run it verbatim (`core/config/rationale/guardrail-hint-loop.md`).
 Side effects: increments `utilization.times_active` on matched (unless `--dry-run`). Pre-2026-05-09 also incremented `times_skipped` on every non-matching active record per call; the audit found this fired hundreds of times per session and inflated skip counters by 2-15x retrieval count, so the increment was removed. The semantically correct `times_skipped` writer is `reflect-bookkeeping.py` `cmd_utilization_delta` (LLM deliberation marks items as skipped). The `utilization-stats.py` exposure floor was simultaneously narrowed to `retrieval_count` alone — see that script's docstring.
 
 All backed by `core/scripts/guardrail-check.py` (Python 3, stdlib only).

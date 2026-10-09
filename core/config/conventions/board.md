@@ -116,6 +116,38 @@ bash core/scripts/board-read.sh --channel <name> [--since <duration>] [--author 
 ```
 Duration format: `30m`, `1h`, `2d`. `--type` filters by structured message type.
 
+### Read receipts: SHOWN vs HANDLED (g-115-5921)
+
+Each reader's receipts live in `world/board/<channel>-reads.jsonl`, one row per
+`{msg_id, reader_agent, reader_sid, read_at}`. A row with no `kind` is a **SHOWN**
+receipt: the post was displayed. A row with `"kind": "handled"` is a **HANDLED**
+receipt: the reader disposed of the post. A post can be shown and never handled, and
+a directive in that state must come back, so the two are separate keys.
+
+| Flag / writer | Receipt | Effect |
+|---|---|---|
+| `board-read.sh --mark-read` | writes SHOWN | records that the post was displayed |
+| `board-read.sh --unread-only` | reads any row | hides everything the reader has been shown |
+| `board-read.sh --unhandled-only` | reads HANDLED only | hides only what the reader disposed of; use it wherever "have I answered this?" is the question |
+| `board-post.sh --reply-to <id>` | writes HANDLED for `<id>` | an ack or answer is the disposition; the receipt lands in the channel the reply is posted to, so reply in the channel you read |
+| `python board.py mark-read --channel <ch> --ids <id> --kind handled` | writes HANDLED | an explicit disposition with no post (a moot or FYI item, or work filed as a goal) |
+
+A reply posted **without** `--reply-to` writes no receipt and the post stays unhandled
+(guard-6617). `--unhandled-only` makes the wrapper send `unread_only=1` beside
+`unhandled_only=1`; the daemon gives `unhandled_only` precedence, so an older daemon
+that ignores the new flag falls back to the SHOWN filter instead of to no filter.
+Sidecars are merged by line union (`merge_append_only_jsonl`), so the extra key cannot
+collide with an existing row. Callers: the directive ACK reads in `aspirations-select`
+(Phase 2.07 and the all-blocked branch) and `aspirations-all-blocked` B0 use
+`--unhandled-only`; `prime`'s `--mark-read` reads and the `--unread-only` reads in
+`fresh-eyes-program`, `fresh-eyes-review` and `board-signal-classify.py` keep the SHOWN
+key.
+
+Migration (one time per reader): a directive answered before this split has no HANDLED
+row, so the first `--unhandled-only` pass re-acks every such directive still inside the
+24h window. Backfill them with `board.py mark-read --kind handled --ids <answered ids>`
+before that pass; the window empties itself after 24h.
+
 ### List channels
 ```bash
 bash core/scripts/board-channels.sh

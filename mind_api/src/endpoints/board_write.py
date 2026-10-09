@@ -128,6 +128,68 @@ class _SubCtx:
         self.body = b""
 
 
+HANDLED_KIND = "handled"
+
+
+def _write_receipts(ctx, channel: str, reader: str, reader_sid: str,
+                    msg_ids: list, kind: str = "") -> int:
+    """Append one receipt row per msg_id the reader has no receipt of this kind for.
+
+    Returns the number of rows written; raises OSError (callers decide whether
+    that is a 500 or a warning). kind="" is the SHOWN receipt (g-2797: the post
+    was displayed); kind="handled" is the HANDLED receipt (g-115-5921: the reader
+    disposed of it). A HANDLED write dedupes against HANDLED rows only, because a
+    shown post can still be handled later; a SHOWN write dedupes against every
+    row, because a handled post was shown. The sync merge line-unions this
+    sidecar, so the extra key cannot collide with an existing row.
+    """
+    sidecar = _reads_sidecar_path(ctx, channel)
+    base = ctx.paths.world
+    agent = _agent_name(ctx)
+    read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    label = f"board-mark-read {channel}" + (f" {kind}" if kind else "")
+    written = 0
+
+    assert_not_cruft(sidecar.parent, "mkdir (board mark-read)")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    with file_locks.locked(sidecar):
+        existing = _read_jsonl(sidecar)
+        seen = {r.get("msg_id") for r in existing
+                if r.get("reader_agent") == reader
+                and (not kind or r.get("kind") == kind)}
+        new_rows = []
+        for mid in msg_ids:
+            if mid in seen:
+                continue
+            # Key order MUST match board.py cmd_mark_read for byte-compat;
+            # kind is appended LAST and only on a HANDLED row, so a SHOWN row
+            # is byte-identical to every row written before .
+            row = {
+                "msg_id": mid,
+                "reader_agent": reader,
+                "reader_sid": reader_sid,
+                "read_at": read_at,
+            }
+            if kind:
+                row["kind"] = kind
+            _validate_no_surrogates(row, sidecar)
+            new_rows.append(row)
+            seen.add(mid)
+            written += 1
+        if new_rows:
+            history.snapshot(sidecar, base, agent, summary=label)
+            # s5c (own-cloud): append each read-row through the backend so
+            # the sidecar reaches S3. LocalBackend = identical raw open('a')
+            # appends (one per row, same bytes/order). N is the unread count
+            # (small); on own-cloud each is a fenced read+append+PUT.
+            for row in new_rows:
+                get_backend().append_jsonl_record(sidecar, row)
+            changelog.append(base, agent, sidecar, "edit",
+                             summary=label, lines_changed=len(new_rows))
+            _jsonl_cache().invalidate(sidecar)
+    return written
+
+
 def _increment_citation(ctx, store: str, cite: str) -> None:
     """Drive the canonical store increment for a findings source-tag.
     Fail-open per-cite (board.py:180-188)."""
@@ -255,7 +317,9 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
     if channel == "coordination":
         try:
             from _wake_signals import touch_peer_signals
-            touch_peer_signals("board-activity")
+            touch_peer_signals("board-activity",
+                               agents_root=ctx.paths.agents_root,
+                               self_agent=ctx.paths.agent_name)
         except Exception:
             pass
 
@@ -268,6 +332,21 @@ def post(ctx) -> "Response":  # type: ignore[name-defined]
                 _increment_citation(ctx, store, cite)
             except Exception:
                 pass  # fail-open per-cite
+
+    # Side-effect 3 (): a reply IS a disposition. Write the HANDLED
+    # receipt for the post it answers, for the author, in the channel the reply
+    # landed in — the truthful writer that --unhandled-only reads. Without it a
+    # shown directive would come back every iteration even after it was acked.
+    # Fail-open: the post is already durable, so a failed receipt only means the
+    # parent re-surfaces on the next unhandled read; the warning says so.
+    if reply_to:
+        try:
+            _write_receipts(ctx, channel, author, session_id, [reply_to],
+                            HANDLED_KIND)
+        except Exception as e:  # noqa: BLE001
+            reply_warnings.append(
+                f"HANDLED receipt for '{reply_to}' was NOT written ({e}) — the "
+                f"post it answers will re-surface on --unhandled-only reads")
 
     resp = {"ok": True, "id": msg["id"], "record": msg}
     if reply_warnings:
@@ -310,53 +389,21 @@ def mark_read(ctx) -> "Response":  # type: ignore[name-defined]
 
     reader = (ctx.query.get("reader") or "").strip() or _agent_name(ctx)
     reader_sid = (ctx.headers.get("x-mind-sid") or "").strip()
-    read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-    sidecar = _reads_sidecar_path(ctx, channel)
-    base = ctx.paths.world
-    agent = _agent_name(ctx)
-    written = 0
+    kind = (ctx.query.get("kind") or "").strip().lower()
+    if kind not in ("", HANDLED_KIND):
+        return Response.error(400, "invalid_param",
+                              "kind must be omitted (SHOWN receipt) or 'handled'")
 
     try:
-        assert_not_cruft(sidecar.parent, "mkdir (board mark-read)")
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
-        with file_locks.locked(sidecar):
-            existing = _read_jsonl(sidecar)
-            seen = {r.get("msg_id") for r in existing
-                    if r.get("reader_agent") == reader}
-            new_rows = []
-            for mid in msg_ids:
-                if mid in seen:
-                    continue
-                # Key order MUST match board.py:234-238 for byte-compat.
-                row = {
-                    "msg_id": mid,
-                    "reader_agent": reader,
-                    "reader_sid": reader_sid,
-                    "read_at": read_at,
-                }
-                _validate_no_surrogates(row, sidecar)
-                new_rows.append(row)
-                seen.add(mid)
-                written += 1
-            if new_rows:
-                history.snapshot(sidecar, base, agent,
-                                 summary=f"board-mark-read {channel}")
-                # s5c (own-cloud): append each read-row through the backend so
-                # the sidecar reaches S3. LocalBackend = identical raw open('a')
-                # appends (one per row, same bytes/order). N is the unread count
-                # (small); on own-cloud each is a fenced read+append+PUT.
-                for row in new_rows:
-                    get_backend().append_jsonl_record(sidecar, row)
-                changelog.append(base, agent, sidecar, "edit",
-                                 summary=f"board-mark-read {channel}",
-                                 lines_changed=len(new_rows))
-                _jsonl_cache().invalidate(sidecar)
+        written = _write_receipts(ctx, channel, reader, reader_sid, msg_ids, kind)
     except OSError as e:
         return Response.error(500, "write_failed", str(e))
 
-    return Response.json({"ok": True, "channel": channel, "marked": written,
-                          "already_read": len(msg_ids) - written})
+    resp = {"ok": True, "channel": channel, "marked": written,
+            "already_read": len(msg_ids) - written}
+    if kind:
+        resp["kind"] = kind
+    return Response.json(resp)
 
 
 # ---------------------------------------------------------------------------

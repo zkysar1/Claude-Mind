@@ -196,9 +196,10 @@ def test_verdict_roundtrip_writer_to_gate(tmp_path):
 
 # ── gate telemetry: branch labels + registry pairing () ──────
 
-def _census(top="g-1", dropped=True, rows=("g-2", "g-3"), age_s=60, now=NOW):
+def _census(top="g-1", dropped=True, rows=("g-2", "g-3"), age_s=60, now=NOW, yielded=False):
     """A select-walk census (worker_execute.worker_view + write_select_census)."""
     return {"top": 10, "scorer_top": top, "scorer_top_dropped": dropped,
+            "scorer_top_yielded": yielded,
             "rows": [{"goal_id": g, "verdict": "eligible"} for g in rows],
             "ts": (now - timedelta(seconds=age_s)).strftime("%Y-%m-%dT%H:%M:%S")}
 
@@ -216,6 +217,8 @@ def _branch_cases():
         ("unsanctioned_deviation", _verdict("g-1"),                           "g-2", "", None),
         ("sanctioned_deviation",   _verdict("g-1"),         "g-2", "self-abstention", None),
         ("walk_dropped_top",       _verdict("g-1"),                     "g-2", "", _census()),
+        ("walk_yielded_top",       _verdict("g-1"),                     "g-2", "",
+         _census(dropped=False, yielded=True)),
     ]
 
 
@@ -267,6 +270,7 @@ def test_decisions_match_caller_control_flow_effect():
     assert d["unsanctioned_deviation"] == "block"    # caller exits 2
     assert d["sanctioned_deviation"] == "override"   # named bypass flag used
     assert d["walk_dropped_top"] == "override"       # the walk's census is the bypass
+    assert d["walk_yielded_top"] == "override"       # the same census, a pace yield
     assert d["top_pick_match"] == "pass"             # validated, claim proceeds
     for path in ("no_verdict", "malformed_verdict", "stale_verdict",
                  "path_resolution_failed"):
@@ -498,6 +502,75 @@ def test_round_trip_through_the_real_walk_census(tmp_path, monkeypatch,
     ranked = [_brief(0, skill=top_skill), _brief(1), _brief(2)]
     _, census = we.worker_view(ranked, 10)
     sess = tmp_path / "sessions" / "sid-133"
+    sess.mkdir(parents=True)
+    we.write_select_census(census, sess)
+    vf = tmp_path / "scorer-verdict.json"
+    vf.write_text(json.dumps(_verdict("g-900-00", ts=datetime.now())), encoding="utf-8")
+    firings = []
+    monkeypatch.setattr(svg, "_log_gate_firing", lambda *a: firings.append(a))
+    monkeypatch.setattr(svg, "_log_override", lambda ev, agent: None)
+    rc = svg.main(["--agent", "alpha", "--goal-id", "g-900-01", "--verdict-file", str(vf),
+                   "--census-file", str(sess / we.SELECT_CENSUS_FILENAME)])
+    assert (rc, firings[0][0]) == (want_rc, want_path)
+
+
+# ── the walk's second sanction: a HIGH top left to faster workers () ──
+#
+# A slow worker's pace forecast leaves a HIGH goal to faster workers when they will
+# finish it sooner, so its first kept row is not the scorer's top. That claim is
+# sanctioned by the same census evidence as a dropped top, under its own code.
+
+def test_a_kept_row_over_a_top_the_walk_yielded_passes_under_its_own_code():
+    path, rc, msg, ev = svg._classify(_verdict("g-1"), "g-2", "", NOW,
+                                      census=_census(dropped=False, yielded=True),
+                                      census_now=NOW)
+    assert (path, rc, msg) == ("walk_yielded_top", 0, "")
+    assert ev == {"claimed": "g-2", "scorer_top": "g-1", "code": "pace-yield"}
+
+
+def test_pace_yield_is_walk_only_and_the_override_audit_classifies_it():
+    """Never a code a caller may pass: the deny's menu would invite a worker to claim
+    a yield the forecast never made. The audit must still know it, as by-design lane
+    discipline rather than a weights signal, or every yield reads as `other`."""
+    import importlib.util
+    assert svg.WALK_YIELDED_CODE not in svg.VALID_DEVIATION_CODES
+    path, rc, _, ev = svg._classify(_verdict("g-1"), "g-2", "pace-yield", NOW,
+                                    census=_census(dropped=False, yielded=True),
+                                    census_now=NOW)
+    assert (path, rc, ev) == ("unsanctioned_deviation", 2, None)
+    spec = importlib.util.spec_from_file_location(
+        "scorer_override_audit", CORE_SCRIPTS / "scorer-override-audit.py")
+    audit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(audit)
+    assert audit._classify(svg.WALK_YIELDED_CODE) == "lane_discipline"
+
+
+@pytest.mark.parametrize("census, why", [
+    (_census(dropped=False, yielded=False), "the walk yielded nothing"),
+    (_census(top="g-9", dropped=False, yielded=True), "the census judged a different top"),
+    (dict(_census(dropped=False), scorer_top_yielded="yes"), "yielded must be the boolean true"),
+    (_census(dropped=False, yielded=True, rows=("g-3",)), "the claimed goal is not a kept row"),
+    (_census(dropped=False, yielded=True, age_s=11 * 60), "a census older than the window"),
+])
+def test_a_yield_needs_the_same_evidence_as_a_drop(census, why):
+    path, rc, _, ev = svg._classify(_verdict("g-1"), "g-2", "", NOW,
+                                    census=census, census_now=NOW)
+    assert (path, rc, ev) == ("unsanctioned_deviation", 2, None), why
+
+
+@pytest.mark.parametrize("yields, want_rc, want_path", [
+    (True, 0, "walk_yielded_top"),          # the forecast left the HIGH top to others
+    (False, 2, "unsanctioned_deviation"),   # positive control: the walk kept it
+])
+def test_round_trip_through_a_walk_that_yields_its_top(tmp_path, monkeypatch,
+                                                       yields, want_rc, want_path):
+    """worker_view with a forecast, its census written and read back by main(). Row 0
+    is HIGH; only the walk whose forecast yielded it sanctions the claim of row 1."""
+    import worker_execute as we
+    ranked = [_brief(0, priority="HIGH"), _brief(1, priority="MEDIUM"), _brief(2)]
+    _, census = we.worker_view(
+        ranked, 10, pace=lambda k: {"decision": "yield" if yields else "take", "k": k})
+    sess = tmp_path / "sessions" / "sid-152"
     sess.mkdir(parents=True)
     we.write_select_census(census, sess)
     vf = tmp_path / "scorer-verdict.json"

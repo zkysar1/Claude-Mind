@@ -324,6 +324,7 @@ fi
 PASSES=0
 FAILS=0
 SKIPPED=0
+RUNTIME_SKIPS=0
 declare -a FAILED_FILES=()
 
 for f in "${INVISIBLE[@]}"; do
@@ -364,6 +365,13 @@ for f in "${INVISIBLE_SH[@]}"; do
   if [ $rc -eq 0 ]; then
     PASSES=$((PASSES + 1))
     echo "PASS $base (shell)"
+  elif [ $rc -eq 77 ]; then
+    # exit 77 is the test's OWN skip (the autotools code): a precondition this world
+    # lacks, stated on its first SKIP line. Counted apart from PASS and from
+    # QUARANTINE, and never a FAIL: a daemon-quiesced deployment cannot run a
+    # daemon-only test, and "did not run" must read as a skip, not as a pass ().
+    RUNTIME_SKIPS=$((RUNTIME_SKIPS + 1))
+    echo "SKIP $base (shell) — $(printf '%s\n' "$out" | grep -m1 '^SKIP' | cut -c1-200)"
   else
     FAILS=$((FAILS + 1))
     FAILED_FILES+=("$base")
@@ -375,6 +383,9 @@ done
 echo "════════════════════════════════════════"
 echo "invisible-suites: $PASSES/$((PASSES + FAILS)) files passed, $SKIPPED quarantined (open goals above)"
 echo "  population: ${#INVISIBLE[@]} main()-style .py + ${#INVISIBLE_SH[@]} shell"
+if [ $RUNTIME_SKIPS -gt 0 ]; then
+  echo "  $RUNTIME_SKIPS shell file(s) SKIPPED by their own precondition (exit 77, reason above): not passed, not failed"
+fi
 if [ $FAILS -gt 0 ]; then
   echo "Failed files (NOT quarantined — new reds):"
   for ff in "${FAILED_FILES[@]}"; do echo "  - $ff"; done

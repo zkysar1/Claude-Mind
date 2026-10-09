@@ -225,9 +225,18 @@ def _fmt_human_record(rec):
             phase, str(cand_in), str(actioned), skipped_fmt,
         ))
     debt = rec.get("post_run_debt") or {}
-    lines.append("post_run_debt: total={} cleared={} threshold={}".format(
-        debt.get("total"), debt.get("cleared"), debt.get("threshold"),
-    ))
+    # : total/cleared are ACTIONABLE debt (bare low_utility excluded
+    # from the aggregate); the raw population (distill) and the excluded class
+    # stay visible. distill_actionable/distill_low_utility are absent on
+    # pre- records — .get() defaults keep old logs rendering.
+    lines.append(
+        "post_run_debt: total={} (actionable) raw_distill={} "
+        "low_utility_excluded={} cleared={} threshold={}".format(
+            debt.get("total"), debt.get("distill", "—"),
+            debt.get("distill_low_utility", "—"),
+            debt.get("cleared"), debt.get("threshold"),
+        )
+    )
     return "\n".join(lines)
 
 

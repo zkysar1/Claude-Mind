@@ -150,6 +150,25 @@ def test_post_coordination_succeeds(running_daemon):
     assert len(_channel_lines(world, "coordination")) == 1
 
 
+def test_post_coordination_wakes_peers_in_the_requests_own_tree(running_daemon):
+    """The wake signal lands under the REQUEST's agents root and skips the
+    posting agent. Until 2026-10-07 the endpoint took both from _wake_signals'
+    module location and this process's MIND_AGENT, so this very daemon touched
+    every OTHER agent's signal in the real repo and none here."""
+    project_root, port = running_daemon
+    agents = project_root / "agents"
+    for name in ("alpha", "bravo"):
+        (agents / name / "session").mkdir(parents=True, exist_ok=True)
+    status, body = _post_raw(port, "/v1/board/post",
+                             {"channel": "coordination"}, "claim g-1-1")
+    assert status == 200, body
+    assert (agents / "bravo" / "session" / "board-activity").exists(), (
+        "the peer in the daemon's own tree was not woken: the signal went to "
+        "another tree")
+    assert not (agents / "alpha" / "session" / "board-activity").exists(), (
+        "the posting agent woke itself")
+
+
 def test_mark_read_roundtrip(running_daemon):
     project_root, port = running_daemon
     world = project_root / "world"
@@ -356,3 +375,52 @@ def test_byte_compat_mark_read(tmp_path):
     assert len(cli_rows) == len(dae_rows) == 2
     for d, c in zip(dae_rows, cli_rows):
         _assert_line_compat(d, c, volatile={"read_at"})
+
+
+def _sidecar_rows(world: Path):
+    p = world / "board" / "general-reads.jsonl"
+    return [ln for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+@pytest.mark.skipif(not BOARD_PY.exists(), reason="core/scripts/board.py missing")
+def test_byte_compat_mark_read_handled(tmp_path):
+    """: the HANDLED row is the SHOWN row plus kind, last, from both writers."""
+    from mind_api.src.endpoints import board_write
+
+    cli_world = _seed_board_world(tmp_path, "cli")
+    dae_world = _seed_board_world(tmp_path, "dae")
+
+    _run_board_cli(cli_world, tmp_path / "cli-meta",
+                   ["mark-read", "--channel", "general", "--ids", "msg-1",
+                    "--kind", "handled"], None)
+    board_write.mark_read(_FakeCtx(dae_world, {"channel": "general", "ids": "msg-1",
+                                               "kind": "handled"}, b""))
+
+    cli_rows = _sidecar_rows(cli_world)
+    dae_rows = _sidecar_rows(dae_world)
+    assert len(cli_rows) == len(dae_rows) == 1
+    _assert_line_compat(dae_rows[0], cli_rows[0], volatile={"read_at"})
+    assert list(json.loads(dae_rows[0]).keys())[-1] == "kind"
+    assert json.loads(dae_rows[0])["kind"] == "handled"
+
+
+@pytest.mark.skipif(not BOARD_PY.exists(), reason="core/scripts/board.py missing")
+def test_byte_compat_reply_writes_the_handled_receipt(tmp_path):
+    """: a post with reply_to is a disposition, in the CLI and the daemon alike."""
+    from mind_api.src.endpoints import board_write
+
+    cli_world = _seed_board_world(tmp_path, "cli")
+    dae_world = _seed_board_world(tmp_path, "dae")
+
+    _run_board_cli(cli_world, tmp_path / "cli-meta",
+                   ["post", "--channel", "general", "--author", "alpha",
+                    "--reply-to", "msg-1"], "Acknowledged")
+    board_write.post(_FakeCtx(dae_world, {"channel": "general", "author": "alpha",
+                                          "reply_to": "msg-1"}, b"Acknowledged"))
+
+    cli_rows = _sidecar_rows(cli_world)
+    dae_rows = _sidecar_rows(dae_world)
+    assert len(cli_rows) == len(dae_rows) == 1
+    _assert_line_compat(dae_rows[0], cli_rows[0], volatile={"read_at"})
+    row = json.loads(dae_rows[0])
+    assert (row["msg_id"], row["reader_agent"], row["kind"]) == ("msg-1", "alpha", "handled")

@@ -32,9 +32,11 @@ did not. Only the zeros are load-bearing — they are the defect.)
 **Consequence.** Any armed `ScheduleWakeup` — the parked-Body re-poll (up to
 3600s) or the deadman net (600s) — fires after the user stop, re-enters
 Phase -0, reads `body_state` still `parked` or `active` (a worker `/stop`
-deliberately does NOT retire the Body, and correctly so), and resumes the
-loop the user just stopped. Observed live: after a `/stop` the park wakeup
-was still armed and had to be cancelled by hand.
+did not retire the Body then), and resumes the loop the user just stopped.
+Observed live: after a `/stop` the park wakeup was still armed and had to be
+cancelled by hand. Since 2026-10-07 a worker `/stop` CLOSES the Body as its
+last step (`worker-stop-close.md`). This gate still runs first, so a wakeup
+armed before the close stands down here before it reaches the closure gate.
 
 Until this gate existed the only defense was the model remembering to call
 `ScheduleWakeup(stop: true)` at stop time — exactly the LLM-only-step shape

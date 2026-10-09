@@ -27,6 +27,11 @@ THE RECORD. It comes from the per-goal aspirations-query.sh projection, and
 falls back to the whole-aspiration aspirations-read.sh when the query does not
 return exactly one record. load_goal says why, with the measured latency.
 
+THE CARRIERS (g-375-162). Each NOT MET row's carrier is looked up with the
+same per-goal query, and a lookup that fails is a warning (carrier_lookup). A
+refusal's JSON line carries `remedy`, the fix commands the refusal prints, so
+verify-preflight prints them as well.
+
 THE ADVISORY (g-375-52). Whatever the verdict, the note it read is also
 checked for session-scratch citations that lack their inline lines or a host.
 The advisory goes to STDERR, because do_verify sends stdout to a log and lets
@@ -59,7 +64,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 # No fallbacks on these imports (guard-391): one that fails crashes the gate
 # with rc 1, which do_verify reports as a fault and proceeds past.
 from gates.closure_evidence import (  # noqa: E402
-    advisory_text, evaluate, refusal_text, scratch_citations)
+    advisory_text, evaluate, refusal_text, remedy_lines, scratch_citations)
 from _paths import PROJECT_ROOT, WORLD_DIR, META_DIR, SESSIONS_DIRNAME, agents_root  # noqa: E402
 from _gate_log import log as _gate_log  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402  guard-580/581: never a bare "bash"
@@ -98,6 +103,46 @@ def load_goal(goal_id: str, source: str) -> dict:
         if isinstance(g, dict) and g.get("id") == goal_id:
             return g
     return {}
+
+
+def carrier_lookup(carriers_json: str | None, goal_json: str | None):
+    """status(goal_id) for the per-row carrier check (): the goal's
+    status, None when no record has the id, and a raise when it cannot look,
+    which the check turns into a warning. The per-goal query is union-only, so
+    an id can match in both queues, and a live match in either counts: the
+    residual-work gate reads both queues too. Where this box does not own the
+    agent queue, which on a worker Body is every queue, the endpoint refuses an
+    empty identity lookup as an unverified absence (agent_queue_unverified_empty,
+    rc 1). So there a carrier id that matches nothing is a warning, while a
+    record that comes back is judged by its status.
+
+    --carriers-json is the test seam, {goal_id: status or null}, and an id it
+    lacks raises. A --goal-json run without it looks nothing up, so no test
+    reads the live store."""
+    if carriers_json:
+        table = json.loads(Path(carriers_json).read_text(encoding="utf-8"))
+
+        def from_table(gid: str):
+            if gid not in table:
+                raise LookupError(f"{gid} is not in --carriers-json")
+            return table[gid]
+        return from_table
+    if goal_json:
+        return None
+    cache: dict = {}
+
+    def from_store(gid: str):
+        if gid not in cache:
+            recs = _run_json("aspirations-query.sh", "--goal-field", "id", gid, "--full")
+            if not isinstance(recs, list):
+                raise LookupError("no record list: a failed query, or an absence this box "
+                                  "cannot verify")
+            from gates.residual_work import ACTIVE_STATUSES
+            found = [r.get("status") for r in recs if isinstance(r, dict)]
+            cache[gid] = next((s for s in found if s in ACTIVE_STATUSES),
+                              found[0] if found else None)
+        return cache[gid]
+    return from_store
 
 
 def pick_note(goal: dict, outcome_note_file: str | None, summary: str) -> tuple[str, str]:
@@ -218,6 +263,8 @@ def main(argv=None) -> int:
     ap.add_argument("--override", default=None,
                     help="justification; turns a refusal into a logged pass")
     ap.add_argument("--goal-json", default=None, help="goal record JSON path (tests)")
+    ap.add_argument("--carriers-json", default=None,
+                    help="carrier statuses {goal_id: status|null} (tests); see carrier_lookup")
     args = ap.parse_args(argv)
     # Drain stdin FIRST: do_verify pipes the summary in, and an early return
     # below must not leave the writer on a closed pipe. Bytes decoded as UTF-8:
@@ -242,7 +289,8 @@ def main(argv=None) -> int:
         if args.summary_file:
             summary = Path(args.summary_file).read_text(encoding="utf-8", errors="replace")
         note, note_source = pick_note(goal, args.outcome_note_file, summary)
-        result = evaluate(goal, note, roots=_roots(), probe=store_probe())
+        result = evaluate(goal, note, roots=_roots(), probe=store_probe(),
+                          carrier_status=carrier_lookup(args.carriers_json, args.goal_json))
     except Exception as e:  # our own fault: never a refusal (guard-142)
         _emit("error", args.goal, reason=f"gate fault: {e}")
         return 0
@@ -262,8 +310,17 @@ def main(argv=None) -> int:
         _emit("override", args.goal, override=args.override, **fields)
         _advise(advice)
         return 0
+    # pick_note's own test: with no --outcome-note-file, a record note is the one
+    # checked, and only that note can be fixed by appending to it.
+    stored = not args.outcome_note_file and bool(str(goal.get("outcome_note") or "").strip())
     try:
-        text = refusal_text(args.goal, result, note_source)
+        fields["remedy"] = remedy_lines(args.goal, result, goal=goal, note=note, stored=stored,
+                                        source=args.source)
+    except Exception as e:  # the commands are help; their fault must not cost the refusal
+        fields["remedy"], fields["remedy_error"] = [], str(e)
+    remedy = fields["remedy"]
+    try:
+        text = refusal_text(args.goal, result, note_source, remedy=remedy, stored=stored)
     except Exception as e:  # guard-3803: a bug in the message must not cancel the refusal
         text = f"{GATE_ID}: REFUSED. {args.goal}: {result.get('problems')} (message failed: {e})"
     print(text, file=sys.stderr)

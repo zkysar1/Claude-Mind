@@ -139,6 +139,9 @@ from _growth_log import (  # noqa: E402  # tree_growth_log SSOT,
 # import adds no new failure mode; it binds a module the process already holds.
 from tree import (  # noqa: E402
     get_distill_candidates as _cli_get_distill_candidates,
+    # : the actionable-debt helper — delegated, not mirrored, so the
+    # exclusion class cannot drift between the CLI writer and this mirror.
+    actionable_distill_count as _cli_actionable_distill_count,
 )
 
 
@@ -2181,11 +2184,17 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                     distill_count = len(distill_detail["candidates"])
                     decompose_count = len(decompose_detail["candidates"])
                 else:
-                    distill_count = len(_get_distill_candidates(ctx, tree))
-                    decompose_count = len(
-                        _get_decompose_candidates(ctx, tree))
+                    distill_detail = _get_distill_candidates(ctx, tree)
+                    decompose_detail = _get_decompose_candidates(ctx, tree)
+                    distill_count = len(distill_detail)
+                    decompose_count = len(decompose_detail)
 
-                post_debt = distill_count + decompose_count
+                # : mirror cmd_record_maintenance — the DEBT
+                # AGGREGATE is actionable debt (bare low_utility excluded via
+                # the CLI helper). Byte-compat: key order and the
+                # last_backlog_clear_at math must stay in lockstep with tree.py.
+                distill_actionable = _cli_actionable_distill_count(distill_detail)
+                post_debt = distill_actionable + decompose_count
                 if post_debt <= debt_threshold:
                     maintenance["last_backlog_clear_at"] = now
 
@@ -2198,6 +2207,8 @@ def write(ctx) -> "Response":  # type: ignore[name-defined]
                     "maintenance": maintenance,
                     "post_run_debt": {
                         "distill": distill_count,
+                        "distill_actionable": distill_actionable,
+                        "distill_low_utility": distill_count - distill_actionable,
                         "decompose": decompose_count,
                         "total": post_debt,
                         "threshold": debt_threshold,

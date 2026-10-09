@@ -1039,11 +1039,12 @@ Item 6 follows 5. Item 7 follows 6 and is one commit.
    until T0 + 14 d, and the read at T0 + 14 d is the dry run of the first real batch (`deletable` is the smaller of 500 and `aged`).
    (U26: read back at a probe, a to e passed.)
 7. **Before `--apply`**: all of these, then one commit.
-   - U16, the anomaly routing, is in the reducer's tree with the tick (item 2). The rehearsal this bullet used to owe has run once, from cc-08
-     on 2026-10-04: the real `board-post.sh` and its daemon carried the tick's post (`msg-20261004-024627-alpha-142`) and it was read back by id
-     ("The live post rehearsal (U18)"). Still owed: the same run from the reducer's box once its tree holds the tick, because that one ran from
-     a worker Body's shell on cc-08 and the reducer starts the tick backgrounded from `iteration-close.sh`. The procedure and the stand-in
-     runner are in that section; the U16 section has the routing itself ("Anomaly routing (U16)").
+   - U16, the anomaly routing, is in the reducer's tree with the tick (item 2). The rehearsal this bullet used to owe has run twice: from cc-08
+     on 2026-10-04, where the real `board-post.sh` and its daemon carried the tick's post (`msg-20261004-024627-alpha-142`, read back by id;
+     "The live post rehearsal (U18)"), and from the reducer's box, cc-03, on 2026-10-08 (`msg-20261008-182214-echo-334`, same readings; "The live
+     post rehearsal from the reducer's box (U33)"). Both ran the tick inline. The backgrounded form `iteration-close.sh` starts was run in U33 with a
+     recording poster only, so the real poster inside it is not yet exercised. The procedure and the stand-in runner are in the U18 section; the
+     U16 section has the routing itself ("Anomaly routing (U16)").
    - The wall-clock bound on the runner has landed (U17): `timeout -k 30 1500` in `run_pass`, 270 s under `LEASE_TTL_S` (1,800 s), which the runner
      never renews. Read in U24 against a timed pass at the real cap on a store holding 40,149 orphans (a throwaway store on the live MinIO): the
      apply pass took 19.57 s, 1.3% of the bound, and an observe pass 3.25 s ("The runner timed on the live store (U24)"). Still owed: the same
@@ -2092,6 +2093,53 @@ recommendation (a); the control proves the undo exists now, not how long it last
 caller, which observes first (the enumeration against a live archive, once the collector has produced a real run) and has its own cadence and lease, one pass a day keeping pace; the first
 real receipt read by the planner; and U28's check, two readings of the archive prefix 7 d apart. This section sits here and not after U28's because the writer-flag unit's unmerged edit
 inserts there.
+
+## The live post rehearsal from the reducer's box (U33)
+
+U18 ran the post rehearsal that item 7 names from a worker Body's shell on cc-08 and left one run owed: the same run from the reducer's box, because the
+reducer starts the tick backgrounded from `iteration-close.sh`. U33 ran it on cc-03 (`hostname` cc-03, `uname -r` 6.8.0-142-generic) as `echo`, the
+reducer, from its session shell on 2026-10-08, and changed no code: the run showed nothing to fix. The call shape, the stand-in runner and the order of
+readings are U18's. The stand-in's strings differ from U18's only by saying "from the reducer's box" and naming U33. Every reading below is from that run.
+
+**The readings** (UTC, from the log headers and the board's own timestamps).
+- Control, 18:22:05, inline (`COMPOSITE_GC_TICK_SYNC=1`), an empty state directory, a recording stand-in in place of the poster: it was called with
+  `--channel coordination --type escalation --tags composite-gc,anomaly` and an 834-byte body on stdin with no `@` in it (rb-2590). The log header read
+  `rc=0 agent=echo elapsed=0s` and the state file `.composite-gc-tick-post` held the key `aaec6a1faf3c`. U18's key was `f516665a46e9`; the two differ because `route_result` builds the key from the verdict and the lead phrase of each anomaly line, and this
+  stand-in's lead phrase ends "from the reducer's box".
+- Live, 18:22:14, inline, a second empty state directory, the real `core/scripts/board-post.sh`: the tick returned 0 and logged
+  `composite-gc route: posted anomaly to coordination as msg-20261008-182214-echo-334 key=aaec6a1faf3c`, and the state file held the same key.
+- Read back by id with `board-read.sh --channel coordination --last 8 --json` and no `--mark-read`: author `echo`, channel `coordination`, type `escalation`,
+  tags `composite-gc` and `anomaly`, `reply_to` null, the reducer session's id. The stored text is 833 bytes. The control's stdin was 834. The two are equal
+  once trailing whitespace is trimmed.
+- De-duplication, 18:22:29: the scratch stamp removed and the state file kept, the tick ran again and logged `composite-gc route: deduplicated anomaly
+  key=aaec6a1faf3c ... the next post for it is due 86400 s after the last one`. `board-read.sh --channel coordination --tag composite-gc --last 20 --json`
+  straight afterwards returned two messages, U18's `msg-20261004-024627-alpha-142` and this one, so the second run added none.
+- The backgrounded form, 18:22:46: the form `iteration-close.sh` starts (no `COMPOSITE_GC_TICK_SYNC`, so `( run_pass ) >>"$LOG" 2>&1 </dev/null &`), a third
+  empty state directory, and the recording poster in place of the real one so the board would gain nothing. The tick returned 0 in the same second; the
+  next call found the log header `rc=0 agent=echo elapsed=0s`, the `posted` route line, the same argv as the inline control, an 834-byte body, and the
+  state file holding `aaec6a1faf3c`. The board still held two `composite-gc` messages.
+- The daemon that carried it: cc-03's `mind_api/state/daemon.pid` names pid 3624159, started 18:08:07 (`ps lstart`). U32's 13:14Z read-back was of the daemon before it (pid 2225335,
+  started 07:37:17, flagless). The new daemon's `/proc` environment, read at 18:25 by counting lines and printing no value, holds one `OWNCLOUD_COMPOSITE_STORES=ayoai-mind`
+  line, no empty one, and one `OWNCLOUD_GZIP_STORES=ayoai-mind` line as the positive control. So the post went through a daemon that carries the flag. The respawn's cause was not read.
+- Reaction check, 5 min 30 s after the post (18:27): the last 60 messages on `coordination` (15:06:05 to 18:25:27) include the post. One message follows it, a claim by bravo at 18:25:27 on g-353-92, a recurring product-focus ledger pull;
+  none has `reply_to` equal to its id and none names the id or the word REHEARSAL. `aspirations-query.sh --title-contains` returned an empty list for "composite GC anomaly" and for
+  "REHEARSAL", and it finds g-358-202 for "Fix the write path". An earlier reading at 2 min 59 s found no message after the post at all.
+
+**What it shows.** From the reducer's box, as the reducer, the tick's post reached the real `board-post.sh` and its daemon: the script returned rc 0 and the
+message id on stdout, the tick wrote its de-duplication key, and the channel holds one `escalation` with the intended tags. The same condition did not post
+a second time against the real state file. The backgrounded form runs the same function to the same poster call.
+
+**What I decided** (override if you disagree).
+- The same label as U18, in the verdict and in the anomaly line, and the body says it overrides the footer's last line.
+- One real post only. The second live run is the de-duplication test, and the backgrounded form ran with the recording poster.
+- No change to the tick or its tests: the run showed no defect.
+- The rehearsal message stays on the channel with its label; nothing was done to withdraw it.
+
+**Not established.**
+- The real poster inside the backgrounded form. It ran once with the recording poster. Production runs `board-post.sh` there with the body arriving by a
+  pipe, so a difference is not expected; none was measured.
+- The runner's own post. The stand-in built the line with the runner's functions; the real runner has not yet produced an anomaly on a live store.
+- Whether anyone acts on a post left on the channel for hours (the reaction reading above is minutes, and one unrelated message followed the post in them).
 
 ## Staged plan
 

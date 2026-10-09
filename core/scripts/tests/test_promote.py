@@ -34,11 +34,24 @@ for _p in (str(CORE_SCRIPTS), str(SCRIPT_DIR)):
 
 import _release_lib as L  # noqa: E402
 from _bash_helpers import BASH  # noqa: E402
+from _frontier_world import requires_frontier_world  # noqa: E402
 
 PROMOTE_SH = CORE_SCRIPTS / "promote-to-upstream.sh"
 LIB = CORE_SCRIPTS / "_release_lib.py"
 INIT_PY = PROJECT_ROOT / "mind_api" / "src" / "__init__.py"
 CHAIN = "frontier,seed,downstream"
+
+
+@pytest.fixture(autouse=True)
+def _no_platform_memo(monkeypatch):
+    # promote's clean-tree check is `git status --porcelain`, which counts UNTRACKED files, and
+    # the real _paths.sh writes a platform memo beside itself on first source. The fixture below
+    # copies THIS checkout's .gitignore, which names the memo only when that file is current. A
+    # downstream deployment owns its .gitignore, so there the fixture read dirty and 22 tests went
+    # red on "working tree is dirty" (the v2.12.95 adopt, ). The memo is a cache and
+    # MIND_SKIP_PLATFORM_MEMO=1 is its documented off switch (_paths.sh), so no .gitignore line
+    # is needed for it.
+    monkeypatch.setenv("MIND_SKIP_PLATFORM_MEMO", "1")
 
 
 def _local_version() -> str:
@@ -182,6 +195,7 @@ _live_release_chain_synced = pytest.mark.skipif(
 
 
 @_live_release_chain_synced
+@requires_frontier_world("it promotes from the real world, which needs an upstream target")
 def test_shell_target_missing_init_exit1(tmp_path):
     bare = tmp_path / "bare"; bare.mkdir()
     r = run_promote("--target", str(bare), "--dry-run")
@@ -190,6 +204,7 @@ def test_shell_target_missing_init_exit1(tmp_path):
 
 
 @_live_release_chain_synced
+@requires_frontier_world("it promotes from the real world, which needs an upstream target")
 def test_shell_invariant_violation_higher_target_exit1(tmp_path):
     """CW2: cannot promote BACKWARDS — target ahead of local is refused."""
     tgt = _mk_target(tmp_path, "99.0.0")
@@ -315,7 +330,8 @@ def _setup_promote_source(tmp_path: Path, version: str = "1.0.0", frontier: bool
     # So the expected value is READ FROM THE OTHER COMPONENT (guard-1220), not
     # copied by hand. It also makes the failure mean something: if a new runtime
     # artifact ever ships WITHOUT its .gitignore line, the real promote breaks,
-    # and now so does this file.
+    # and now so does this file. The platform memo is the one exception: _no_platform_memo
+    # switches it off for every test here, so a deployment's own .gitignore need not name it.
     shutil.copy(PROJECT_ROOT / ".gitignore", src / ".gitignore")
     _git(src, "init", "-q")
     _gitcfg(src)

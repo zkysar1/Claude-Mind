@@ -114,7 +114,7 @@ def _stale_world_archive(world, install, extra_goal):
                                  completed_date="2026-09-01T00:00:00"))]
     _write(arch, local)
     install({arch: local + [_asp("asp-2", extra_goal)]})
-    assert extra_goal["id"] not in _ids(arch)  # POSITIVE CONTROL: mirror is stale
+    assert extra_goal["id"] not in _ids(arch)  # POSITIVE CONTROL: mirror is stale ()
     return arch
 
 
@@ -206,7 +206,7 @@ def _stale_pipeline_archive(world, install, local_ids, store_ids, **fields):
     _write(arch, [dict({"id": i}, **fields) for i in local_ids])
     install({arch: [dict({"id": i}, **fields) for i in store_ids]})
     on_disk = {json.loads(ln)["id"] for ln in arch.read_text().splitlines() if ln.strip()}
-    assert not (set(store_ids) - set(local_ids)) & on_disk  # POSITIVE CONTROL: mirror is stale
+    assert not (set(store_ids) - set(local_ids)) & on_disk  # POSITIVE CONTROL: mirror is stale ()
     return arch
 
 
@@ -268,7 +268,7 @@ def test_insight_trigger_sweep_converted_ids_include_store_only_goal(tree, monke
     local = [_asp("asp-1", _goal("g-1-01", origin_signal="insight_trigger:msg-1"))]
     _write(asps, local)
     install({asps: local + [_asp("asp-2", _goal("g-2-01", origin_signal="insight_trigger:msg-2"))]})
-    assert "msg-2" not in asps.read_text()  # POSITIVE CONTROL: mirror is stale
+    assert "msg-2" not in asps.read_text()  # POSITIVE CONTROL: mirror is stale ()
     monkeypatch.setattr(mod, "WORLD_ASPS", asps)
     monkeypatch.setattr(mod, "_agents_root", lambda: agent.parent)
     assert "msg-2" in mod.load_converted_ids()
@@ -284,7 +284,7 @@ def test_displaced_id_audit_collects_pair_from_store_only_reid_archive(tree, tmp
     _write(arch, [kept])
     install({arch: [kept, {"id": "guard-10", "rule": "moved", "displaced_from": "guard-7"}]})
     assert "guard-10" not in arch.read_text()  # POSITIVE CONTROL
-    pairs, _occ, _stats = mod.collect(world, meta)
+    pairs, _occ, _meta, _stats = mod.collect(world, meta)
     assert ("guard-7", "guard-10") in {(p["old"], p["new"]) for p in pairs}
 
 

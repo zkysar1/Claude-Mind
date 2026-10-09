@@ -4,7 +4,7 @@
 #
 # Usage:
 #   bash core/scripts/session-summary-write.sh \
-#       --sid <SID> --agent <NAME> --reason <graceful-stop|consolidate|crash-recovered|unknown> \
+#       --sid <SID> --agent <NAME> --reason <graceful-stop|worker-stop|consolidate|crash-recovered|unknown> \
 #       [--iterations N] [--goals-filed N] [--tree-writes N] [--uncommitted-paths N]
 #
 # Best-effort: if the session dir doesn't exist, exits 0 silently.

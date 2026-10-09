@@ -204,9 +204,13 @@ print(json.dumps({
             mkdir -p "$_IF_STATE_DIR" 2>&1 || echo "[team-state-in-flight] WARN: could not create $_IF_STATE_DIR (birth carrier will be skipped; claim unaffected)" >&2
             _IF_CARRIER="$_IF_STATE_DIR/body-heartbeat-$MIND_SID.json"
             if [ -d "$_IF_STATE_DIR" ] && [ ! -f "$_IF_CARRIER" ]; then
-                printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s"}\n' \
+                # : the harness, as heartbeat-tick.sh publishes it, so a
+                # Body is counted under its harness from its first claim.
+                rt_judge_provenance
+                [[ "${RT_JUDGE_HARNESS:-}" =~ ^[a-z-]{0,32}$ ]] || RT_JUDGE_HARNESS=""
+                printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s","harness":"%s"}\n' \
                     "$MIND_SID" "$AGENT" "$(hostname || echo unknown)" \
-                    "$(date +%Y-%m-%dT%H:%M:%S)" "" > "$_IF_CARRIER.tmp" \
+                    "$(date +%Y-%m-%dT%H:%M:%S)" "" "${RT_JUDGE_HARNESS:-}" > "$_IF_CARRIER.tmp" \
                     && mv -f "$_IF_CARRIER.tmp" "$_IF_CARRIER" \
                     && echo "[team-state-in-flight] birth carrier written: body-heartbeat-${MIND_SID}.json" >&2 \
                     || echo "[team-state-in-flight] WARN: birth carrier write failed for ${AGENT}/${MIND_SID} (claim unaffected)" >&2

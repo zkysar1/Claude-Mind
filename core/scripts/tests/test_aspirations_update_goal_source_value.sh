@@ -43,6 +43,13 @@ run_wrapper() {
   printf 'RC=%s\n' "$rc"
 }
 
+# Every grep -q below reads a here-string, never `printf | grep -q`. Under `set -o pipefail`
+# grep exits at its FIRST match, printf is killed by SIGPIPE while still writing the rest of a
+# long `bash -x` trace, and the pipeline reads FALSE. With a daemon and a session id present the
+# trace is ~44 KB, so these assertions flipped at random (200 of 300 runs measured on one saved
+# trace; 0 of 300 with a here-string). The inverted check on the bogus value passed vacuously
+# for the same reason. omni-382 class 6, .
+
 echo "Test 1: a bogus --source value is refused, exit 2, both values named, no daemon call"
 out=$(run_wrapper g-fake-test-101 status pending --source aspirations-execute)
 rc=$(printf '%s\n' "$out" | { grep -E '^RC=' || true; } | tail -1 | sed 's/^RC=//')
@@ -51,13 +58,13 @@ if [[ "$rc" == "2" ]]; then
 else
   fail "expected exit 2 on a bogus --source, got rc=$rc"
 fi
-if printf '%s\n' "$out" | grep -q "takes 'world' or 'agent'" \
-   && printf '%s\n' "$out" | grep -q "got 'aspirations-execute'"; then
+if grep -q "takes 'world' or 'agent'" <<<"$out" \
+   && grep -q "got 'aspirations-execute'" <<<"$out"; then
   pass "refusal names the two accepted values and the offending token"
 else
   fail "refusal message missing the accepted values / offending token"
 fi
-if printf '%s\n' "$out" | grep -qE '^\+ QUERY='; then
+if grep -qE '^\+ QUERY=' <<<"$out"; then
   fail "the bogus value still reached QUERY assembly (a daemon call would follow)"
 else
   pass "refused before QUERY assembly — no daemon round-trip"
@@ -66,9 +73,9 @@ fi
 for src in world agent; do
   echo "Test: --source $src passes the value check and reaches QUERY assembly"
   out=$(run_wrapper g-fake-test-102 status pending --source "$src")
-  if printf '%s\n' "$out" | grep -q "takes 'world' or 'agent'"; then
+  if grep -q "takes 'world' or 'agent'" <<<"$out"; then
     fail "--source $src was refused by the value check"
-  elif printf '%s\n' "$out" | grep -qE "^\+ QUERY=.*source=$src"; then
+  elif grep -qE "^\+ QUERY=.*source=$src" <<<"$out"; then
     pass "--source $src reached QUERY with source=$src"
   else
     fail "--source $src produced no QUERY line carrying source=$src. Last 5 lines:"
@@ -78,7 +85,7 @@ done
 
 echo "Test: no --source at all keeps the world default"
 out=$(run_wrapper g-fake-test-103 status pending)
-if printf '%s\n' "$out" | grep -qE '^\+ QUERY=.*source=world'; then
+if grep -qE '^\+ QUERY=.*source=world' <<<"$out"; then
   pass "default source=world reached QUERY"
 else
   fail "default invocation produced no QUERY line with source=world"

@@ -189,8 +189,16 @@ def _stage_root(tmp: Path, *, with_session_dir: bool,
 
 
 def _tick(root: Path, agent_dir: Path, *,
-          sid: str | None, args: tuple[str, ...] = ()) -> subprocess.CompletedProcess:
+          sid: str | None, args: tuple[str, ...] = (),
+          harness_env: dict | None = None) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    if harness_env is not None:
+        # The harness variables rt_judge_provenance reads (). The
+        # launching shell's own are dropped first, so the test, not the box it
+        # runs on, decides which harness the tick sees.
+        for _var in ("CLAUDECODE", "ZAKCODE_MODEL", "ZAKCODE_SESSION"):
+            env.pop(_var, None)
+        env.update(harness_env)
     env["STORAGE_BACKEND"] = "local"
     env["MIND_AGENT"] = AGENT
     # MIND_AGENT_DIR is the PUBLIC name of the seam (_paths.sh copies it into
@@ -379,7 +387,10 @@ def _write_manifest(agent_dir: Path, state: str) -> None:
 
 def test_carrier_carries_the_body_state_from_the_manifest():
     import json
-    for state in ("active", "parked", "closed-pending-merge"):
+    # Live states only. A CLOSED Body's carrier is stamped by its close
+    # (_mirror_state_to_carrier), and the tick writes nothing after that: see
+    # test_a_closed_body_writes_no_liveness below.
+    for state in ("active", "parked"):
         with tempfile.TemporaryDirectory() as tmpd:
             root, adir = _stage_root(Path(tmpd), with_session_dir=True)
             _write_manifest(adir, state)
@@ -410,6 +421,135 @@ def test_carrier_is_valid_json_with_an_absent_manifest():
         assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
         doc = json.loads(c.read_text(encoding="utf-8"))  # must still parse
         assert doc["body_state"] == ""
+        assert doc["sid"] == SID
+
+
+# --- 6b. a CLOSED Body writes no liveness (2026-10-07) ----------------------
+#
+# A closed Body's session can stay open, and every tick would keep its carrier
+# fresh. Every carrier reader trusts freshness before state, so the ended Body
+# would read as live (heartbeat-tick.sh says which readers act on that). The
+# close stamps the carrier itself, so after it the tick writes nothing.
+
+def _closed_states() -> tuple:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "body_manifest", REPO / "core" / "scripts" / "body-manifest.py")
+    bm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bm)
+    return bm.CLOSED_STATES
+
+
+def test_the_tick_closed_state_grep_is_body_manifests_closed_set():
+    import re
+    text = Path(SCRIPT).read_text(encoding="utf-8")
+    m = re.search(r"\^body_state: .*?\(([^)]*)\)", text)
+    assert m, "heartbeat-tick.sh's closed-state grep not found -- it moved or was renamed"
+    assert sorted(m.group(1).split("|")) == sorted(_closed_states()), (
+        "heartbeat-tick.sh's closed set drifted from body-manifest CLOSED_STATES: a "
+        "new closed state would keep ticking, so the ended Body reads as live")
+
+
+def _seed_closed_carrier(adir: Path, state: str) -> Path:
+    """The carrier as a close leaves it: the state mirrored, the ts old."""
+    import json
+    c = _carrier(adir)
+    c.write_text(json.dumps({"sid": SID, "ts": "2026-01-01T00:00:00",
+                             "body_state": state}) + "\n", encoding="utf-8")
+    return c
+
+
+def test_a_closed_body_writes_no_liveness():
+    """Each closed state leaves the carrier exactly as the close wrote it and
+    touches no same-box heartbeat."""
+    for state in _closed_states():
+        with tempfile.TemporaryDirectory() as tmpd:
+            root, adir = _stage_root(Path(tmpd), with_session_dir=True)
+            _write_manifest(adir, state)
+            c = _seed_closed_carrier(adir, state)
+            before = c.read_bytes()
+            r = _tick(root, adir, sid=SID)
+            assert c.read_bytes() == before, (
+                f"the tick refreshed a {state} Body's carrier: {c.read_text()}")
+            assert not _body_hb(adir).exists(), (
+                f"the tick touched a {state} Body's same-box heartbeat")
+            assert "this Body is closed" in r.stderr, r.stderr[-400:]
+
+
+def test_positive_control_an_open_body_in_the_same_shape_still_ticks():
+    """guard-4166: the same staged root and seeded carrier with an ACTIVE manifest
+    must still be written. With the closed check disabled, the test above goes red
+    and this one stays green."""
+    import json
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True)
+        _write_manifest(adir, "active")
+        c = _seed_closed_carrier(adir, "closed-pending-merge")
+        _tick(root, adir, sid=SID)
+        doc = json.loads(c.read_text(encoding="utf-8"))
+        assert doc["body_state"] == "active" and doc["ts"] != "2026-01-01T00:00:00", doc
+        assert _body_hb(adir).exists()
+
+
+# --- 6a. harness: who is live, by harness () ----------------------
+def _stage_runtime(root: Path) -> None:
+    """The REAL _runtime.sh and the launcher it sources, so the tick resolves the
+    harness through rt_judge_provenance exactly as it does on a Body."""
+    for name in ("_runtime.sh", "_python_launcher.sh"):
+        shutil.copy2(REPO / "core" / "scripts" / name, root / "core" / "scripts" / name)
+
+
+def test_carrier_publishes_the_harness_it_runs_in():
+    """The HIGH-goal pace forecast counts the live workers of each harness from
+    these carriers. Each case drops the launching shell's harness variables and
+    sets one, so a Claude Code shell running this test cannot decide it."""
+    import json
+    cases = (({"CLAUDECODE": "1"}, "claude-code"),
+             ({"ZAKCODE_SESSION": "s"}, "zakcode"),
+             ({"ZAKCODE_MODEL": "m"}, "zakcode"),
+             ({}, ""))
+    for env, want in cases:
+        with tempfile.TemporaryDirectory() as tmpd:
+            root, adir = _stage_root(Path(tmpd), with_session_dir=True)
+            _stage_runtime(root)
+            r = _tick(root, adir, sid=SID, harness_env=env)
+            c = _carrier(adir)
+            assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
+            doc = json.loads(c.read_text(encoding="utf-8"))
+            assert doc.get("harness") == want, (
+                f"with {env or 'no harness variable'} the carrier says "
+                f"{doc.get('harness')!r}, not {want!r}. doc={doc}")
+            assert doc["sid"] == SID and doc["ts"], "the liveness fields must survive"
+
+
+def test_carrier_without_a_resolver_still_parses_with_an_empty_harness():
+    """FAIL-SAFE. When _runtime.sh cannot be sourced the harness is empty and the
+    carrier stays valid JSON, so liveness never depends on the new field."""
+    import json
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True)  # no _runtime.sh
+        r = _tick(root, adir, sid=SID, harness_env={"CLAUDECODE": "1"})
+        c = _carrier(adir)
+        assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
+        doc = json.loads(c.read_text(encoding="utf-8"))
+        assert doc.get("harness") == "", doc
+        assert doc["sid"] == SID
+
+
+def test_a_malformed_harness_is_published_empty_and_the_carrier_still_parses():
+    """The VALUE GUARD. The carrier is the Body's liveness signal, so the new field
+    must never be able to break its JSON. A resolver value outside [a-z-] is
+    published as empty, the way main_base is."""
+    import json
+    with tempfile.TemporaryDirectory() as tmpd:
+        root, adir = _stage_root(Path(tmpd), with_session_dir=True)
+        _stub(root / "core" / "scripts" / "_runtime.sh",
+              "rt_judge_provenance() { RT_JUDGE_HARNESS='claude\"code'; }")
+        r = _tick(root, adir, sid=SID)
+        c = _carrier(adir)
+        assert c.exists(), f"no carrier written. stderr={r.stderr[-400:]}"
+        doc = json.loads(c.read_text(encoding="utf-8"))
+        assert doc.get("harness") == "", doc
         assert doc["sid"] == SID
 
 

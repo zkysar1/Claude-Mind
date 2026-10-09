@@ -188,11 +188,6 @@ The marker line is the selection signal: once ≥2 DISTINCT agents carry a `[rec
 Drop semantics — the meter ONLY drops sweeps when:
 1. `tier == always-run` → never drop
 2. `zone == tight` AND `tier ∈ zone_drop_rules.tight` (default `[deferrable]`)
-(The former rule 3 — `tier == deferrable` AND `elapsed_ms > cap_ms` — was REMOVED
-in g-115-1489: wall-clock-since-meter-start is dominated by inter-tool-call LLM
-latency, not script cost, so it dropped every deferrable sweep every iteration and
-starved the cadence rituals. Zone-drop is now the sole drop path; `elapsed_ms` /
-`cap_ms` are telemetry-only.)
 
 Fail-open: any meter error returns `run`. The meter is velocity optimization,
 not safety gating — never block the loop on a meter bug.
@@ -1128,12 +1123,10 @@ Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5.0-scripted
 ```
 Bash: bash core/scripts/execution-diary.sh phase-start phase-0.5a-guardrails
 Bash: matched=$(bash core/scripts/guardrail-check.sh --context any --phase pre-selection --type both 2>/dev/null)
-IF matched.matched_count > 0:
-    FOR EACH guardrail in matched.matched:
-        Bash: <run {guardrail.action_hint}>
-        IF output reveals issues:
-            → invoke CREATE_BLOCKER(affected_skill, issue_description, ...)
-Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5a-guardrails
+# The matched rules are counted, not run: action_hint is a regex-picked prose token, sometimes a script the rule forbids.
+# Rationale (WHY one bounded action): core/config/rationale/guardrail-hint-loop.md
+Bash: bash core/scripts/infra-health.sh streak-alert --no-sync-blockers   # read-only; rc=1 = alerts, escalation is Phase 0.5b's
+Bash: bash core/scripts/execution-diary.sh phase-end phase-0.5a-guardrails --note "0.5a matched=<matched_count> hints=<with action_hint> hints_run=0 alerts=<alert_count>"
 ```
 
 ## Phase 0.5b: Blocker Resolution Check

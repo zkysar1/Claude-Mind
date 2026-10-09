@@ -1809,6 +1809,22 @@ do_verify() {
             || echo "[iteration-close] ⚠ completed_by_role stamp failed for $GOAL_ID (non-fatal; field stays absent = unknown)" >&2
     fi
 
+    # g-375-152: stamp the HARNESS the closing worker ran in, under the role
+    # stamp's exact guard. The HIGH-goal pace forecast measures each harness's
+    # median hours per goal from these closes, and nothing else on a closed goal
+    # says whether a Claude Code session or a zakcode Body did the work.
+    # rt_judge_provenance is the one resolver, and it runs here in the closer's
+    # own process, never in the daemon, which holds some other session's
+    # environment. An unresolvable harness writes nothing: absent means unknown.
+    if [[ -n "${BODY_ROLE:-}" && "$GOAL_STATUS" == "completed" ]]; then
+        local _closer_harness
+        _closer_harness="$(source "$SCRIPT_DIR/_runtime.sh" && rt_judge_provenance && printf '%s' "$RT_JUDGE_HARNESS")" || _closer_harness=""
+        if [[ -n "$_closer_harness" ]]; then
+            bash "$SCRIPT_DIR/aspirations-update-goal.sh" --source "$SOURCE" "$GOAL_ID" completed_by_harness "$_closer_harness" \
+                || echo "[iteration-close] ⚠ completed_by_harness stamp failed for $GOAL_ID (non-fatal; field stays absent = unknown)" >&2
+        fi
+    fi
+
     # g-306-442: stamp the DELIVERABLE SHA on a worker close. The delivery gate
     # in _delivery_gate.py holds a dependent whose blocker's commit is reachable
     # only from refs/workers/** -- but it reads the registered `commit_sha`

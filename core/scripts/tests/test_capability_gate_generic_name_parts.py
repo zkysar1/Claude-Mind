@@ -59,9 +59,14 @@ import sys
 
 import pytest
 
+from _frontier_world import requires_frontier_world
+
 SCRIPT_DIR = pathlib.Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 GATE_PY = CORE_SCRIPTS / "capability-gate.py"
+
+pytestmark = requires_frontier_world(
+    "its expectations are counted on the frontier origin's 241-entry capability catalog")
 
 # The two measured FPs. Neither names a capability: no imperative verb aimed at a
 # provisionable action, no compound identifier, no script name.

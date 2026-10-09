@@ -47,6 +47,8 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 if str(CORE_SCRIPTS) not in sys.path:
@@ -60,6 +62,17 @@ sys.modules["gs_saturation_waiver"] = gs
 _spec.loader.exec_module(gs)
 if _KEEP is not None:
     os.environ["MIND_AGENT"] = _KEEP
+
+
+@pytest.fixture(autouse=True)
+def _weights_present(monkeypatch):
+    # The selector takes its weights from this deployment's meta strategy file and treats an
+    # absent key as opted out (rb-215). A downstream meta evolves on its own and may lack these
+    # two, which made 5 tests here red on KeyError or None where 0.0 is expected (the v2.12.95
+    # adopt, ). The tests pin the waiver's logic, not the meta file: a live weight is
+    # kept, and an absent one takes the value the docstring above documents.
+    for name, documented in (("per_goal_saturation", 0.8), ("directive_boost", 1.5)):
+        monkeypatch.setitem(gs.WEIGHTS, name, gs.WEIGHTS.get(name, documented))
 
 
 def _sig(hours_ago=0.5):

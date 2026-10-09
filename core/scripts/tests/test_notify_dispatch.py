@@ -20,6 +20,10 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS))
 
 import notify_dispatch as nd  # noqa: E402
+from _frontier_world import requires_frontier_world  # noqa: E402
+
+pytestmark = requires_frontier_world(
+    "it runs as the frontier origin's alpha and bravo agents, whose self.md the payload builder reads")
 
 FAKE_TRANSPORT = '''#!/usr/bin/env bash
 # fake domain transport: record the payload + env, succeed unless asked to fail

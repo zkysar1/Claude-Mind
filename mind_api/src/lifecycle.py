@@ -15,6 +15,7 @@ import contextlib
 import errno
 import os
 import socket
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +67,17 @@ def parent_pid_file(project_root: Path) -> Path:
     return runtime_dir(project_root) / "daemon.parent.pid"
 
 
+def host_file(project_root: Path) -> Path:
+    # : the HOST that published daemon.pid, written by that daemon. A pid only
+    # means something on the host that owns it: on a state dir shared across hosts (a
+    # vessel mind-workspace on a network filesystem) every `kill -0` / is_pid_alive on THIS host reads a
+    # peer host's live daemon as dead. The file's MTIME is the daemon's heartbeat
+    # (touch_host_marker), so one file says both whose pid it is and whether that host
+    # is still serving. core/scripts/_daemon_host_hold.sh is the shell twin of
+    # foreign_host_hold below.
+    return runtime_dir(project_root) / "daemon.host"
+
+
 def daemon_log(project_root: Path) -> Path:
     return runtime_dir(project_root) / "daemon.log"
 
@@ -91,7 +103,7 @@ def _atomic_write_text(target: Path, content: str) -> None:
 
 def write_pid_and_port_atomic(project_root: Path, pid: int, port: int,
                               parent_pid: Optional[int] = None) -> None:
-    """Write PID, PORT, and (optionally) parent-PID files atomically.
+    """Write PID, PORT, host-marker, and (optionally) parent-PID files atomically.
 
     Order matters: write port FIRST, then parent_pid, then PID. is_daemon_alive()
     requires BOTH port + pid files to exist before reading PID — port-first
@@ -113,7 +125,65 @@ def write_pid_and_port_atomic(project_root: Path, pid: int, port: int,
     else:
         with contextlib.suppress(FileNotFoundError):
             parent_pid_file(project_root).unlink()
+    # : the host marker goes BEFORE the pid, like the parent pid: by the time the
+    # pid is published (and is_daemon_alive starts returning True) the file saying whose
+    # pid it is is already on disk, so no reader sees a pid without its owner.
+    _atomic_write_text(host_file(project_root), f"{local_host_id()}\n")
     _atomic_write_text(pid_file(project_root), f"{pid}\n")
+
+
+# : another host's daemon counts as LIVE while daemon.host is younger than this.
+# The daemon touches it every __main__._SUPERSEDE_CHECK_SECONDS (10 s); 120 s tolerates a
+# dozen missed ticks plus NFS attribute-cache lag. core/scripts/_daemon_host_hold.sh
+# carries the same number as _DHH_HOLD_SECONDS; test_daemon_foreign_host_hold pins the pair.
+HOST_HOLD_SECONDS = 120
+
+
+def local_host_id() -> str:
+    """This host as daemon.host records it: the kernel nodename, lowercased."""
+    return socket.gethostname().strip().lower()
+
+
+def read_host(project_root: Path) -> Optional[str]:
+    """The host named in daemon.host, or None (absent, empty or unreadable)."""
+    try:
+        text = host_file(project_root).read_text(encoding="utf-8").strip().lower()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
+
+
+def foreign_host_hold(project_root: Path, now: Optional[float] = None) -> Optional[str]:
+    """The OTHER host whose daemon still holds these runtime files, else None.
+
+    daemon.host names the host that published daemon.pid and its mtime is that daemon's
+    heartbeat. Held = another host AND refreshed within HOST_HOLD_SECONDS. No marker
+    (every daemon that predates it), an empty one, or one naming this host is None:
+    behaviour unchanged. A foreign marker whose heartbeat has lapsed is None too (that
+    daemon is gone), though its pid is still not ours to probe or signal, which is the
+    extra `stale` state the shell twin gives the launchers.
+    """
+    recorded = read_host(project_root)
+    if recorded is None or recorded == local_host_id():
+        return None
+    try:
+        age = (time.time() if now is None else now) - host_file(project_root).stat().st_mtime
+    except OSError:
+        return None
+    return recorded if age < HOST_HOLD_SECONDS else None
+
+
+def touch_host_marker(project_root: Path) -> None:
+    """Heartbeat: refresh daemon.host while daemon.pid still names this process.
+
+    Called from the daemon main loop. The pid check keeps a superseded daemon from
+    refreshing its successor's marker. Best effort: a failed touch only ages the
+    heartbeat, and a lapsed heartbeat degrades to the pre-marker behaviour.
+    """
+    if read_pid(project_root) != os.getpid():
+        return
+    with contextlib.suppress(OSError):
+        os.utime(host_file(project_root), None)
 
 
 def clear_runtime_files(project_root: Path) -> None:
@@ -137,11 +207,15 @@ def clear_runtime_files(project_root: Path) -> None:
     spawns serialize on _spawn_lock. Do NOT add locking here — it would guard
     an interleaving the orchestration already prevents.
     """
+    # : files published by ANOTHER host whose daemon is still heartbeating are not
+    # ours to clear. is_pid_alive below runs on THIS host and would read that daemon as dead.
+    if foreign_host_hold(project_root) is not None:
+        return
     owner = read_pid(project_root)
     if owner is not None and owner != os.getpid() and is_pid_alive(owner):
         return
     for f in (pid_file(project_root), port_file(project_root),
-              parent_pid_file(project_root)):
+              parent_pid_file(project_root), host_file(project_root)):
         with contextlib.suppress(FileNotFoundError):
             f.unlink()
 

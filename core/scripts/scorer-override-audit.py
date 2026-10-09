@@ -84,7 +84,11 @@ FORCE_CODE = "force-override"
 # — the real actionable signal both real fires carried ( 4×,
 #  13×) that the "tune weights" text buried.
 WEIGHT_SIGNAL_CODES = frozenset({"force-override"})
-LANE_DISCIPLINE_CODES = frozenset({"cross-agent", "self-abstention"})
+# pace-yield (): a slow session's walk (a worker's select-walk or, since
+# , the reducer's pace walk) left a HIGH top to faster sessions its pace
+# forecast says finish it sooner. By design, like self-abstention, and logged only
+# from the walk's own census (scorer-verdict-gate WALK_YIELDED_CODE).
+LANE_DISCIPLINE_CODES = frozenset({"cross-agent", "self-abstention", "pace-yield"})
 RUNNABILITY_CODES = frozenset({"precondition-fail", "partner-claim", "blocker-gate"})
 STUCK_TOP_THRESHOLD = 3  # STRICTLY MORE THAN this many deviations over ONE scorer_top
 # : a single claim DECISION that is retried emits one diary row per
@@ -357,7 +361,8 @@ def _recommendation_clauses(report: dict) -> list[tuple[str, str]]:
         who = ", ".join(f"{a} ({n}×)" for a, n in lane_agents)
         clauses.append((
             "lane",
-            f"LANE-DISCIPLINE (by-design, NOT weights): {who} — cross-agent + self-abstention are "
+            f"LANE-DISCIPLINE (by-design, NOT weights): {who} — cross-agent, self-abstention and "
+            "pace-yield are "
             "deviations the scorer INTENTIONALLY leaves to the agent layer. Encoding lane into the "
             "weights would VIOLATE Scorer Sovereignty (g-115-2939 explicit conclusion). No weight "
             "tuning warranted; any residual action is agent-layer lane discipline, not the scorer.",

@@ -650,7 +650,7 @@ Bash: source core/scripts/_paths.sh && py -3 core/scripts/hardcoded-scope-audit.
 # domain half. Without the projection the body is ~144KB.
 IF verdict == "SCANNED_PARTIAL" AND roots_skipped: surface it — counts are a FLOOR.
 IF files_scanned == 0: surface READ FAILURE. ELIF tier_counts["active-scope"] == 0:
-   continue silently to Phase 0.5c.
+   continue silently to Phase 0.5b.23.
 ELSE: surface the count; pull rows with `--tier active-scope --json`, route by lane.
 ```
 

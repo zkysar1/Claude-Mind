@@ -44,6 +44,10 @@ source "$SCRIPT_DIR/_paths.sh"
 # IRREDUCIBLY LOCAL for the per-Bash-call latency budget. Do not "unify" those.
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/_daemon_env_scrub.sh"
+# : who owns the pid in daemon.pid (this host or another). One definition,
+# two callers (this file and _runtime.sh rt_spawn): the _daemon_host_hold.sh header.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_daemon_host_hold.sh"
 
 # B16: RUNTIME_DIR override isolates the daemon's runtime files so a
 # daemon-integration test can spawn a daemon without hijacking the live one's
@@ -53,6 +57,7 @@ RT_DIR="${RUNTIME_DIR:-$PROJECT_ROOT/mind_api/state}"
 PID_FILE="$RT_DIR/daemon.pid"
 PORT_FILE="$RT_DIR/daemon.port"
 PARENT_PID_FILE="$RT_DIR/daemon.parent.pid"
+HOST_FILE="$RT_DIR/daemon.host"
 SPAWN_LOG="$RT_DIR/spawn.log"
 
 # --restart forces a recycle even when the daemon is healthy-and-responsive.
@@ -172,7 +177,18 @@ _read_parent_pid() {
 }
 
 _clean_runtime_files() {
-    rm -f "$PID_FILE" "$PORT_FILE" "$PARENT_PID_FILE" 2>/dev/null || true
+    rm -f "$PID_FILE" "$PORT_FILE" "$PARENT_PID_FILE" "$HOST_FILE" 2>/dev/null || true
+}
+
+# : daemon.pid names a daemon on ANOTHER host that is still heartbeating.
+# Cleaning the files, signalling the pid or spawning over them would take that
+# daemon's files (or a same-numbered local process), so do none of it. Exit 1
+# matches the shared-runtime claim gate (); the EXIT trap releases the lock.
+_daemon_host_refuse() {
+    _log "REFUSED: daemon.pid (PID=$1) was published by host $_dhh_host, not this host; heartbeat ${_dhh_age}s old, held for ${_DHH_HOLD_SECONDS}s. Not cleaning, signalling or spawning over it."
+    echo "[daemon-start] REFUSED: $PID_FILE names a daemon on host '$_dhh_host', heartbeat ${_dhh_age}s old." >&2
+    echo "[daemon-start]   A state dir shared across hosts holds ONE daemon. Give this host its own runtime dir (RUNTIME_DIR), or wait for the heartbeat to pass ${_DHH_HOLD_SECONDS}s if that host is gone." >&2
+    exit 1
 }
 
 # _acquire_spawn_lock / _release_spawn_lock — wrapper-side spawn mutex.
@@ -579,6 +595,11 @@ fi
 # path — see _force_kill_tree.
 existing_parent_pid="$(_read_parent_pid || echo "")"
 
+# : whose pid is this? On a state dir shared across hosts it can belong to a
+# daemon on ANOTHER host, which `kill -0` here reads as dead. Classify it BEFORE the
+# probe-then-kill/clean decision below (why: the _daemon_host_hold.sh header).
+daemon_host_hold "$PID_FILE"
+
 # 1. Check if daemon is already up and healthy.
 #  fix: health-probe FIRST. POSIX `kill -0` false-negatives on
 # MSYS Git Bash against detached native-Windows processes — concluding
@@ -595,6 +616,11 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
         if [ "$FORCE_RESTART" != "1" ]; then
             _log "daemon already running (PID=$existing_pid, port=$existing_port)"
             exit 0
+        fi
+        # : --restart recycles the pid in daemon.pid (signal it, delete its files).
+        # Another host's live heartbeat means that pid is not this host's to recycle.
+        if [ "$_dhh_state" = "held" ]; then
+            _daemon_host_refuse "$existing_pid"
         fi
         # --restart: healthy but a daemon-code commit landed, so the
         # in-memory code is stale. Recycle.
@@ -734,6 +760,12 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
         date +%s > "$_rr_stamp" 2>/dev/null || true
         _log "daemon healthy (PID=$existing_pid parent=${existing_parent_pid:-?}) but --restart requested; recycling for fresh code"
         need_recycle=1
+    elif [ "$_dhh_state" = "held" ]; then
+        _daemon_host_refuse "$existing_pid"
+    elif [ "$_dhh_state" = "stale" ]; then
+        # Not this host's pid: the daemon that wrote it is gone (heartbeat lapsed), but a
+        # same-numbered local process is unrelated, so clean the files and never signal it.
+        _log "stale PID file (PID=$existing_pid was published by host $_dhh_host, heartbeat ${_dhh_age}s old), cleaning up without signalling it"
     elif _is_pid_alive "$existing_pid"; then
         # Health probe failed but kill -0 says the PID is alive —
         # genuinely unresponsive daemon (not a Windows false-negative).
@@ -749,10 +781,22 @@ if [ -n "$existing_pid" ] && [ -n "$existing_port" ]; then
     fi
 elif [ -n "$existing_pid" ]; then
     # PID file but no port file — partial state.
-    if _is_pid_alive "$existing_pid"; then
+    if [ "$_dhh_state" = "held" ]; then
+        _daemon_host_refuse "$existing_pid"
+    elif [ "$_dhh_state" = "local" ] && _is_pid_alive "$existing_pid"; then
         _log "PID $existing_pid alive but no port file — killing orphan"
         need_recycle=1
     fi
+fi
+
+#  (fresh-eyes finding): a fresh heartbeat from ANOTHER host and no pid file at all. Every
+# refusal above needs an existing_pid, so this case fell through to the clean below, which deleted
+# the live peer's marker and port file, and then spawned a second daemon over them. The peer writes
+# the host before the pid, so a launcher arriving inside that window lands here; so does a pid file
+# something else removed. It ends on its own: the heartbeat runs only while daemon.pid names the
+# daemon, so within the hold window the marker classifies `stale` and the files go as usual.
+if [ "$_dhh_state" = "held" ]; then
+    _daemon_host_refuse "${existing_pid:-none}"
 fi
 
 #  v3 BULLETPROOF KILL:
@@ -767,9 +811,13 @@ fi
 #   3. Each Stop-Process is CommandLine-guarded against 'mind_api' to defend
 #      against Windows PID reuse.
 #   4. Results are logged to spawn.log — no more silent >/dev/null 2>&1.
-if [ "$need_recycle" = "1" ]; then
+# : gate on the EFFECT. `held` never reaches here (refused above), and a `stale`
+# foreign pid number may name an unrelated local process: its files go, the signal does not.
+if [ "$need_recycle" = "1" ] && [ "$_dhh_state" = "local" ]; then
     _kill_escalate "$existing_pid" "$existing_port"
     _force_kill_tree "$existing_pid" "$existing_parent_pid"
+elif [ "$need_recycle" = "1" ]; then
+    _log "not signalling PID $existing_pid: published by host $_dhh_host, not this host (its files are cleaned below)"
 fi
 
 # Clean state files regardless of whether we killed. A stale PID file

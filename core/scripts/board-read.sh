@@ -28,12 +28,13 @@ LAST=""
 AS_JSON=0
 MARK_READ=0
 UNREAD_ONLY=0
+UNHANDLED_ONLY=0
 
 # Value-arg pattern: "${2-}" + safe shift; see retrieve.sh for rationale.
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
-            echo "Usage: board-read.sh --channel <ch> [--since <w>] [--author <a>] [--tag <t>] [--type <t>] [--last <N>] [--json] [--mark-read] [--unread-only]"
+            echo "Usage: board-read.sh --channel <ch> [--since <w>] [--author <a>] [--tag <t>] [--type <t>] [--last <N>] [--json] [--mark-read] [--unread-only] [--unhandled-only]"
             exit 0;;
         --channel) CHANNEL="${2-}"; shift $(( $# >= 2 ? 2 : 1 ));;
         --since)   SINCE="${2-}";   shift $(( $# >= 2 ? 2 : 1 ));;
@@ -44,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --json)       AS_JSON=1; shift;;
         --mark-read)  MARK_READ=1; shift;;
         --unread-only) UNREAD_ONLY=1; shift;;
+        --unhandled-only) UNHANDLED_ONLY=1; shift;;
         *)
             # : this arm silently appended to a dead PASSTHROUGH
             # accumulator (fed the pre-2026-05-14 CLI fallback, read by nothing
@@ -51,7 +53,7 @@ while [[ $# -gt 0 ]]; do
             # WRONG population with rc=0 (the rb-245 authoritative-false-count
             # shape). Refuse loudly. Exit 2 per the _argv_strict.sh convention
             # (the daemon path exits 1, so tests need a distinct rc).
-            argv_strict_refuse_unknown "board-read.sh" "$1" "--channel <ch> | --since <window> | --author <a> | --tag <t> | --type <t> | --last <N> | --json | --mark-read | --unread-only";;
+            argv_strict_refuse_unknown "board-read.sh" "$1" "--channel <ch> | --since <window> | --author <a> | --tag <t> | --type <t> | --last <N> | --json | --mark-read | --unread-only | --unhandled-only";;
     esac
 done
 
@@ -70,6 +72,12 @@ else
     [ "$AS_JSON" = "1" ]     && QUERY+="&json=1"
     [ "$MARK_READ" = "1" ]   && QUERY+="&mark_read=1"
     [ "$UNREAD_ONLY" = "1" ] && QUERY+="&unread_only=1"
+    # : --unhandled-only filters on the HANDLED receipt (a disposition),
+    # not the SHOWN one --mark-read writes. unread_only=1 rides beside it on
+    # purpose: the daemon gives unhandled_only precedence, and a daemon that
+    # predates the flag ignores it and so degrades to the SHOWN filter (the old
+    # dedup) instead of to no filter, which would re-ack every directive per pass.
+    [ "$UNHANDLED_ONLY" = "1" ] && QUERY+="&unhandled_only=1&unread_only=1"
     # : mark_read=1 makes this GET a WRITE (the daemon appends read
     # receipts), so rt_call must never send it twice — with --unread-only the
     # second reply is EMPTY, because the first one consumed the unread set.

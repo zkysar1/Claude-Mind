@@ -1,5 +1,27 @@
 [
   {
+    "version": "2.12.97",
+    "previous_version": "2.12.96",
+    "date": "2026-10-09",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "deployment-shaped-run rerun-3 VALID (ref 3fc177d6ca): CONTROL 4/4 seeded probes red, probe leg exactly 4, harness rc=1; TOTAL 175 red of 28552 tests (607 skipped, NOT run) in 1515 files = main leg 158 failed + 12 errors (27774 passed, 3190.55s) + invisible leg 5/83 red; CLASSES agent-conf=24 catalog=1 daemon=2 other=143; every red file owned (unit-3 omni table 19/19; unowned residue -> g-358-247; g-360-14/g-115-8407/g-115-8874 folded here); FULL suite at tag point 30213 passed / 33 failed (18 files, none touched by this goal's commits); REPLACES v2.12.96 (cut but REFUSED by seed-preflight at the plant: pilot-run-harvest SKILL.md unparseable frontmatter, unquoted '#' in the triggers flow sequence opened a YAML comment; v2.12.96 = DO-NOT-PROMOTE); fix in this tag: 2111bf8eb4 (quote the trigger; 152/152 SKILL.md parse); harness two-leg split 3fc177d6ca 812b96b6b9 4fb935803d; g-358-245 node fixes 1f0d6f07d4 f9c3f2073a 65e147cda1 bc23367e8e",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
+    "version": "2.12.96",
+    "previous_version": "2.12.95",
+    "date": "2026-10-09",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "deployment-shaped-run rerun-3 VALID (ref 3fc177d6ca): CONTROL 4/4 seeded probes red, probe leg exactly 4, harness rc=1; TOTAL 175 red of 28552 tests (607 skipped, NOT run) in 1515 files = main leg 158 failed + 12 errors (27774 passed, 3190.55s) + invisible leg 5/83 red (test_cross_lane_claim.py, test-g3-worker-store-rails.sh, test-runner-identity-check.sh, test_guardrails_update_field_argv.sh, test_temp_drain_purge.sh); CLASSES agent-conf=24 catalog=1 daemon=2 other=143; every red file owned (unit-3 omni table 19/19; unowned residue -> g-358-247; g-360-14/g-115-8407/g-115-8874 folded here); FULL suite at tag point 30213 passed / 33 failed (18 files, none touched by this goal's commits); fixes in tag: harness two-leg split 3fc177d6ca 812b96b6b9 4fb935803d, hermetic wm-advisory-lock file-read, g-358-245 node fixes 1f0d6f07d4 f9c3f2073a 65e147cda1 bc23367e8e",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.95",
     "previous_version": "2.12.94",
     "date": "2026-10-07",

@@ -131,9 +131,16 @@ def _dump_jsonl(records: list) -> bytes:
     """Serialize records back to jsonl bytes (one compact object per line).
 
     The union keeps whole records unchanged (it does not re-key them), so each
-    record's own key order is preserved by json.dumps(sort_keys=False)."""
-    lines = [json.dumps(r, ensure_ascii=False) for r in records]
-    return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+    record's own key order is preserved by json.dumps(sort_keys=False).
+
+    The bytes are coordination_merge's, which are those of every writer of these
+    ledgers: json.dumps(rec, ensure_ascii=True) + "\\n" (experience_write.py,
+    BYTE-COMPATIBILITY). Until 2026-10-07 this dumped ensure_ascii=False, so each
+    git merge rewrote every non-ASCII record raw and the next store write escaped
+    them all again. Measured: 37 counter bumps reached git as a 350-line diff of
+    agents/alpha/experience.jsonl (rb-12090 measured the same re-serialization
+    from the reading side)."""
+    return cm._dump_jsonl(records)
 
 
 # retrieval_stats fields every writer only ever RAISES (both callers of
@@ -600,8 +607,10 @@ def merge_bytes(pathname: str, ours: bytes, theirs: bytes,
     if bn in _COUNTER_JSON:
         a = json.loads(ours.decode("utf-8") or "{}")
         b = json.loads(theirs.decode("utf-8") or "{}")
+        # The writers' bytes: json.dump(meta, indent=2, ensure_ascii=True) + "\n"
+        # (experience_write.py, experience.py write_json), as for the jsonl above.
         return (
-            json.dumps(cm._merge_counters(a, b), ensure_ascii=False, indent=2) + "\n"
+            json.dumps(cm._merge_counters(a, b), ensure_ascii=True, indent=2) + "\n"
         ).encode("utf-8")
     handler = cm.merge_handler_for(pathname)
     if handler is not None:

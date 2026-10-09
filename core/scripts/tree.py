@@ -1420,6 +1420,44 @@ def get_distill_candidates(tree, include_skipped=False, *,
     return candidates
 
 
+# : the DEBT AGGREGATE is actionable debt, not the raw candidate
+# count. 95.8% of distill candidates are bare `low_utility` -- a trigger the
+# framework's OWN distill gate documents as over-flagging (rb-94 / guard-896 /
+# : low retrieval signals under-instrumentation / niche value, NOT
+# bloat; the prescribed per-node outcome is maintain_exempt, not distill).
+# Counting them as debt keeps the auto-backlog predicate (debt > threshold*3
+# = 120) armed PERMANENTLY even though the actionable population is ~32.
+#
+# This helper narrows the DEBT AGGREGATE ONLY. It excludes bare `low_utility`
+# and nothing else: the read-cap arms (oversized_append_grown /
+# oversized_not_append_grown) and large_mediocre are all genuinely actionable
+# (a body past the Read cap is unreadable regardless of how it grew;
+# large_mediocre carries a min-votes + recency bar). It never filters or
+# mutates the candidate list itself, so --distill-candidates callers keep
+# seeing the full population. Do NOT widen the exclusion set to make the
+# number go down -- that is the per-node coherence judgment the gate
+# explicitly requires by body-reading (goal option (c), rejected);
+# automating it converts a safety gate into a rubber stamp.
+_ACTIONABLE_DISTILL_EXCLUDE = frozenset({"low_utility"})
+
+
+def actionable_distill_count(candidates):
+    """Count the distill CANDIDATES that are actually debt ().
+
+    `candidates` is the return of get_distill_candidates -- a plain list of
+    candidate dicts (each with a `trigger` field), or the `candidates` value
+    of its include_skipped `{candidates, skipped}` shape. Bare `low_utility`
+    rows are the over-flag class this function excludes; every other trigger
+    counts. The input is not mutated and the full list is never filtered here.
+    """
+    if isinstance(candidates, dict):
+        candidates = candidates.get("candidates", [])
+    return sum(
+        1 for c in candidates
+        if c.get("trigger") not in _ACTIONABLE_DISTILL_EXCLUDE
+    )
+
+
 def get_children(tree, key):
     """Return immediate children of a node as JSON array with defaults."""
     nodes = tree.get("nodes", {})
@@ -2377,6 +2415,35 @@ def cmd_read(args):
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
 
+    elif args.debt:
+        # : the single code-derived tree-debt number. The prose
+        # predicate sites (aspirations-loop-digest.md Phase 8.7/8.8,
+        # aspirations-consolidate Step 6, /tree SKILL backlog trigger) used to
+        # hand-sum candidate lists; they consume THIS output instead.
+        # `total` is ACTIONABLE debt (bare low_utility excluded) — the number
+        # the auto-backlog predicate and post_run_debt use; the raw candidate
+        # population stays visible under raw_*.
+        distill_c = get_distill_candidates(tree)
+        decompose_c = get_decompose_candidates(tree)
+        actionable = actionable_distill_count(distill_c)
+        threshold = yaml.safe_load(
+            (CONFIG_DIR / "tree.yaml").read_text(encoding="utf-8")
+        )["tree_debt_check"]["debt_threshold"]
+        result = {
+            "total": actionable + len(decompose_c),
+            "decompose": len(decompose_c),
+            "distill_actionable": actionable,
+            "raw": {
+                "distill": len(distill_c),
+                "distill_low_utility": len(distill_c) - actionable,
+            },
+            "threshold": threshold,
+            "backlog_trigger": threshold * 3,
+            "backlog_armed": actionable + len(decompose_c) > threshold * 3,
+            "cleared": actionable + len(decompose_c) <= threshold,
+        }
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
     elif args.maintenance:
         # Single-source-of-truth read path for the maintenance cadence block.
         # Callers (aspirations Phase 8.8) depend on this — DO NOT shadow with
@@ -2535,10 +2602,18 @@ def cmd_record_maintenance(args):
             captured["decompose_detail"] = decompose_detail
             captured["redistribute_detail"] = redistribute_detail
         else:
-            distill_count = len(get_distill_candidates(tree))
-            decompose_count = len(get_decompose_candidates(tree))
+            distill_detail = get_distill_candidates(tree)
+            decompose_detail = get_decompose_candidates(tree)
+            distill_count = len(distill_detail)
+            decompose_count = len(decompose_detail)
 
-        post_debt = distill_count + decompose_count
+        # : the DEBT AGGREGATE is actionable debt. Bare `low_utility`
+        # distill candidates are the over-flag class this framework's own
+        # distill gate documents as not-bloat (see actionable_distill_count) —
+        # they stay in the candidate list and in distill_count, but they no
+        # longer gate last_backlog_clear_at or the auto-backlog predicate.
+        distill_actionable = actionable_distill_count(distill_detail)
+        post_debt = distill_actionable + decompose_count
         if post_debt <= debt_threshold:
             maintenance["last_backlog_clear_at"] = now
 
@@ -2546,19 +2621,29 @@ def cmd_record_maintenance(args):
         tree["last_updated"] = date.today().isoformat()
         captured["maintenance"] = maintenance
         captured["distill_count"] = distill_count
+        captured["distill_actionable"] = distill_actionable
         captured["decompose_count"] = decompose_count
         return tree
 
     locked_modify_yaml(_tree_path(), _do_record)
     maintenance = captured["maintenance"]
     distill_count = captured["distill_count"]
+    distill_actionable = captured["distill_actionable"]
     decompose_count = captured["decompose_count"]
-    post_debt = distill_count + decompose_count
+    post_debt = distill_actionable + decompose_count
 
     result = {
         "maintenance": maintenance,
+        # : `total`/`cleared` are ACTIONABLE debt (bare `low_utility`
+        # excluded — see actionable_distill_count). The raw population stays
+        # visible in distill (raw candidate count, legacy key) and
+        # distill_low_utility; nothing is hidden, the aggregate is narrowed.
+        # Key insertion order is byte-compat significant (daemon mirror in
+        # mind_api/src/world/tree_write.py record-maintenance) — keep in sync.
         "post_run_debt": {
             "distill": distill_count,
+            "distill_actionable": distill_actionable,
+            "distill_low_utility": distill_count - distill_actionable,
             "decompose": decompose_count,
             "total": post_debt,
             "threshold": debt_threshold,
@@ -3902,6 +3987,13 @@ def main():
                             help="Return only ## Decision Rules and ## Verified Values sections from node .md")
     read_group.add_argument("--distill-candidates", action="store_true",
                             help="Leaf nodes eligible for DISTILL based on utility thresholds")
+    read_group.add_argument("--debt", action="store_true",
+                            help=("g-115-5421: the ACTIONABLE tree-debt number "
+                                  "(decompose + distill excluding bare low_utility) "
+                                  "vs tree_debt_check.debt_threshold and its *3 "
+                                  "auto-backlog trigger. Single code-derived "
+                                  "source for the prose predicate sites; never "
+                                  "hand-sum candidate lists."))
     read_group.add_argument("--maintenance", action="store_true",
                             help="Top-level maintenance cadence block from _tree.yaml (single source of truth)")
     read_group.add_argument("--summary", action="store_true",

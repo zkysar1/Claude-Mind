@@ -36,8 +36,9 @@
 #   OUTCOME <n>: NOT MET — <what is missing>; deferred to <goal-id>
 # This script writes whatever it is given. The CHECK is closure-evidence-gate.py,
 # which do_verify runs before the status write. Because this script never
-# clobbers, a note it writes without the table stays on the record, and the
-# close must then be re-run with --outcome-note-file. Spec:
+# clobbers, a note it writes without the table stays on the record. The fix is
+# an appended corrected row, whose command the refusal prints (), or a
+# re-run with --outcome-note-file. Spec:
 # core/config/conventions/goal-schemas.md § Closure Evidence Table.
 #
 # CONTRACT

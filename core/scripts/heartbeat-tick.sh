@@ -164,7 +164,23 @@ fi
 # 120m behavior, which is the fail-open direction.
 if [ -n "${MIND_SID:-}" ]; then
     _HB_BODY_DIR="$AGENT_DIR/$SESSIONS_DIRNAME/$MIND_SID"
-    if [ -d "$_HB_BODY_DIR" ]; then
+    # A CLOSED Body writes neither heartbeat (2026-10-07). It runs no more work
+    # units, but its session can stay open, and every caller of this tick (both
+    # tool-call hooks, the diary path) would keep its carrier fresh for as long
+    # as it does. Fresh is what every carrier reader trusts first: the stall
+    # probe calls it alive before reading body_state, live-Body counts and
+    # reducer promotion act on that, and the worker-ref retire gate carries the
+    # ref (body_row_reaper keeps a fresh `closed` carrier). Writing nothing lets
+    # `ts` age like any ended Body's. The close itself mirrors the closed state
+    # into the carrier (body-manifest _mirror_state_to_carrier), so the stale
+    # carrier reads stale-no-claim and never alerts. This grep is the
+    # stop-hook's, pinned to body-manifest CLOSED_STATES by
+    # test_body_heartbeat_writer.py. An unreadable manifest ticks as before.
+    if [ -f "$_HB_BODY_DIR/body-manifest.yaml" ] \
+        && grep -Eq "^body_state: '?(closed-pending-merge|merged|closed-stale|closed-graceful)'?[[:space:]]*$" \
+            "$_HB_BODY_DIR/body-manifest.yaml"; then
+        echo "[heartbeat-tick] no liveness written: this Body is closed ($_HB_BODY_DIR/body-manifest.yaml) and runs no more work units" >&2
+    elif [ -d "$_HB_BODY_DIR" ]; then
         touch "$_HB_BODY_DIR/body-heartbeat" || true
         # Atomic: write-then-rename, so a concurrent reader never sees a
         # half-written object and decode-fails into a false "holder is dead".
@@ -255,10 +271,18 @@ if [ -n "${MIND_SID:-}" ]; then
         _HB_BASE="$(git -C "$PROJECT_ROOT" merge-base HEAD origin/main)" \
             || { echo "[heartbeat-tick] main_base not published (carrier written without it; git's message is above)" >&2; _HB_BASE=""; }
         [[ "$_HB_BASE" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || _HB_BASE=""
+        # : publish the HARNESS this Body runs in ("claude-code" or
+        # "zakcode"), resolved by _runtime.sh rt_judge_provenance in this
+        # process. The HIGH-goal pace forecast counts the live workers of each
+        # harness from these carriers. The subshell keeps _runtime.sh's
+        # definitions out of the tick. EMPTY IS THE SAFE DIRECTION, as for the
+        # fields above: a carrier with no harness is counted under no harness.
+        _HB_HARNESS="$(source "$(dirname "$0")/_runtime.sh" && rt_judge_provenance && printf '%s' "$RT_JUDGE_HARNESS")" || _HB_HARNESS=""
+        [[ "$_HB_HARNESS" =~ ^[a-z-]{0,32}$ ]] || _HB_HARNESS=""
         _HB_TMP="$_HB_CARRIER.tmp.${BASHPID:-$$}"
-        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s","machine_id":"%s","main_base":"%s"}\n' \
+        printf '{"sid":"%s","agent":"%s","host":"%s","ts":"%s","body_state":"%s","machine_id":"%s","main_base":"%s","harness":"%s"}\n' \
             "$MIND_SID" "${MIND_AGENT:-}" "$(hostname || echo unknown)" \
-            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" "$_HB_BASE" > "$_HB_TMP" \
+            "$(date +%Y-%m-%dT%H:%M:%S)" "$_HB_STATE" "${MACHINE_ID:-}" "$_HB_BASE" "$_HB_HARNESS" > "$_HB_TMP" \
             && mv -f "$_HB_TMP" "$_HB_CARRIER" || { rm -f "$_HB_TMP" || true; }
     else
         # Say so. A silent skip here reads as "the tick ran and wrote nothing",

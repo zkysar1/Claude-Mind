@@ -82,8 +82,9 @@ def main(argv=None) -> int:
             gid = current[0]
             print(f"[release-train] LLM-ACTION: release train stalled - {verdict['reason']}; "
                   f"open goal {gid} holds the disposal: cut and promote per "
-                  f"core/config/conventions/promotion-runbook.md, or close {gid} skipped "
-                  f"with why not.")
+                  f"core/config/conventions/promotion-runbook.md (run "
+                  f"core/scripts/deployment-shaped-run.py on the candidate before the cut), "
+                  f"or close {gid} skipped with why not.")
         return 0
 
     if args.json:

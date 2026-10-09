@@ -16,6 +16,12 @@ Optional filters (all combinable):
     json=1               output as JSONL (one message per line)
                           default: human-readable [ts] author (type): text ...
     unread_only=1        filter out messages already seen by the requesting agent
+    unhandled_only=1     filter out messages the requesting agent has DISPOSED of
+                          (a sidecar row carrying kind=handled), so a post that was
+                          shown but never acted on comes back (g-115-5921). Takes
+                          precedence over unread_only: a caller sends both so a
+                          daemon that predates this flag degrades to the SHOWN
+                          filter instead of to no filter at all.
     mark_read=1          after returning messages, append their IDs to the
                           per-channel reads sidecar so subsequent reads skip them
 
@@ -222,8 +228,13 @@ def _reads_sidecar_path(ctx, channel: str):
     return ctx.paths.world / "board" / f"{channel}-reads.jsonl"
 
 
-def _load_seen_set(ctx, channel: str, agent: str) -> set:
+def _load_seen_set(ctx, channel: str, agent: str, kind: str | None = None) -> set:
     """Load msg_ids already read by `agent` from the sidecar.
+
+    kind=None counts every row by the agent (SHOWN: a handled row implies the
+    post was shown). kind="handled" counts only rows carrying kind=handled
+    (HANDLED: the agent disposed of the post); legacy rows carry no kind and so
+    never count as handled.
 
     Mirrors board.py:_load_read_msg_ids (lines 375-400). Fail-open: returns
     empty set on any error so unread_only never blocks the read path.
@@ -243,6 +254,8 @@ def _load_seen_set(ctx, channel: str, agent: str) -> set:
                 except json.JSONDecodeError:
                     continue
                 if row.get("reader_agent") == agent:
+                    if kind and row.get("kind") != kind:
+                        continue
                     mid = row.get("msg_id")
                     if mid:
                         seen.add(mid)
@@ -527,11 +540,18 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
     # T1.7: --unread-only / --mark-read parity (board.py lines 245-296).
     from ._jsonl_common import flag as _flag
     unread_only = _flag(q, "unread_only")
+    unhandled_only = _flag(q, "unhandled_only")
     mark_read = _flag(q, "mark_read")
     current_agent = ctx.paths.agent_name or "unknown"
     seen = (_load_seen_set(ctx, channel, current_agent)
             if (unread_only or mark_read) else set())
-    if unread_only:
+    if unhandled_only:
+        # HANDLED, not SHOWN: --mark-read below still records that the post was
+        # displayed, but only a disposition (kind=handled) removes it from this
+        # filter, so a shown-but-unacted post re-surfaces ().
+        handled = _load_seen_set(ctx, channel, current_agent, "handled")
+        messages = [m for m in messages if m.get("id") not in handled]
+    elif unread_only:
         messages = [m for m in messages if m.get("id") not in seen]
 
     as_json = (q.get("json") or "").lower() not in ("", "0", "false", "no")
@@ -574,7 +594,9 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
         _v = q.get(_k)
         if _v:
             _filters.append(f"{_k}={_v}")
-    if unread_only:
+    if unhandled_only:
+        _filters.append("unhandled_only=1")
+    elif unread_only:
         _filters.append("unread_only=1")
     if archive_note:
         _filters.append(archive_note)

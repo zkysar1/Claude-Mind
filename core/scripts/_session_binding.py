@@ -138,6 +138,56 @@ def _parse_yaml_min(text: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+#: Binding modes that, on a session which forked a per-Body working memory, mean
+#: that session's own worker /stop LANDED it (stop/SKILL.md Step 0.6, worker
+#: branch): its Body is closed and the session is no longer a worker. Nothing else
+#: writes these modes onto a forked session, because /start refuses a reader or
+#: assistant bind on an ex-worker SID in all three branches. So the predicate
+#: changes only at this session's own command boundary, never under it by another
+#: process, which is why it keys on the binding and not on the manifest's
+#: body_state (bash-agent-inject.py, ).
+LANDED_MODES = ("reader", "assistant")
+
+
+def is_landed_mode(mode: Optional[str]) -> bool:
+    """True when a binding's `mode` marks a FORKED session as landed."""
+    return (mode or "").strip() in LANDED_MODES
+
+
+def landed_mode_in(session_dir: Path) -> Optional[str]:
+    """The landed mode of the session whose per-session dir this is, else None.
+
+    Landed means the dir holds a forked working-memory.yaml (the session was a
+    worker Body) AND its binding.yaml carries a mode in LANDED_MODES. Callers:
+    bash-agent-inject.py (worker routing), _shared_tick.py (heartbeat),
+    session.py and session-mode-get.sh (mode; the .sh mirrors this by hand),
+    postcompact-restore.py (banner).
+
+    A line scan rather than _parse_yaml_min: _shared_tick runs this on every tool
+    call of a Body, and session-binding-write.py writes `mode:` on its own line.
+    Fail-open: any error answers None, the pre-landing behaviour.
+    """
+    try:
+        if not (session_dir / "working-memory.yaml").is_file():
+            return None
+        text = (session_dir / _BINDING_FILENAME).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    for line in text.splitlines():
+        if line.startswith("mode:"):
+            tokens = line[len("mode:"):].split()
+            mode = tokens[0].strip("'\"") if tokens else ""
+            return mode if is_landed_mode(mode) else None
+    return None
+
+
+def landed_mode(project_root: Path, agent: str, sid: str) -> Optional[str]:
+    """landed_mode_in() for `agent`'s session `sid` under `project_root`."""
+    if not _valid_sid_shape(sid) or not _valid_agent_name(agent):
+        return None
+    return landed_mode_in(_agent_dir(project_root, agent) / _SESSIONS_DIRNAME / sid)
+
+
 def _try_phase26_binding(sid: str, project_root: Path) -> Optional[SessionBinding]:
     """Look for agents/*/sessions/<SID>/binding.yaml. Returns None if absent.
 

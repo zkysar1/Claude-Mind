@@ -50,7 +50,7 @@ bridge that calls the helper via `py -3 -c "from <module> import ..."`:
 | File | Constants inlined | Reason |
 |------|-------------------|--------|
 | `core/scripts/cleanup-stale-bindings.sh` | `AGENTS_PARENT_DIR` (`_APD`), `SESSIONS_DIRNAME` (`_SDN`) | IRREDUCIBLY LOCAL — per-Bash-call latency budget |
-| `core/scripts/session-mode-get.sh` | `AGENTS_PARENT_DIR` (`_APD`) | IRREDUCIBLY LOCAL — session-state critical path |
+| `core/scripts/session-mode-get.sh` | `AGENTS_PARENT_DIR` (`_APD`), `SESSIONS_DIRNAME` (`_SDN`) | IRREDUCIBLY LOCAL — session-state critical path |
 | `core/scripts/session-signal-exists.sh` | `AGENTS_PARENT_DIR` (`_APD`) | IRREDUCIBLY LOCAL — hook hot path |
 | `core/scripts/session-state-get.sh` | `AGENTS_PARENT_DIR` (`_APD`) | IRREDUCIBLY LOCAL — every loop iteration |
 | `core/scripts/_wake_signals.py` | `AGENTS_PARENT_DIR` (`_AGENTS_PARENT_DIR`) | imported via `py -3 -c "from _wake_signals import ..."` from shell — must stay self-contained |

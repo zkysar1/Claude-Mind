@@ -41,12 +41,15 @@ Read this once per session. Reference it at each of the three orchestrator phase
    and journal:
        OUTCOME <n>: MET — <measured value>. Source: <command + output | path | sha | the two timestamps>
        OUTCOME <n>: NOT MET — <what is missing>; deferred to <goal-id>
-   Write it to a file and pass `--summary-file <file>`. If the record already
-   carries an outcome_note, pass `--outcome-note-file <file>`: it REPLACES the
-   note, so put the rows above its text. do_verify's closure-evidence gate refuses a
-   completed close without the table, or whose MET row cites a missing path or
-   store key, or an interval without two timestamps. Spec: goal-schemas.md
-   § Closure Evidence Table. Blocked/skipped closes take a one-line `--summary`.
+   Write it to a file and pass `--summary-file <file>`. do_verify's closure-evidence
+   gate refuses a completed close without the table, or whose MET row cites a
+   missing path or store key, or an interval without two timestamps, or whose NOT
+   MET row names no live (pending or in-progress) carrier. If the record already
+   carries an outcome_note, the refusal prints the fix: append a `(corrected)` row
+   per failing outcome, then re-run the same close. `--outcome-note-file <file>`
+   rewrites the whole note instead: it REPLACES it, so put the rows above its text.
+   Spec: goal-schemas.md § Closure Evidence Table. Blocked/skipped closes take a
+   one-line `--summary`.
 
 5. **Gate D primary-outcome env (only when `gate-d-check.sh` returns "on";
    GATE-INTEGRITY — omni-blessed text, do not modify):** prefix the

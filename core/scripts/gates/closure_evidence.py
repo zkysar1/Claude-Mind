@@ -40,9 +40,22 @@ THE CHECKS ON A MET ROW. Each maps to a measured shape:
 A row that asserts ABSENCE (removed, deleted, exists: false) is exempt from the
 path check: its paths are meant to be gone (guard-2190, polarity).
 
-A NOT MET row on a completed close must say "deferred to <goal-id>". That
-phrase is a residual-work marker, so gates.residual_work then requires the
-named goal to be live. This module does not re-implement that check.
+A NOT MET row on a completed close must say "deferred to <goal-id>", and the
+goal it names must be live (g-375-162). The residual-work gate asks only that
+SOME carrier in the whole note be live, so one live carrier lifted every row:
+measured 2026-10-08, a note whose outcome 3 deferred to a completed goal passed
+it once outcome 4 named a live one. So each NOT MET row is checked on its own,
+by the residual-work gate's own live set, when the caller passes
+carrier_status. The goal itself never counts as its own carrier. A carrier
+that cannot be looked up is a warning, never a refusal.
+
+A STORED NOTE IS FIXED BY APPENDING A ROW. The closure-note writer never
+overwrites a note, so a bad row stays on the record (zc-04, 2026-10-08: one
+refusal, then 3.5 h without the hand-rebuilt note it asked for). A row headed
+"OUTCOME <n> (corrected): ..." that comes LAST for its outcome replaces every
+earlier row for it, so goal-field-append.sh can fix one row and leave the rest
+of the note alone. remedy_lines() prints that command, and the command that
+files a missing carrier as pending.
 
 It never decides a close by itself. It returns a verdict. The CLI
 (closure-evidence-gate.py) picks the note that will land, wires the store, and
@@ -58,6 +71,7 @@ claim rests on, or whose note names no host. See its section at the end.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 from pathlib import Path
@@ -76,6 +90,14 @@ ROW_RE = re.compile(
 STATUS_RE = re.compile(r"^(NOT[ \t-]+MET|UNMET|MET)\b", re.IGNORECASE)
 DEFERRED_RE = re.compile(r"\bdeferred\s+to\b[^\n]*?\bg-\d{1,4}-\d+\b", re.IGNORECASE)
 AGENT_LEG_RE = re.compile(r"\bagent-leg-complete\b", re.IGNORECASE)
+# "OUTCOME 4 (corrected): ...". Matched only in the header, before the
+# separator, so a row whose TEXT says "(corrected" is not a corrected row.
+CORRECTED_RE = re.compile(r"\(\s*corrected\b", re.IGNORECASE)
+# A carrier id as a lookup needs it, lettered child kept: -b is a
+# different goal from , and a narrower pattern silently looks up the
+# parent (guard-2414). aspirations.py GOAL_ID_RE admits the child; the
+# residual-work gate's own pattern still drops it ().
+CARRIER_ID_RE = re.compile(r"\bg-\d{1,4}-\d+\b(?:-[a-z]\b)?")
 
 EVIDENCE_RE = re.compile(
     r"\d|[/\\]|`|::|\.(?:py|sh|md|ya?ml|jsonl?|java|kts?|ts|js|lua|txt|log|toml)\b",
@@ -109,13 +131,33 @@ FRAMEWORK_PREFIXES = ("core/", ".claude/", "mind_api/")
 
 # ─── parsing ──────────────────────────────────────────────────────────────
 
+#: The line that signs a worker Body's note, as _body_stamp.stamp_line writes it:
+#: "Auto-signed: alpha worker Body 5af0e4c1, hostname zc-04." Every note writer
+#: puts it after the text, so it can follow a row directly.
+SIGNATURE_PREFIX = "Auto-signed:"
+
+
+def _ends_row(line: str) -> bool:
+    """A blank line, goal-field-append.sh's sentinel "[appended:<marker>]" (by
+    that script's own predicate, is_block_boundary), or a Body's signature. The
+    last two are not part of the row above them: their digits (a marker, a sid,
+    a host) would otherwise pass a MET row's evidence check."""
+    return (not line.strip() or line.startswith(SIGNATURE_PREFIX)
+            or (line.startswith("[appended:") and line.rstrip().endswith("]")))
+
+
 def parse_rows(note: str) -> Dict[str, list]:
     """Split a note into outcome rows. A row runs from its header to the next
-    header or the first blank line. `malformed` holds headers whose status is
-    neither MET nor NOT MET: a PASS or a DONE must not slip past as a row this
-    gate silently declines to check (sig-40, the weaker-predicate trap)."""
+    header or the first line that _ends_row(). `malformed` holds headers whose
+    status is neither MET nor NOT MET: a PASS or a DONE must not slip past as a
+    row this gate silently declines to check (sig-40, the weaker-predicate trap).
+
+    A corrected row that comes LAST for its outcome supersedes every earlier
+    entry for that outcome, malformed ones included. Those move to `superseded`,
+    so every reader of `rows` sees the table as corrected (g-375-162)."""
     rows: List[dict] = []
     malformed: List[dict] = []
+    order: List[dict] = []
     cur: Optional[dict] = None
     for line in (note or "").splitlines():
         m = ROW_RE.match(line)
@@ -124,17 +166,39 @@ def parse_rows(note: str) -> Dict[str, list]:
             sm = STATUS_RE.match(rest)
             if not sm:
                 malformed.append({"n": int(m.group(1)), "header": line.strip()[:160]})
+                order.append(malformed[-1])
                 cur = None
                 continue
             status = "MET" if sm.group(1).upper() == "MET" else "NOT MET"
             cur = {"n": int(m.group(1)), "status": status,
+                   "corrected": bool(CORRECTED_RE.search(line[:m.start(2)])),
                    "header": line.strip(), "text": rest[sm.end():]}
             rows.append(cur)
-        elif not line.strip():
+            order.append(cur)
+        elif _ends_row(line):
             cur = None
         elif cur is not None:
             cur["text"] += "\n" + line
-    return {"rows": rows, "malformed": malformed}
+    last = {e["n"]: e for e in order}
+    superseded = [e for e in order if last[e["n"]] is not e and last[e["n"]].get("corrected")]
+    gone = {id(e) for e in superseded}
+    return {"rows": [r for r in rows if id(r) not in gone],
+            "malformed": [m for m in malformed if id(m) not in gone],
+            "superseded": superseded}
+
+
+def deferred_carriers(text: str) -> List[str]:
+    """The goal ids a row's "deferred to" names, in order: every id from that
+    phrase to the end of the line its first id is on. [] without the phrase."""
+    m = DEFERRED_RE.search(text)
+    if not m:
+        return []
+    end = text.find("\n", m.end())
+    out: List[str] = []
+    for gid in CARRIER_ID_RE.findall(text[m.start():end if end >= 0 else len(text)].lower()):
+        if gid not in out:
+            out.append(gid)
+    return out
 
 
 def required_outcomes(goal: dict, note: str) -> Tuple[List[str], str]:
@@ -281,13 +345,48 @@ def _check_paths(text: str, roots, probe, cache) -> Tuple[List[str], List[str]]:
     return problems, warnings
 
 
+def _check_carriers(body: str, own_id: str,
+                    carrier_status: Callable[[str], Optional[str]]) -> Tuple[Optional[str], List[str]]:
+    """-> (problem or None, warnings) for one NOT MET row's deferral. It refuses
+    only when every goal the row defers to was looked up and none is live: a
+    lookup that raised leaves the row unknown, and unknown is a warning."""
+    try:
+        from gates.residual_work import ACTIVE_STATUSES  # the live set has one definition
+    except Exception as e:  # our own fault: never a refusal (guard-142)
+        return None, [f"carrier liveness not checked ({str(e)[:80]})"]
+    named: List[str] = []
+    failed: List[str] = []
+    for gid in deferred_carriers(body):
+        if gid == own_id:
+            named.append(f"{gid} (this goal)")
+            continue
+        try:
+            status = carrier_status(gid)
+        except Exception as e:
+            failed.append(f"{gid} ({str(e)[:80]})")
+            continue
+        if status in ACTIVE_STATUSES:
+            return None, []
+        named.append(f"{gid} ({status or 'not found'})")
+    if failed:
+        return None, [f"carrier lookup failed, so its liveness is unchecked: {'; '.join(failed)}"]
+    if not named:
+        return None, []
+    return (f"it defers to {', '.join(named)}, and none of them is live (pending or "
+            f"in-progress), so nothing owns this gap. Name a live goal that does"), []
+
+
 def evaluate(goal: dict, note: str, *,
              roots: Optional[Dict[str, Optional[Path]]] = None,
-             probe: Optional[Callable[[Path, str], dict]] = None) -> dict:
+             probe: Optional[Callable[[Path, str], dict]] = None,
+             carrier_status: Optional[Callable[[str], Optional[str]]] = None) -> dict:
     """Verdict for closing `goal` as completed with `note` as its closure note.
 
     decision: "noop" (nothing to evidence), "pass", or "block". Problems are
-    per-row strings the refusal prints verbatim; warnings never refuse."""
+    per-row strings the refusal prints verbatim; warnings never refuse.
+    carrier_status(goal_id) returns that goal's status, or None when no goal has
+    the id, and may raise when it cannot look. Without it no carrier is looked
+    up. `fix` lists each outcome the closer has to change, for remedy_lines()."""
     if goal.get("recurring"):
         return {"decision": "noop", "reason": "recurring goal (closes through complete-by, "
                 "never status=completed)", "problems": [], "warnings": [], "rows": []}
@@ -302,13 +401,22 @@ def evaluate(goal: dict, note: str, *,
     warnings: List[str] = []
     rows_out: List[dict] = []
     cache: dict = {}
+    fix: Dict[int, dict] = {}
+
+    def needs_fix(n: int, status: Optional[str] = None, carrier: bool = False) -> None:
+        f = fix.setdefault(n, {"n": n, "status": None, "needs_carrier": False})
+        f["status"] = status or f["status"]
+        f["needs_carrier"] = f["needs_carrier"] or carrier
 
     if not parsed["rows"] and not parsed["malformed"]:
         problems.append(f"the note has no evidence table: {len(outcomes)} outcome(s) need "
                         f"one OUTCOME row each")
+        for i in range(1, len(outcomes) + 1):
+            needs_fix(i)
     for m in parsed["malformed"]:
         problems.append(f"OUTCOME {m['n']}: the status after the colon must be MET or "
                         f"NOT MET (got: {m['header'][:80]!r})")
+        needs_fix(m["n"])
 
     by_n: Dict[int, List[dict]] = {}
     for r in parsed["rows"]:
@@ -319,18 +427,31 @@ def evaluate(goal: dict, note: str, *,
         if not rows:
             if parsed["rows"] and i not in malformed_n:
                 problems.append(f"OUTCOME {i} has no row (\"{text[:70]}\")")
+                needs_fix(i)
             continue
         if len(rows) > 1:
             problems.append(f"OUTCOME {i} has {len(rows)} rows. Write one")
+            needs_fix(i, rows[-1]["status"])
             continue
         row = rows[0]
         row_problems: List[str] = []
+        needs_carrier = False
         body = row["text"]
         if row["status"] == "NOT MET":
             if not DEFERRED_RE.search(body):
                 row_problems.append("a NOT MET row on a completed close must say "
                                     "\"deferred to <goal-id>\" so the residual-work gate "
                                     "can require that goal to be live")
+                needs_carrier = True
+            elif carrier_status is not None:
+                # Lowered like the ids deferred_carriers returns, so the goal never
+                # passes as its own carrier.
+                c_problem, c_warns = _check_carriers(body, str(goal.get("id") or "").lower(),
+                                                     carrier_status)
+                if c_problem:
+                    row_problems.append(c_problem)
+                    needs_carrier = True
+                warnings += [f"OUTCOME {i}: {w}" for w in c_warns]
         else:
             if not EVIDENCE_RE.search(body):
                 row_problems.append("MET with no measured value. Cite the value and its "
@@ -350,13 +471,17 @@ def evaluate(goal: dict, note: str, *,
                         f"timestamps the interval was measured between (e.g. POST 08:50:29 -> "
                         f"first seen 08:52:24)")
         problems += [f"OUTCOME {i} ({row['status']}): {p}" for p in row_problems]
-        rows_out.append({"n": i, "status": row["status"], "problems": row_problems})
+        rows_out.append({"n": i, "status": row["status"], "problems": row_problems,
+                         "needs_carrier": needs_carrier})
+        if row_problems:
+            needs_fix(i, row["status"], needs_carrier)
     extra = sorted(n for n in by_n if n > len(outcomes) or n < 1)
     if extra:
         warnings.append(f"row(s) {extra} match no outcome ({len(outcomes)} in {field})")
 
     return {"decision": "block" if problems else "pass", "field": field,
             "required": len(outcomes), "rows": rows_out,
+            "fix": [fix[n] for n in sorted(fix)],
             "problems": problems, "warnings": warnings}
 
 
@@ -367,10 +492,68 @@ FORMAT_HELP = (
     "    OUTCOME <n>: NOT MET - <what is missing>; deferred to <goal-id>\n")
 
 
-def refusal_text(goal_id: str, result: dict, note_source: str) -> str:
+#: goal-field-append's marker is its idempotency key, so each fix takes a new one.
+FIX_MARKER = "closure-fix-"
+_FIX_SENTINEL_RE = re.compile(r"^\[appended:" + re.escape(FIX_MARKER) + r"(\d+)\]", re.MULTILINE)
+
+
+def remedy_lines(goal_id: str, result: dict, *, goal: Optional[dict] = None, note: str = "",
+                 stored: bool = False, source: str = "world") -> List[str]:
+    """The commands that fix a refused close, filled in for this goal ().
+
+    Measured 2026-10-08 on zc-04: after one refusal a worker Body read framework
+    source 14 times and took four tries over 85 minutes to file a carrier, and
+    3.5 h later still had a 3,021-character note to rebuild by hand. So the
+    refusal hands over both commands:
+      - when a NOT MET row has no live carrier, the filing that makes one. Its
+        origin is decomposition:<goal>, which intake files as pending, a live
+        status;
+      - when the note is the record's stored one, an append of one row per
+        failing outcome. Nothing else in the note changes, so there is nothing to
+        rebuild and no shrink for the daemon to refuse.
+    Commands sit at column 0, where a here-document needs its closing word."""
+    goal = goal or {}
+    fix = result.get("fix") or []
+    lines: List[str] = []
+    if any(f.get("needs_carrier") for f in fix):
+        m = re.match(r"^g-(\d+)-", goal_id)
+        body = {"title": f"Residual: <what is missing> (from {goal_id})",
+                "priority": goal.get("priority") or "MEDIUM", "participants": ["agent"],
+                "category": goal.get("category") or "<category>",
+                "origin_signal": f"decomposition:{goal_id}",
+                "description": f"<what is missing>, left open by {goal_id}."}
+        lines += ["  File the carrier first. It lands as pending, so it is live. Put the id it "
+                  "prints in the row:",
+                  f"bash core/scripts/aspirations-add-goal.sh --source {source} "
+                  f"{'asp-' + m.group(1) if m else '<asp-id>'} <<'GOAL'",
+                  json.dumps(body), "GOAL"]
+    if stored and fix:
+        parsed = parse_rows(note)
+        had = {e["n"] for k in ("rows", "malformed", "superseded") for e in parsed[k]}
+        k = 1 + max((int(x) for x in _FIX_SENTINEL_RE.findall(note or "")), default=0)
+        lines += ["  Fix the stored note in place: this appends a row per failing outcome, and a "
+                  "(corrected) row replaces the earlier rows for its outcome:",
+                  f"bash core/scripts/goal-field-append.sh --source {source} {goal_id} "
+                  f"outcome_note {FIX_MARKER}{k} --value-stdin <<'ROWS'"]
+        for f in fix[:8]:
+            head = f"OUTCOME {f['n']}" + (" (corrected)" if f["n"] in had else "")
+            lines.append(f"{head}: NOT MET - <what is missing>; deferred to <live goal-id>"
+                         if f.get("status") == "NOT MET" else
+                         f"{head}: MET - <measured value>. Source: <command + output | path | sha>")
+        lines.append("ROWS")
+        if len(fix) > 8:
+            lines.append(f"  Add outcome(s) {', '.join(str(f['n']) for f in fix[8:])} the same way.")
+    return lines
+
+
+def refusal_text(goal_id: str, result: dict, note_source: str,
+                 remedy: Optional[List[str]] = None, stored: bool = False) -> str:
     """Short on purpose: a lesser model acts on the first screen of a refusal
     (the g-375-10 lesson). Names each failing row, the note that was read, the
-    format, and the one retry."""
+    fix, and the one retry. The fix is remedy_lines(): for a stored note its
+    append rows stand in for the format, unless an outcome's status is not
+    known yet (no table, a missing row, a malformed one), when the rows show
+    only the MET form and the closer still needs both."""
     lines = [f"closure-evidence-gate: REFUSED. {goal_id} status was NOT changed: the closure "
              f"note must show a measured value for each verification outcome (g-375-05)."]
     probs = result.get("problems") or []
@@ -378,11 +561,16 @@ def refusal_text(goal_id: str, result: dict, note_source: str) -> str:
     if len(probs) > 8:
         lines.append(f"  - ... and {len(probs) - 8} more")
     lines.append(f"  Note checked: {note_source}.")
-    lines.append(FORMAT_HELP.rstrip("\n"))
+    appends = bool(stored and remedy)
+    if not appends or any(f.get("status") is None for f in result.get("fix") or []):
+        lines.append(FORMAT_HELP.rstrip("\n"))
+    lines += remedy or []
     # The file REPLACES the note, and the daemon refuses a replacement under 25% of
     # a note over 2000 chars (field_shrink.py) with an override iteration-close
     # does not forward. Rows ABOVE the current text never shrink it (guard-1532).
-    lines.append(f"  Then re-run this same close with --outcome-note-file <file>. The file REPLACES "
+    rerun = ("Then re-run this same close as it was. Or rewrite the whole note: re-run it"
+             if appends else "Then re-run this same close")
+    lines.append(f"  {rerun} with --outcome-note-file <file>. The file REPLACES "
                  f"the record's note: put the rows first and keep the note's current text below "
                  f"them (read it: bash core/scripts/aspirations-query.sh --goal-field id {goal_id} "
                  f"--full). For a false refusal, add --override-closure-evidence \"<why>\" (audited).")

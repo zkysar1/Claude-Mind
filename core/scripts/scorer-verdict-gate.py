@@ -77,6 +77,12 @@ GATE_ID = "scorer-sovereignty-claim-gate"
 # does not import that module on the claim path.
 SELECT_CENSUS_FILENAME = "select-census.json"
 WALK_DROPPED_CODE = "self-abstention"
+# : the walk's SECOND sanction. A slow session's walk leaves a HIGH top to
+# faster sessions when its pace forecast says they finish it sooner, and records
+# that as scorer_top_yielded. A code of its own, never self-abstention, so the
+# override audit can tell a measured hand-off from a capability mismatch. The
+# reducer's pace walk (pace_forecast.py walk, ) writes the same census.
+WALK_YIELDED_CODE = "pace-yield"
 
 # Every branch of _classify maps to exactly one _gate_log decision, chosen by
 # the branch's OBSERVABLE CONTROL-FLOW EFFECT AT THE CALLER (guard-1743), not
@@ -105,6 +111,7 @@ DECISION_BY_PATH = {
     "unsanctioned_deviation": "block",
     "sanctioned_deviation":   "override",
     "walk_dropped_top":       "override",   # the walk's census is the named bypass
+    "walk_yielded_top":       "override",   # the same census, its pace-forecast yield
 }
 
 
@@ -139,7 +146,8 @@ def _deny_message(claimed, top, code):
     )
 
 
-def _walk_dropped_top(census, top, claimed, now, freshness_minutes=FRESHNESS_MINUTES):
+def _walk_dropped_top(census, top, claimed, now, freshness_minutes=FRESHNESS_MINUTES,
+                      flag="scorer_top_dropped"):
     """True when this session's select census shows its walk DROPPED `top` (the
     verdict's top pick) before the cut and KEPT `claimed` (g-375-133).
 
@@ -152,10 +160,14 @@ def _walk_dropped_top(census, top, claimed, now, freshness_minutes=FRESHNESS_MIN
     Any kept row passes, not only the first: the worker loop has the Body take
     the first kept row it can, skipping one a partner already holds, and this
     gate cannot see a partner's in-flight set.
+
+    `flag` names WHICH drop: scorer_top_dropped (a row this worker can never
+    take) or scorer_top_yielded (a HIGH row its pace forecast left to faster
+    workers, g-375-152). Every other condition is the same for both.
     """
     if not isinstance(census, dict) or census.get("scorer_top") != top:
         return False
-    if census.get("scorer_top_dropped") is not True:
+    if census.get(flag) is not True:
         return False
     rows = census.get("rows")
     if not isinstance(rows, list) or claimed not in {
@@ -216,6 +228,12 @@ def _classify(verdict, claimed_goal_id, deviation_code, now,
         # this one: a sanctioned self-abstention, with the walk as its evidence.
         return ("walk_dropped_top", 0, "",
                 {"claimed": claimed, "scorer_top": top, "code": WALK_DROPPED_CODE})
+    if not code and census_now is not None and _walk_dropped_top(
+            census, top, claimed, census_now, freshness_minutes, flag="scorer_top_yielded"):
+        # The walk left the HIGH top to faster workers who finish it sooner and
+        # kept this one (): sanctioned, under its own code.
+        return ("walk_yielded_top", 0, "",
+                {"claimed": claimed, "scorer_top": top, "code": WALK_YIELDED_CODE})
     if not code or code not in VALID_DEVIATION_CODES:
         return "unsanctioned_deviation", 2, _deny_message(claimed, top, code), None
 

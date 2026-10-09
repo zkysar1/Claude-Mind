@@ -6279,6 +6279,29 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
             # wake every peer for a no-op. The one real cost of the narrowness
             # is cosmetic and accepted: the response can report had_claim
             # false for a call that did pop a field.
+            # : a worker Body never releases a claim it does not
+            # hold. Nothing is written: the claim, the status and
+            # last_modified stay exactly as the holder left them. `released`
+            # appears only on this path, so every other response is unchanged;
+            # aspirations-release.sh reads it to clear only the worker's own
+            # in-flight records.
+            kept_for = _worker_release_keeps_claim(ctx, goal)
+            if kept_for is not None:
+                skip_note = (
+                    f"release of {goal_id} SKIPPED: this worker session "
+                    f"(sid={(ctx.query.get('sid') or '').strip()}) does not "
+                    f"hold the claim. It is held by {kept_for} since "
+                    f"{goal.get('claimed_at')}, so the claim was left in place "
+                    f"and nothing was written. Do not retry the release; your "
+                    f"own in-flight records are cleared, so move on to your "
+                    f"next unit (g-115-12306).")
+                import sys
+                print(f"[daemon release] WORKER-SKIP: {skip_note}",
+                      file=sys.stderr)
+                return Response.json({"ok": True, "goal": goal,
+                                      "had_claim": had_claim,
+                                      "released": False,
+                                      "warnings": [skip_note]})
             # Compute BEFORE the pops — the warning reads the holder fields.
             nonholder_warning = _nonholder_claim_warning(
                 ctx, goal, goal_id, "release")
@@ -6461,7 +6484,9 @@ def release(ctx) -> "Response":  # type: ignore[name-defined]
     if had_claim:
         try:
             from _wake_signals import touch_peer_signals
-            touch_peer_signals("goal-claim-released")
+            touch_peer_signals("goal-claim-released",
+                               agents_root=ctx.paths.agents_root,
+                               self_agent=ctx.paths.agent_name)
         except Exception:
             pass
 
@@ -7957,6 +7982,59 @@ def _nonholder_claim_warning(ctx, goal: dict, goal_id: str,
                 f"— check before proceeding (g-115-3176).")
     except Exception:
         return None
+
+
+def _worker_release_keeps_claim(ctx, goal: dict) -> Optional[str]:
+    """Name the holder when a WORKER Body's release would clear a claim it does not hold.
+
+    g-115-12306. A worker Body releases at the end of every unit it did not
+    finish (worker-loop step 4a), and that release took the claim with it no
+    matter who held the claim by then. Measured on g-335-1718: zc-02 took the
+    goal over at 2026-10-08T16:41:44 (the sanctioned 24 h hold-cap takeover of
+    a stuck zc-06), zc-06's unit kept running, and its end-of-unit release at
+    2026-10-09T05:01:34 cleared the claim zc-02 held. guard-7486 already tells
+    a caller to confirm its own session holds the claim before releasing; a
+    Body ending a long unit does not re-check, so the check lives here, under
+    the same lock as the write.
+
+    Returns a label for the holder when the caller says it is a worker
+    (X-Mind-Body-Role, forwarded by aspirations-release.sh) and the claim
+    belongs to someone else: another agent, or another session of this agent.
+    release() then skips the release and writes nothing.
+
+    WORKER-SCOPED ON PURPOSE. Every other caller keeps the warn-only path in
+    `_nonholder_claim_warning` above, because the recovery paths release
+    claims they never held and that is how a dead session's claim gets
+    cleared (g-115-3176). None of them is a worker Body: stranded-claim-sweep
+    posts with no role header, body-claims-release releases as the holder's
+    own sid, and the abandoned-claim lane runs only on the reducer.
+
+    NO LIVENESS CHECK, BY CHOICE. A worker never needs to clear a claim it
+    does not hold, so whether the holder is alive does not change the answer;
+    a dead holder's claim is the stranded-claim sweep's to clear. A liveness
+    probe would also fail toward clearing the claim whenever its evidence is
+    missing, and clearing it is the harm this exists to stop.
+
+    Absent evidence keeps the old behaviour: with no caller sid, no claim, or
+    a same-agent claim that carries no sid, this returns None and the release
+    runs as it always has.
+    """
+    # No try/except, unlike the warning helpers above: an error here should
+    # fail the release loudly, never fall through to clearing the claim.
+    role = (ctx.headers.get("x-mind-body-role") or "").strip().lower()
+    if role != "worker":
+        return None
+    caller_sid = (ctx.query.get("sid") or "").strip()
+    holder = goal.get("claimed_by")
+    if not caller_sid or not holder:
+        return None
+    holder_sid = str(goal.get("claimed_by_sid") or "").strip()
+    if holder != _agent_name(ctx):
+        # Another agent's claim is never this worker's to give back, sid or not.
+        return f"{holder} sid={holder_sid or 'unrecorded'}"
+    if holder_sid and holder_sid != caller_sid:
+        return f"{holder} sid={holder_sid}"
+    return None
 
 
 def claim(ctx) -> "Response":  # type: ignore[name-defined]

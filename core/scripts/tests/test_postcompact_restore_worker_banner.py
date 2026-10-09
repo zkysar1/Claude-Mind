@@ -55,6 +55,7 @@ _COPY = [
     "_resolve_agent_from_sid.py",
     "_session_binding.py",
     "_agents.py",
+    "worker_stall.py",
 ]
 
 # Same resolver the tests invoke; see test_postcompact_restore_body_guard.py for
@@ -279,3 +280,56 @@ def test_the_runner_is_told_when_its_close_is_owed(repo):
             "state-update, learning-gate, productivity-check.") in out
     assert "STALE ANCHOR" not in out
     assert "worker Body" not in out
+
+
+# After a worker /stop (2026-10-07). Measured on the Body that made this change: its
+# stop had closed it, and this banner still told it to continue the worker loop and
+# to resume the goal the stop had released. Every case below must drop both.
+
+def _stopped(root: Path, *, mode=None, body_state=None) -> Path:
+    """The worker above after its /stop armed stop-requested; `mode` is the binding
+    its last call wrote (the landing), `body_state` what the stop-hook's close set."""
+    d = _worker(root)
+    (d / "stop-requested").touch()
+    for name, old, new in (("binding.yaml", "mode: autonomous", mode),
+                           ("body-manifest.yaml", "body_state: active", body_state)):
+        if new is not None:
+            text = (d / name).read_text(encoding="utf-8")
+            (d / name).write_text(text.replace(old, old.split(":")[0] + ": " + new),
+                                  encoding="utf-8")
+    return d
+
+
+def _stopped_banner(root: Path, **kwargs) -> str:
+    _stopped(root, **kwargs)
+    r = _run(root, BODY_SID)
+    assert r.returncode == 0, (r.returncode, r.stderr)
+    out = r.stdout
+    assert "continue the worker loop" not in out, out
+    assert "IN-FLIGHT GOAL" not in out and GOAL not in out, out
+    return out
+
+
+@pytest.mark.parametrize("mode", ["assistant", "reader"])
+def test_a_landed_session_is_told_its_mode(repo, mode):
+    out = _stopped_banner(repo, mode=mode, body_state="closed-pending-merge")
+    assert f"post-compaction, stopped worker Body, now {mode} mode" in out
+    assert f"ACTION: serve the user in {mode} mode" in out
+    assert f"core/config/modes/{mode}.md" in out
+    agent_wm = repo / _paths.AGENTS_PARENT_DIR / AGENT / "session" / "working-memory.yaml"
+    assert f"working memory: {agent_wm.as_posix()} (agent-wide" in out
+
+
+def test_a_closed_session_that_did_not_land_is_told_how_to_land(repo):
+    """A Body closed by a stop from before the landing existed, or by one whose
+    landing write failed. The closed set comes from worker_stall, so this also
+    fails if that import silently stops resolving."""
+    out = _stopped_banner(repo, body_state="closed-pending-merge")
+    assert "this worker Body is CLOSED (body_state closed-pending-merge)" in out
+    assert f"/stop {AGENT} lands this session" in out
+
+
+def test_a_stop_in_progress_is_finished_not_resumed_as_work(repo):
+    out = _stopped_banner(repo)
+    assert "a /stop of this worker Body is in progress" in out
+    assert ".claude/skills/stop/SKILL.md" in out and "Step 0.6" in out

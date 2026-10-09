@@ -318,6 +318,7 @@ def test_cli_due_exit_code_and_nudge_needs_an_open_goal(repo, tmp_path):
     assert rc == 0
     assert out.startswith("[release-train] LLM-ACTION: release train stalled")
     assert "g-115-77777" in out and "promotion-runbook.md" in out
+    assert "deployment-shaped-run.py" in out, "the nudge must name the pre-cut deployment-shaped run (g-358-244)"
 
 
 def test_cli_not_due_when_tag_is_fresh(tmp_path):

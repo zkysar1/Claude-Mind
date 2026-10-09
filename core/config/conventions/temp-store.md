@@ -559,7 +559,7 @@ That goal reached the same verdict from the metrics side and is worth quoting,
 because it is independent confirmation rather than an echo: unclassified files are
 "not drain-drainable and not purgeable, so counting them toward the drain threshold
 would fire drain goals that cannot drain them. **Visibility is the fix; changing
-threshold semantics is not.**" `unclassified_count` is that visibility. This
+threshold semantics is not.**" `unclassified_count` was that visibility until 2026-10-05 (2811057a30), when `temp_decisions.pressure_counts` (`pending`, `by_class`; any suffix) replaced the suffix classes it counted. This
 decision supplies the half it deliberately left open — what to DO with the files
 once seen.
 

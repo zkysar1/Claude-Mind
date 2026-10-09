@@ -56,7 +56,8 @@ IF first_action is set (from handoff):
 ```
 # ASSERTION: goal-selector.sh MUST run every iteration. No exceptions.
 # After autocompact, memory of blockers is unreliable. The script reads live state.
-Bash: goal-selector.sh
+# The pace walk drops the HIGH goals faster Bodies finish first (g-375-157).
+Bash: goal-selector.sh | py -3 core/scripts/pace_forecast.py walk
 parsed_output = parse JSON output
 
 # Blocked-goals detection: script returns object with "all_blocked" when
@@ -65,14 +66,13 @@ IF parsed_output is a JSON object with "all_blocked": true:
     Output: "▸ ALL GOALS BLOCKED: {blocked_count} goals — {by_reason summary}"
     FOR EACH goal in blocked_goals: Output: "  {goal_id}: {detail}"
     # parsed_output contains blocked_goals, blocked_count, by_reason — orchestrator needs these
-    # g-357-94: an idle agent must still HEAR directives. Phase 2.07 sits BELOW this return,
-    # so while all-blocked no directive was acked, marked or passed on for as long as the
-    # agent stayed idle (measured 2026-09-03: a user scope directive unheard for 4h). ACK
-    # here exactly as 2.07 (dedup read + moot short-circuit); the honor set is empty with
-    # zero candidates. Hand the ACTIVE set to the all-blocked handler, which reads it as
-    # generation SCOPE (B0/B1/B2) — a directive never creates work by itself (guard-732).
-    Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
-    FOR EACH directive in new_directives: ack per Phase 2.07 (skip moot targets; else
+    # g-357-94: an idle agent must still HEAR directives; Phase 2.07 sits BELOW this return, so
+    # while all-blocked none was acked, marked or passed on (measured 2026-09-03: a user scope
+    # directive unheard for 4h). ACK here exactly as 2.07 (dedup read + moot short-circuit); the
+    # honor set is empty with zero candidates. Hand the ACTIVE set to the all-blocked handler,
+    # which reads it as generation SCOPE (B0/B1/B2) — a directive never creates work by itself (guard-732).
+    Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unhandled-only --mark-read --json
+    FOR EACH directive in new_directives: ack per Phase 2.07 (moot: mark handled; else
         echo "Acknowledged directive {directive.id}" | board-post.sh --channel coordination --type status --reply-to {directive.id} --tags "acknowledged,{AGENT_NAME}")
     Bash: parsed_output.active_directives = board-read.sh --channel coordination --type directive --since 96h --json
         # 96h not 24h (g-115-10429): a directive declares its own `expires:` (seen to 72h). The
@@ -165,9 +165,9 @@ criterion). The LLM handles acknowledgment and insight trigger processing.
 
 ```
 # Directive ack + HONOR (g-115-2797 / guard-1310). TWO reads, DIFFERENT scopes AND DIFFERENT
-# WINDOWS (g-115-2990, g-115-10429). ACK dedups (--unread-only returns only directives THIS
-# agent has not seen; --mark-read records the receipt) and STAYS at 24h — it asks "have I seen
-# this?", and widening it re-acks old directives (the 5x-spam g-115-2990 fixed). HONOR asks
+# WINDOWS (g-115-2990, g-115-10429). ACK dedups (--unhandled-only returns only directives THIS
+# agent has not answered; --mark-read only records SHOWN, g-115-5921) and STAYS at 24h — it asks
+# "have I answered this?"; widening re-acks old directives (the 5x-spam g-115-2990 fixed). HONOR asks
 # "is this still binding?", which the WRITER declares via `expires:` (observed up to 72h), so a
 # 24h honor read went blind for most of each directive's life. Read 96h, then drop ONLY those
 # whose own `expires:` is already past — no `expires:` tag means ADMITTED. That is
@@ -176,21 +176,21 @@ criterion). The LLM handles acknowledgment and insight trigger processing.
 # longest `expires:` in use. Rationale: core/config/rationale/directive-honor-read-window.md
 Bash: all_directives = board-read.sh --channel coordination --type directive --since 96h --json
         THEN drop any whose tags carry an `expires:<ISO>` earlier than now.
-Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unread-only --mark-read --json
+Bash: new_directives = board-read.sh --channel coordination --type directive --since 24h --unhandled-only --mark-read --json
 directive_targeted_goals = {}   # goal_id -> directive_id, ONLY for directives directed at THIS agent
-FOR EACH directive in new_directives:   # ONLY unseen directives — dedup by construction
+FOR EACH directive in new_directives:   # ONLY unhandled directives — dedup by construction
     # Terminal-target short-circuit (mirror the select-path stale-trigger detection
     # g-115-2969 / guard-1310): a directive whose target:{goal-id} tags are ALL terminal
     # (completed/skipped/expired) is MOOT — the work it tasked is already done, so acking it is
-    # noise. Do NOT ack (the --mark-read above already recorded the receipt, so it will not
-    # re-surface next iteration). Read each target's current status: Bash: aspirations-read.sh
+    # noise. Do NOT ack; mark it HANDLED (--mark-read only records SHOWN, so it would return
+    # every iteration — g-115-5921). Read each target's status: Bash: aspirations-read.sh
     # --source <world|agent> --id asp-<NNN>, then find the goal by id (the aspiration prefix is
-    # g-<NNN>-*); or aspirations-read.sh --source <world|agent> --id <asp-id> to read
-    # a specific aspiration. NOTE: aspirations-query.sh has NO --goal-id flag (it takes
+    # g-<NNN>-*). NOTE: aspirations-query.sh has NO --goal-id flag (it takes
     # --goal-status / --title-contains / --goal-field / --full and errors without one).
     targets = [t.split(":",1)[1] for t in (directive.tags or []) if t.startswith("target:")]
     IF targets is non-empty AND every target goal's status in (completed, skipped, expired):
         Output: "▸ DIRECTIVE (moot — targets {targets} already terminal): {directive.id}, no ack (g-115-2990)"
+        Bash: py -3 core/scripts/board.py mark-read --channel coordination --ids {directive.id} --kind handled
         continue
     Output: "▸ DIRECTIVE: {directive.text} (from {directive.author}, weight: {parsed weight})"
     echo "Acknowledged directive {directive.id}" | \
@@ -633,24 +633,7 @@ goal = find by goal_id in returned aspiration's goals array
 # is not in it. `status: pending` does NOT mean unstarted — under the Mind/Body
 # split a worker finishes a goal and hands it back pending, because verify is a
 # reducer-only phase (guard-2803).
-#
-# THE COST LANDS HERE, ONE PHASE BEFORE guard-2803's OWN TRIGGER: it fires after
-# aspirations-claim.sh returns — correct, and still too late, because selection
-# is where "this goal is bigger than it says" gets decided, from the description,
-# while the answer sits unread in the same record. Three escalating occurrences,
-# guard-2803 already written and active (times_active 763) for all three:
-#   2026-08-05 g-335-818  (bravo) caught AT claim — worked as designed
-#   2026-08-13 g-335-1173 (alpha) ~15 min re-deriving scope already written down
-#   2026-08-13 g-335-1201 (bravo) FULL duplicate implementation of a partner's
-#                                 open PR (#193 vs #194), merged before discovery
-# A guardrail cannot outvote the instrument it guards (guard-1984) — hence these
-# lines, not a fourth guardrail.
-#
-# TELL, counter-intuitive: a re-derived conclusion arriving CORRECT is not
-# reassurance, it is the signature — it matched because it was already recorded.
-# g-335-1201's two independent implementations converged on byte-compatible wire
-# formats, reading as strong validation of the design and ALSO proving that one
-# of them never needed writing.
+# Rationale (WHY at selection, not a fourth guardrail): core/config/rationale/read-handoff-fields-at-selection.md
 ```
 
 ## Phase 2.94: Scorer-Divergence Deviation Code (Scorer Sovereignty Layer B, g-115-2812)
@@ -663,7 +646,9 @@ stamps a marker key on it and only indices >=1 are score-ordered — guard-5135,
 `core/config/rationale/selector-index-0-is-a-hoist.md`.
 Compute `deviation_code` here for Phase 4.
 Single-point: compare the finalized selection to `top_goal_id`; never thread a
-variable through the divergence phases above.
+variable through the divergence phases above. One divergence takes NO code: a HIGH top
+the pace walk left to faster Bodies, which the gate sanctions from the walk's census
+(g-375-157); an explicit `--deviation pace-yield` is refused.
 
 ```
 IF goal is None:
@@ -777,7 +762,7 @@ Bash: NOW="$(date +%Y-%m-%dT%H:%M:%S)";
 ## Chaining
 
 - **Called by**: `/aspirations` orchestrator (Phase 2, every iteration)
-- **Calls**: `goal-selector.sh`, `load-tree-summary.sh`, `work-alignment.sh`, `infra-health.sh`, `aspirations-read.sh --source`, `aspirations-update-goal.sh --source`, `/create-aspiration` (no-goals + alignment)
+- **Calls**: `goal-selector.sh` (piped through `pace_forecast.py walk`), `load-tree-summary.sh`, `work-alignment.sh`, `infra-health.sh`, `aspirations-read.sh --source`, `aspirations-update-goal.sh --source`, `/create-aspiration` (no-goals + alignment)
 - **Reads**: meta/goal-selection-strategy.yaml, profile.yaml (focus), working memory (blockers), context-budget.json, tree summary, handoff decisions
 
 ## Return Protocol

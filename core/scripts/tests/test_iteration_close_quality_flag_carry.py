@@ -36,6 +36,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _runtime_bash import BASH  # noqa: E402
+from _frontier_world import requires_frontier_world  # noqa: E402
+
+pytestmark = requires_frontier_world("its fixtures are completed goals of the frontier origin's own world")
 
 SCRIPT = Path(__file__).resolve().parents[1] / "iteration-close.sh"
 REPO = Path(__file__).resolve().parents[3]

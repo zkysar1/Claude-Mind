@@ -6,10 +6,14 @@ wider one carries a filter, and why 96h rather than "the whole channel".
 
 ## Why the two reads differ at all
 
-They answer different questions. The ACK read asks *"have I seen this before?"* — a
-question about FIRST SIGHT, which is correctly bounded by recency and correctly deduped
-by `--unread-only --mark-read`. The HONOR read asks *"is this still binding on me?"* —
-a question about the directive's LIFETIME, which the writer declares itself.
+They answer different questions. The ACK read asks *"have I answered this yet?"* — a
+question about DISPOSITION, which is correctly bounded by recency and correctly deduped
+by `--unhandled-only --mark-read` (it asked *"have I seen this before?"* and filtered on
+`--unread-only` until g-115-5921: `--mark-read` records first SIGHT, so a directive that
+was shown but not acked went invisible to the ack path, measured 2026-08-11 — see
+`core/config/conventions/board.md` "Read receipts"). The HONOR read asks *"is this still
+binding on me?"* — a question about the directive's LIFETIME, which the writer declares
+itself.
 
 g-115-2990 established the scope split (ack dedups, honor does not). g-115-10429 found
 that the split stopped at scope and never reached the WINDOW: both reads were `--since

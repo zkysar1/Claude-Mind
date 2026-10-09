@@ -93,7 +93,10 @@ def test_no_override_omits_flag():
         f"got overrides={call['overrides']!r}"
     )
     assert call["asp_id"] == "asp-240"
-    assert call["source"] == "world"
+    # The default source is RESOLVED per deployment at import (): it is
+    # "world" or "agent" by which queue holds the escalation aspiration, so a literal
+    # "world" pinned this test to the checkout it was written in.
+    assert call["source"] == mod.TARGET_ASP_SOURCE
 
 
 def test_override_appends_flag_and_justification():

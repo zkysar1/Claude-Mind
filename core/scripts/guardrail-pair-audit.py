@@ -46,6 +46,19 @@ contradiction resolves by finding the PRECONDITION under which each side is righ
 together. learning-philosophy rule 5: retirement is a judgement the loop must make,
 not delegate.
 
+FIRST-CLAUSE SIMILARITY (g-115-11476). Whole-rule subject Jaccard is necessary but
+not sufficient for near-duplicates whose identity lives in the opening clause:
+a pair whose first clause is verbatim identical hides as the members'
+elaborations diverge in length — the richer the evidence paragraph, the lower
+the whole-rule score. Measured by echo (cc-03, 2026-09-21, in g-115-9438's
+progress_note): guard-7131 and guard-7149 share 88 identical opening characters,
+category, severity, author and source goal; whole-rule Jaccard 0.140 against
+the 0.6 floor, first_clause() Jaccard 1.000 — the pair was COMPARED and
+discarded. A pair is therefore reported when EITHER score clears the floor,
+and both scores are printed. The same polarity-stripping applies to the
+first-clause tokens as to the whole rule: the score is about identity, never
+about polarity.
+
 ADJUDICATION MEMORY (g-115-9438). Ported from guardrail-protocol-conflict-check.py,
 which already ships both halves of the seam. Without it this audit re-reported its
 whole slate every run, and three agents on three days re-derived one pair's verdict.
@@ -144,6 +157,17 @@ def first_clause(rule: str) -> str:
     return head or (rule or "")
 
 
+def first_clause_subject_tokens(rule: str) -> set:
+    """Subject of the FIRST CLAUSE ().
+
+    The identity-bearing head of the rule, same polarity-stripping as the
+    whole-rule subject. A near-duplicate pair whose heads are identical hides
+    as the tails diverge in length, so the head is scored separately and a
+    pair is reported when either score clears the floor.
+    """
+    return subject_tokens(first_clause(rule))
+
+
 def polarity(rule: str) -> str:
     """'neg' | 'pos' | 'unknown' — read from the FIRST CLAUSE (guard-1421).
 
@@ -228,6 +252,7 @@ def load_active_guardrails(world: Path) -> list:
                 "rule": rule,
                 "category": rec.get("category") or "",
                 "subject": subject_tokens(rule),
+                "first_clause_subject": first_clause_subject_tokens(rule),
                 "polarity": polarity(rule),
                 "reconciled": reconciled_partners(rec),
             })
@@ -258,6 +283,7 @@ def audit(records: list, threshold: float, max_bucket: int,
     findings = []
     oversized = 0
     compared = 0
+    skipped_pairs = 0
 
     for key, idxs in buckets.items():
         if len(idxs) < 2:
@@ -268,6 +294,10 @@ def audit(records: list, threshold: float, max_bucket: int,
             # COUNTED and reported, never silent — an unreported skip makes the
             # slate read as complete when it is not (guard-3830).
             oversized += 1
+            # Pairs grow quadratically in bucket size, so the skipped-bucket
+            # count understates the skipped PAIRS (measured: --max-bucket 60
+            # -> 250 took compared pairs 1,000,019 -> 2,112,822). Count both.
+            skipped_pairs += len(idxs) * (len(idxs) - 1) // 2
             continue
         for i, j in combinations(sorted(idxs), 2):
             if (i, j) in seen_pairs:
@@ -276,7 +306,11 @@ def audit(records: list, threshold: float, max_bucket: int,
             compared += 1
             a, b = records[i], records[j]
             sim = jaccard(a["subject"], b["subject"])
-            if sim < threshold:
+            fc_sim = jaccard(a["first_clause_subject"], b["first_clause_subject"])
+            # A pair is reported when EITHER score clears the floor
+            # (): identical heads hide as the tails diverge in
+            # length, so the whole-rule score alone is a false all-clear.
+            if sim < threshold and fc_sim < threshold:
                 continue
             pa, pb = a["polarity"], b["polarity"]
             if pa == "unknown" or pb == "unknown":
@@ -294,6 +328,7 @@ def audit(records: list, threshold: float, max_bucket: int,
             findings.append({
                 "class": cls,
                 "similarity": round(sim, 3),
+                "first_clause_similarity": round(fc_sim, 3),
                 "a_id": a["id"], "a_polarity": pa, "a_rule": a["rule"][:240],
                 "b_id": b["id"], "b_polarity": pb, "b_rule": b["rule"][:240],
                 "category": a["category"],
@@ -302,7 +337,8 @@ def audit(records: list, threshold: float, max_bucket: int,
                 "known": bool(adjudicated) or {a["id"], b["id"]} <= known,
             })
 
-    findings.sort(key=lambda f: (-f["similarity"], f["a_id"], f["b_id"]))
+    findings.sort(key=lambda f: (-max(f["similarity"], f["first_clause_similarity"]),
+                                 f["a_id"], f["b_id"]))
     by_class = {}
     for f in findings:
         by_class[f["class"]] = by_class.get(f["class"], 0) + 1
@@ -310,6 +346,7 @@ def audit(records: list, threshold: float, max_bucket: int,
         "active_guardrails": len(records),
         "buckets": len(buckets),
         "oversized_buckets_skipped": oversized,
+        "pairs_skipped": skipped_pairs,
         "pairs_compared": compared,
         "findings_total": len(findings),
         "by_class": by_class,
@@ -364,12 +401,14 @@ def main(argv=None) -> int:
 
     print(f"[guardrail-pair-audit] active={result['active_guardrails']} "
           f"buckets={result['buckets']} compared={result['pairs_compared']} "
+          f"skipped_pairs={result['pairs_skipped']} "
           f"findings={result['findings_total']} by_class={result['by_class']} "
           f"novel={result['novel']} adjudicated={result['adjudicated']}")
     if result["oversized_buckets_skipped"]:
         print(f"  NOTE {result['oversized_buckets_skipped']} hub bucket(s) skipped "
-              f"(> --max-bucket {args.max_bucket}) — the slate is bounded, "
-              f"not exhaustive")
+              f"(> --max-bucket {args.max_bucket}); "
+              f"{result['pairs_skipped']} pair(s) live in those buckets — "
+              f"the slate is bounded, not exhaustive")
     shown = rows[:args.top]
     print(f"  showing {len(shown)} of {len(rows)} (--top {args.top}) — the cap "
           f"bounds the SLATE, never the scan")
@@ -380,6 +419,7 @@ def main(argv=None) -> int:
         elif r["known"]:
             tag = " [known]"
         print(f"\n  [{r['class']}]{tag} sim={r['similarity']} "
+              f"fc_sim={r['first_clause_similarity']} "
               f"cat={r['category']} tok={r['shared_token']}")
         print(f"    {r['a_id']} ({r['a_polarity']}): {r['a_rule'][:150]}")
         print(f"    {r['b_id']} ({r['b_polarity']}): {r['b_rule'][:150]}")

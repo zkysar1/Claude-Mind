@@ -7770,6 +7770,10 @@ def _brief_rows(scored, n):
             "source": row.get("source"),
             "title": title,
             "score": row.get("score"),
+            # The goal's own priority (goal, else its aspiration, else MEDIUM), as
+            # score_goal resolved it into raw["priority"]. A Body's walk reads it to
+            # know which rows are HIGH (); nothing here weighs or sorts by it.
+            "priority": _PRIORITY_NUM_TO_NAME.get((row.get("raw") or {}).get("priority")),
             "skill": row.get("skill"),
             "executable_by_role": row.get("executable_by_role"),
             "recurring": row.get("recurring"),

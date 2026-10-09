@@ -239,9 +239,64 @@ def cmd_post(args):
                     print(f"[board] citation increment failed for {cite} "
                           f"({store}): {e}", file=sys.stderr)
 
+    # : a reply IS a disposition. Write the HANDLED receipt for the
+    # post it answers, for the author, in the channel the reply landed in — the
+    # truthful writer that --unhandled-only reads (twin: board_write.py post,
+    # side-effect 3). Fail-soft and visible: the post already landed, so a failed
+    # receipt only means the parent re-surfaces.
+    if args.reply_to:
+        try:
+            _append_receipts(channel, author, os.environ.get("MIND_SID", ""),
+                             [args.reply_to], "handled")
+        except Exception as e:  # fail-soft: the post already landed
+            print(f"[board-post] WARN: HANDLED receipt for '{args.reply_to}' "
+                  f"was NOT written ({e}) — the post it answers will "
+                  f"re-surface on --unhandled-only reads", file=sys.stderr)
+
 def reads_sidecar_path(channel):
     """Get the sidecar path for a channel's read events."""
     return BOARD_DIR / f"{channel}-reads.jsonl"
+
+def _append_receipts(channel, reader, reader_sid, msg_ids, kind=""):
+    """Append one receipt row per msg_id the reader has no receipt of this kind for.
+
+    kind="" is the SHOWN receipt (g-2797: the post was displayed); kind="handled"
+    is the HANDLED receipt (g-115-5921: the reader disposed of it). A HANDLED
+    write dedupes against HANDLED rows only, because a shown post can still be
+    handled later; a SHOWN write dedupes against every row. Returns the number of
+    rows written. Twin: board_write.py _write_receipts.
+    """
+    read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    sidecar = reads_sidecar_path(channel)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+
+    # Dedup against existing sidecar rows so re-marking the same msg_id by the
+    # same agent is a no-op (idempotent). Cross-agent re-marks still write.
+    seen = _load_read_msg_ids(channel, reader, kind or None)
+
+    from _fileops import locked_append_jsonl
+    written = 0
+    for mid in msg_ids:
+        if mid in seen:
+            continue
+        # locked_append_jsonl takes ONE item per call; loop here. For prime's
+        # typical batch (a few coordination posts), this is sub-ms per row.
+        # If batch sizes ever grow large, swap to locked_write_jsonl(read-
+        # modify-write append) to acquire the lock once.
+        row = {
+            "msg_id": mid,
+            "reader_agent": reader,
+            "reader_sid": reader_sid,
+            "read_at": read_at,
+        }
+        if kind:
+            # Appended LAST and only on a HANDLED row, so a SHOWN row stays
+            # byte-identical to every row written before .
+            row["kind"] = kind
+        locked_append_jsonl(sidecar, row)
+        seen.add(mid)
+        written += 1
+    return written
 
 def cmd_mark_read(args):
     """Mark message IDs as read by the current agent.
@@ -265,37 +320,19 @@ def cmd_mark_read(args):
 
     reader = args.reader or os.environ.get("MIND_AGENT", "unknown")
     reader_sid = os.environ.get("MIND_SID", "")
-    read_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    kind = getattr(args, "kind", None) or ""
 
-    sidecar = reads_sidecar_path(args.channel)
-    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    written = _append_receipts(args.channel, reader, reader_sid, msg_ids, kind)
+    print(f"Marked {written} new message(s) {kind or 'read'} in {args.channel} by "
+          f"{reader} ({len(msg_ids) - written} already {kind or 'read'})",
+          file=sys.stderr)
 
-    # Dedup against existing sidecar rows so re-marking the same msg_id by the
-    # same agent is a no-op (idempotent). Cross-agent re-marks still write.
-    seen = _load_read_msg_ids(args.channel, reader)
-
-    from _fileops import locked_append_jsonl
-    written = 0
-    for mid in msg_ids:
-        if mid in seen:
-            continue
-        # locked_append_jsonl takes ONE item per call; loop here. For prime's
-        # typical batch (a few coordination posts), this is sub-ms per row.
-        # If batch sizes ever grow large, swap to locked_write_jsonl(read-
-        # modify-write append) to acquire the lock once.
-        locked_append_jsonl(sidecar, {
-            "msg_id": mid,
-            "reader_agent": reader,
-            "reader_sid": reader_sid,
-            "read_at": read_at,
-        })
-        seen.add(mid)
-        written += 1
-    print(f"Marked {written} new message(s) read in {args.channel} by {reader} "
-          f"({len(msg_ids) - written} already read)", file=sys.stderr)
-
-def _load_read_msg_ids(channel, reader_agent):
+def _load_read_msg_ids(channel, reader_agent, kind=None):
     """Return the set of msg_ids in <channel>-reads.jsonl already read by reader_agent.
+
+    kind=None counts every row by the reader (SHOWN: a handled row implies the
+    post was shown); kind="handled" counts only rows carrying kind=handled
+    (HANDLED). Legacy rows carry no kind, so they never count as handled.
 
     Fail-open: returns empty set on any error so --unread-only never blocks read.
     """
@@ -314,6 +351,8 @@ def _load_read_msg_ids(channel, reader_agent):
                 except json.JSONDecodeError:
                     continue
                 if row.get("reader_agent") == reader_agent:
+                    if kind and row.get("kind") != kind:
+                        continue
                     mid = row.get("msg_id")
                     if mid:
                         seen.add(mid)
@@ -385,6 +424,9 @@ def build_parser():
     mr_p.add_argument("--channel", required=True, help="Channel name")
     mr_p.add_argument("--ids", help="Comma-separated msg IDs (or pipe one-per-line via stdin)")
     mr_p.add_argument("--reader", help="Reader agent (defaults to MIND_AGENT)")
+    mr_p.add_argument("--kind", choices=["handled"],
+                      help="Write a HANDLED receipt (the post was disposed of, not merely "
+                           "shown) so --unhandled-only stops returning it (g-115-5921)")
 
     # channels
     sub.add_parser("channels", help="List channels with message counts")

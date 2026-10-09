@@ -124,7 +124,16 @@ print('seeded 5 stale slots (200 min old)')
 # so a guard phrased as "!= the live path" would keep this file flagged forever
 # and freeze its SHELL_ALLOWLIST entry in place, defeating the self-retirement
 # that allowlist is built around.
-_routing_probe=$(bash "$CORE_ROOT/scripts/wm-read.sh" last_fresh_eyes_review 2>/dev/null || echo "ERR")
+_routing_probe=$(bash "$CORE_ROOT/scripts/wm-read.sh" last_fresh_eyes_review 2>"$TEST_SESSION_DIR/routing-probe.err" || echo "ERR")
+# wm-read.sh and wm-prune.sh are daemon-only. With no daemon (a deployment's
+# daemon-quiesced verify) the read-back is not a routing failure, it is a missing
+# precondition: say so with the runner's skip code (77) instead of a red that reads as
+# a defect. A reachable daemon that mis-routes still falls through to the FAIL below
+# (omni-382 class 6, ).
+if grep -q 'daemon is unreachable' "$TEST_SESSION_DIR/routing-probe.err" 2>/dev/null; then
+    echo "SKIP: needs a reachable mind_api daemon (wm-read.sh and wm-prune.sh are daemon-only) and none is up here."
+    exit 77
+fi
 if [ "$_routing_probe" != "test_value_for_last_fresh_eyes_review" ]; then
     echo "TEST FAIL: refusing to run prune — per-session routing is not in effect."
     echo "  read-back of a seeded slot returned '$_routing_probe', not the fixture value."
