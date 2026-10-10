@@ -725,7 +725,10 @@ def test_write_site_consults_spark_fired_session_before_writing():
     """The structural fix: do_state_update asks whether the spark already fired
     BEFORE writing the sentinel. Without this call the window is back."""
     src = ITERATION_CLOSE_SH.read_text(encoding="utf-8", errors="replace")
-    assert "spark-fire-dedup.py\" fired" in src or "spark-fire-dedup.py fired" in src, \
+    # Wrapper-agnostic literals ( routes the call through _winpath,
+    # so the bare "spark-fire-dedup.py fired" adjacency no longer holds): pin
+    # the script name and the fired-subcommand invocation separately.
+    assert "spark-fire-dedup.py" in src and 'fired "$GOAL_ID"' in src, \
         "do_state_update no longer invokes the `fired` write-side gate"
     assert "spark_fired_session" in src, \
         "do_state_update no longer reads the spark_fired_session map"
@@ -751,10 +754,12 @@ def test_consumer_passes_producer_flag():
 # ---------------------------------------------------------------- already_fired
 
 def test_already_fired_present_true():
+    #  write-site pin: ANY parseable entry -> True (id/date are fixtures)
     assert spark_fire_dedup.already_fired_this_close({"g-A": "2026-07-28T18:18:01"}, "g-A") is True
 
 
 def test_already_fired_absent_false():
+    #  write-site pin: absent entry fails open to False (write the sentinel)
     assert spark_fire_dedup.already_fired_this_close({"g-A": "2026-07-28T18:18:01"}, "g-B") is False
 
 
@@ -806,8 +811,9 @@ def test_gap_seconds_none_when_absent_or_unparseable():
 # --------------------------------------------- read-side backstop, both orderings
 
 def test_field_measurements_all_deduped_under_nonrecurring_producer():
-    """All FOUR real-world false-fires now SKIP. Each was a genuine in-turn spark
-    that the bounded lookback failed to recognize."""
+    """All FOUR real-world false-fires (incident data,  / )
+    now SKIP. Each was a genuine in-turn spark that the bounded lookback
+    failed to recognize."""
     for goal_id, fired_at, set_at, label in FIELD_MEASUREMENTS:
         assert spark_fire_dedup.fired_in_consumption_window(
             {goal_id: fired_at}, goal_id, datetime.fromisoformat(set_at),
@@ -946,23 +952,84 @@ def _spark_row(goal_id, ts, kind="phase_start", phase="phase-6-spark"):
             "content": f"{kind} {phase}", "goal_id": goal_id}
 
 
-def test_diary_fired_at_finds_the_marker():
+def _replay_row(goal_id, ts, verdict="checked, 0 observations"):
+    """A worker-spark-replay provenance row in the EXACT shape the spark skill
+    writes (aspirations-spark SKILL.md lines 126/189, g-306-251):
+    `content` = "worker-spark-replay: <verdict>" and `goal_id` = the closing
+    goal. The `timestamp` is auto-stamped by execution-diary.sh (its
+    `cmd_append` adds one when absent — execution-diary.py line 391), so a
+    writer row and a test row are the same shape on disk. The default verdict
+    is the EMPTY branch ("checked, 0 observations"); pass the fire branch as
+    verdict="FIRED, 1 observation(s) from <gids>". A spark DEFERRED before this
+    step writes NEITHER branch — no row at all — so there is no 'deferred'
+    spelling to construct here (guard-4323: match only what the writer emits)."""
+    return {"entry_type": "observation", "goal_id": goal_id,
+            "content": f"worker-spark-replay: {verdict}", "timestamp": ts}
+
+
+def test_diary_fired_at_finds_the_replay_marker():
     """The pure core takes LINES, never a path, so it is testable with no
-    filesystem — the same contract every other helper in the module keeps."""
-    lines = [json.dumps(_spark_row(ECHO_GOAL, "2026-08-05T04:53:00"))]
+    filesystem — the same contract every other helper in the module keeps.
+    g-115-11324: the marker a REAL spark leaves is the worker-spark-replay
+    provenance row, not the digest's phase-6-spark bracket."""
+    lines = [json.dumps(_replay_row(ECHO_GOAL, "2026-08-05T04:53:00"))]
     got = spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL)
     assert got == datetime(2026, 8, 5, 4, 53, 0)
 
 
 def test_diary_fired_at_returns_the_LATEST_of_several():
-    """A recurring goal accumulates markers across closes; only the most recent
-    can be THIS close's, and the consumption window judges it from there."""
+    """A recurring goal accumulates replay rows across closes; only the most
+    recent can be THIS close's, and the consumption window judges it from
+    there. The rows span BOTH writer verdicts (checked, FIRED) — the matcher
+    must accept both, not just the empty branch."""
     lines = [
-        json.dumps(_spark_row(ECHO_GOAL, "2026-08-04T01:00:00")),
+        json.dumps(_replay_row(ECHO_GOAL, "2026-08-04T01:00:00")),
+        json.dumps(_replay_row(ECHO_GOAL, "2026-08-05T04:53:00")),
+        json.dumps(_replay_row(ECHO_GOAL, "2026-08-05T04:53:40",
+                               verdict="FIRED, 1 observation(s) from g-306-251")),
+    ]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) == datetime(2026, 8, 5, 4, 53, 40)
+
+
+def test_diary_fired_at_ignores_a_pure_phase_6_spark_bracket():
+    """THE  DEFECT, pinned at the pure core: the digest's
+    phase-6-spark BRACKET (phase_start + phase_end) is written around the
+    Skill(aspirations-spark) CALL by the LLM and lands even when the spark is
+    then DEFERRED (zone tight), abbreviated, or cut by an autocompact before
+    the body runs — a phase-ENTRY marker read as proof of completion
+    (guard-3117). A bracket alone must NOT corroborate; only a
+    worker-spark-replay provenance row does. Before the fix this test FAILS —
+    the old matcher returned the bracket's timestamp, which is the false-skip
+    that dropped 9 measured owed sparks (alpha 4, zeta 4, bravo 1)."""
+    lines = [
         json.dumps(_spark_row(ECHO_GOAL, "2026-08-05T04:53:00")),
         json.dumps(_spark_row(ECHO_GOAL, "2026-08-05T04:53:40", kind="phase_end")),
     ]
-    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) == datetime(2026, 8, 5, 4, 53, 40)
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) is None
+
+
+def test_diary_fired_at_ignores_a_row_that_spells_deferred():
+    """The writer emits exactly two provenance spellings today (checked, FIRED);
+    a replay that did not complete leaves NO row at all. If the writer ever
+    adds a spelling for a deferral (e.g. 'worker-spark-replay: DEFERRED ...'),
+    the matcher must not accept it — that would re-introduce the false-skip
+    from the other direction. Pinned now, before the writer changes."""
+    lines = [json.dumps({
+        "entry_type": "observation", "goal_id": ECHO_GOAL,
+        "content": "worker-spark-replay: DEFERRED undrained, 1 observation(s) from g-306-251",
+        "timestamp": "2026-08-05T04:53:00"})]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) is None
+
+
+def test_diary_fired_at_ignores_a_row_that_only_MENTIONS_replay_in_its_content():
+    """A bracket row whose CONTENT merely mentions the provenance phrase (a
+    narration line) is not a provenance row: the prefix is anchored at the
+    START of content, and a bracket's phase field is not a verdict."""
+    lines = [json.dumps({
+        "entry_type": "phase_end", "phase": "phase-6-spark",
+        "goal_id": ECHO_GOAL, "timestamp": "2026-08-05T04:53:40",
+        "content": "phase_end phase-6-spark (worker-spark-replay checked earlier)"})]
+    assert spark_fire_dedup.diary_fired_at(lines, ECHO_GOAL) is None
 
 
 def test_diary_fired_at_ignores_another_goals_marker():
@@ -1029,13 +1096,40 @@ def test_cli_absent_record_without_diary_still_fires_UNCHANGED(tmp_path):
     assert rc == 0
 
 
-def test_cli_absent_record_IS_corroborated_by_the_diary(tmp_path):
-    """The fix, on the incident's own numbers: same map, same set_at, same
-    producer — only the diary is added, and the verdict flips."""
+def test_cli_deferred_bracket_only_diary_still_fires(tmp_path):
+    """THE  REGRESSION PIN, on the incident's own numbers: an ABSENT
+    record plus a diary whose ONLY spark evidence is the phase-6-spark BRACKET
+    (the spark entered Phase 6, then was deferred/abbreviated/compacted before
+    it ran its replay step, so it wrote no provenance row). The owed spark must
+    STILL FIRE — this is the false-skip, measured 9 times across three agents.
+    FAILS against the pre-fix code (which read the bracket as a fire and
+    returned 'skip'); PASSES on the fix. Its positive control is the next test
+    (guard-4166): the same input with one real provenance row flips to 'skip',
+    so this test cannot be passing merely because corroboration is broken."""
     diary = _diary(tmp_path, [
         _spark_row(ECHO_GOAL, "2026-08-05T04:10:00", phase="phase-4-execute"),
         _spark_row(ECHO_GOAL, "2026-08-05T04:53:00"),
         _spark_row(ECHO_GOAL, "2026-08-05T04:53:40", kind="phase_end"),
+    ])
+    rc, out = _run_dedup_cli(
+        ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
+         "--producer", spark_fire_dedup.NONRECURRING_PRODUCER,
+         "--diary-file", diary], ECHO_MAP)
+    assert out == "fire", "a bracket alone is a phase-ENTRY marker, not a fire (guard-3117)"
+    assert rc == 0
+
+
+def test_cli_absent_record_IS_corroborated_by_the_diary(tmp_path):
+    """The fix, on the incident's own numbers: same map, same set_at, same
+    producer — only the diary is added, and the verdict flips. The corroborating
+    signal is the worker-spark-replay provenance row a REAL spark writes during
+    its replay step (g-306-251); this is also the POSITIVE CONTROL for the
+    bracket-only test above (guard-4166)."""
+    diary = _diary(tmp_path, [
+        _spark_row(ECHO_GOAL, "2026-08-05T04:10:00", phase="phase-4-execute"),
+        _spark_row(ECHO_GOAL, "2026-08-05T04:53:00"),
+        _spark_row(ECHO_GOAL, "2026-08-05T04:53:40", kind="phase_end"),
+        _replay_row(ECHO_GOAL, "2026-08-05T04:53:40"),
     ])
     rc, out = _run_dedup_cli(
         ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
@@ -1049,7 +1143,7 @@ def test_cli_diary_with_no_marker_for_this_goal_still_fires(tmp_path):
     """FAIL-OPEN PRESERVED, and this is the assertion that keeps the fix from
     becoming a suppressor: a diary that exists and is readable but carries no
     spark row for THIS goal must not dedup. Absent record AND absent marker
-    still fires — unchanged from before this feature."""
+    still fires — unchanged from before the diary feature (g-115-4201)."""
     diary = _diary(tmp_path, [
         _spark_row("g-OTHER-999", "2026-08-05T04:53:00"),
         _spark_row(ECHO_GOAL, "2026-08-05T04:53:00", phase="phase-4-execute"),
@@ -1086,7 +1180,7 @@ def test_cli_a_PRESENT_record_stays_authoritative_over_the_diary(tmp_path):
     the record is a day old and outside it, so the two signals disagree: correct
     code follows the RECORD and fires; a version that let the diary override
     would skip."""
-    diary = _diary(tmp_path, [_spark_row(ECHO_GOAL, "2026-08-05T05:10:00")])
+    diary = _diary(tmp_path, [_replay_row(ECHO_GOAL, "2026-08-05T05:10:00")])
     stale_record = json.dumps({ECHO_GOAL: "2026-08-04T01:00:00"})
     rc, out = _run_dedup_cli(
         ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
@@ -1101,7 +1195,11 @@ def test_cli_diary_marker_from_a_PREVIOUS_close_does_not_dedup(tmp_path):
     goal (bounded lookback — no producer field) falls outside it and still
     fires. This is what stops the corroboration becoming a blanket 'ever fired'
     test."""
-    diary = _diary(tmp_path, [_spark_row(ECHO_GOAL, "2026-08-04T01:00:00")])
+    # A REPLAY row (not a bracket) with a timestamp from a genuine previous
+    # close: it corroborates, but the substituted ts must then fall OUTSIDE the
+    # bounded window and still fire — the pin the pre- bracket row
+    # used to carry, which the new matcher never even reads.
+    diary = _diary(tmp_path, [_replay_row(ECHO_GOAL, "2026-08-04T01:00:00")])
     rc, out = _run_dedup_cli(
         ["check", ECHO_GOAL, "--sentinel-set-at", ECHO_SET_AT,
          "--diary-file", diary], ECHO_MAP)

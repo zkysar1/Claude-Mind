@@ -1013,6 +1013,53 @@ def test_the_read_finds_a_goal_in_every_status(monkeypatch, status):
     assert GFA.read_goal("g-1-1", "world")["status"] == status
 
 
+# ── 10b. A same-id rehome leaves TWO records under one id () ──────────
+# Section 10 let the read see `superseded`. A rehome leaves a `superseded` POINTER
+# under the id beside the adopted live copy, so a rehomed goal read as two rows and
+# was refused as ambiguous (measured 2026-10-09: , and 24 of the 27
+# rehome pointers had a live twin). The daemon's write lookup,
+# aspirations_write._find_goal, takes the first non-superseded copy, so the read
+# must take the same one: otherwise it reads one record and the write lands on the
+# other. The refusal stays for the cases that are genuinely ambiguous.
+
+def _pointer_and_live(live_status="pending", pointer_status="superseded"):
+    pointer = {"goal_id": "g-1-1", "asp_id": "asp-1", "status": pointer_status,
+               "priority": "MEDIUM", "progress_note": "", "rehomed_to": "asp-2"}
+    live = {"goal_id": "g-1-1", "asp_id": "asp-2", "status": live_status,
+            "priority": "MEDIUM", "progress_note": "kept", "rehomed_from": "asp-1"}
+    return pointer, live
+
+
+def _serve_rows(monkeypatch, rows):
+    monkeypatch.setattr(GFA, "_run", lambda argv, **kw: _Res(stdout=json.dumps(rows)))
+
+
+@pytest.mark.parametrize("pointer_first", [True, False])
+def test_a_rehomed_goal_reads_as_its_live_copy_in_either_file_order(monkeypatch, pointer_first):
+    pointer, live = _pointer_and_live()
+    _serve_rows(monkeypatch, [pointer, live] if pointer_first else [live, pointer])
+    row = GFA.read_goal("g-1-1", "world")
+    assert (row["asp_id"], row["status"], row["progress_note"]) == ("asp-2", "pending", "kept")
+
+
+def test_a_lone_pointer_is_still_read(monkeypatch):
+    pointer, _ = _pointer_and_live()
+    _serve_rows(monkeypatch, [pointer])
+    assert GFA.read_goal("g-1-1", "world")["status"] == "superseded"
+
+
+@pytest.mark.parametrize("rows_of", [
+    lambda: _pointer_and_live(live_status="pending", pointer_status="in-progress"),
+    lambda: _pointer_and_live(live_status="superseded", pointer_status="superseded"),
+], ids=["two-live-copies", "no-live-copy"])
+def test_an_ambiguous_pair_is_still_refused(monkeypatch, capsys, rows_of):
+    _serve_rows(monkeypatch, list(rows_of()))
+    with pytest.raises(SystemExit) as exc:
+        GFA.read_goal("g-1-1", "world")
+    assert exc.value.code == GFA.RC_READ_UNSAFE
+    assert "expected exactly 1 record for g-1-1, got 2" in capsys.readouterr().err
+
+
 # ── 11. The idempotency key is a whole LINE, not a substring () ──────
 # compose() writes the sentinel alone on the last line of its block. A note that
 # only MENTIONS a sentinel inside a sentence is text, not a landed write. A

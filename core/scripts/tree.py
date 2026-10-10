@@ -1006,6 +1006,21 @@ _OWNER_TERMINAL_STATUSES = frozenset(
     ("completed", "skipped", "expired", "superseded", "decomposed"))
 
 
+class _OwnerMap(dict):
+    """``{stem: goal id | None}`` plus ``rank``: ``{stem: (matched_in_title, owner_is_open)}``.
+
+    A dict subclass rather than a new return shape, so every existing caller,
+    and the joins the tests patch in, keeps getting the mapping it always did,
+    while the call site can read how STRONG each hit was without a second scan
+    of the aspiration store (g-115-10095). ``rank`` holds only the stems that
+    resolved and is empty on the fail-open path.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rank = {}
+
+
 def _distill_owner_index(stems):
     """Map each node stem -> an owning goal id, or None. ANNOTATION ONLY.
 
@@ -1046,7 +1061,7 @@ def _distill_owner_index(stems):
     readable; a missing owner is a weaker annotation, an exception is a broken
     producer.
     """
-    owners = {stem: None for stem in stems}
+    owners = _OwnerMap({stem: None for stem in stems})
     if not stems:
         return owners
     try:
@@ -1100,6 +1115,7 @@ def _distill_owner_index(stems):
                             best[stem] = (gid, rank)
         for stem, hit in best.items():
             owners[stem] = hit[0]
+            owners.rank[stem] = hit[1]
     except Exception:
         return {stem: None for stem in stems}
     return owners
@@ -1347,6 +1363,13 @@ def get_distill_candidates(tree, include_skipped=False, *,
                 # `recommended_action` are emitted unconditionally and this is
                 # the same shape.
                 "owned_by": None,
+                # Strength of the `owned_by` hit, filled beside it ():
+                # where the owner matched ("title" | "description") and whether
+                # that goal is still open. A skip-as-owned is licensed only by
+                # owner_match == "title" AND owner_open == True; see the
+                # OWNERSHIP paragraph in .claude/skills/tree/SKILL.md.
+                "owner_match": None,
+                "owner_open": None,
             })
         elif include_skipped:
             # Attribute the skip to the most specific gate that failed.
@@ -1408,8 +1431,13 @@ def get_distill_candidates(tree, include_skipped=False, *,
         try:
             _owners = _distill_owner_index(
                 sorted({str(c["key"]).rsplit("/", 1)[-1] for c in _readcap_rows}))
+            _rank = getattr(_owners, "rank", {})
             for _c in _readcap_rows:
-                _c["owned_by"] = _owners.get(str(_c["key"]).rsplit("/", 1)[-1])
+                _stem = str(_c["key"]).rsplit("/", 1)[-1]
+                _c["owned_by"] = _owners.get(_stem)
+                if _stem in _rank:
+                    _c["owner_match"] = "title" if _rank[_stem][0] else "description"
+                    _c["owner_open"] = bool(_rank[_stem][1])
         except Exception:
             # Rows keep the `owned_by: None` they were emitted with. A weaker
             # annotation is the correct degradation; a broken producer is not.

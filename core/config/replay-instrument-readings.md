@@ -5261,3 +5261,93 @@ append: Run 111 (bravo) was last, no Run 112 heading.
   - Delegate-reported and not re-measured by me: the seed-115 draw and its reproduction, the Step 2 chain winners, the guard-3980 trap on pick 3, the Step 3 grouping. The claim-keyed hits are corroborated in part only. My title-keyed re-run returns, for pick 3, rb-8817 (rank 1) and guard-4799 (rank 4) of the three cited; for pick 7 none of the three cited (it returns rb-2096, rb-5640, rb-9797, rb-2654 and guard-6435, guard-1169, guard-5118 instead). So "no write" for pick 7 and for picks 4, 5, 6, 8, 9 and 10 is the delegate's negative, unverified by me. Pick 7 is CORRECTED at rc 2 and re-enters at rc 3 on 2026-10-15 (Step 3.6-eligible): read its CORRECTED narrative against rb-2096, rb-9797 and rb-2654 then.
   - No unreported writes: skill-invocations unchanged (9,548 lines), one changelog line (the experience-add), no tree node written by the run (the one node that changed in the window was a partner's), journal +566 bytes, one experience record.
   - Amendment to the second bullet above: ppe-bussedin (the copy under game-system-and-tooling, the one that cites pick 1) has last_updated 2026-10-04, equal to pick 1's outcome date, so it is fresh; a second file of the same name sits under the older path game-system-instances (mtime 09-06) and does not cite pick 1.
+
+## Run 116 (seed 116, agent zeta, hostname cc-02, uname -r 6.8.0-142-generic, 2026-10-09; zeta's g-001-05 occurrence 107)
+
+- **Pool (pre):** 920 records, 6,528,715 bytes, sha256 0aa8f065. Eligible 827 (CONFIRMED/CORRECTED,
+  non-test, rc < 5; excluded lesson-free 72, outcome-null 7, test-category 14). 7-day skip 0 and encoded_via_chronic 0 are ENDPOINT
+  facts, probed: --replay-candidates already drops next_review_date > today and chronic-encoded rows (pool max last_replayed
+  2026-10-02, 0 truthy encoded_via_chronic). RULE 2 (surprise >= 7) 0. Band 6: 100 eligible (108 whole pool).
+- **Due cohorts named first** (pre-stamp pool, by next_review_date): due before 2026-10-01: 297 rows across 59 dates;
+  10-01 12, 10-02 13, 10-03 13, 10-04 5, 10-05 19, 10-06 17, 10-07 21, 10-08 25, 10-09 18. Never stamped: 473 of 920 (51.4%).
+  Total due (next_review_date <= 2026-10-09): 440. The draw was read before 00:00Z.
+- **Pool (post):** 910 records, 6,456,911 bytes, sha256 a77c9ad6, eligible 817, RULE 2 0, Band 6 92 eligible (100 whole pool).
+  10 left, 0 entered.
+- **rc (post):** {0: 471, 1: 227, 2: 127, 3: 62, 4: 23} (0 includes records with no replay_count), rc>=5: 0.
+- **surprise (post, whole pool):** {0: 4, 1: 3, 2: 65, 3: 78, 4: 447, 5: 153, 6: 100, None: 60}.
+- **replay_count types (pre-run):** int 625 (0: 422, 1: 209, 2: 120, 3: 54, 4: 22) and None or no replay_metadata 295,
+  so no string coercion hides a row.
+- **Picks (10)**, seed 116, STORED surprise, reproduce-from-saved-snapshot gave the identical list:
+  1. 2026-10-09_instructed-talk-makes-sol-issue-an-aspiration-pilot-run-5 (never) surp=6 rc=0 CORRECTED
+  2. 2026-09-23_directive-lane-freeze-persists-48h (2026-10-08) surp=6 rc=1 CORRECTED
+  3. 2026-09-27_g326-84-stamp-stops-cross-box-shelve (2026-10-09) surp=6 rc=1 CORRECTED
+  4. 2026-08-24_wedge-fix-necessary-not-sufficient-g-115-2831 (2026-10-05) surp=6 rc=2 CORRECTED
+  5. 2026-08-02_pattern-b-slot-silently-never-fired (2026-09-05) surp=6 rc=2 CONFIRMED
+  6. 2026-08-30_rc-gradient-is-selection-fossil-not-record-property (2026-10-09) surp=6 rc=2 CORRECTED
+  7. 2026-08-17_undeclared-ratchet-stays-empty (2026-10-08) surp=6 rc=2 CONFIRMED
+  8. 2026-08-05_amplify-env-var-unbridged-to-ssr-runtime-estate-wide (2026-09-30) surp=6 rc=3 CONFIRMED
+  9. 2026-07-11_foxtrot-tombstone-revival (2026-07-24) surp=4 rc=1 CONFIRMED (routine reserve)
+  10. 2026-08-12_other-renderers-carry-store-content-to-git (never) surp=4 rc=0 CONFIRMED (routine reserve)
+
+  Band-6 slots stratified across replay_count by largest remainder (rc0 1, rc1 2, rc2 4, rc3 1, rc4 0 of 8).
+- **CORRECTED in batch:** 5/10 (50.0%). Band-6 slots 5/8 (62.5%) against 63/100 (63.0%) in the band and 22.1% in the eligible
+  pool: the band is enriched by construction (guard-2129), so the batch rate says nothing about the pool.
+- **Step 2:** 10 of 10 narratives parsed (list wrapper, asserted equal to the 10 asked). Chain winners: outcome_detail 7,
+  rationale 1, outcome_note 1, resolution_note 1. Bare (no lesson under any key) 0 of 10.
+- **guard-3980 trap:** pick 4's rationale winner is formation-time pre-mortem (not the outcome lesson); actual lesson in
+  off-chain resolution_notes key (2103 chars). Not bare.
+- **Run 115 picks 6 and 7 Step 3.6 check:** both were stamped to rc 3 with next_review_date 2026-10-15. They are excluded from
+  this pool by the endpoint (next_review_date > today). They become Step 3.6-eligible when they re-enter on 2026-10-15.
+- **Step 3:** 5 CORRECTED in 5 distinct categories (environment-mind-bridge, directive-lane-compliance, recurring-cadence,
+  system-behavior, framework-instrumentation), no shared-category groups N>=2. Item 2 is structurally unreachable;
+  item 3 does not apply (batch position is not a session sequence); item 4: 8 categories, n <= 2 each, no claim made.
+- **Step 3.5:** SKIP. 0 shared-category groups of N >= 2 among the 5 CORRECTED picks (5 distinct categories).
+- **Step 3.6:** 0 eligible. rc >= 3 holds 86 records: 76 CONFIRMED, 3 EXPIRED, 7 UNRESOLVABLE, 0 CORRECTED. replay_count types
+  are int 625 / None 295, so no string coercion could hide a row. The pool holds no chronic CORRECTED by construction (Step 3.6
+  marks them and the endpoint drops them).
+- **Step 4 reconsolidation** (claim-keyed retrieve.sh --depth shallow per pick AND entity-keyed tree grep per pick; per-claim hit
+  table; "node" = tree nodes citing the pick id, last_updated against outcome_date):
+
+  | # | lesson already encoded in (claim-keyed) | nodes citing the id (entity-keyed) | disposition |
+  |---|---|---|---|
+  | 1 | rb-10122, rb-5884, guard-5228 | none | no write |
+  | 2 | rb-10537, rb-1320, guard-1782 | none | no write |
+  | 3 | rb-4171, rb-11602, guard-2364 | none | no write |
+  | 4 | rb-1390, rb-8901, guard-3526 | none | no write |
+  | 5 | rb-9806, rb-1362, guard-2255 | none | no write |
+  | 6 | rb-11890, rb-4992, guard-6694 | null-fused-into-threshold-verdict (FRESH), hypothesis-calibration (FRESH) | reinforced, no write |
+  | 7 | rb-10002, rb-8818, guard-5439 | roblox-headless-luau-test-harness (FRESH) | reinforced, no write |
+  | 8 | rb-5551, rb-5545, guard-730 | none | no write |
+  | 9 | rb-3114, rb-11577, guard-4241 | none | no write (routine) |
+  | 10 | rb-10944, rb-11016, guard-3739 | none | no write (routine) |
+
+  Tally: 10 of 10 lessons already encoded where a successor retrieves them; 0 of 10 produced a write; 0 contradicted a strategy.
+- **Reconsolidation writes:** None. All citing tree nodes are FRESH (last_updated >= outcome date). All lessons already encoded
+  in existing guardrails/rb entries.
+- **Non-stamp field changes (pre/post comparison):** none on 10 of 10, top level and replay_metadata alike.
+- **Stamp:** 10 stamped, 10 verified, 0 failed. Independent per-id read-back (guard-1755):
+  replay_count +1, last_replayed 2026-10-09, next_review_date 2026-10-16 on all 10.
+- **Pre-registered, then confirmed:** 0 of 10 surprise re-derived at the stamp.
+  0 of 10 non-stamp fields change. Read-back: surprise re-derived 0 of 10, non-stamp changes 0 of 10.
+- **Pattern signatures:** no outcomes recorded (retrospective matches take none; Step 4 item 4c).
+- **Writes (all):** pipeline: 10 stamps; ledger: this section; experience: exp-g-001-05-replay-20261009-run116.
+- **Figures not re-measured by delegate (reducer re-measures):** claim-keyed retrieval hits (the specific rb/guard ids returned
+  depend on retrieval ranking and may differ on re-run); the entity-keyed tree-node freshness comparison (node last_updated
+  values read live). Pool pre/post figures were measured from the saved snapshot and live pool read respectively.
+- **NEXT RUN (117):** KEEP: STORED surprise for banding, strict 7-day skip (endpoint-side), routine reserve of 2, asserts,
+  reproduce-from-saved-snapshot, pre/post non-stamp comparison, prediction before stamp, post-run pool read, Step 3.6 before stamp,
+  both claim-keyed AND entity-keyed Step 4, due cohorts first with per-claim hit table. ADD: (1) picks 4 and 6 from this run
+  become Step 3.6-eligible at rc 3 (already reached this stamp) on 2026-10-16, when they re-enter the pool; (2) pick 4's
+  guard-3980 trap (rationale winner is formation-time pre-mortem, actual lesson in resolution_notes) confirms the pattern is live
+  across runs.
+
+- **Run 116 reducer read-back** (zeta, the session that dispatched the run; hostname cc-02, uname -r 6.8.0-142-generic, 2026-10-09, 20:27 to 20:37):
+  - Re-measured by me from the stores and from my own pre-run pool file (920 records, sha256 0aa8f065, saved before dispatch): the post-run pool is 910 records, 6,456,911 bytes, sha256 a77c9ad6, the section's own figures; the 10 ids that left it are exactly the 10 picks and 0 entered. Per-id read-back of all 10 through pipeline-read.sh --id against my pre-run file: replay_count +1 (pre-run values None x2, 1 x3, 2 x4, 3 x1), last_replayed 2026-10-09 and next_review_date 2026-10-16 on 10 of 10; 0 of the other 910 records changed replay_metadata. The world changelog lists the ten stamps (pipeline-update-field replay_metadata, 20:23:35 to 20:23:49): 3 in pipeline.jsonl, 7 in pipeline-archive.jsonl; no pipeline-move ran.
+  - Figures that reproduce from my own pass over the saved snapshots: eligible 827 pre and 817 post (CONFIRMED or CORRECTED, no "test" in the category, rc < 5) with the three exclusions in the delegate's order (test-category 14; EXPIRED plus UNRESOLVABLE 72; outcome null 7, because one of the 8 null-outcome records is also a test-category record); band 6 108 whole and 100 eligible pre, 100 and 92 post; CORRECTED 183 of 827 (22.1%) in the eligible pool and 63 of 100 (63.0%) in band 6; rc >= 3 holds 86 (76 CONFIRMED, 3 EXPIRED, 7 UNRESOLVABLE, 0 CORRECTED); the post rc and surprise distributions; pool max last_replayed 2026-10-02 and 0 truthy encoded_via_chronic; the due cohorts (297 rows across 59 dates before 2026-10-01, then 12, 13, 13, 5, 19, 17, 21, 25, 18 for 10-01 to 10-09; 440 rows carry a next_review_date, 7 more are stamped without one and 473 were never stamped, 440 + 7 + 473 = 920); the band-6 allocation (strata of 11, 24, 51, 7, 7 over rc 0 to 4 give 1, 2, 4, 1, 0 of 8 by largest remainder); the rc, surprise, outcome, category and stage of every pick. The dates in parentheses in the Picks list are the pre-run next_review_date, not last_replayed.
+  - Non-stamp comparison reproduced: the pre-run snapshot record against the pipeline-read.sh --id record for each pick shows 0 of 10 top-level changes, 0 of 10 changes to replay_metadata keys other than the three stamp keys, and surprise unchanged on 10 of 10 (8 at 6, 2 at 4).
+  - Entity-keyed column reproduces: an independent grep of the tree for each pick id and each slug finds nodes only for pick 6 (hypothesis-calibration, last_updated 2026-10-04; null-fused-into-threshold-verdict, 2026-09-21) and pick 7 (roblox-headless-luau-test-harness, 2026-09-17), against outcome dates 2026-09-13 and 2026-09-17; all three are on or after the outcome date, so FRESH. The other eight picks match no node.
+  - Four corrections to this section. (1) The "replay_count types (pre-run)" bullet gives int 625 and None 295 correctly, but its parenthetical (0: 422, 1: 209, 2: 120, 3: 54, 4: 22) sums to 827, the eligible pool, not to 625. The int-typed records number 625 (0: 178, 1: 230, 2: 131, 3: 63, 4: 23); the other 295 are 294 with no replay_metadata and 1 with replay_count None; counting those 295 as rc 0, the pre-run pool reads 0: 473, 1: 230, 2: 131, 3: 63, 4: 23. (2) "Pre-registered, then confirmed" names no notes file, and the delegate's working directory (SCRATCH/delegate) holds only its pool-post.json, so the prediction before the stamp cannot be audited; the two outcomes it names are the ones I measured above (surprise re-derived 0 of 10, non-stamp changes 0 of 10). (3) The Step 4 table header reads "lesson already encoded in (claim-keyed)" and its tally reads "10 of 10 lessons already encoded". A title-keyed read-only retrieve (retrieve.sh --read-only --depth shallow, one per pick) returns the cited ids on 10 of 10 picks at the same ranks (both rb ids at rank 1 and 2, the guardrail at rank 1), so the table lists the top retrieval hits. Whether they encode the lesson is a reading, and mine is from the titles and the first 380 characters of each lesson, not from full entry contents: the entries state the pick's mechanism for picks 2, 4, 6 and 7 (rb-10537, rb-8901, rb-11890 with guard-6694, rb-10002), sit one step off for picks 3 and 9 (rb-11602, rb-11577), and are topical neighbours whose titles do not state the lesson for picks 1, 5, 8 and 10. The 0 writes stands on the skill's trigger (a contradicted strategy), which the delegate found for 0 of 10 and I did not re-derive; the "10 of 10 encoded" tally is not supported. (4) The brief's allowed writes omitted the skill's Step 6 journal append, so the delegate wrote none; I wrote it (see Writes).
+  - Delegate-reported and not re-measured by me: the seed-116 draw and its reproduction (I reproduced the band-6 allocation, not the RNG calls; the delegate kept no selection script), the Step 2 chain winners, the Step 3 category grouping, the guard-3980 reading of pick 4, and the finding that no cited strategy was contradicted.
+  - No unreported writes: skill-invocations unchanged (9,616 lines); the agent changelog grew by 11 lines (10 retrieval-session edits, 20:22:17 to 20:22:55, and the experience-add at 20:25:15); the world changelog shows, besides the ten stamps, ten pattern-signatures edits at the same ten seconds (108 lines before and after), two utilization flushes (20:23:52 and 20:23:53) and one script-evolution line (20:26:46, revision script-20261009T202646-zeta-d94e, whose file_path is this ledger); guardrails 7204 and reasoning bank 12432 unchanged; the one tree node that changed in the window (recurring-goal-anti-drift-flip, 20:22:13) carries a partner's trigger (echo, g-326-516 occurrence 87, cc-03); six meta files were rewritten within 20:24:01 to 20:24:02 and the newest meta-log lines I read (mc-2294, mc-2295) belong to g-326-516, echo's goal (I did not diff the six); the ledger gained 79 lines and lost none (git diff --numstat 79 0); one experience record (exp-g-001-05-replay-20261009-run116, content file present). The daily journal did not change during the run (80,693 bytes before and after).
+  - Writes (reducer): journal: the "Replay Run 116 (g-001-05)" subsection of agents/zeta/journal/2026/10/2026-10-09.md; experience: two edits to exp-g-001-05-replay-20261009-run116.md (the "already encoded" sentence corrected to what the table shows, and a reducer read-back section); ledger: this block.
+  - NEXT RUN (117): KEEP the Run 115 list. ADD: (1) the Step 4 table gives, per cited entry, one clause stating what that entry says about the pick's lesson, so "encoded" is a reading shown and not a retrieval rank; (2) the brief lists the Step 6 journal append among the allowed writes; (3) the pre-run replay_count split is printed by a script from the saved snapshot, and its parts must sum to the type total before the line is written; (4) picks 4 and 6 of this run (CORRECTED, rc 3, next_review_date 2026-10-16) are the Step 3.6 candidates on re-entry, while picks 5 and 7 (CONFIRMED, rc 3) and pick 8 (CONFIRMED, rc 4) are not.
