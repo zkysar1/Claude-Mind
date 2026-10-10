@@ -89,12 +89,63 @@ is that caller; the pin is a check in section PU2 of
 `core/config/verify-learning-checks.jsonl`, so the producer and consumer cannot
 drift apart again.
 
+## Why the row also carries the strength of the hit (g-115-10095)
+
+`owned_by` alone was read as "cite that goal". The join returns an id for a
+title hit and for a description-only hit alike, so a reader could not tell a goal
+whose title names the node from a sweep that merely lists it, and 4 of the top 10
+links a reader followed named non-owners (filed by bravo, 2026-09-16). The join
+already computed the difference: `rank = (matched_in_title, owner_is_open)` picks
+the winner, and the return then threw the rank away. `owner_match`
+(`title` | `description`) and `owner_open` (bool) hand it to the consumer without
+a second scan of the aspiration store.
+
+**Why a dict subclass.** The tests that patch the join in, and the fail-open
+return, use a plain `fn(stems) -> {stem: goal id | None}`. A new return shape or
+an extra keyword would raise `TypeError` inside the call site's `try`, which
+swallows it and leaves every `owned_by` null. `_OwnerMap(dict)` keeps the mapping
+every caller already consumes and adds `.rank`; the call site reads it with
+`getattr(owners, "rank", {})`, so a patched or fail-open join leaves both fields
+null, meaning "strength unknown, do the lookup", never a guessed "strong".
+
+**Why only title + open + a size verb licenses a skip.** A description hit may be
+a claim about a LIST that contains the node (the census trap above). A terminal
+owner means the last look is over and nobody is on the node now. A title can name
+a node for a reason unrelated to its size (an Investigate about a retrieval bug,
+a contradiction between nodes), so the owner's title must also name the size (fold,
+split, carve, over-cap, read cap, distill). The reader checks that last condition;
+the two fields make the first two readable on the row.
+
+**Why an owner is a plan, not a worker** (bravo's outcome 4, rb-12846). Even a
+real owner is a pointer to a plan. An OPEN, UNCLAIMED, executable carve plan for
+an over-cap row is carried out inside the `/tree maintain` pass, and
+`owned_by_open_goal_annotated_not_recensused` is no accepted skip reason for it.
+Without this clause the licensed skips would recreate the original failure at a
+smaller scale: a plan nobody is executing, cited as if somebody were.
+
+**Measured** (alpha, hostname cc-04, `uname -r` 6.8.0-142-generic, 2026-10-10
+01:38 UTC, `bash core/scripts/tree-read.sh --distill-candidates`): 1,145 rows, of
+which 101 are read-cap rows. 85 are owned: 51 description-only, 30 title with an
+open owner, 4 title with a terminal owner. 16 are unowned. Of the 30 title+open
+rows, 22 have an owner whose title also names a size verb, so 22 of 101 rows
+license a skip and 63 of the 85 owned rows (74%) are a false owner under the new
+reading. Echo's recheck of 00:30Z counted 82 owned and 19 unowned, with the same
+51 description-only; the 3-row shift is title-named owners filed since.
+
+The pin is `test_distill_owned_by_annotation.py` (unit tests for the join's rank,
+the call site, the real join into the real row, and a text pin that the OWNER
+STRENGTH paragraph of `.claude/skills/tree/SKILL.md` names exactly the `owner_*`
+fields a row carries). It was checked against nine in-memory mutants of the
+producer and the consumer; each makes at least one new test fail.
+
 ## Cross-references
 
+- `g-115-10095` — the strength fields and the plan-not-worker clause
+- `rb-12846`, `guard-6849` — an owner id is a pointer to a plan; the false-owner class
 - `sig-229` — the two-census recurrence this annotation exists to end
 - `guard-1555` — archived goals disappear from the live store
 - `guard-2228` — title-only probes miss owners named only in a description
-- `core/scripts/tests/test_distill_owned_by_annotation.py` — the 11 tests pinning
+- `core/scripts/tests/test_distill_owned_by_annotation.py` — the 17 tests pinning
   every constraint above
 - `.claude/skills/tree/SKILL.md` DISTILL step 1 — the consumer
 - `core/config/verify-learning-checks.jsonl` section PU2 — the producer/consumer

@@ -180,3 +180,11 @@ def test_two_leg_split_keeps_the_probe_out_of_the_directory_collection(tmp_path)
     assert len(_probe_items([dsr.PROBE_REL], wt)) == 4
     # main leg: directories only; the probe must not appear in the collection at all
     assert _probe_items(["core/scripts/tests", "core/tests"], wt) == []
+
+
+def test_script_still_compiles_after_the_staging_namespace_rename():
+    """The staging sync renames MIND_ to MIND_ in every file (guard-5584), so the script must still
+    compile once it has. v2.12.97 shipped a keyword call naming both MIND_AGENT and MIND_AGENT; the
+    rename repeated the keyword, a SyntaxError that aborted pytest collection on every downstream
+    Mind (omni-407). Only a call's keywords fail this way: a dict literal's repeated keys are legal."""
+    compile(SCRIPT.read_text(encoding="utf-8").replace("MIND_", "MIND_"), str(SCRIPT), "exec")

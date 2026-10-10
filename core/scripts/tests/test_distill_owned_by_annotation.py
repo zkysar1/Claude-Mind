@@ -28,6 +28,7 @@ FAIL-OPEN (candidate production must never depend on the aspiration store).
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -128,6 +129,61 @@ class OwnedByAnnotationTest(unittest.TestCase):
             tree_engine._distill_owner_index(["delta-node"])["delta-node"],
             "g-5-OPEN")
 
+    def test_rank_records_title_vs_description_and_open_vs_terminal(self):
+        # : the join always knew HOW STRONG each hit was and threw it
+        # away, so a consumer could not tell an owner from a sweep that merely
+        # mentions the node. `rank` is (matched_in_title, owner_is_open).
+        self._store([
+            _goal("g-6-SWEEP", "Recurring freshness sweep",
+                  "covers gamma-node among others"),
+            _goal("g-6-DONE", "epsilon-node read cap", status="completed"),
+        ])
+        got = tree_engine._distill_owner_index(
+            ["gamma-node", "epsilon-node", "no-such-node"])
+        self.assertEqual(got.rank["gamma-node"], (False, True),
+                         "description-only hit on an open sweep: not a claim about the node")
+        self.assertEqual(got.rank["epsilon-node"], (True, False),
+                         "title hit on a terminal goal: names the node, nobody is on it")
+        self.assertNotIn("no-such-node", got.rank)
+        self.assertEqual(
+            got, {"gamma-node": "g-6-SWEEP", "epsilon-node": "g-6-DONE",
+                  "no-such-node": None},
+            "the mapping itself must stay exactly what every caller always got")
+
+    def test_strength_reaches_the_emitted_rows_through_the_real_join(self):
+        # : the seam the other tests straddle. The rank test pins the
+        # join and the patched-join test pins the call site; this one runs the
+        # real join into the real row, so a rename on either side fails here.
+        self._store([
+            _goal("g-7-OWN", "titled-node exceeds the read cap"),
+            _goal("g-7-SWEEP", "Recurring freshness sweep",
+                  "covers swept-node among others"),
+        ])
+
+        def _node():
+            fd, path = tempfile.mkstemp(suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as h:
+                h.write("## Architecture overview\n" + ("plain payload text line\n" * 4000))
+            self.addCleanup(lambda p=path: os.path.exists(p) and os.remove(p))
+            return {"file": path, "retrieval_count": 0, "utility_ratio": 0.0,
+                    "times_helpful": 0, "times_noise": 0, "children": []}
+
+        rows = {c["key"]: c for c in tree_engine.get_distill_candidates(
+            {"nodes": {"titled-node": _node(), "swept-node": _node(),
+                       "orphan-node": _node()}})}
+        self.assertEqual(sorted(rows), ["orphan-node", "swept-node", "titled-node"],
+                         "fixture must produce a read-cap row per node")
+        self.assertEqual(
+            (rows["titled-node"]["owned_by"], rows["titled-node"]["owner_match"],
+             rows["titled-node"]["owner_open"]), ("g-7-OWN", "title", True))
+        self.assertEqual(
+            (rows["swept-node"]["owned_by"], rows["swept-node"]["owner_match"],
+             rows["swept-node"]["owner_open"]), ("g-7-SWEEP", "description", True),
+            "a sweep that only mentions the node must read as description-only")
+        self.assertEqual(
+            (rows["orphan-node"]["owned_by"], rows["orphan-node"]["owner_match"],
+             rows["orphan-node"]["owner_open"]), (None, None, None))
+
     def test_unmatched_stem_reports_none_rather_than_a_nearest_guess(self):
         self._store([_goal("g-6-1", "something else entirely")])
         self.assertIsNone(
@@ -198,6 +254,41 @@ class AnnotateNeverSuppressTest(unittest.TestCase):
         self.assertIsNone(unowned[0]["owned_by"])
         self.assertEqual(owned[0]["owned_by"], "g-999-99")
 
+    def test_strength_fields_follow_the_rank_the_join_reports(self):
+        # : the call site copies the join's rank onto the row and
+        # never upgrades a weak hit. A weak owner still annotates; strength
+        # decides whether the reader may skip, not whether the row carries it.
+        tree = self._oversized_tree()
+
+        def _ranked(rank):
+            def _join(stems):
+                owners = tree_engine._OwnerMap({s: "g-999-99" for s in stems})
+                owners.rank.update({s: rank for s in stems})
+                return owners
+            return _join
+
+        self._patch_join(_ranked((True, True)))
+        strong = tree_engine.get_distill_candidates(tree)[0]
+        self.assertEqual((strong["owner_match"], strong["owner_open"]),
+                         ("title", True))
+
+        self._patch_join(_ranked((False, False)))
+        weak = tree_engine.get_distill_candidates(tree)[0]
+        self.assertEqual((weak["owner_match"], weak["owner_open"]),
+                         ("description", False))
+        self.assertEqual(weak["owned_by"], "g-999-99")
+
+    def test_a_join_that_reports_no_rank_leaves_strength_unknown(self):
+        # A plain mapping (every join the older tests patch in, and the fail-open
+        # return) carries no rank. `null` beside a non-null owned_by is the
+        # documented "strength unknown: do the lookup", never a silent "strong".
+        tree = self._oversized_tree()
+        self._patch_join(lambda stems: {s: "g-999-99" for s in stems})
+        row = tree_engine.get_distill_candidates(tree)[0]
+        self.assertEqual(row["owned_by"], "g-999-99")
+        self.assertIsNone(row["owner_match"])
+        self.assertIsNone(row["owner_open"])
+
     def test_a_raising_join_does_not_break_candidate_production(self):
         # Fail-open at the CALL SITE too, not only inside the helper.
         tree = self._oversized_tree()
@@ -212,14 +303,61 @@ class AnnotateNeverSuppressTest(unittest.TestCase):
         except Exception as exc:  # pragma: no cover - the assertion IS the point
             self.fail("a failing ownership join must never break the producer: %r" % exc)
         self.assertEqual([c["key"] for c in baseline], [c["key"] for c in after])
+        self.assertTrue(after, "fixture must actually produce a read-cap row")
+        for cand in after:
+            # A failed join must not leave a half-written strength behind.
+            self.assertIsNone(cand["owner_match"])
+            self.assertIsNone(cand["owner_open"])
 
     def test_owned_by_key_is_present_on_every_emitted_row(self):
         # Schema stability: `trigger` and `recommended_action` are emitted
         # unconditionally and this is the same shape, so consumers never have
         # to distinguish "absent key" from "no owner".
         tree = self._oversized_tree()
+        # No owner resolves, so every key below comes from the row template
+        # itself and not from the annotation step that fills it in.
+        self._patch_join(lambda stems: {s: None for s in stems})
         for cand in tree_engine.get_distill_candidates(tree):
             self.assertIn("owned_by", cand)
+            self.assertIn("owner_match", cand)
+            self.assertIn("owner_open", cand)
+
+    # ── the consumer half: the skill text that reads these fields ────────
+
+    def _owner_strength_paragraph(self):
+        """OWNER STRENGTH paragraph of /tree maintain, whitespace-normalised."""
+        skill_path = MODULE_PATH.parents[2] / ".claude" / "skills" / "tree" / "SKILL.md"
+        skill = " ".join(skill_path.read_text(encoding="utf-8").split())
+        marker = "OWNER STRENGTH (g-115-10095"
+        self.assertIn(marker, skill, "the consumer lost its owner-strength paragraph")
+        return skill.split(marker, 1)[1].split("# Rationale", 1)[0]
+
+    def test_consumer_names_exactly_the_strength_fields_a_row_carries(self):
+        # : the remedy lives in two files. A rename on either side
+        # leaves the other instructing a field no row carries, and a reader that
+        # finds neither falls back to "cite that goal" for every non-null
+        # owned_by, which is the false positive this goal fixed.
+        self._patch_join(lambda stems: {s: None for s in stems})
+        emitted = {k for k in tree_engine.get_distill_candidates(
+            self._oversized_tree())[0] if k.startswith("owner_")}
+        named = set(re.findall(r"\bowner_[a-z]+\b", self._owner_strength_paragraph()))
+        self.assertTrue(emitted, "fixture must emit at least one owner_* field")
+        self.assertEqual(named, emitted)
+
+    def test_consumer_keeps_the_rules_that_decide_a_skip(self):
+        # Each phrase is a rule a reader acts on; dropping one reopens the
+        # false positive (4 of the top 10 links named non-owners, 2026-09-16).
+        paragraph = self._owner_strength_paragraph()
+        for phrase in (
+                'owner_match == "title"',      # the only strength that licenses a skip
+                "description-only match",       # a mention is not a claim
+                "sweep or census goal",         # a list that contains the node
+                "terminal owner is NOT an owner",   # nobody is on it
+                "strength unknown",             # null beside a non-null owned_by
+                "a PLAN, not evidence the work is under way",   # an id is a pointer
+                "owned_by_open_goal_annotated_not_recensused",  # no longer a skip reason
+        ):
+            self.assertIn(phrase, paragraph)
 
 
 if __name__ == "__main__":

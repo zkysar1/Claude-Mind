@@ -13,10 +13,12 @@ The fix has two halves and this file pins both:
   * the endpoint: a release that says it comes from a worker
     (X-Mind-Body-Role) and from a session that does not hold the claim is
     SKIPPED. Nothing is written, and the answer carries `"released": false`.
-  * the wrapper: aspirations-release.sh forwards BODY_ROLE as that header,
-    and after a skipped release clears only the worker's own records (its
-    in_flight_bodies row and its body-keyed checkpoint), never the
-    agent-keyed in_flight row, which can be the holder's.
+  * the wrapper: aspirations-release.sh sends that header, as the literal
+    `worker`, when BODY_ROLE is worker (the one value the daemon acts on), on
+    the first call and on the retry after an autospawn. After a skipped
+    release it clears only the worker's own records (its in_flight_bodies
+    row and its body-keyed checkpoint), never the agent-keyed in_flight row,
+    which can be the holder's.
 
 What must NOT change is pinned beside it (guard-4166): the worker's release of
 its OWN claim still releases (the positive control), and a release with no
@@ -64,8 +66,11 @@ CLAIMED_AT = "2026-10-08T16:41:44"
 
 # ── endpoint ─────────────────────────────────────────────────────────────────
 
-def _make_world(tmp: Path, *, claimed_by: str, claimed_by_sid: str | None) -> Path:
-    """One in-progress world goal, claimed by `claimed_by` (and sid, when given)."""
+def _make_world(tmp: Path, *, claimed_by: str | None, claimed_by_sid: str | None) -> Path:
+    """One in-progress world goal, claimed by `claimed_by` (and sid, when given).
+
+    `claimed_by=None` leaves the goal unclaimed.
+    """
     world = tmp / "world"
     world.mkdir()
     goal = {
@@ -74,9 +79,10 @@ def _make_world(tmp: Path, *, claimed_by: str, claimed_by_sid: str | None) -> Pa
         "status": "in-progress", "priority": "MEDIUM", "blocked_by": [],
         "verification": {"outcomes": ["x"], "checks": [], "preconditions": []},
         "origin_signal": "user_directive", "participants": ["agent"],
-        "claimed_by": claimed_by, "claimed_at": CLAIMED_AT,
         "last_modified": CLAIMED_AT,
     }
+    if claimed_by is not None:
+        goal.update(claimed_by=claimed_by, claimed_at=CLAIMED_AT)
     if claimed_by_sid is not None:
         goal["claimed_by_sid"] = claimed_by_sid
     asp = {
@@ -123,7 +129,8 @@ def _release(port: int, *, sid: str, role: str | None) -> tuple[int, dict]:
 @pytest.mark.parametrize("holder,holder_sid", [
     ("alpha", HOLDER_SID),   # the  shape: another session of this agent
     ("bravo", HOLDER_SID),   # another agent's claim is never this worker's either
-], ids=["other-session", "other-agent"])
+    ("bravo", None),         # ...even when that claim recorded no sid
+], ids=["other-session", "other-agent", "other-agent-no-sid"])
 def test_worker_release_over_a_claim_it_does_not_hold_is_skipped(holder, holder_sid):
     with tempfile.TemporaryDirectory() as tmpd:
         world = _make_world(Path(tmpd), claimed_by=holder, claimed_by_sid=holder_sid)
@@ -173,13 +180,18 @@ def test_a_non_worker_release_still_clears_a_claim_it_does_not_hold(role):
         assert g["status"] == "pending"
 
 
-def test_worker_release_of_a_claim_with_no_sid_still_releases():
-    # Absent evidence keeps the old behaviour: a same-agent claim that carries
-    # no sid could be this worker's own, so the release runs as it always has.
+@pytest.mark.parametrize("claimed_by,claimed_by_sid,sid", [
+    ("alpha", None, WORKER_SID),   # a same-agent claim with no sid could be this worker's own
+    ("alpha", HOLDER_SID, ""),     # a worker that sends no sid cannot be told from the holder
+    (None, None, WORKER_SID),      # an unclaimed goal has no holder to protect
+], ids=["claim-without-sid", "caller-without-sid", "unclaimed"])
+def test_worker_release_without_the_evidence_still_releases(claimed_by, claimed_by_sid, sid):
+    # Absent evidence keeps the old behaviour, in each of the three cases the
+    # endpoint's docstring names: the release runs as it always has.
     with tempfile.TemporaryDirectory() as tmpd:
-        world = _make_world(Path(tmpd), claimed_by="alpha", claimed_by_sid=None)
+        world = _make_world(Path(tmpd), claimed_by=claimed_by, claimed_by_sid=claimed_by_sid)
         with DaemonFixture(world, agent="alpha") as df:
-            code, resp = _release(df.port, sid=WORKER_SID, role="worker")
+            code, resp = _release(df.port, sid=sid, role="worker")
         assert code == 200, resp
         assert "released" not in resp, resp
         assert "claimed_by" not in _goal(world)
@@ -189,11 +201,17 @@ def test_worker_release_of_a_claim_with_no_sid_still_releases():
 
 # Stub _runtime.sh: records the query and the headers rt_call was handed, then
 # answers with a canned response. Test data travels by env, never into shell
-# source (guard-165).
+# source (guard-165). With DOWN_ONCE set to a marker path, the first call finds
+# the daemon down (rc 3) and leaves the marker, rt_try_autospawn succeeds, and
+# only the wrapper's retry reaches the sinks.
 STUB_RUNTIME = """
 rt_url_encode() { printf '%s' "$1"; }
 rt_python_launcher() { printf '%s' "$RT_PY"; }
 rt_call() {
+    if [ -n "${DOWN_ONCE:-}" ] && [ ! -e "$DOWN_ONCE" ]; then
+        : > "$DOWN_ONCE"
+        return 3
+    fi
     local q="" h=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -208,7 +226,7 @@ rt_call() {
     printf '%s' "$RESPONSE_JSON"
     return 0
 }
-rt_try_autospawn() { return 1; }
+rt_try_autospawn() { [ -n "${DOWN_ONCE:-}" ]; }
 rt_no_daemon_error() { echo "no daemon: $1" >&2; exit 1; }
 """
 
@@ -241,7 +259,8 @@ def _stage(tmp: Path) -> Path:
     return scripts / "aspirations-release.sh"
 
 
-def _run_wrapper(tmp: Path, *, response: str, body_role: str | None):
+def _run_wrapper(tmp: Path, *, response: str, body_role: str | None,
+                 down_once: bool = False):
     """Run the worker-loop's literal step-4a call (guard-920) and return what it did."""
     script = _stage(tmp)
     sinks = {k: tmp / f"{k}.txt" for k in ("query", "headers", "calls")}
@@ -258,6 +277,8 @@ def _run_wrapper(tmp: Path, *, response: str, body_role: str | None):
     }
     if body_role is not None:
         env["BODY_ROLE"] = body_role
+    if down_once:
+        env["DOWN_ONCE"] = str(tmp / "down-once.marker")
     proc = subprocess.run(
         [BASH, script.as_posix(), GOAL_ID, "--source", "world",
          "--reason", "unit ended, work remains", "--reason-kind", "progress"],
@@ -273,11 +294,25 @@ def test_the_wrapper_forwards_the_worker_role_as_a_header(tmp_path):
     assert f"sid={WORKER_SID}" in seen["query"], seen
 
 
-def test_without_a_role_the_wrapper_sends_no_role_header(tmp_path):
-    # Every caller that is not a Body sends exactly what it sent before.
-    proc, seen = _run_wrapper(tmp_path, response=RELEASED, body_role=None)
+@pytest.mark.parametrize("role", [None, "reducer"], ids=["no-role", "reducer"])
+def test_without_the_worker_role_the_wrapper_sends_no_role_header(tmp_path, role):
+    # Every caller that is not a worker Body sends no role, the same answer the
+    # daemon gives to every value but worker.
+    proc, seen = _run_wrapper(tmp_path, response=RELEASED, body_role=role)
     assert proc.returncode == 0, proc.stderr
+    assert seen["query"], "rt_call never ran, so the empty header sink proves nothing"
     assert "X-Mind-Body-Role" not in seen["headers"], seen
+
+
+def test_the_retry_after_an_autospawn_still_sends_the_role(tmp_path):
+    # When the daemon is down the wrapper re-issues the release after
+    # rt_try_autospawn. A retry without the header would clear the holder's
+    # claim, which is the bug this goal fixes.
+    proc, seen = _run_wrapper(tmp_path, response=RELEASED, body_role="worker",
+                              down_once=True)
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "down-once.marker").exists(), "the first call never found the daemon down"
+    assert "X-Mind-Body-Role: worker" in seen["headers"].splitlines(), seen
 
 
 def test_a_skipped_release_clears_only_the_workers_own_records(tmp_path):

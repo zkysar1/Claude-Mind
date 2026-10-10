@@ -142,6 +142,34 @@ NONRECURRING_PRODUCER = "nonrecurring-state-update"
 # for a Phase-6 spark.
 DIARY_PHASE = "phase-6-spark"
 
+# : the digest's `phase-6-spark` BRACKET is written around the
+# Skill(aspirations-spark) CALL by the LLM (aspirations-loop-digest.md line 435),
+# and it is written even when the spark is then DEFERRED (zone tight), ABBREVIATED,
+# or cut by an autocompact BEFORE the skill body runs. So the bracket is a
+# phase-ENTRY marker, not proof the spark RAN — guard-3117's exact inference flaw:
+# a marker written when phase N was ENTERED read as proof the work inside phase N
+# FINISHED. Matching it (the pre- behavior) silently dropped 9 measured
+# owed sparks across three agents (alpha 4, zeta 4, bravo 1).
+#
+# The row that a REAL spark writes is the worker-spark-replay provenance row the
+# spark skill emits during its replay-drain step (, on BOTH branches —
+# these are the ONLY two spellings the writer emits today, SKILL.md lines 126/189):
+#   - empty branch : "worker-spark-replay: checked, 0 observations"
+#   - fire branch  : "worker-spark-replay: FIRED, <N> observation(s) from <gids>"
+# A spark deferred (zone tight), abbreviated, or cut by an autocompact BEFORE that
+# step writes NEITHER — no provenance row at all. That absence is the whole
+# discriminator: only a spark that got far enough to actually run its replay step
+# leaves a row, and every row the writer emits today spells checked or FIRED.
+#
+# The matcher selects checked|FIRED and nothing else: a bare prefix match on
+# "worker-spark-replay:" would also count any spelling the writer adds later for a
+# replay that did NOT complete (e.g. a future DEFERRED row), re-introducing the
+# false-skip from the other direction. The two accepted verdicts are pinned to the
+# WRITER's exact case below (lowercase `checked`, uppercase `FIRED`) so a case-fold
+# cannot start matching a spelling the writer never emits (guard-4323).
+REPLAY_PREFIX = "worker-spark-replay:"
+REPLAY_MATCH_SUFFIXES = ("checked", "FIRED")
+
 
 def _parse_dt(value):
     """Parse an ISO timestamp; return None on any failure (guard-420 pattern:
@@ -216,17 +244,63 @@ def fired_in_consumption_window(fired_map, goal_id, set_at,
     return lo <= ts <= hi
 
 
-def diary_fired_at(lines, goal_id, phase=DIARY_PHASE):
-    """Latest timestamp at which the execution diary records `phase` for
-    goal_id, or None when there is no such row (g-115-4201).
+def _replay_row_completed(content):
+    """True iff a diary row's content is a worker-spark-replay provenance row
+    for a spark that actually RAN its replay step — i.e. it spells `checked` or
+    `FIRED`, and never `DEFERRED` (g-115-11324, g-306-251).
 
-    PURE by the same contract as every other helper here: it takes an ITERABLE
-    OF JSONL STRINGS, never a path, so the decision logic is unit-testable with
-    no filesystem. The single `open()` lives in the CLI layer below.
+    The spark skill writes one of these two provenance rows during its
+    replay-drain step (g-306-251, the ONLY two spellings it emits), and only
+    reaches that step if it executed past its entry:
+      - "worker-spark-replay: checked, 0 observations"      -> ran, nothing to drain
+      - "worker-spark-replay: FIRED, N observation(s) from <gids>" -> ran, drained
+    A spark DEFERRED at zone tight, abbreviated, or cut by an autocompact BEFORE
+    that step writes NEITHER — no provenance row at all. That absence is the
+    whole discriminator: only a spark that got far enough to run its replay step
+    can corroborate a fire. The matcher accepts exactly these two verdicts and
+    nothing else, so a replay that did not complete (no row, or any future
+    spelling the writer may add for it) can never be read as a fire (guard-4323:
+    match the writer's exact spelling, nothing it does not emit).
 
-    LATEST, not first: a recurring goal can carry markers from several closes,
-    and only the most recent one can be THIS close's. The caller then runs it
-    through the SAME consumption window as a real record, so a marker from a
+    The prefix is anchored at the START of content: the spark skill writes the
+    row as `content = "worker-spark-replay: <verdict>"`, so a row whose content
+    merely MENTIONS the phrase elsewhere (a decision row, a narration) is not a
+    provenance row and must not count. The two accepted verdicts are exact
+    substrings of the remainder, which preserves the writer's case
+    (lowercase `checked`, uppercase `FIRED`) — a case-fold here would start
+    matching spellings the writer never emits (guard-4323).
+    """
+    if not isinstance(content, str):
+        return False
+    if not content.startswith(REPLAY_PREFIX):
+        return False
+    rest = content[len(REPLAY_PREFIX):]
+    return any(suffix in rest for suffix in REPLAY_MATCH_SUFFIXES)
+
+
+def diary_fired_at(lines, goal_id):
+    """Latest timestamp at which the execution diary records a worker-spark-replay
+    `checked`/`FIRED` provenance row for goal_id, or None when there is no such
+    row (g-115-4201, re-scoped by g-115-11324).
+
+    The signal a spark RAN is NOT the digest's `phase-6-spark` bracket: that
+    bracket is written around the Skill(aspirations-spark) CALL by the LLM and
+    lands even when the spark is then deferred, abbreviated, or compacted before
+    the body runs — a phase-ENTRY marker read as proof of completion
+    (guard-3117). That mis-read silently dropped 9 owed sparks across three
+    agents (measured 2026-09-28, the g-115-11324 origin record). The provenance
+    row the spark skill writes during its
+    replay step (checked|FIRED, never DEFERRED) is the closest per-goal trace of
+    a spark that actually executed, and is what this now matches.
+
+    PURE by the same contract as every other helper here (g-115-4201): it takes
+    an ITERABLE OF JSONL STRINGS, never a path, so the decision logic is
+    unit-testable with no filesystem. The single `open()` lives in the CLI layer
+    below.
+
+    LATEST, not first: a recurring goal can carry rows from several closes, and
+    only the most recent one can be THIS close's. The caller then runs it
+    through the SAME consumption window as a real record, so a row from a
     genuine previous close falls outside the window and still fires — the diary
     gets no privilege the WM record does not have.
 
@@ -242,8 +316,8 @@ def diary_fired_at(lines, goal_id, phase=DIARY_PHASE):
             continue
         stripped = line.strip()
         # Cheap prefilter before the json parse: the diary is a few thousand
-        # rows and only a handful ever mention a spark phase.
-        if not stripped or goal_id not in stripped or phase not in stripped:
+        # rows and only a handful ever carry a replay provenance row.
+        if not stripped or goal_id not in stripped or REPLAY_PREFIX not in stripped:
             continue
         try:
             row = json.loads(stripped)
@@ -251,7 +325,9 @@ def diary_fired_at(lines, goal_id, phase=DIARY_PHASE):
             continue
         if not isinstance(row, dict):
             continue
-        if row.get("goal_id") != goal_id or row.get("phase") != phase:
+        if row.get("goal_id") != goal_id:
+            continue
+        if not _replay_row_completed(row.get("content")):
             continue
         ts = _parse_dt(row.get("timestamp"))
         if ts is None:
@@ -266,14 +342,15 @@ def already_fired_this_close(fired_map, goal_id):
     the spark_fired_session map at all — no time comparison of any kind.
 
     Consulted by iteration-close.sh do_state_update BEFORE it writes the
-    pending_phase_6_spark sentinel on the NON-recurring path. When the in-turn
-    Phase-6 spark already fired for this goal, the sentinel has nothing to
-    trigger, so the correct action is to NOT WRITE IT — which makes the in-turn
-    path timing-free and leaves the sentinel doing only its real job (covering
-    the bg-timeout path where no in-turn fire happened).
+    pending_phase_6_spark sentinel on the NON-recurring path (g-115-3351). When
+    the in-turn Phase-6 spark already fired for this goal, the sentinel has
+    nothing to trigger, so the correct action is to NOT WRITE IT — which makes
+    the in-turn path timing-free and leaves the sentinel doing only its real job
+    (covering the bg-timeout path where no in-turn fire happened).
 
     This is the fix that ELIMINATES the window rather than widening it a fourth
-    time. It is sound precisely because a non-recurring goal closes exactly once:
+    time (g-115-3351). It is sound precisely because a non-recurring goal
+    closes exactly once:
     there is no earlier close of this goal_id whose fire could be mistaken for
     this one. That is why no timestamp is compared here, and why adding one back
     would re-introduce the uncalibratable bound (see UNBOUNDED_LOOKBACK).
@@ -343,8 +420,9 @@ def _read_diary_lines(path):
     lines, not a path — so nothing about the unit tests changes.
 
     Reading the file whole is deliberate rather than a tail scan: the largest
-    live diary measured across the fleet is 644 KB / 2,766 rows (alpha, cc-07,
-    2026-08-28), which is single-digit milliseconds, and a tail bound would be a
+    live diary measured across the fleet (g-115-4201) is 644 KB / 2,766 rows
+    (alpha, cc-07, 2026-08-28), which is single-digit milliseconds, and a tail
+    bound would be a
     PROXY for "recent" that a chatty iteration can push a relevant marker past.
 
     Fail-open: a missing path, an unreadable file, or any OS error yields [] ->

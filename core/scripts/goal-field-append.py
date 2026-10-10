@@ -222,6 +222,15 @@ def read_goal(goal_id: str, source: str) -> dict:
     except Exception as exc:  # noqa: BLE001
         _die(RC_READ_UNSAFE, f"read returned unparseable output: {exc}")
     rows = parsed if isinstance(parsed, list) else (parsed.get("goals") or parsed.get("results") or [])
+    if len(rows) > 1:
+        # A same-id rehome () leaves a `superseded` POINTER under the id beside
+        # the adopted live copy, so the all-status read above returns both. The write
+        # lookup (aspirations_write._find_goal) takes the first non-superseded copy; take
+        # the same one here or this read and the write address different records. Two live
+        # copies, or no live copy, stay ambiguous and fall through to the refusal.
+        live = [r for r in rows if isinstance(r, dict) and r.get("status") != "superseded"]
+        if len(live) == 1:
+            rows = live
     if len(rows) != 1:
         _die(RC_READ_UNSAFE,
              f"expected exactly 1 record for {goal_id}, got {len(rows)}. "

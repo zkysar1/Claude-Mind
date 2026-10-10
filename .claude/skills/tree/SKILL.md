@@ -387,21 +387,12 @@ Read {node.file}
 #      Reads (offset/limit); a full Read truncates exactly the node this fork is
 #      for — then route on shape, never on total size.
 #
-#      ⚠ MEASURE **BYTES** PER SECTION, NOT LINE SPANS. This block said "line
-#      spans" until 2026-08-17 and the unit is wrong by up to 7x, silently, in
-#      the direction that hides the dominant section. Measured that day (foxtrot,
-#      `hostname` LAPTOP-3IOFCNEO, `uname -r` 6.6.87.2-microsoft-standard-WSL2)
-#      on a per-agent series shard (an index TABLE plus dated narrative entries):
-#      its `## Series` TABLE section is
-#      **456 B/line** against **63 B/line** for the narrative entry sections, so
-#      by lines it is 6.4% of the node and by bytes it is **32.5%**. The
-#      consequence is not academic — a RANGED Read of just its first 215 lines
-#      returned **35,462 tokens and was REFUSED for exceeding the 25,000 cap**,
-#      i.e. the fork's own prescribed measurement step cannot complete on a
-#      table-dense node while reporting a small line count. Tables, `|`-rows, id
-#      lists and timestamps tokenize far denser than prose (the same density trap
-#      `.claude/rules/self.md` measures at 2.48-2.51 B/token for ID-dense
-#      markdown). ONE CALL profiles it — a scoped call to the shared tool
+#      ⚠ MEASURE **BYTES** PER SECTION, NOT LINE SPANS: a line span is wrong by up
+#      to 7x, silently, in the direction that hides the dominant section, and a
+#      RANGED Read of a table-dense node can be REFUSED at the 25,000-token cap
+#      while it reports a small line count.
+#      Rationale (WHY bytes, the measured case): core/config/rationale/tree-shape-fork-measured-cases.md
+#      ONE CALL profiles it — a scoped call to the shared tool
 #      (gap-111), never a hand-run awk, so its thresholds cannot drift from the
 #      config that owns them:
 #        Bash: bash core/scripts/tree-shape-fork.sh {node.file}   # --json to parse
@@ -436,18 +427,11 @@ Read {node.file}
 #            default. keep-newest-N then cannot reach the cap NO MATTER HOW MANY
 #            entries it deletes, because the dominant section is not an entry —
 #            so the rollup pays its full destructive cost and still leaves the
-#            node unreadable. Two live cases, both measured 2026-08-17 (foxtrot,
-#            LAPTOP-3IOFCNEO, 6.6.87.2-microsoft-standard-WSL2):
-#              · a per-agent SERIES SHARD — its `## Series` index TABLE is 82,104
-#                of 252,815 B (32.5%) and ~35.7k est tokens, i.e. **over the 25k
-#                cap BY ITSELF**. Archiving every one of its 28 dated entries
-#                still leaves the node 1.46x over cap. Untouchable by rollup.
-#              · a FAILURE-MODE CATALOG node — 284,057 B, 4.9x cap,
-#                `refresh_sections: 30`, `recommended_action: distill`. Its cost
-#                was 145,425 B (51%) of dated `### n=NN` cycle entries accumulated
-#                **under a `## Cross-references` heading**, plus a second 72,423 B
-#                (25%) append series. 76.7% of a "catalog" node was series, filed
-#                where no heading said so.
+#            node unreadable. Two live cases, measured 2026-08-17: a series shard
+#            whose index TABLE alone was over the 25k cap (archiving every dated
+#            entry still left it 1.46x over cap), and a "catalog" node that was
+#            76.7% dated series filed under a non-series heading. Numbers:
+#            core/config/rationale/tree-shape-fork-measured-cases.md
 #            -> Route by WHAT the dominant section IS, never by the crit3 label:
 #               a mis-nested SERIES (dated subsections under a non-series heading)
 #               -> SPLIT it out to its own child, then the parent is a catalog and
@@ -735,6 +719,19 @@ Thresholds from `core/config/tree.yaml` `pruning` section.
    list as new work — cite that goal rather than re-censusing (sig-229).
    It ANNOTATES, it does NOT SUPPRESS: an owned row still appears and still takes
    the routing below. `null` is weak evidence, not proof — the join fails open.
+   OWNER STRENGTH (g-115-10095, guard-6849) — the row also carries `owner_match`
+   (`title` | `description`) and `owner_open` (bool). "Cite that goal" licenses a
+   skip ONLY when `owner_match == "title"` AND `owner_open` is true AND the
+   owner's title names that node's size (fold, split, carve, over-cap, read cap,
+   distill): read it with `aspirations-query.sh --goal-field id <owner> --full`.
+   A description-only match, a sweep or census goal, or a terminal owner is NOT an
+   owner — route the row as unowned and name the false owner in the run record.
+   Both fields `null` beside a non-null `owned_by` means strength unknown: do the
+   lookup. Even a real owner is a PLAN, not evidence the work is under way
+   (rb-12846): an OPEN, UNCLAIMED, executable carve plan for an over-cap row is
+   carried out inside the pass (sha1 backup, verbatim split, tree-split-verify
+   before and after install) and its evidence appended to the owner —
+   `owned_by_open_goal_annotated_not_recensused` is no accepted skip reason for it.
    # Rationale (WHY annotate rather than filter, why `null` is weak, and the
    # two-census incident): core/config/rationale/distill-owned-by-annotation.md
 2. For each candidate (largest line_count first, up to `max_distill_per_invocation`):

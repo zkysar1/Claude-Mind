@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.98",
+    "previous_version": "2.12.97",
+    "date": "2026-10-10",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "REPLACES v2.12.97 as the adoptable tag: omni-407 measured the staged v2.12.97 deployment-shaped-run.py SyntaxError (seed G2 MIND_->MIND_ rename repeated the MIND_AGENT keyword in the dict(...) call -> keyword argument repeated -> pytest collection aborted every framework_pull --adopt verify, all rolled back; defect new-in-hop, absent at v2.12.95, first planted v2.12.96 blob 3603eac; rb-12461 blind spot corrected in the unit verdict: the selector is test-files-only and the one test importing the harness transforms cleanly, so it was never run at dest). Fix in this tag: de6a634992 (dict literal; two equal keys legal) + regression test test_script_still_compiles_after_the_staging_namespace_rename; also 2966b5767a (X-Mind-Body-Role literal header form, the v2.12.97 census red) and the v2.12.97..origin/main delta (143 commits, 15 manifest-relevant files, 819 insertions: deployment-shaped-run.py, tests/test_deployment_shaped_run.py, tree.py, spark-fire-dedup.py, aspirations-release.sh, goal-field-append.py, tree SKILL.md + rationale/config docs); v2.12.96 remains DO-NOT-PROMOTE; v2.12.97 remains tagged but is DO-NOT-ADOPT (staged tree at /opt/GitHub/Claude-Mind 66c7b4af carries the SyntaxError)",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.97",
     "previous_version": "2.12.96",
     "date": "2026-10-09",

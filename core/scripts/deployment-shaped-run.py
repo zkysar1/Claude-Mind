@@ -289,8 +289,11 @@ def main(argv=None):
     try:
         reshape(wt, skel, strategy)
         (wt / PROBE_REL).write_text(probe_source(dev_agent, dev_goal), encoding="utf-8")
-        env = dict(os.environ, MIND_AGENT=HUSK, MIND_AGENT=HUSK, STORAGE_BACKEND="local",
-                   RUNTIME_DIR=str(out / "rt"), RT_NO_AUTOSPAWN="1")
+        # A dict literal on purpose, not dict(..., MIND_AGENT=, MIND_AGENT=): the staging sync renames
+        # MIND_ to MIND_, which leaves two equal keys here (legal) where a keyword call would repeat one
+        # (a SyntaxError that aborted pytest collection on v2.12.97, omni-407).
+        env = {**os.environ, "MIND_AGENT": HUSK, "MIND_AGENT": HUSK, "STORAGE_BACKEND": "local",
+               "RUNTIME_DIR": str(out / "rt"), "RT_NO_AUTOSPAWN": "1"}
         for k in ("MIND_WORLD", "MIND_META"):
             env.pop(k, None)
         # THE PROBE LEG IS ITS OWN CALL ON A PRISTINE SHAPED TREE (measured 2026-10-08 zc-10):

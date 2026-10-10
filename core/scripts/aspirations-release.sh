@@ -284,11 +284,17 @@ fi
 # releasing a claim that another session holds (_worker_release_keeps_claim in
 # aspirations_write.py). Same header, same reason as aspirations-update-goal.sh:
 # BODY_ROLE is injected into every Bash call by bash-agent-inject.py and is
-# absent inside the daemon, so it has to travel. With it unset nothing is sent
-# and the daemon releases exactly as before, so the sweeps and every other
-# caller that is not a worker Body are unchanged.
+# absent inside the daemon, so it has to travel. With any other value, or none,
+# nothing is sent and the daemon releases exactly as before, so the sweeps and
+# every other caller that is not a worker Body are unchanged.
+#
+# A LITERAL, NOT "$BODY_ROLE". The daemon acts on the worker role alone and
+# bash-agent-inject.py exports no other value, so nothing is lost. A header that
+# interpolates a value joins the population test_unknown_flag_refusal.py pins
+# (: a header value cannot carry a line break), and that matrix is
+# keyed by argv flags, which this value is not.
 declare -a HEADER_ARGS=()
-[ -n "${BODY_ROLE:-}" ] && HEADER_ARGS+=(--header "X-Mind-Body-Role: $BODY_ROLE")
+[ "${BODY_ROLE:-}" = "worker" ] && HEADER_ARGS+=(--header "X-Mind-Body-Role: worker")
 
 # --- in_flight clear () -----------------------------------------
 # SYMMETRY, not a new mechanism. aspirations-claim.sh SETS the busy signal
