@@ -387,6 +387,11 @@ def _row(ts, op, agent="bravo", field=None):
     return {"ts": ts, "agent": agent, "op": op, "field": field}
 
 
+# PROVENANCE. 's verification names  (drain) and 
+# (hypothesis-resolution) as the two instances to pin. Neither has a record in the
+# live stores or a row in the readable changelog window (it starts 2026-09-15), so
+# the rows below are OTHER measured members of those two classes, not those goals'
+# own sequences.
 _DRAIN_ROWS = [                                    # cause 4: CNC-drain
     _row("2026-08-25T14:02:36", "claim", "foxtrot"),
     _row("2026-09-06T06:41:58", "complete-by", "echo"),
@@ -525,3 +530,524 @@ def test_the_emitted_prose_did_not_grow_into_a_sixth_caveat():
     out = cps.render(r)
     assert len(out) < 1200, f"findings line regrew to {len(out)} chars"
     assert "close-phase-skip-causes.md" in out
+
+
+# ── The no-`complete-by` DRAIN close (, unit zc04-nocb-drain) ───────
+# The 2026-08-29 cause catalog named the 0.5g.7 completed-not-closed drain as
+# cause 4, fingerprinted `complete-by` + `outcome_class` seconds apart. But the
+# drain was re-shown to no longer emit `complete-by` at all (rechecks
+# 2026-10-08..11): the iteration-close DRAIN branch writes `status`,
+# `outcome_class`, then its OWN close-time stamp `key_finding`, seconds apart,
+# with no `complete-by` row. So the pre-branch classifier hit its
+# `complete_by is None` early return and read EVERY one as a lost state-update,
+# re-firing the false alarm daily.
+#
+# THE DISCRIMINATOR IS THE DRAIN'S OWN STAMP. `key_finding` as an
+# `update-goal` row has EXACTLY ONE writer (measured, ):
+# iteration-close.sh's DRAIN branch. `aspirations-complete-by.sh` folds
+# key_finding into the record under its own `complete-by` row, never as
+# `update-goal key_finding`. So a `key_finding` row with NO `complete-by` row
+# in the goal's entire changelog can only be a drained close — and a drained
+# close is a sanctioned non-executing close (the drainer ran no unit), so the
+# missing state-update is EXCLUDEd, CREDITed nothing. The claim history is
+# irrelevant for THIS shape (unlike the with-`complete-by` fingerprint, where
+# it is the only separator): `--drain` is the closer's own declaration it did
+# not run the unit.
+#
+# ANTI-VACUITY (guard-5163): the drained close and the cause-3 bare-status
+# close are IDENTICAL on every pre-existing signal — both have no `complete-by`,
+# both are uncounted. The only thing that separates them is the drain's own
+# `key_finding` stamp beside the close triple. The first test below asserts the
+# old signals really do collapse, so the second — that the classifier now
+# separates them — proves something.
+
+def _drain_rows(status_field="status", kf_offset=6, oc_offset=3, claim=True):
+    """The measured drain shape: [claim], then the close triple seconds apart.
+    `status_field` is the logged field of the status row (`status`, or
+    `status+outcome_note` when the closure note was folded into the SAME locked
+    RMW as the status flip — g-358-36 companion; measured on drain close
+    g-377-108, recheck 2026-10-10). `kf_offset`/`oc_offset` are seconds after
+    the status row for key_finding / outcome_class."""
+    base = "2026-10-08T07:49:"
+    rows = []
+    if claim:
+        rows.append(_row("2026-10-08T07:49:00", "claim", "bravo"))
+    rows.append(_row(base + "20", "update-goal", "bravo", status_field))
+    rows.append(_row(base + f"{20 + oc_offset:02d}", "update-goal", "bravo",
+                     "outcome_class"))
+    rows.append(_row(base + f"{20 + kf_offset:02d}", "update-goal", "bravo",
+                     "key_finding"))
+    return rows
+
+
+_DRAIN_ROWS_NOCL = _drain_rows()          # bare status + outcome_class + key_finding
+_DRAIN_ROWS_COMPANION = _drain_rows(status_field="status+outcome_note")
+_BARE_STATUS_NOCL = [                      # cause 3: bare-status close, NO drain stamp
+    _row("2026-10-10T09:00:00", "claim", "bravo"),
+    _row("2026-10-10T09:05:00", "update-goal", "bravo", "status"),
+]
+
+
+def test_the_drain_and_bare_status_collapse_on_every_dead_signal():
+    """The half that makes the next test mean something.
+
+    Both are uncounted and both have NO `complete-by` row. Every record-derived
+    discriminator reads the same for both; the only thing that separates them is
+    the drain's own key_finding stamp, which the old classifier never read.
+    """
+    for rows in (_DRAIN_ROWS_NOCL, _BARE_STATUS_NOCL):
+        assert not any(r["op"] == "complete-by" for r in rows), rows
+        assert any(r["op"] == "claim" for r in rows), rows
+        assert any(r["field"] == "status" for r in rows), rows
+
+
+def test_the_classifier_separates_the_drain_close_from_a_bare_status():
+    """The new branch: a drained close (key_finding stamp, no complete-by) is a
+    sanctioned non-executing close -> EXCLUDE. A bare-status close (cause 3, no
+    drain stamp) stays a finding -> UNCLASSIFIED."""
+    assert cps.classify_close_path(_DRAIN_ROWS_NOCL, "bravo") == \
+        cps.PATH_SANCTIONED_DISPOSAL
+    assert cps.classify_close_path(_BARE_STATUS_NOCL, "bravo") == \
+        cps.PATH_UNCLASSIFIED
+
+
+def test_the_drain_close_is_excluded_even_for_a_same_agent_claim():
+    """`--drain` is the closer's own declaration it ran no unit, so a same-agent
+    claim does NOT make the missing state-update owed (unlike the with-
+    `complete-by` fingerprint, where a same-agent claim under-matches to
+    UNCLASSIFIED). The 10-08..11 rechecks measured exactly this same-agent drain
+    shape being misread as a loss; the repair (a state-update) would corrupt the
+    counters it is meant to fix."""
+    rows = _drain_rows(claim=True)
+    assert any(r["op"] == "claim" and r["agent"] == "bravo" for r in rows)
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_SANCTIONED_DISPOSAL
+
+
+def test_the_companion_status_field_variant_is_also_a_drain_close():
+    """ folds the closure note into the SAME locked RMW as the status
+    flip; the daemon logs that row's field as `status+outcome_note`, not
+    `status`. Measured on drain close g-377-108 (recheck 2026-10-10). It must
+    classify as the same EXCLUDE, not under-match to a finding."""
+    assert cps.classify_close_path(_DRAIN_ROWS_COMPANION, "bravo") == \
+        cps.PATH_SANCTIONED_DISPOSAL
+
+
+def test_the_drain_branch_never_fires_when_a_complete_by_is_present():
+    """The branch is gated on `complete_by is None`. A goal that DID close
+    through complete-by (and also carries a key_finding, as the recurring /
+    hypothesis-resolution paths can) must take the with-`complete-by` path, not
+    be re-read as a drain. No claim row -> CREDIT, never the drain's EXCLUDE."""
+    rows = [
+        _row("2026-09-07T14:36:00", "complete-by", "bravo"),
+        _row("2026-09-07T14:36:04", "update-goal", "bravo", "outcome_class"),
+        _row("2026-09-07T14:36:06", "update-goal", "bravo", "key_finding"),
+    ]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_SANCTIONED_SELF
+
+
+def test_the_drain_fingerprint_anchors_on_the_close_cluster_not_the_first_flip():
+    """A goal's window can carry an in-progress `status` flip days before the
+    close. Anchoring on that earlier row would read the days-long gap as a
+    resume and under-match a real drain; each cluster member must be the row
+    NEAREST the drain's own stamp."""
+    rows = [
+        _row("2026-09-01T10:00:00", "claim", "bravo"),
+        _row("2026-09-01T10:05:00", "update-goal", "bravo", "status"),  # days earlier
+        _row("2026-09-20T21:18:54", "update-goal", "bravo", "status"),  # the close
+        _row("2026-09-20T21:18:57", "update-goal", "bravo", "outcome_class"),
+        _row("2026-09-20T21:19:00", "update-goal", "bravo", "key_finding"),
+    ]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_SANCTIONED_DISPOSAL
+
+
+def test_a_drain_close_with_a_gap_past_the_bound_stays_a_finding():
+    """A close triple where outcome_class lands >60s from the drain stamp is not
+    the sanctioned seconds-apart shape — under-match to a finding."""
+    rows = [
+        _row("2026-10-08T07:49:00", "claim", "bravo"),
+        _row("2026-10-08T07:49:20", "update-goal", "bravo", "status"),
+        _row("2026-10-08T07:49:26", "update-goal", "bravo", "key_finding"),
+        _row("2026-10-08T07:52:00", "update-goal", "bravo", "outcome_class"),  # 154s after kf
+    ]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_a_row_interposed_inside_the_drain_cluster_breaks_the_fingerprint():
+    """The same intra-cluster hygiene the with-`complete-by` fingerprint enforces:
+    a stray mid-close write breaks the match and the close stays a finding."""
+    rows = [
+        _row("2026-10-08T07:49:00", "claim", "bravo"),
+        _row("2026-10-08T07:49:20", "update-goal", "bravo", "status"),
+        _row("2026-10-08T07:49:22", "update-goal", "bravo", "outcome_note"),  # stray
+        _row("2026-10-08T07:49:23", "update-goal", "bravo", "outcome_class"),
+        _row("2026-10-08T07:49:26", "update-goal", "bravo", "key_finding"),
+    ]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_a_drain_stamp_without_the_full_triple_is_not_a_drain_close():
+    """A key_finding row with no outcome_class, or with no status, beside it is
+    not the close triple — a lone stamp does not prove the close ran. Both
+    under-match to a finding."""
+    no_oc = [
+        _row("2026-10-08T07:49:00", "claim", "bravo"),
+        _row("2026-10-08T07:49:20", "update-goal", "bravo", "status"),
+        _row("2026-10-08T07:49:26", "update-goal", "bravo", "key_finding"),
+    ]
+    no_st = [
+        _row("2026-10-08T07:49:00", "claim", "bravo"),
+        _row("2026-10-08T07:49:23", "update-goal", "bravo", "outcome_class"),
+        _row("2026-10-08T07:49:26", "update-goal", "bravo", "key_finding"),
+    ]
+    assert cps.classify_close_path(no_oc, "bravo") == cps.PATH_UNCLASSIFIED
+    assert cps.classify_close_path(no_st, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_an_unparseable_drain_stamp_never_reads_as_a_small_gap():
+    rows = [
+        _row("2026-10-08T07:49:00", "claim", "bravo"),
+        _row("2026-10-08T07:49:20", "update-goal", "bravo", "status"),
+        _row("2026-10-08T07:49:23", "update-goal", "bravo", "outcome_class"),
+        _row("not-a-timestamp", "update-goal", "bravo", "key_finding"),
+    ]
+    assert cps.classify_close_path(rows, "bravo") == cps.PATH_UNCLASSIFIED
+
+
+def test_decide_excludes_an_uncounted_drain_close_and_keeps_the_sweep_clean():
+    """The integration half: an uncounted close the classifier attributes to a
+    drained path is EXCLUDED (not a finding), and a sweep whose only uncounted
+    close is such a drain renders CLEAN, not findings."""
+    r = cps.decide([{"id": "g-1"}], lambda _g: "absent",
+                   close_path=lambda _g: cps.classify_close_path(_DRAIN_ROWS_NOCL,
+                                                                 "bravo"))
+    assert r["skipped"] == [] and r["sanctioned_excluded"] == ["g-1"]
+    assert r["status"] == "clean"
+    assert "EXCLUDED" in cps.render(r)
+
+
+# ── The RESOLVE-PASS close (, cause 11, zeta/cc-02 2026-10-11) ──────
+# A hypothesis RESOLVER goal closed by the resolve pass itself. The pass is an
+# iteration of an enclosing recurring goal (, occurrence 81) whose own
+# state-update ran — its journal block is stamped 03:25 and the goal reads
+# counted — while the two resolver goals it closed read uncounted and were
+# reported as "NO state-update". Neither had an iteration of its own: no claim
+# row, no outcome_class row, just a note and a bare `complete-by` 8 seconds
+# later. That changelog shape is byte-identical to a lost DIRECT close (causes 2
+# and 5), so the changelog alone cannot separate them (the first test pins that).
+# What separates them is a DURABLE RECORD OF THE WORK: the pipeline stamps the
+# hypothesis `resolved_at` / `resolved_by` when the pass resolves it.
+#
+# THE DISCRIMINATOR AND ITS NEIGHBOURS (guard-2898). The property that carries
+# the carve-out is "no iteration of this goal's own existed AND its work is
+# recorded by the closer's own resolution" — a CONJUNCTION. Each neighbour that a
+# narrower reading of it would wrongly admit is pinned below to keep its old
+# verdict: a claimed resolver goal that lost its close, a close that ran the
+# verify machinery, another agent's resolution, a close that PRECEDES the
+# resolution, another agent's complete-by, and every unreadable input.
+
+_RESOLVE_ROWS_11976 = [                      # measured, cc-02, 2026-10-11
+    _row("2026-10-04T04:35:38", "add-goal", "zeta"),
+    _row("2026-10-04T04:35:55", "update-goal", "zeta", "status+outcome_note"),
+    _row("2026-10-11T02:56:42", "update-goal", "zeta", "outcome_note"),
+    _row("2026-10-11T02:56:50", "complete-by", "zeta"),
+]
+_RESOLUTION_11976 = {"resolved_at": "2026-10-11T02:55:08", "resolved_by": "zeta"}
+_RESOLVE_ROWS_12073 = [                      # measured, cc-02, 2026-10-11
+    _row("2026-10-11T03:15:44", "update-goal", "zeta", "status+outcome_note"),
+    _row("2026-10-11T03:16:15", "update-goal", "zeta", "outcome_note"),
+    _row("2026-10-11T03:16:23", "complete-by", "zeta"),
+]
+_RESOLUTION_12073 = {"resolved_at": "2026-10-11T03:10:57", "resolved_by": "zeta"}
+_RESOLVE_CASES = [(_RESOLVE_ROWS_11976, _RESOLUTION_11976),
+                  (_RESOLVE_ROWS_12073, _RESOLUTION_12073)]
+
+
+def test_the_resolve_pass_close_is_a_finding_on_the_changelog_alone():
+    """Anti-vacuity (guard-5163). Both measured closes have no claim, no
+    outcome_class and a lone complete-by — the exact fingerprint of a lost direct
+    close — so without the pipeline stamp they MUST stay findings. If this
+    passed through to EXCLUDE, the stamp would be doing no work."""
+    for rows, _res in _RESOLVE_CASES:
+        assert not any(r["op"] == "claim" for r in rows)
+        assert not any(r["field"] == "outcome_class" for r in rows)
+        assert cps.classify_close_path(rows, "zeta") == cps.PATH_UNCLASSIFIED
+
+
+def test_the_pipeline_stamp_separates_the_measured_resolve_pass_closes():
+    for rows, res in _RESOLVE_CASES:
+        assert cps.classify_close_path(rows, "zeta", resolution=res) \
+            == cps.PATH_SANCTIONED_DISPOSAL
+        assert cps.classify_close_path(rows, "zeta", resolution=lambda r=res: r) \
+            == cps.PATH_SANCTIONED_DISPOSAL
+
+
+def test_a_claimed_resolver_goal_whose_close_was_lost_stays_a_finding():
+    """The neighbour that matters most: a resolver goal executed as an iteration
+    of its own (claimed) and closed without state-update is the loss this check
+    exists to catch, and it has the same pipeline stamp as the resolve pass."""
+    for claimant in ("zeta", "echo"):
+        rows = [_row("2026-10-11T02:30:00", "claim", claimant)] + _RESOLVE_ROWS_11976
+        assert cps.classify_close_path(rows, "zeta", resolution=_RESOLUTION_11976) \
+            == cps.PATH_UNCLASSIFIED
+
+
+def test_a_close_that_ran_the_verify_machinery_is_not_this_branch():
+    """Any outcome_class row means close machinery ran, so the cause-6 pair, the
+    cause-1 resume and the cause-8 reversal own the verdict."""
+    rows = _RESOLVE_ROWS_11976
+    late = rows + [_row("2026-10-11T03:11:50", "update-goal", "zeta", "outcome_class")]
+    early = [_row("2026-10-11T02:56:30", "update-goal", "zeta", "outcome_class")] + rows
+    for shape in (late, early):
+        assert cps.classify_close_path(shape, "zeta", resolution=_RESOLUTION_11976) \
+            == cps.PATH_UNCLASSIFIED
+    # the cause-6 pair keeps its CREDIT verdict even when a resolution exists
+    res = {"resolved_at": "2026-09-07T14:00:00", "resolved_by": "bravo"}
+    assert cps.classify_close_path(_HYPRES_ROWS, "bravo", resolution=res) \
+        == cps.PATH_SANCTIONED_SELF
+
+
+def test_another_agents_resolution_is_not_the_closers_work():
+    res = dict(_RESOLUTION_11976, resolved_by="echo")
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, "zeta", resolution=res) \
+        == cps.PATH_UNCLASSIFIED
+
+
+def test_a_close_that_precedes_the_resolution_is_not_its_bookkeeping():
+    late = dict(_RESOLUTION_11976, resolved_at="2026-10-11T02:56:51")
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, "zeta", resolution=late) \
+        == cps.PATH_UNCLASSIFIED
+    same = dict(_RESOLUTION_11976, resolved_at="2026-10-11T02:56:50")
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, "zeta", resolution=same) \
+        == cps.PATH_SANCTIONED_DISPOSAL
+
+
+def test_another_agents_complete_by_is_not_the_closers_close():
+    rows = _RESOLVE_ROWS_11976[:-1] + [_row("2026-10-11T02:56:50", "complete-by", "echo")]
+    assert cps.classify_close_path(rows, "zeta", resolution=_RESOLUTION_11976) \
+        == cps.PATH_UNCLASSIFIED
+
+
+@pytest.mark.parametrize("resolution", [
+    None, {}, {"resolved_by": "zeta"}, {"resolved_at": "2026-10-11T02:55:08"},
+    {"resolved_at": "not-a-timestamp", "resolved_by": "zeta"}, "resolved", [],
+])
+def test_an_unreadable_resolution_never_suppresses(resolution):
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, "zeta", resolution=resolution) \
+        == cps.PATH_UNCLASSIFIED
+
+
+def test_a_raising_or_unknown_closer_never_suppresses():
+    def boom():
+        raise RuntimeError("pipeline unreadable")
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, "zeta", resolution=boom) \
+        == cps.PATH_UNCLASSIFIED
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, None,
+                                   resolution=_RESOLUTION_11976) == cps.PATH_UNCLASSIFIED
+    bad_close = _RESOLVE_ROWS_11976[:-1] + [_row("garbled", "complete-by", "zeta")]
+    assert cps.classify_close_path(bad_close, "zeta", resolution=_RESOLUTION_11976) \
+        == cps.PATH_UNCLASSIFIED
+
+
+def test_the_resolution_is_read_only_when_the_changelog_shape_already_matches():
+    """The pipeline read is a subprocess. It must not happen for every uncounted
+    close — only for one whose changelog already says no claim, no outcome_class
+    and the closer's own complete-by."""
+    calls = []
+
+    def lookup():
+        calls.append(1)
+        return _RESOLUTION_11976
+
+    claimed = [_row("2026-10-11T02:30:00", "claim", "zeta")] + _RESOLVE_ROWS_11976
+    verified = _RESOLVE_ROWS_11976 + [_row("2026-10-11T02:56:53", "update-goal",
+                                           "zeta", "outcome_class")]
+    foreign = _RESOLVE_ROWS_11976[:-1] + [_row("2026-10-11T02:56:50", "complete-by", "echo")]
+    foreign_status = [_row("2026-10-11T02:56:42", "update-goal", "echo", "status")]
+    note_only = [_row("2026-10-11T02:56:42", "update-goal", "zeta", "outcome_note")]
+    for rows in (claimed, verified, foreign, foreign_status, note_only):
+        cps.classify_close_path(rows, "zeta", resolution=lookup)
+    assert calls == []
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, "zeta", resolution=lookup) \
+        == cps.PATH_SANCTIONED_DISPOSAL
+    assert calls == [1]
+    # the status-flip close matches the same structure, so it reads exactly once too
+    bare = [_row("2026-10-11T02:56:42", "update-goal", "zeta", "status")]
+    assert cps.classify_close_path(bare, "zeta", resolution=lookup) \
+        == cps.PATH_SANCTIONED_DISPOSAL
+    assert calls == [1, 1]
+
+
+def test_there_is_no_time_bound_on_the_close():
+    """Deliberate (see _resolve_pass_close): conditions 1-4 already say no
+    iteration existed and the work is recorded, so how long after the resolution
+    the close came does not change the verdict. A future bound must break this
+    test on purpose, not by accident."""
+    early = dict(_RESOLUTION_11976, resolved_at="2026-09-20T09:00:00")
+    assert cps.classify_close_path(_RESOLVE_ROWS_11976, "zeta", resolution=early) \
+        == cps.PATH_SANCTIONED_DISPOSAL
+
+
+def test_decide_excludes_both_measured_resolve_pass_closes_and_keeps_the_sweep_clean():
+    by_goal = {"g-115-11976": (_RESOLVE_ROWS_11976, _RESOLUTION_11976),
+               "g-115-12073": (_RESOLVE_ROWS_12073, _RESOLUTION_12073)}
+    r = cps.decide([{"id": g} for g in by_goal], lambda _g: "absent",
+                   close_path=lambda g: cps.classify_close_path(
+                       by_goal[g][0], "zeta", resolution=by_goal[g][1]))
+    assert r["skipped"] == [] and r["sanctioned_credited"] == []
+    assert sorted(r["sanctioned_excluded"]) == ["g-115-11976", "g-115-12073"]
+    assert r["status"] == "clean"
+
+
+# The SAME close typed as a bare status flip (no `complete-by`). SHAPE AS REPORTED
+# by foxtrot ( recheck-foxtrot-20261011: three hypothesis-review
+# sub-goals closed by `update-goal outcome_note` then `update-goal status` inside
+# one occurrence of ) — NOT measured on this box, so these rows are
+# modeled on the measured complete-by rows of  with the close typed as
+# a status flip. The earlier `status+outcome_note` row is that goal's real GROOM
+# promote, days before the resolution: it is why the branch must anchor on the
+# LAST status write — anchored on the first, the ordering test would fail.
+_RESOLVE_STATUS_ROWS = [
+    _row("2026-10-04T04:35:38", "add-goal", "foxtrot"),
+    _row("2026-10-04T04:35:55", "update-goal", "foxtrot", "status+outcome_note"),
+    _row("2026-10-11T02:56:42", "update-goal", "foxtrot", "outcome_note"),
+    _row("2026-10-11T02:56:50", "update-goal", "foxtrot", "status"),
+]
+_RESOLUTION_STATUS = {"resolved_at": "2026-10-11T02:55:08", "resolved_by": "foxtrot"}
+
+
+def test_a_resolve_pass_close_typed_as_a_status_flip_needs_the_stamp_too():
+    """Anti-vacuity: without the stamp this is cause 3's bare-status fingerprint
+    and stays a finding; the pipeline stamp is the only thing that moves it."""
+    assert cps.classify_close_path(_RESOLVE_STATUS_ROWS, "foxtrot") == cps.PATH_UNCLASSIFIED
+    assert cps.classify_close_path(_RESOLVE_STATUS_ROWS, "foxtrot",
+                                   resolution=_RESOLUTION_STATUS) \
+        == cps.PATH_SANCTIONED_DISPOSAL
+
+
+def test_the_status_flip_variant_accepts_the_companion_field_and_keeps_its_neighbours():
+    close = _row("2026-10-11T02:56:50", "update-goal", "foxtrot", "status+outcome_note")
+    folded = _RESOLVE_STATUS_ROWS[:2] + [close]
+    assert cps.classify_close_path(folded, "foxtrot", resolution=_RESOLUTION_STATUS) \
+        == cps.PATH_SANCTIONED_DISPOSAL
+    claimed = [_row("2026-10-11T02:30:00", "claim", "foxtrot")] + _RESOLVE_STATUS_ROWS
+    verified = _RESOLVE_STATUS_ROWS + [_row("2026-10-11T02:56:53", "update-goal",
+                                            "foxtrot", "outcome_class")]
+    foreign_close = _RESOLVE_STATUS_ROWS[:-1] + [_row("2026-10-11T02:56:50", "update-goal",
+                                                      "echo", "status")]
+    no_status = [_row("2026-10-11T02:56:42", "update-goal", "foxtrot", "outcome_note")]
+    for name, rows in (("claimed", claimed), ("verified", verified),
+                       ("foreign close", foreign_close), ("no status write", no_status)):
+        assert cps.classify_close_path(rows, "foxtrot", resolution=_RESOLUTION_STATUS) \
+            == cps.PATH_UNCLASSIFIED, name
+    other = dict(_RESOLUTION_STATUS, resolved_by="echo")
+    assert cps.classify_close_path(_RESOLVE_STATUS_ROWS, "foxtrot", resolution=other) \
+        == cps.PATH_UNCLASSIFIED
+    late = dict(_RESOLUTION_STATUS, resolved_at="2026-10-11T02:56:51")
+    assert cps.classify_close_path(_RESOLVE_STATUS_ROWS, "foxtrot", resolution=late) \
+        == cps.PATH_UNCLASSIFIED
+
+
+def test_a_drain_close_still_takes_the_drain_branch_first():
+    """The two no-complete-by branches must not shadow each other: a drain triple
+    is EXCLUDEd by the drain fingerprint whether or not a resolution is passed."""
+    assert cps.classify_close_path(_DRAIN_ROWS_NOCL, "bravo") == cps.PATH_SANCTIONED_DISPOSAL
+    assert cps.classify_close_path(_DRAIN_ROWS_NOCL, "bravo",
+                                   resolution={"resolved_at": "2026-01-01T00:00:00",
+                                               "resolved_by": "bravo"}) \
+        == cps.PATH_SANCTIONED_DISPOSAL
+
+
+# ── The CLI half carries the resolution to the classifier (guard-2241, rb-6234) ─
+# Widening what the classifier READS is inert if its production call site never
+# hands it the data. Every test above passes `resolution=` by hand, so none of
+# them can see a call site that forgets to. These do.
+
+def _cl_line(ts, agent, op, gid, field=""):
+    return (f"[{ts}] {agent} edit aspirations.jsonl (27 lines) — {op} {gid}"
+            f"{(' ' + field) if field else ''}")
+
+
+def _fake_run(changelog_lines, pipeline, seen):
+    """Stand-in for subprocess.run: answers the changelog read and the pipeline
+    read, and refuses anything else so a stray call cannot pass silently."""
+    class _Done:
+        def __init__(self, out):
+            self.stdout, self.stderr, self.returncode = out, "", 0
+
+    def run(cmd, **_kw):
+        target = str(cmd[1])
+        if target.endswith("changelog-read.sh"):
+            return _Done("\n".join(changelog_lines) + "\n")
+        if target.endswith("pipeline-read.sh") and cmd[2] == "--id":
+            seen.append(cmd[3])
+            rec = pipeline.get(cmd[3])
+            return _Done(json.dumps(rec) if rec is not None else "")
+        raise AssertionError(f"unexpected subprocess call: {cmd}")
+    return run
+
+
+def test_the_population_carries_the_hypothesis_id_to_the_oracle():
+    cli = _load_cli_module()
+    goals = [{"id": "g-1", "completed_by_sid": "S", "completed_by": "me",
+              "completed_at": "2026-10-11T02:56:47", "hypothesis_id": "2026-10-04_h"},
+             {"id": "g-2", "completed_by_sid": "S", "completed_by": "me",
+              "completed_at": "2026-10-11T02:57:00"}]
+    with tempfile.TemporaryDirectory() as td:
+        pop, _, _ = cli._closed_this_session(_store(td, goals), "S", 25, "me")
+    assert {r["id"]: r["hypothesis_id"] for r in pop} == {"g-1": "2026-10-04_h", "g-2": None}
+
+
+def test_the_oracle_hands_the_classifier_a_lazy_pipeline_lookup(monkeypatch):
+    cli = _load_cli_module()
+    lines = [
+        _cl_line("2026-10-11T02:56:42", "zeta", "update-goal", "g-900-01", "outcome_note"),
+        _cl_line("2026-10-11T02:56:50", "zeta", "complete-by", "g-900-01"),
+        # the same shape, but CLAIMED: an iteration of its own, so a real loss
+        _cl_line("2026-10-11T02:30:00", "zeta", "claim", "g-900-02"),
+        _cl_line("2026-10-11T02:56:42", "zeta", "update-goal", "g-900-02", "outcome_note"),
+        _cl_line("2026-10-11T02:56:50", "zeta", "complete-by", "g-900-02"),
+        # the same shape with NO hypothesis behind it
+        _cl_line("2026-10-11T02:56:42", "zeta", "update-goal", "g-900-03", "outcome_note"),
+        _cl_line("2026-10-11T02:56:50", "zeta", "complete-by", "g-900-03"),
+    ]
+    pipeline = {"2026-10-04_h": {"id": "2026-10-04_h", "stage": "resolved",
+                                 "resolved_at": "2026-10-11T02:55:08", "resolved_by": "zeta"}}
+    seen = []
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run(lines, pipeline, seen))
+    verdict = cli._close_path_oracle(
+        ["g-900-01", "g-900-02", "g-900-03"], "zeta",
+        {"g-900-01": "2026-10-04_h", "g-900-02": "2026-10-04_h"})
+    assert verdict("g-900-01") == cps.PATH_SANCTIONED_DISPOSAL
+    assert verdict("g-900-02") == cps.PATH_UNCLASSIFIED
+    assert verdict("g-900-03") == cps.PATH_UNCLASSIFIED
+    assert seen == ["2026-10-04_h"], "pipeline read only for the matching shape"
+
+
+@pytest.mark.parametrize("record", [
+    {"stage": "active", "resolved_at": None},
+    {"stage": "resolved"},
+    {"stage": "discovered", "resolved_at": "2026-10-11T02:55:08", "resolved_by": "zeta"},
+    None,
+])
+def test_an_unresolved_or_unreadable_pipeline_record_never_suppresses(monkeypatch, record):
+    cli = _load_cli_module()
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run([], {"h": record}, []))
+    assert cli._hypothesis_resolution("h") is None
+
+
+def test_a_resolved_pipeline_record_yields_its_stamp_even_list_wrapped(monkeypatch):
+    cli = _load_cli_module()
+    rec = {"stage": "resolved", "resolved_at": "2026-10-11T02:55:08", "resolved_by": "zeta"}
+    for payload in (rec, [rec]):
+        monkeypatch.setattr(cli.subprocess, "run", _fake_run([], {"h": payload}, []))
+        assert cli._hypothesis_resolution("h") == {"resolved_at": "2026-10-11T02:55:08",
+                                                   "resolved_by": "zeta"}
+
+
+def test_main_passes_the_hypothesis_map_into_the_oracle():
+    """Pin the production call site (rb-6234): the unit tests above hand the map
+    to `_close_path_oracle` themselves, so a `main()` that stopped building it
+    would leave every one of them green and the lane unchanged."""
+    src = (_SCRIPTS / "close-phase-skip-check.py").read_text(encoding="utf-8")
+    assert "_close_path_oracle(gids, agent, hypotheses)" in src
+    assert 'if r.get("id") and r.get("hypothesis_id")' in src

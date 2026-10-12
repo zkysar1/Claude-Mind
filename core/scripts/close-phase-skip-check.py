@@ -125,7 +125,8 @@ def _closed_this_session(store_path, sid, limit, agent):
                     continue
                 total += 1
                 rows.append({"id": g.get("id"),
-                             "completed_at": g.get("completed_at") or ""})
+                             "completed_at": g.get("completed_at") or "",
+                             "hypothesis_id": g.get("hypothesis_id")})
     rows.sort(key=lambda r: r["completed_at"], reverse=True)
     return rows[:limit], total, foreign
 
@@ -202,12 +203,44 @@ _CHANGELOG = _HERE / "changelog-read.sh"
 _CHANGELOG_LIMIT = 20000
 
 
-def _close_path_oracle(goal_ids, agent):
+_PIPELINE_READ = _HERE / "pipeline-read.sh"
+
+
+def _hypothesis_resolution(hypothesis_id):
+    """The pipeline's own resolution stamp for one hypothesis, or None.
+
+    `{resolved_at, resolved_by}` is what the pipeline write path stamps when a
+    hypothesis is resolved (`_stamp_resolution_provenance`, mind_api/src/world/
+    pipeline_write.py; never overwritten) — the durable record of the work a
+    resolver goal's close is only the bookkeeping for. A record resolved before
+    that stamp existed carries neither field and reads as None. Read through the
+    canonical wrapper (guard-2676). FAIL-OPEN TO None, WHICH IS THE FINDING SIDE:
+    an unreadable, unresolved or unparseable record never suppresses a report.
+    """
+    try:
+        proc = subprocess.run([_BASH, str(_PIPELINE_READ), "--id", hypothesis_id],
+                              capture_output=True, text=True, timeout=40)
+        rec = json.loads(proc.stdout)
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(rec, list):
+        rec = rec[0] if rec else None
+    if (not isinstance(rec, dict) or rec.get("stage") not in ("resolved", "archived")
+            or not rec.get("resolved_at")):
+        return None
+    return {"resolved_at": rec["resolved_at"], "resolved_by": rec.get("resolved_by")}
+
+
+def _close_path_oracle(goal_ids, agent, hypothesis_ids=None):
     """callable(goal_id) -> a close_phase_skip.PATH_* verdict.
 
     Reads the changelog ONCE through its canonical wrapper (guard-2676 — never
     a hand-rolled read of the store) and buckets every row naming a goal under
     test.
+
+    `hypothesis_ids` maps a hypothesis RESOLVER goal to its hypothesis. It is
+    handed to the classifier as a LAZY callable, so the pipeline is read only for
+    a close whose changelog shape already matches (cause 11) — normally none.
 
     FAIL-OPEN TO `UNCLASSIFIED`, WHICH IS THE FINDING SIDE. If the changelog
     cannot be read or parsed, every uncounted close stays a finding and this
@@ -236,7 +269,14 @@ def _close_path_oracle(goal_ids, agent):
         return lambda _g: cps.PATH_UNCLASSIFIED
     for g in rows:
         rows[g].sort(key=lambda r: r["ts"])
-    return lambda g: cps.classify_close_path(rows.get(g) or [], agent)
+    hyp = hypothesis_ids or {}
+
+    def _verdict(g):
+        hid = hyp.get(g)
+        return cps.classify_close_path(
+            rows.get(g) or [], agent,
+            resolution=(lambda: _hypothesis_resolution(hid)) if hid else None)
+    return _verdict
 
 
 def main(argv=None):
@@ -278,9 +318,11 @@ def main(argv=None):
             return 2
         gids = [r["id"] for r in population if r.get("id")]
         oracle = _membership_oracle(gids)
+        hypotheses = {r["id"]: r["hypothesis_id"] for r in population
+                      if r.get("id") and r.get("hypothesis_id")}
         report = cps.decide(population, oracle,
                             _bump_failures(agent, project_root), role="reducer",
-                            close_path=_close_path_oracle(gids, agent))
+                            close_path=_close_path_oracle(gids, agent, hypotheses))
         report["population_total_this_session"] = total
         report["population_bound"] = args.limit
         if foreign:

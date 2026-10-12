@@ -176,6 +176,173 @@ PATH_SANCTIONED_SELF = "sanctioned-self"          # closer DID work -> CREDIT (r
 PATH_UNCLASSIFIED = "unclassified"                # stays a finding
 
 
+def _drain_fingerprint(rows):
+    """The  drain shape: NO `complete-by` at all, but the drain path's
+    own close-time stamp — `key_finding` — with the close triple (`status`,
+    `outcome_class`) seconds around it.
+
+    WHY `key_finding` IS PATH-PROVEN HERE (and is not the record-derived
+    discriminator the rationale file measured to failure). Four record-side
+    signals all collapsed, because they describe what the goal was about or who
+    touched it. The CHANGELOG records which script ran. `key_finding` has exactly
+    two writers (measured, g-115-8295): `aspirations-complete-by.sh` — which
+    always emits a `complete-by` row, so any key_finding it stamps sits BESIDE a
+    complete-by and never reaches this branch — and `iteration-close.sh`'s
+    DRAIN branch, gated `[[ -n "$DRAIN" && "$GOAL_STATUS" == "completed" ]]`.
+    So a `key_finding` row with no `complete-by` row in the goal's entire
+    changelog can only be a drained close. A genuinely skipped close (the
+    autocompact-resume shape, or a hand-typed bare-status close) never completes
+    do_verify, so it writes none of the triple and cannot match.
+
+    WHY EXCLUDE RATHER THAN CREDIT, even for a SAME-AGENT claim. `--drain` is
+    the closer's own declaration that it "did not run the unit" (iteration-close
+    documents it; the 0.5g.7 completed-not-closed drain disposes another lane's
+    finished-but-unbanked work). The claim history is therefore irrelevant for
+    THIS shape — unlike the with-`complete-by` fingerprint, where it is the only
+    separator (causes 4 and 6 are byte-identical there). The work, if any, was
+    executed by whoever the row belonged to, not by the drainer, and a
+    `--phase state-update` repair would book that work to the drainer's session —
+    the counter corruption this goal's point (a) exists to prevent. Measured
+    shape (g-115-8295 rechecks 2026-10-08 to 10-11): `status`, `outcome_class`,
+    `key_finding` 3 to 13 s apart, no `complete-by`, SAME-agent claim rows
+    present — the pre-branch classifier read every one of them as a lost
+    state-update.
+    """
+    kf = next((r for r in rows if r.get("op") == "update-goal"
+               and r.get("field") == "key_finding"), None)
+    if kf is None:
+        return False
+    t_kf = _ts_seconds(kf.get("ts"))
+    if t_kf is None:
+        return False
+    # ANCHOR ON THE CLOSE CLUSTER, NOT THE FIRST STATUS FLIP. A goal's window
+    # can carry an in-progress `status` flip days before the close (the
+    #  measured window shows exactly that shape), and anchoring the
+    # triple on that earlier row would read the days-long gap as a resume and
+    # under-match a real drain. Each cluster member is the row NEAREST the
+    # drain's own stamp, within the sanctioned bound.
+    def _nearest(field):
+        cands = [r for r in rows if r.get("op") == "update-goal"
+                 and r.get("field") == field
+                 and _ts_seconds(r.get("ts")) is not None
+                 and abs(_ts_seconds(r.get("ts")) - t_kf)
+                     <= SANCTIONED_GAP_SECONDS]
+        return min(cands, key=lambda r: abs(_ts_seconds(r.get("ts")) - t_kf)) \
+            if cands else None
+
+    def _nearest_status():
+        # The status row's logged field is `status`, or `status+outcome_note`
+        # when the closure note was folded into the SAME locked RMW as the
+        # status flip ( companion; the daemon's changelog summary is
+        # `update-goal <id> status+outcome_note` in that case — measured on a
+        # real drain close, ,  recheck 2026-10-10). Both
+        # are the close; neither is a stray.
+        return _nearest_in(("status", "status+outcome_note"))
+
+    def _nearest_in(fields):
+        cands = [r for r in rows if r.get("op") == "update-goal"
+                 and r.get("field") in fields
+                 and _ts_seconds(r.get("ts")) is not None
+                 and abs(_ts_seconds(r.get("ts")) - t_kf)
+                     <= SANCTIONED_GAP_SECONDS]
+        return min(cands, key=lambda r: abs(_ts_seconds(r.get("ts")) - t_kf)) \
+            if cands else None
+
+    st = _nearest_status()
+    oc = _nearest("outcome_class")
+    if st is None or oc is None:
+        return False
+    lo = min(t_kf, _ts_seconds(st.get("ts")), _ts_seconds(oc.get("ts")))
+    hi = max(t_kf, _ts_seconds(st.get("ts")), _ts_seconds(oc.get("ts")))
+    # Nothing else naming this goal may sit inside the close cluster — the
+    # same hygiene the with-`complete-by` fingerprint enforces, so a stray
+    # mid-close write breaks the match and the close stays a finding.
+    for r in rows:
+        t = _ts_seconds(r.get("ts"))
+        if t is None or r is kf or r is st or r is oc:
+            continue
+        if lo <= t <= hi:
+            return False
+    return True
+
+
+def _last_status_row(rows):
+    """The goal's last `status` write — the closing row of a close taken as a bare
+    status flip, which writes no `complete-by`. The logged field is `status`, or
+    `status+outcome_note` when the note rode the same locked write."""
+    status = [r for r in rows if r.get("op") == "update-goal"
+              and r.get("field") in ("status", "status+outcome_note")]
+    return status[-1] if status else None
+
+
+def _resolve_pass_close(rows, close_row, closing_agent, resolution):
+    """A hypothesis-resolution close taken DIRECTLY by the resolve pass: the
+    closer resolved the hypothesis, then closed that hypothesis's resolver goal
+    with a bare `complete-by` — or, when the pass typed it as a status flip, a
+    bare `status` write — never having claimed it (cause 11). `close_row` is that
+    closing row.
+
+    THE PROPERTY THAT CARRIES THIS CARVE-OUT (guard-2898) is neither "it is a
+    hypothesis goal" nor "it has no claim" — either alone admits its neighbours.
+    It is the CONJUNCTION that says no iteration of this goal's own existed AND
+    its work product is durably recorded elsewhere:
+
+      1. NO `claim` row from ANY agent. An iteration of the goal's own would have
+         claimed it, so a lost state-update of such an iteration still reports.
+      2. NO `outcome_class` row at all. If any close machinery (verify) ran, the
+         cause-6 pair, the cause-1 resume and the cause-8 reversal own that
+         verdict, and this branch must not reach them.
+      3. The closing row is the CLOSING agent's own.
+      4. The goal's hypothesis is recorded as resolved BY THE CLOSING AGENT at or
+         before that closing row. `resolution` is the pipeline's own stamp
+         (`{resolved_at, resolved_by}`), joined on the goal's `hypothesis_id` by
+         the CLI half — or a zero-argument callable returning it, so the pipeline
+         read happens only once 1-3 already hold. That stamp is the durable
+         record of the work, which is what makes dropping the counter bump safe:
+         nothing the bump would have booked is unrecorded.
+
+    WHY EXCLUDE AND NOT CREDIT (cause 6 is CREDIT). Cause 6 ran the close
+    machinery for a goal it never claimed, so only the last phase was lost and
+    the work is genuinely unbooked. Here the closer ran no close machinery at
+    all: the resolve pass is itself an iteration of an enclosing recurring goal
+    whose own state-update booked the pass (measured 2026-10-11, zeta/cc-02:
+    g-115-11976 and g-115-12073, closed 02:56:50 and 03:16:23, inside g-001-02
+    occurrence 81, whose journal block is stamped 03:25 and which reads counted).
+    Repairing the resolver goal with `--phase state-update` would book the same
+    pass twice.
+
+    NO TIME BOUND, deliberately. The verdict does not depend on how long after
+    the resolution the close came — conditions 1-4 already say no iteration
+    existed and the work is recorded — so a bound would be a parameter without a
+    purpose, and an unmeasured one (n=2: 102 s and 326 s). The ORDER is kept,
+    because a close that PRECEDES the resolution cannot be that resolution's
+    bookkeeping.
+
+    Every ambiguous input returns False — a missing or unreadable resolution, an
+    unparseable stamp, a raising callable — and the close stays a finding.
+    """
+    if resolution is None or not closing_agent:
+        return False
+    if any(r.get("op") == "claim" for r in rows):
+        return False
+    if any(r.get("op") == "update-goal" and r.get("field") == "outcome_class"
+           for r in rows):
+        return False
+    if close_row.get("agent") != closing_agent:
+        return False
+    t_close = _ts_seconds(close_row.get("ts"))
+    if t_close is None:
+        return False
+    try:
+        res = resolution() if callable(resolution) else resolution
+    except Exception:  # noqa: BLE001 — an unreadable resolution is a finding, never a suppression
+        return False
+    if not isinstance(res, dict) or res.get("resolved_by") != closing_agent:
+        return False
+    t_res = _ts_seconds(res.get("resolved_at"))
+    return t_res is not None and t_res <= t_close
+
+
 def _ts_seconds(stamp):
     """Naive `YYYY-MM-DDTHH:MM:SS` -> epoch-ish seconds. Returns None if
     unparseable — an unreadable stamp must never render as a small gap."""
@@ -186,13 +353,17 @@ def _ts_seconds(stamp):
         return None
 
 
-def classify_close_path(rows, closing_agent=None):
+def classify_close_path(rows, closing_agent=None, resolution=None):
     """Classify HOW one goal was closed, from that goal's changelog rows.
 
     rows: chronological list of dicts for ONE goal id, each {ts, agent, op,
         field}. `op` is one of claim | release | complete-by | update-goal |
         add-goal; `field` is set only for update-goal.
     closing_agent: the agent whose session is being checked.
+    resolution: for a hypothesis resolver goal only — the pipeline's own
+        `{resolved_at, resolved_by}` stamp for the goal's hypothesis, or a
+        zero-argument callable returning it (read lazily, see
+        `_resolve_pass_close`). None for every other goal.
 
     Returns one of the PATH_* constants. Every ambiguous input returns
     PATH_UNCLASSIFIED, because under-matching is the safe direction here: a
@@ -205,8 +376,22 @@ def classify_close_path(rows, closing_agent=None):
 
     complete_by = next((r for r in rows if r.get("op") == "complete-by"), None)
     if complete_by is None:
-        # No complete-by at all: a bare-status close or a resume. Not sanctioned
-        # by anything this function can see.
+        # No complete-by at all. ONE shape in the no-complete-by family is
+        # separable here: the iteration-close DRAIN close, which never emits
+        # complete-by but stamps its own close-time row (key_finding) beside
+        # the close triple. _drain_fingerprint carries the path proof for why
+        # that row is path-proven and why the verdict is EXCLUDE rather than
+        # CREDIT (and why a same-agent claim does not change it).
+        if _drain_fingerprint(rows):
+            return PATH_SANCTIONED_DISPOSAL
+        # The resolve-pass close (cause 11) typed as a bare status flip instead of
+        # a `complete-by`: same conjunction, anchored on the last status write.
+        status_row = _last_status_row(rows)
+        if status_row is not None and _resolve_pass_close(
+                rows, status_row, closing_agent, resolution):
+            return PATH_SANCTIONED_DISPOSAL
+        # Otherwise a bare-status close or a resume. Not sanctioned by
+        # anything this function can see.
         return PATH_UNCLASSIFIED
 
     t0 = _ts_seconds(complete_by.get("ts"))
@@ -214,6 +399,13 @@ def classify_close_path(rows, closing_agent=None):
                if r.get("op") == "update-goal" and r.get("field") == "outcome_class"
                and (_ts_seconds(r.get("ts")) or -1) >= (t0 or 0)), None)
     if oc is None or t0 is None:
+        # No outcome_class after the complete-by: the direct-close family (causes
+        # 2 and 5), which the changelog alone cannot separate. ONE member is
+        # separable by joining the pipeline's resolution stamp — cause 11, the
+        # resolver goal closed by the resolve pass itself.
+        if oc is None and _resolve_pass_close(rows, complete_by, closing_agent,
+                                              resolution):
+            return PATH_SANCTIONED_DISPOSAL
         return PATH_UNCLASSIFIED
     t1 = _ts_seconds(oc.get("ts"))
     if t1 is None or (t1 - t0) > SANCTIONED_GAP_SECONDS:
@@ -359,7 +551,7 @@ def render(report):
             "these. These are the closes the classifier could NOT attribute to a "
             "sanctioned non-executing path, so establish the cause per goal: "
             "`changelog-read.sh --limit 20000 | grep <goal-id>` and read the "
-            "SEQUENCE and its gaps, never the presence of any single row. The six "
+            "SEQUENCE and its gaps, never the presence of any single row. The "
             "measured close shapes and which are sanctioned: "
             "core/config/rationale/close-phase-skip-causes.md."
         )

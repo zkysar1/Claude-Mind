@@ -392,10 +392,22 @@ def main() -> int:
     bad = sorted((r for r in real if r["cls"] == "UNRELATED" and r["citations"]),
                  key=lambda r: -r["citations"])
 
+    # : --json emits the PRECOMPUTED per-class citation sums beside
+    # the raw events, so a caller can quote a labelled quantity instead of
+    # hand-summing `events[].citations` -- where the class choice is invisible
+    # (ZDS  published a 3-7x delta from differencing UNRELATED against
+    # the all-class total). The TEXT headline below is UNRELATED-only and
+    # equals citations_by_cls["UNRELATED"] by construction.
+    citations_by_cls = {c: sum(r["citations"] for r in real if r["cls"] == c)
+                        for c in ("UNRELATED", "NEAR-TWIN", "DANGLING")}
+    citations_total = sum(citations_by_cls.values())
+
     if a.json:
         print(json.dumps({"control_hits": ctrl, "scan": stats,
                           "surface_files": nfiles, "surface_bytes": nbytes,
                           "sentinels": sorted(sentinels),
+                          "citations_by_cls": citations_by_cls,
+                          "citations_total": citations_total,
                           "events": real}, indent=1))
         return 1 if (a.strict and bad) else (2 if not ctrl else 0)
 

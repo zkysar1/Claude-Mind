@@ -264,13 +264,24 @@ def _pin_intended_agent_roster(monkeypatch):
     """
     try:
         from gates import intended_agent_vocab as _iav
+        import aspirations as _aspirations
     except ImportError:
         yield
         return
+    _fixture_roster = ("alpha", "bravo", "charlie", "delta", "echo",
+                       "foxtrot", "omni", "zeta")
     monkeypatch.setattr(
         _iav, "_resolve_roster",
-        lambda: ("alpha", "bravo", "charlie", "delta", "echo",
-                 "foxtrot", "omni", "zeta"))
+        lambda: _fixture_roster)
+    #  (omni-388): the goal-selector resolves the roster through
+    # aspirations._valid_intended_agents() -> _agents.get_active_agents(), a
+    # consumer the gate pin above does NOT reach. Pin that root seam in process
+    # too, so fixture names (alpha/bravo) route identically in a deployment-
+    # shaped run as here; unseeded the selector stays exposed (guard-1038's
+    # cross-deployment form, now closed for the selector path as well).
+    monkeypatch.setattr(
+        _aspirations, "_valid_intended_agents",
+        lambda: set(_fixture_roster) | {"either"})
     yield
 
 

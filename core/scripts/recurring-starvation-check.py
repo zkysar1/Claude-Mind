@@ -885,6 +885,20 @@ def _file_unblock(row: dict, errors: list | None = None) -> str | None:
         "origin_signal": _origin_signal(goal_id, row["source"],
                                         anchor=row.get("anchor")),
     }
+    # An agent-queue Unblock lives in a store only its owner can write, so the
+    # queue owner is the one agent that can execute it. Say so ().
+    # With no routing in the payload the daemon's capability router classifies
+    # by CONTENT and stamps whichever agent the starved goal's title reads as;
+    # the agent-queue routing gate then refuses that stamped filing as
+    # unclaimable by construction, so the sweep reports file_failures=1 on every
+    # run for the one goal it most needs to rescue. A caller-set intended_agent
+    # skips the router (rb-4879). World rows keep the router's stamp: every
+    # agent can claim from the world store, so a stamp there is reachable.
+    # MIND_AGENT is the owner (_sources() scans the agent queue only when it
+    # is set); "either" is the gate-safe value for a hand-built row with none.
+    if row["source"] == "agent":
+        payload["intended_agent"] = (
+            os.environ.get("MIND_AGENT", "").strip() or "either")
     try:
         rec = _rt.aspirations_add_goal(row["aspiration_id"], payload,
                                       source=row["source"])

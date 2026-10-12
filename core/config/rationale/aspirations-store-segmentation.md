@@ -320,9 +320,16 @@ Decisions (mine, from those answers; override if you disagree):
   window stops being a second recovery layer for swept segments and the archive (mandatory) is the only copy.
   In return no delete markers accumulate and no header the store may ignore is needed.
 - Still open: a sweep between the writer's look at a young object and its head commit (margin-based), so the
-  late `composite_gc_restore` stays owed. The U2e probe's residue (4 noncurrent versions behind 4 delete
-  markers) expires on the successor's clock, rounded up to midnight UTC (rb-11687): list it again on or after
-  2026-10-10T00:00Z.
+  late `composite_gc_restore` stays owed. The U2e probe's residue was listed again on/after 2026-10-10T00:00Z
+  (zeta cc-02 04:07Z; re-verified zc-02 10:23Z, unit zc02-u2e-delete-marker-anomaly-20261010): the 4 noncurrent
+  versions and 3 of the 4 delete markers expired on the successor's clock, rounded up to midnight UTC
+  (rb-11687); the fourth delete marker persists — it is the LATEST entry at its key
+  (`asp-probe/tok0.2f33e1492bb2e01e22feb77dcadfb781.jsonl`, version `84a691fe-15c0-4d7c-8174-8baf70414af6`,
+  2026-10-02T23:10:09.462Z), a latest marker is never noncurrent, and the NoncurrentVersionExpiration rule
+  (dahltuosvdj4bop74t70, NoncurrentDays 7) does not reach it. Disposition (g-358-202 progress_note, block
+  g358202-zc02-u2e-anomaly-disposition-20261010): harmless zero-byte probe residue, outside the GC runner's
+  scope; remediation deferred to an ExpiredObjectDeleteMarker rule or a version-targeted delete with
+  archive-before-delete (either needs the bucket-config grant this worker's principal lacks).
 
 ## Version-targeted delete (U8)
 

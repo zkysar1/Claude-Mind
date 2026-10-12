@@ -10,8 +10,10 @@ have produced the permissive answer proves nothing about the refusal.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +36,12 @@ def _row(bodies=None, in_flight=None):
 
 def _decide(sessions, row):
     return tcp.decide(sessions, row, STATUS.get)
+
+
+def _age(path, hours):
+    """Make path's mtime `hours` ago, on the clock probe() reads."""
+    then = time.time() - hours * 3600
+    os.utime(path, (then, then))
 
 
 # --------------------------------------------------------------------------- #
@@ -258,6 +266,77 @@ def test_a_box_with_no_session_and_no_agent_is_noloop():
                                              "none RUNNING; 0 session(s), none a worker Body")
 
 
+# --------------------------------------------------------------------------- #
+# a worker Body that has ended is not a Body that runs here ()
+# --------------------------------------------------------------------------- #
+ENDED = {BODY: 72.4}   # the worker session was last written 72.4 h ago
+
+
+def test_a_worker_session_that_has_ended_is_not_a_body_that_runs_here():
+    """The measured shape as the pure rule sees it: a worker-role session, every agent IDLE."""
+    assert tcp.no_loop({BODY: "worker"}, IDLE_BOX, ENDED) == (
+        "noloop", "no loop runs here: 3 agent(s) configured, none RUNNING; "
+                  "1 worker Body session(s) ended, the newest silent 72 h")
+    # CONTROLS: the same sessions with no word that they ended.
+    assert tcp.no_loop({BODY: "worker"}, IDLE_BOX) is None
+    assert tcp.no_loop({BODY: "worker"}, IDLE_BOX, {}) is None
+
+
+def test_one_worker_inside_the_window_leaves_the_box_to_decide():
+    roles = {BODY: "worker", OTHER_BOX: "worker"}
+    assert tcp.no_loop(roles, IDLE_BOX, {BODY: 72.0}) is None
+    # CONTROL: once the other session has ended too, and the evidence names the newest.
+    assert tcp.no_loop(roles, IDLE_BOX, {BODY: 72.0, OTHER_BOX: 30.0}) == (
+        "noloop", "no loop runs here: 3 agent(s) configured, none RUNNING; "
+                  "2 worker Body session(s) ended, the newest silent 30 h")
+
+
+def test_an_ended_session_excuses_none_of_the_other_doubts():
+    assert tcp.no_loop({BODY: "worker"}, dict(IDLE_BOX, bravo="RUNNING"), ENDED) == (
+        "unknown", "bravo is RUNNING here, so its loop owns the merge")
+    assert tcp.no_loop({BODY: "worker", SEAT: None}, IDLE_BOX, ENDED)[0] == "unknown"
+    assert tcp.no_loop({BODY: "worker", SEAT: "worker-lite"}, IDLE_BOX, ENDED)[0] == "unknown"
+    # CONTROL: the same box without those doubts.
+    assert tcp.no_loop({BODY: "worker", SEAT: "observer"}, IDLE_BOX, ENDED)[0] == "noloop"
+
+
+def test_session_idle_hours_reads_the_writers_files_not_the_directory(tmp_path):
+    """guard-7582: a directory's mtime moves only when a direct child is created or removed."""
+    now = time.time()
+    assert tcp.session_idle_hours(tmp_path, now) is None      # neither file: no evidence
+    manifest = tmp_path / tcp.BODY_MARKER
+    manifest.write_text("role: worker\n", encoding="utf-8")
+    _age(manifest, 10)
+    assert tcp.session_idle_hours(tmp_path, now) == pytest.approx(10, abs=0.01)
+    heartbeat = tmp_path / tcp.HEARTBEAT
+    heartbeat.write_text("", encoding="utf-8")
+    _age(heartbeat, 2)
+    assert tcp.session_idle_hours(tmp_path, now) == pytest.approx(2, abs=0.01)   # newest wins
+    # An ancient directory mtime does not make a running writer read silent ...
+    _age(tmp_path, 100)
+    heartbeat.touch()
+    assert tcp.session_idle_hours(tmp_path, time.time()) == pytest.approx(0, abs=0.01)
+    # ... and a fresh one does not make a silent writer read alive.
+    _age(heartbeat, 50)
+    _age(manifest, 60)
+    os.utime(tmp_path, None)
+    assert tcp.session_idle_hours(tmp_path, time.time()) == pytest.approx(50, abs=0.01)
+
+
+def test_ended_sessions_lists_a_session_only_once_it_has_been_silent_for_live_hours(tmp_path):
+    root = tmp_path / "sessions"
+    for sid, hours in ((BODY, tcp.LIVE_HOURS + 0.5), (OTHER_BOX, tcp.LIVE_HOURS - 0.5)):
+        (root / sid).mkdir(parents=True)
+        (root / sid / tcp.HEARTBEAT).write_text("", encoding="utf-8")
+        _age(root / sid / tcp.HEARTBEAT, hours)
+    (root / SEAT).mkdir()          # no file at all: no evidence either way, so never ended
+    (root / "index").mkdir()       # not a session dir
+    ended = tcp.ended_sessions(root, time.time())
+    assert set(ended) == {BODY}
+    assert ended[BODY] == pytest.approx(tcp.LIVE_HOURS + 0.5, abs=0.01)
+    assert tcp.ended_sessions(tmp_path / "absent", time.time()) == {}
+
+
 @pytest.mark.parametrize("text, want", [
     (None, ""),
     ("role: worker\nbody_state: active\n", "worker"),
@@ -330,6 +409,102 @@ def test_a_running_agent_on_a_box_of_seats_is_unknown(monkeypatch, tmp_path):
     # CONTROL: the same box once that loop has stopped.
     (root / "agents/bravo/session/agent-state").write_text("IDLE\n", encoding="utf-8")
     assert tcp.probe(str(root))[0] == "noloop"
+
+
+# --------------------------------------------------------------------------- #
+# end to end: the box measured on cc-08, cc-09, cc-15 and cc-17 ()
+# --------------------------------------------------------------------------- #
+ALL_AGENTS = ["alpha", "bravo", "echo", "foxtrot", "zeta"]
+
+
+def _worker(root, agent, sid, hours):
+    """A worker Body session of `agent` on the fake box, last written `hours` ago."""
+    d = root / "agents" / agent / "sessions" / sid
+    d.mkdir(parents=True)
+    (d / tcp.BODY_MARKER).write_text("role: worker\n", encoding="utf-8")
+    (d / tcp.HEARTBEAT).write_text("", encoding="utf-8")
+    _age(d / tcp.BODY_MARKER, hours + 0.1)
+    _age(d / tcp.HEARTBEAT, hours)
+    return d
+
+
+def test_a_multi_agent_box_whose_worker_bodies_have_ended_answers_noloop(monkeypatch, tmp_path):
+    """Five confs, three worker-role session dirs last written 72, 100 and 1500 h ago, two
+    agent-state files IDLE and the rest absent: the shape that answered `unknown` on every
+    tick while the box fell 938 to 1004 commits behind."""
+    root = _fake_box(monkeypatch, tmp_path, ALL_AGENTS)
+    live = _worker(root, "alpha", BODY, 72.4)
+    _worker(root, "alpha", OTHER_BOX, 100)
+    _worker(root, "foxtrot", SEAT, 1500)
+    for agent in ("alpha", "foxtrot"):
+        (root / "agents" / agent / "session").mkdir()
+        (root / "agents" / agent / "session" / "agent-state").write_text("IDLE\n", encoding="utf-8")
+    assert tcp.probe(str(root)) == (
+        "noloop", "-", "no loop runs here: 5 agent(s) configured, none RUNNING; "
+                       "3 worker Body session(s) ended, the newest silent 72 h")
+    # NEGATIVE CONTROL: one of those Bodies writes its heartbeat. The tick stays log-only.
+    (live / tcp.HEARTBEAT).touch()
+    assert tcp.probe(str(root)) == ("unknown", "-", "5 agents have a local-paths.conf here")
+
+
+def test_the_window_between_live_and_ended_is_live_hours(monkeypatch, tmp_path):
+    root = _fake_box(monkeypatch, tmp_path, ALL_AGENTS)
+    body = _worker(root, "alpha", BODY, tcp.LIVE_HOURS - 0.5)
+    assert tcp.probe(str(root)) == ("unknown", "-", "5 agents have a local-paths.conf here")
+    for name in (tcp.HEARTBEAT, tcp.BODY_MARKER):
+        _age(body / name, tcp.LIVE_HOURS + 0.5)
+    assert tcp.probe(str(root))[0] == "noloop"
+
+
+def test_a_session_with_a_manifest_but_no_heartbeat_ends_by_its_manifest(monkeypatch, tmp_path):
+    """A Body that never ticked is judged by when /start wrote its manifest."""
+    root = _fake_box(monkeypatch, tmp_path, ALL_AGENTS)
+    body = _worker(root, "alpha", BODY, 72)
+    (body / tcp.HEARTBEAT).unlink()
+    assert tcp.probe(str(root))[0] == "noloop"
+    # CONTROL: the same session started a minute ago has had no time to tick yet.
+    _age(body / tcp.BODY_MARKER, 1 / 60)
+    assert tcp.probe(str(root)) == ("unknown", "-", "5 agents have a local-paths.conf here")
+
+
+def test_a_running_agent_keeps_a_box_of_ended_bodies_unknown(monkeypatch, tmp_path):
+    root = _fake_box(monkeypatch, tmp_path, ALL_AGENTS)
+    _worker(root, "alpha", BODY, 72)
+    assert tcp.probe(str(root))[0] == "noloop"        # CONTROL: nothing RUNNING
+    (root / "agents/bravo/session").mkdir(parents=True)
+    (root / "agents/bravo/session/agent-state").write_text("RUNNING\n", encoding="utf-8")
+    assert tcp.probe(str(root)) == (
+        "unknown", "-", "bravo is RUNNING here, so its loop owns the merge")
+
+
+def test_the_ended_rule_is_for_a_box_that_names_no_agent(monkeypatch, tmp_path):
+    """A named agent hands the box back to the claim rule, as before."""
+    import _paths
+    root = _fake_box(monkeypatch, tmp_path, ALL_AGENTS)
+    _worker(root, "alpha", BODY, 72)
+    assert tcp.probe(str(root))[0] == "noloop"        # CONTROL: no agent named
+    monkeypatch.setenv("MIND_AGENT", "alpha")
+    monkeypatch.setattr(_paths, "WORLD_DIR", "")
+    assert tcp.probe(str(root)) == ("unknown", "alpha", "WORLD_PATH does not resolve")
+
+
+def test_a_single_agent_box_keeps_the_claim_rule_whatever_its_heartbeat_age(monkeypatch, tmp_path):
+    """With one resident agent the claim rule can still name whose integrate to run, and an
+    ended Body there may have left commits that integrate must merge (g-375-96)."""
+    import yaml
+    import _paths
+    import _team_state
+    root = _fake_box(monkeypatch, tmp_path, ["alpha"])
+    world = tmp_path / "world"
+    row_file = _team_state.row_path(world, "alpha")
+    row_file.parent.mkdir(parents=True)
+    row_file.write_text(yaml.safe_dump({"in_flight_bodies": {BODY: {"goal_id": "g-1-1"}}}),
+                        encoding="utf-8")
+    _queue(world / tcp.QUEUE_FILE, [{"id": "g-1-1", "status": "pending"}])
+    monkeypatch.setattr(_paths, "WORLD_DIR", str(world))
+    monkeypatch.setattr(tcp, "_goal_status_resolver", lambda w: STATUS.get)
+    _worker(root, "alpha", BODY, 72)
+    assert tcp.probe(str(root)) == ("held", "alpha", f"row {BODY[:8]} names g-1-1 (pending)")
 
 
 @pytest.mark.parametrize("role", ["reducer", "observer"])

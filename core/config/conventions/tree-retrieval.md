@@ -142,14 +142,45 @@ Each tree node entry includes `match_channel` (how it was matched) and `match_sc
    non-alphanumeric separator — hyphen, space, underscore, slash
    (`re.findall(r'[a-z0-9]+', ...)`). Was pure `split("-")` until 2026-05-09;
    before that fix, space-separated and natural-language queries became one
-   unsplit token and returned 0 tree nodes.
+   unsplit token and returned 0 tree nodes. Both sides fold a plural `-ies` to
+   `-y` first (`_fold_ies`, 2026-10-10, g-379-01 u5): `probability` and
+   `probabilities` compare equal. Before, a node keyed `...-probabilities` was
+   unreachable by the singular (one of 28 pack questions, 18/28 -> 19/28 reach
+   at medium; evidence `audit-reports/g-379-01/real-editions-u5-20261010/`).
 5. **Concept**: query tokens matched against `.md` front-matter `entities` fields
 
-After matching, sibling and parent inclusion runs ONLY when `--depth deep`
-was requested. Gating added 2026-04-23 after a diagnostic showed sibling
-and parent channels contributed the bulk of "retrieved but never helpful"
-entries at shallow / medium depth (sparse categories returning thin
-results IS honest signal — do not pad). At deep:
+After matching, whole-branch inclusion runs at EVERY depth (data-gated), then
+sibling and parent inclusion run ONLY when `--depth deep` was requested. Gating
+added 2026-04-23 after a diagnostic showed sibling and parent channels
+contributed the bulk of "retrieved but never helpful" entries at shallow /
+medium depth (sparse categories returning thin results IS honest signal — do
+not pad).
+
+- **Whole-branch inclusion** (`_whole_branch_expand` in `tree_match.py`,
+  2026-10-11, g-379-10): a node marked `whole_branch: true` in `_tree.yaml`
+  opts its subtree into sibling inclusion at EVERY depth, not deep-only. When
+  a direct-channel match sits inside (or IS) a marked node's subtree, every
+  child of the marked node joins the matched set on the `whole_branch`
+  channel (score 1.0, like `sibling`). The data carries the instruction — the
+  installer marks the pack branch nodes of born-ready vessels at registration
+  (provision-env store stage) — so a pack question that hits ANY one of a
+  pack's nodes returns the whole pack at the shallow/medium depth the agent's
+  /respond default uses, whatever depth the caller chose. Direct channels
+  only: sibling/parent/whole_branch-included nodes never trigger further
+  expansion (same rule as `_include_siblings`); the NEAREST marked ancestor
+  wins when the chain carries several marks. No marks in the tree → the stage
+  adds nothing: byte-identical retrieval for pre-existing trees (additive
+  only, guard-2201's class). Measured 2026-10-11 over the 28 tree-node exam
+  tasks of the two real editions (audit-reports/g-379-01/
+  real-editions-u5-20261010): verbatim source-node reach at medium 19/28 →
+  28/28 (100%), agent-style short queries 10/28 → 23/28 (82%), deep 27/28 →
+  28/28, 0 removed. The remaining short-query medium misses are token-layer
+  zero-triggers (no pack node matched at all) — no lever downstream of
+  matching reaches them; the embedding channel (below) is the routed owner of
+  that class. Pinned in `tests/test_retrieval_whole_branch.py` (the first
+  suite-collected test driving `load_tree_nodes` over a pack-shaped tree).
+
+At deep:
 
 - **Sibling inclusion** (`_include_siblings` in `tree_match.py`): direct-match
   nodes (`exact_key`, `substring`, `entity_index`, `word_prefix`, `concept`)

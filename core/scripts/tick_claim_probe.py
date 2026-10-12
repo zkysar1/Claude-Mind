@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tick_claim_probe.py -- who may merge on this box right now? (, )
+"""tick_claim_probe.py -- who may merge on this box right now? (, , )
 
 Asked by `iteration-push.sh --ff-only`, the root-cron sync tick. The tick used to take
 a clean fast-forward only and LOG every other shape. Measured 2026-09-30 (g-375-94):
@@ -20,7 +20,8 @@ This script answers that one question and nothing else. It prints ONE line:
     <verdict> <agent> <evidence>
 
 verdict is `none` (positively no claim held by this box's worker Body), `noloop` (no
-worker Body has run here and no loop runs here now), `held`, or `unknown`. agent is `-`
+worker Body runs here, because none has or every one has ended, and no loop runs here
+now), `held`, or `unknown`. agent is `-`
 when it could not be resolved, and always `-` for `noloop`. `none` licenses the handoff
 to the loop's integrate, and `noloop` the fast-forward around agents/* files. The tick
 treats `held`, `unknown`, a crash or any other output as "log only", which is exactly
@@ -28,7 +29,8 @@ its behaviour before either change. Always exits 0.
 
 WHAT "THIS BOX'S BODY" MEANS. A root cron has no session: no MIND_AGENT, no MIND_SID.
   agent     MIND_AGENT when set, else the ONE agent with a local-paths.conf on this box.
-            Zero or several -> unknown: a multi-resident box is out of scope.
+            Zero or several -> unknown, except a box whose every worker Body has ended
+            (A MULTI-AGENT BOX WHOSE WORKER BODIES HAVE ENDED, below).
   sessions  the per-session dirs under agents/<agent>/sessions/. They are gitignored and
             never synced, so they name exactly the sessions that ran on this box. Every
             one must be a worker Body session: its body-manifest.yaml records role
@@ -58,6 +60,36 @@ is the file the loop's own stop hook reads: agents/<agent>/session/agent-state.
             merge. The loop running here writes it, so a copy that came from another
             box, or one a crash left behind, can only err toward unknown. A missing file
             is not RUNNING, since /start writes it before a loop runs.
+
+A MULTI-AGENT BOX WHOSE WORKER BODIES HAVE ENDED (g-115-12280). Several agents with a
+local-paths.conf and no MIND_AGENT left the claim rule with no agent to ask, so such a box
+answered `unknown` for as long as ANY session dir on it recorded the worker role, however
+old. Measured 2026-10-10 10:47 from cc-02, read-only: cc-08, cc-09, cc-15 and cc-17 each hold
+five agent confs, no loop process and no RUNNING agent, and 1 to 3 worker-role session dirs
+whose newest heartbeat is 65 to 72 h old. Between each box's last merge (2026-10-06 14:00 to
+2026-10-07 01:31) and 2026-10-10, 241 of 244, 250 of 253, 257 of 276 and 257 of 279 logged
+ticks answered `unknown` and none merged (re-derive: `grep -ac 'claim probe: unknown'
+<repo>/.git/iteration-push.log`), and the four boxes read 938 to 1004 commits behind
+origin/main. The box-local answer to "is a Body alive here" is the Body's own heartbeat.
+  ended     a worker session is over when neither body-heartbeat nor body-manifest.yaml has
+            been written for LIVE_HOURS. heartbeat-tick.sh touches the first from the
+            tool-call hooks, at most once per _shared_tick.SHARED_HEARTBEAT_INTERVAL_S
+            (600 s on 2026-10-10) while the Body works, and on every loop iteration; it
+            writes nothing once the Body's manifest records it closed. So a live Body
+            reads as ended only if it makes no tool call for LIVE_HOURS (hung, stopped or
+            paused). Both are regular files written in place, so their own mtimes are read,
+            never the session directory's, which a running Body leaves still (guard-7582).
+            A session with neither file has no evidence and is never ended.
+  verdict   every worker session ended -> the `no_loop` answer, so `noloop` unless an agent
+            is RUNNING or a manifest is unreadable or of an unknown role. One worker session
+            still inside the window -> `unknown`, as before.
+Why `noloop` is safe here: no Body runs to be disturbed, a claim an ended session still holds
+is stranded work for the stranded-claim sweep rather than a reason to hold a merge, and the
+tick's `noloop` path is its narrowest licence, since it fast-forwards a clean follower and
+refuses anything ahead, staged, or dirty outside agents/*. Scope: only a box that names no
+agent and configures several. A box with one resident agent keeps the claim rule, which can
+still name whose integrate to run, and an ended Body there may have left commits that
+integrate must merge.
 
 WHY THIS BOX'S OWN ROW FILE, NOT THE DAEMON. A Body writes its claim, and its own release,
 into this box's row file first; the store of record catches up from here. So for this
@@ -110,6 +142,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -127,6 +160,17 @@ SID_RE = re.compile(r"^[0-9a-f][0-9a-f-]{7,63}$")
 # seat write it too, so the role inside it, not its presence, marks a worker Body
 # ().
 BODY_MARKER = "body-manifest.yaml"
+
+# The file heartbeat-tick.sh touches in a session dir from the tool-call hooks (at most once
+# per _shared_tick.SHARED_HEARTBEAT_INTERVAL_S) and on every loop iteration, and not once the
+# Body's manifest records it closed: same-box, pure mtime, never synced.
+HEARTBEAT = "body-heartbeat"
+
+# A worker session is over when neither HEARTBEAT nor BODY_MARKER has been written for this
+# long (). `_session_telemetry.reap_stale_active` gives the same signal the same 6 h
+# (its liveness_hours). body_row_reaper reaps a row after 180 min, but a longer window here
+# only keeps a box log-only a little longer, which is the safe side.
+LIVE_HOURS = 6.0
 
 # The role /start records for a worker Body (body-manifest.py VALID_ROLES).
 WORKER_ROLE = "worker"
@@ -188,6 +232,33 @@ def agent_state(agent_dir):
     except FileNotFoundError:
         return None
     return "".join(text.split())
+
+
+def session_idle_hours(session_dir, now):
+    """-> hours since session_dir's Body last wrote HEARTBEAT or BODY_MARKER, or None when
+    it has neither. Reads those files' own mtimes: a directory's moves only when a direct
+    child is created or removed, so it reads a running writer as silent (guard-7582). A file
+    that exists but cannot be stat'd raises, and main() then answers unknown."""
+    newest = None
+    for name in (HEARTBEAT, BODY_MARKER):
+        try:
+            mtime = (Path(session_dir) / name).stat().st_mtime
+        except FileNotFoundError:
+            continue
+        newest = mtime if newest is None else max(newest, mtime)
+    return None if newest is None else (now - newest) / 3600.0
+
+
+def ended_sessions(sessions_root, now):
+    """-> {sid: idle hours} for the session dirs under sessions_root whose Body has written
+    nothing for LIVE_HOURS or more (empty if the dir is absent). A dir with no evidence
+    either way is not listed: it is never read as over (g-115-12280)."""
+    root = Path(sessions_root)
+    if not root.is_dir():
+        return {}
+    idle = {p.name: session_idle_hours(p, now)
+            for p in root.iterdir() if p.is_dir() and SID_RE.match(p.name)}
+    return {sid: hours for sid, hours in idle.items() if hours is not None and hours >= LIVE_HOURS}
 
 
 def open_store_claims(queue_path, sids):
@@ -258,14 +329,17 @@ def decide(sessions, row, status_of, claims=()):
     return "none", f"no in-flight row for this box's {len(sessions)} Body session(s)"
 
 
-def no_loop(roles, states):
-    """-> (verdict, evidence) for a box no worker Body has run on, or None when one has
-    and decide() answers instead (g-375-108). Pure, so the rule is testable without a box.
+def no_loop(roles, states, ended=None):
+    """-> (verdict, evidence) for a box no worker Body runs on, or None when one does and
+    decide() answers instead (g-375-108). Pure, so the rule is testable without a box.
 
     roles   {sid: manifest_role} for every session dir on this box, of every agent
     states  {agent: agent_state} for every agent with a local-paths.conf on this box
+    ended   {sid: idle hours} for the sessions whose Body is over (g-115-12280); a worker
+            session listed here is not a Body that runs here
     """
-    if WORKER_ROLE in roles.values():
+    ended = ended or {}
+    if any(role == WORKER_ROLE and sid not in ended for sid, role in roles.items()):
         return None
     unread = sorted(sid for sid, role in roles.items() if role is None)
     if unread:
@@ -277,6 +351,11 @@ def no_loop(roles, states):
     running = sorted(agent for agent, state in states.items() if state == "RUNNING")
     if running:
         return "unknown", f"{running[0]} is RUNNING here, so its loop owns the merge"
+    over = sorted(hours for sid, hours in ended.items() if roles.get(sid) == WORKER_ROLE)
+    if over:
+        return "noloop", (f"no loop runs here: {len(states)} agent(s) configured, none RUNNING; "
+                          f"{len(over)} worker Body session(s) ended, the newest silent "
+                          f"{over[0]:.0f} h")
     return "noloop", (f"no loop runs here: {len(states)} agent(s) configured, none RUNNING; "
                       f"{len(roles)} session(s), none a worker Body")
 
@@ -304,11 +383,24 @@ def probe(repo):
     roles = {}
     for conf_agent in confs:
         roles.update(local_sessions(_paths.agent_sessions_root(conf_agent)))
-    answer = no_loop(roles, {a: agent_state(_paths.agent_dir(a)) for a in confs})
+    states = {a: agent_state(_paths.agent_dir(a)) for a in confs}
+    answer = no_loop(roles, states)
     if answer:
         return answer[0], "-", answer[1]
-    agent, why = resident_agent(confs, os.environ.get("MIND_AGENT", "").strip())
+    env_agent = os.environ.get("MIND_AGENT", "").strip()
+    agent, why = resident_agent(confs, env_agent)
     if not agent:
+        if not env_agent and len(confs) > 1:
+            # Several agents live here and none is named, so the claim rule has no one to
+            # ask. The box is still a follower when every worker Body on it is over
+            # (); one Body inside the window leaves the answer `unknown`.
+            now = time.time()
+            ended = {}
+            for conf_agent in confs:
+                ended.update(ended_sessions(_paths.agent_sessions_root(conf_agent), now))
+            answer = no_loop(roles, states, ended)
+            if answer:
+                return answer[0], "-", answer[1]
         return "unknown", "-", why
     world = _paths.WORLD_DIR
     if not world:
