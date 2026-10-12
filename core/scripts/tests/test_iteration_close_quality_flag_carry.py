@@ -14,12 +14,24 @@ The suffix carry lives inside `case "$_live" in completed)`, where `_live` is
 fixture passes before AND after breaking `_quality_flag_suffix`: green while pinning
 nothing. Measured at fix time; do not "simplify" these fixtures to a synthetic id.
 
-THE PROBE IS NOT MOCKED, AND DOES NOT NEED TO BE (measured 2026-08-28, g-115-7752).
-`_probe_goal_record` is a plain `aspirations-read.sh | python3` read, not a daemon call,
-so it returns "completed" identically with and without PYTEST_CURRENT_TEST set — the
-g-115-3329 refusal blocks daemon SPAWNS and never reaches this path. The sibling module
-test_iteration_close_recovery_probe.py exercises the *unreadable* branch because its
-fixture goal id is unparseable, which is a property of that fixture and not of pytest.
+THE PROBE IS NOT MOCKED (g-115-7752; corrected 2026-10-11, g-358-248 — the text this
+replaced said the probe "is a plain `aspirations-read.sh | python3` read, not a daemon
+call", which is STALE: aspirations-read.sh has been DAEMON-ONLY since 2026-05-14, so
+`_probe_goal_record` is a live daemon read — rt_call GET /v1/aspirations/read — and it
+returns "completed" because the frontier origin's live daemon answers, not because a
+file was read). It fails open to empty when the daemon is unreachable (the python side
+sys.exit(0)s on any parse failure, `|| rec=""`), so in a daemon-quiesced environment the
+module would fail at _require_completed — which is exactly why the
+requires_frontier_world skipif below is load-bearing for the deployment-shaped run: its
+skeleton world is self_role: downstream (deployment-shaped-run.py writes it) and the
+shaped pytest invocation adds NO -m clause to deselect, so the runtime skipif is the
+only route that fires there, and it fires before the probe is called. The registered
+`frontier_world` marker the module ALSO carries (pytest.ini, g-358-248) is the
+complementary -m route: run-full-suite.py deselects it, narrated, when THIS world's
+self_role is not "frontier" — the non-shaped path the skipif cannot reach by -m.
+The sibling module test_iteration_close_recovery_probe.py exercises the *unreadable*
+branch because its fixture goal id is unparseable, which is a property of that fixture
+and not of pytest.
 
 FIXTURES ARE REAL, TERMINAL GOALS rather than created ones. `completed` is terminal, so
 these ids cannot flip back and the module writes nothing to any store — no agent dir and
@@ -38,7 +50,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _runtime_bash import BASH  # noqa: E402
 from _frontier_world import requires_frontier_world  # noqa: E402
 
-pytestmark = requires_frontier_world("its fixtures are completed goals of the frontier origin's own world")
+# : TWO routes, each load-bearing where the other cannot reach:
+#  - requires_frontier_world (runtime skipif, _frontier_world.py): the ONLY route
+#    that fires in a deployment-shaped run — it invokes pytest directly and adds
+#    NO -m clause. The shaped world is self_role: downstream, so the skip fires
+#    before the daemon-backed probe is ever called (a daemon-quiesced probe fails
+#    open to empty and _require_completed would go red).
+#  - pytest.mark.frontier_world (REGISTERED marker, pytest.ini): the -m route
+#    run-full-suite.py deselects, narrated, on a non-frontier self_role
+#    (--frontier-world auto). It does NOT replace the skipif: the shaped run
+#    cannot express it, and a marker-only module would be red there.
+pytestmark = [
+    requires_frontier_world("its fixtures are completed goals of the frontier origin's own world"),
+    pytest.mark.frontier_world,
+]
 
 SCRIPT = Path(__file__).resolve().parents[1] / "iteration-close.sh"
 REPO = Path(__file__).resolve().parents[3]

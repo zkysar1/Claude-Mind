@@ -636,12 +636,14 @@ def test_when_every_reducer_only_row_is_routed_away_the_floor_is_inert(
     assert status["reducer_only_rows_unclaimable"] == 1
 
 
-@pytest.mark.parametrize("ia", [None, "", "either", "zeta", "delta"])
+@pytest.mark.parametrize("ia", [None, "", "either", "zeta", "no-such-agent"])
 def test_self_either_unset_and_off_roster_rows_are_still_nominated(
         monkeypatch, _pinned_roster, ia):
     """The other direction (guard-6106): the permissive values stay AVAILABLE.
-    'delta' is off the pinned roster, and a value naming nobody routes nowhere
-    (g-115-3482), so it is claimable like 'either'."""
+    'no-such-agent' is off every roster (a real name like 'delta' sits on the
+    conftest fixture roster, whose autouse pin of aspirations._valid_intended_agents
+    sits above this test's own _get_active_agents pin), and a value naming nobody
+    routes nowhere (g-115-3482), so it is claimable like 'either'."""
     rows = _routed(("g-1-1", None, None), ("g-2-2", "reducer", ia))
     picked, status = _floor_as(monkeypatch, "zeta", rows)
     assert picked is not None and picked["goal_id"] == "g-2-2"

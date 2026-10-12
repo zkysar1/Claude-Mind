@@ -1592,6 +1592,66 @@ def _populated_agents(agents_root_dir=None):
         return None, "agents root unreadable (%s)" % e
 
 
+def _frontier_world_role(world_dir=None):
+    """self_role from <world_dir>/config/compatibility.yaml. -> (role|None, reason)
+
+    g-358-248: the registered `frontier_world` -m marker (pytest.ini) labels
+    tests whose fixtures are records only the FRONTIER ORIGIN's world holds
+    (its completed goal ids, its capability catalog, its fleet's agent dirs).
+    On a downstream or seed deployment those fixtures are absent, so the test
+    fails for a reason that is not a defect in the code under test — the same
+    failure class fleet_layout covers for the agents/ tree. run-full-suite
+    deselects the marker, narrated, when THIS world's self_role is not
+    "frontier".
+
+    The signal is the world's own declaration: config/compatibility.yaml
+    `self_role`, the same field promote-to-upstream.sh and
+    core/scripts/tests/_frontier_world.py read. This runner duplicates the
+    read rather than importing that test helper, so the runner stays free of
+    a dependency on the tests/ tree (mirrors _populated_agents' duplicated
+    _has_agent_identity predicate).
+
+    Mirrors _populated_agents' fail-toward-running: an unreadable or absent
+    role is (None, reason) and callers MUST NOT read that as "not frontier" —
+    an unknown role RUNS the marked tests, the same direction the runtime skip
+    route takes for an unreadable self_role (a wrong skip deletes coverage
+    everywhere, a wrong run costs a red on one box).
+    """
+    if world_dir is None:
+        try:
+            sys.path.insert(0, str(SCRIPT_DIR))
+            from _paths import WORLD_DIR            # the ONLY sanctioned resolver
+            world_dir = WORLD_DIR
+        except Exception as e:                       # noqa: BLE001
+            return None, "world dir unresolved (%s)" % e
+    if world_dir is None:
+        return None, "world dir is None (unresolved)"
+    try:
+        p = Path(world_dir) / "config" / "compatibility.yaml"
+        if not p.is_file():
+            return None, "no config/compatibility.yaml at %s" % world_dir
+        text = p.read_text(encoding="utf-8")
+        role = None
+        try:
+            import yaml
+            role = (yaml.safe_load(text) or {}).get("self_role")
+        except Exception:                             # noqa: BLE001
+            # no yaml (or a malformed file): read the one line. A line parse
+            # that also fails falls through to the None returns below.
+            for line in text.splitlines():
+                s = line.strip()
+                if s.startswith("self_role:"):
+                    role = s.split(":", 1)[1].strip().strip("'\"")
+                    break
+        if role is None:
+            return None, "self_role absent in %s" % p
+        if not isinstance(role, str):
+            return None, "self_role is not a string (%r) in %s" % (role, p)
+        return role, None
+    except OSError as e:
+        return None, "compatibility.yaml unreadable (%s)" % e
+
+
 # ── The log dir is shared, so treat it like one ──────────────────────────────
 # Two distinct defects, one dir (). The dir is keyed only on agent
 # name, so every run by one agent on one box lands in the SAME place.
@@ -1951,6 +2011,13 @@ def main(argv=None):
                     help="fleet_layout-marked tests (fixtures needing a populated "
                          "multi-agent layout). auto=exclude only when this box has "
                          "<2 agent dirs with a self.md; include/exclude force it")
+    ap.add_argument("--frontier-world", choices=("auto", "include", "exclude"),
+                    default="auto",
+                    help="frontier_world-marked tests (fixtures needing the "
+                         "frontier origin's own world data: its completed goal "
+                         "ids, capability catalog, fleet agent dirs). auto=deselect "
+                         "only when this world's config/compatibility.yaml "
+                         "self_role is not 'frontier'; include/exclude force it")
     ap.add_argument("--confirm-solo", action="store_true",
                     help="on a contended verdict, re-run the worst-hit file alone to prove it")
     ap.add_argument("--print-out-dir", action="store_true",
@@ -2148,6 +2215,33 @@ def main(argv=None):
     print("  fleet_layout %s: %s"
           % ("excluded" if exclude_fleet_layout else "INCLUDED", fleet_why))
 
+    # frontier_world decision (). Narrated exactly like fleet_layout:
+    # this clause NARROWS what runs, and a runner that reports what it ran but
+    # not what it declined to look for is how the mind_api gap hid (guard-1760).
+    # The evidence is printed with the verdict so a reader can check the premise
+    # instead of trusting the label.
+    self_role, role_err = _frontier_world_role()
+    if args.frontier_world == "auto":
+        if self_role is None:
+            # UNKNOWN is not non-frontier. Fail toward running MORE tests: a
+            # wrong deselect deletes frontier coverage everywhere, a wrong run
+            # costs a red on one box — the same direction the runtime skip route
+            # takes for an unreadable self_role (_frontier_world.py).
+            exclude_frontier_world = False
+            frontier_why = "auto -> INCLUDED (self_role undeterminable: %s)" % role_err
+        elif self_role != "frontier":
+            exclude_frontier_world = True
+            frontier_why = ("auto -> excluded (self_role=%r — not the frontier "
+                            "origin; its world's records are absent here)" % self_role)
+        else:
+            exclude_frontier_world = False
+            frontier_why = "auto -> INCLUDED (self_role=frontier)"
+    else:
+        exclude_frontier_world = (args.frontier_world == "exclude")
+        frontier_why = "forced --frontier-world %s" % args.frontier_world
+    print("  frontier_world %s: %s"
+          % ("excluded" if exclude_frontier_world else "INCLUDED", frontier_why))
+
     # : record HEAD BEFORE the first chunk. The chunk file lists are
     # computed AT LAUNCH, so a merge landing mid-run hands later chunks paths
     # that may no longer exist -- chunk 00 runs against one tree and the rest
@@ -2257,6 +2351,8 @@ def main(argv=None):
             marker_terms.append("not daemon_integration")
         if exclude_fleet_layout:
             marker_terms.append("not fleet_layout")
+        if exclude_frontier_world:
+            marker_terms.append("not frontier_world")
         if marker_terms:
             cmd += ["-m", " and ".join(marker_terms)]
         # --parallel N: xdist workers WITHIN each chunk. Chunking and this are

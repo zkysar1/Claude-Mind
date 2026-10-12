@@ -54,7 +54,7 @@ guardrails, pattern signatures, experiences, beliefs, and experiential index.
 Matching strategies (applied in order, results merged):
   1. Substring: category appears in key/summary/topic (bidirectional)
   2. Entity index: category matches a semantic entity in _tree.yaml
-  3. Word-prefix: hyphen-split words, prefix match (min 4 chars)
+  3. Word-prefix: hyphen-split words, prefix match (min 4 chars), -ies/-y folded
   4. Concept: .md front-matter entities matched against query tokens
 
 Results are scored by match quality (not depth-first), so specific deep nodes
@@ -215,8 +215,8 @@ SUPPLEMENTARY_CAPS = {"shallow": 20, "medium": 40, "deep": 80}
 # Matching engine imported from shared module
 from tree_match import (
     build_concept_index, _match_nodes, _include_siblings,
-    _include_parents, _score_and_limit, _compute_match_score, CHANNEL_SCORES,
-    COSINE_BONUS_WEIGHT, _mmr_rerank, safe_num, _yaml_loader,
+    _include_parents, _whole_branch_expand, _score_and_limit, _compute_match_score,
+    CHANNEL_SCORES, COSINE_BONUS_WEIGHT, _mmr_rerank, safe_num, _yaml_loader,
 )
 
 def _goal_id_is_terminal(goal_id):
@@ -889,6 +889,21 @@ def load_tree_nodes(categories, depth, read_only=False):
 
     # Convert to list form for sibling/parent inclusion
     matched = [(k, v) for k, v in all_matched.items()]
+
+    # : whole-branch inclusion — DATA-gated (the node mark in
+    # _tree.yaml), so it runs at EVERY depth, including the shallow/medium
+    # defaults the agent's /respond uses. The installer marks the pack branch
+    # nodes of born-ready vessels, so any direct hit inside a pack pulls the
+    # whole pack's nodes (tree_match._whole_branch_expand). No marks in the
+    # tree -> adds nothing: byte-identical retrieval for pre-existing trees
+    # (additive-only, guard-2201's class; measured 2026-10-11, 28 task
+    # audit, removed 0). Runs BEFORE the deep-only sibling/parent stage; the
+    # two expand different parent levels and neither triggers the other
+    # (direct channels only), so order between them is a no-op — pinned in
+    # test_retrieval_whole_branch.py.
+    matched, all_matched_keys, all_channels, _wb_added = _whole_branch_expand(
+        matched, all_matched_keys, all_channels, nodes
+    )
 
     # Sibling/parent inclusion broadens the match set with peripherally-related
     # nodes — useful at `deep` for full-context exploration, too noisy at

@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.99",
+    "previous_version": "2.12.98",
+    "date": "2026-10-12",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Release-train cut after a 54h stall. Deployment-shaped run (g-358-244) by bravo on cc-05 at ref 4f8075c2: CONTROL 4/4 seeded probes red, 143 red of 28725 tests, 580 skipped (NOT run), 1523 files, invisible leg 4 red of 83, 0 files newly red against the 2026-10-08 baseline at 3fc177d6. Delta past that ref (cargo-cult-detector, recurring-starvation-check, a new agent-queue filer test) by zeta on cc-02 at the cut ref 3d1a461e: CONTROL 4/4, 31 files, 3 red of 466 tests, 1 skipped; the 3 reds are test_rt_transport_timeout_maps_to_rterror and are red at 4f8075c2 too. Promotion preflight CLEAN exit 0; full-tree domain-leak CLEAN. g-115-12415, g-358-248.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.98",
     "previous_version": "2.12.97",
     "date": "2026-10-10",

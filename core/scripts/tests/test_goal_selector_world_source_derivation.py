@@ -99,8 +99,11 @@ _LIVE_PEERS = sorted(n for n in _vocab() if n not in (SELF_AGENT, "either"))
 OTHER_AGENT = _LIVE_PEERS[0] if _LIVE_PEERS else "alpha"
 
 # A name that is NOT on the roster -- the  case, pinned explicitly
-# below so both halves of the routing contract live in this file.
-OFFROSTER_AGENT = "delta"
+# below so both halves of the routing contract live in this file. SYNTHETIC on
+# purpose (guard-1699): it was "delta", a real name that is retired here but sits
+# on the conftest fixture roster, so the autouse _pin_intended_agent_roster
+# ( (b)) made it ON-roster and the goal routed away (, it490).
+OFFROSTER_AGENT = "no-such-agent"
 
 
 def _make_goal(goal_id: str, intended_agent: str | None,

@@ -23,11 +23,20 @@ Modes:
     index_stale[] lists (every {key, idx, fm}) instead of only the capped
     samples, so a hypothesis resolution_method can evaluate every entry
     against the full set, not a sample (g-115-1820).
-  --apply: BACKFILL. For every desynced node set the index last_updated = that
-    node's .md fm last_updated, atomically via locked_modify_yaml(TREE_PATH)
-    (guard-366 / g-115-417 -- a single locked read-modify-write, NOT a
-    read_tree/write_tree split). The .md fm reads happen INSIDE the modifier so
-    the whole operation is consistent under the lock.
+  --apply: BACKFILL. For every index-STALE node set the index last_updated =
+    that node's .md fm last_updated (a forward write; durable), atomically via
+    locked_modify_yaml(TREE_PATH) (guard-366 / g-115-417 -- a single locked
+    read-modify-write, NOT a read_tree/write_tree split). The .md fm reads
+    happen INSIDE the modifier so the whole operation is consistent under the
+    lock.
+
+    index-AHEAD nodes are REPORTED, never written (g-115-5509): last_updated
+    is a NEWER-wins merge field (coordination_merge._TREE_NEWER_FIELDS), so a
+    backward index write cannot survive the next peer merge (rb-7277,
+    guard-3209) -- and on a stale read-through mirror it can PERSIST and
+    overwrite a correct index (bravo cc-05, 2026-09-30, progress_note marker
+    bravo-cc05-drift-apply-mirror-20260930). Each such node is skipped with a
+    loud per-node line naming the merge class and the evidence trail.
 """
 import argparse
 import json
@@ -152,7 +161,14 @@ def cmd_audit(exit_on_ahead, full=False):
 
 
 def cmd_apply():
-    captured = {"backfilled": 0, "details": [], "skipped_errors": {}}
+    captured = {
+        "backfilled": 0,
+        "details": [],
+        "skipped_errors": {},
+        # : index_ahead rows are REPORTED, never written (see the
+        # module docstring for the merge-class reason).
+        "index_ahead_not_written": [],
+    }
 
     def _backfill(data):
         if not isinstance(data, dict) or "nodes" not in data:
@@ -173,20 +189,45 @@ def cmd_apply():
                     captured["skipped_errors"][err] = \
                         captured["skipped_errors"].get(err, 0) + 1
                 continue
-            if idx != fm:
-                # node .md fm is the single source of truth (): set the
-                # index to it for BOTH index_ahead (spurious-bump) and
-                # index_stale (2026-01-01 placeholder) nodes.
+            if idx == fm:
+                continue
+            if idx < fm:
+                # index-STALE: node .md fm is the single source of truth
+                # (); the write moves the index FORWARD, which is the
+                # durable direction (NEWER-wins merge keeps the higher value).
                 node["last_updated"] = fm
                 captured["backfilled"] += 1
                 if len(captured["details"]) < 12:
                     captured["details"].append({"key": key, "from": idx, "to": fm})
+            else:
+                # index-AHEAD (): the write would move the index
+                # BACKWARD, and last_updated is a NEWER-wins merge field
+                # (coordination_merge._TREE_NEWER_FIELDS): a peer holding the
+                # higher value restores it on the next merge, so the write
+                # cannot survive (rb-7277, guard-3209) -- and on a stale
+                # read-through mirror it can persist and CORRUPT a correct
+                # index (bravo cc-05, 2026-09-30). Fail visibly, not silently:
+                # report the row, change nothing.
+                entry = {"key": key, "idx": idx, "fm": fm}
+                captured["index_ahead_not_written"].append(entry)
+                if len(captured["index_ahead_not_written"]) <= 8:
+                    print(
+                        f"index_ahead NOT WRITTEN: {key} (index {idx} > fm {fm}) -- "
+                        f"last_updated merges NEWER-wins "
+                        f"(coordination_merge._TREE_NEWER_FIELDS), a backward "
+                        f"write cannot survive a peer merge (rb-7277, guard-3209) "
+                        f"and can persist on a stale mirror "
+                        f"(g-115-5509); reconcile the node .md fm instead",
+                        file=sys.stderr)
         # Intentionally do NOT touch data["last_updated"] (the tree-file write
         # timestamp): this backfill corrects per-node fields only (scope).
         return data
 
     # guard-366 / : single locked read-modify-write, no split.
     # : a run with nothing drifted writes nothing (no new index version).
+    # A run whose ONLY drift is index_ahead now changes nothing either, so it
+    # writes nothing (skip_if_unchanged) -- the loud stderr lines above are
+    # the record.
     locked_modify_yaml(TREE_PATH, _backfill, skip_if_unchanged=True)
     print(json.dumps({
         "mode": "apply",
@@ -194,6 +235,9 @@ def cmd_apply():
         "backfilled": captured["backfilled"],
         "skipped_errors": captured["skipped_errors"],
         "sample": captured["details"],
+        # Full, not capped: the caller (recurring sweep) must see EVERY row it
+        # must reconcile separately, not a sample.
+        "index_ahead_not_written": captured["index_ahead_not_written"],
     }, indent=2, ensure_ascii=False))
     return 0
 

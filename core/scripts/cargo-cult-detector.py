@@ -329,6 +329,14 @@ def file_idea(asp_id: str, source: str, idea: dict) -> str | None:
     IS what the detector surfaces. See g-248-24 for the 4-instance pattern.
     """
     override = "cargo-cult-alert: pattern repetition IS the finding"
+    # An agent-queue filing must name its executor. With no routing the daemon's
+    # capability router stamps a different agent by content, and the agent-queue
+    # routing gate refuses that row as unclaimable by construction (measured on
+    # a contract-mode close, ). The env agent is the goal's real
+    # owner (see build_idea): same fix as recurring-starvation-check's Unblock.
+    if source == "agent" and "intended_agent" not in idea:
+        idea = {**idea, "intended_agent":
+                os.environ.get("MIND_AGENT", "").strip() or "either"}
     try:
         record = _rt.aspirations_add_goal(
             asp_id, idea, source=source,

@@ -327,5 +327,77 @@ def test_text_summary_splits_by_determination(tmp_path, monkeypatch, capsys):
     assert "clone CANDIDATES" in out    # the precision caveat rendered
 
 
+# ---- : the JSON emits the per-class citation sums ------------------
+
+def test_json_citation_sums_reconcile(tmp_path, monkeypatch, capsys):
+    """OUTCOME 1: --json carries citations_by_cls (every class that has an
+    event) and citations_total; each class sum equals the hand-sum of its
+    events' `citations`, and the class sums reconcile to citations_total.
+
+    One event PER CLASS so all three sums are exercised:
+      g-a -> g-b: occupant token-disjoint from moved  => UNRELATED (cited 1)
+      g-c -> g-d: occupant token-overlaps moved       => NEAR-TWIN (cited 1)
+      g-e -> g-f: no record at the old id             => DANGLING  (cited 1)
+    """
+    mod = _load()
+    world, meta, repo, agents = (tmp_path / n for n in
+                                 ("world", "meta", "repo", "agents"))
+    world.mkdir()
+    meta.mkdir()
+    repo.mkdir()
+    agents.mkdir()
+    _write(world / "guardrails.jsonl",
+           # UNRELATED: moved snippet vs occupant share no 4+ tokens
+           json.dumps({"id": "g-a", "rule": "the old apple rule",
+                       "created": "2026-01-01T00:00:00"}) + "\n"
+           + json.dumps({"id": "g-b", "rule": "moved zebra migration note",
+                         "displaced_from": "g-a",
+                         "created": "2026-01-02T00:00:00"}) + "\n"
+           # NEAR-TWIN: high token overlap between occupant and moved
+           + json.dumps({"id": "g-c", "rule": "quiet harbor rule ledger",
+                         "created": "2026-01-01T00:00:00"}) + "\n"
+           + json.dumps({"id": "g-d", "rule": "quiet harbor rule ledger entry",
+                         "displaced_from": "g-c",
+                         "created": "2026-01-02T00:00:00"}) + "\n"
+           # DANGLING: g-e has no text-bearing record at all
+           + json.dumps({"id": "g-f", "rule": "the moved vortex ledger entry",
+                         "displaced_from": "g-e",
+                         "created": "2026-01-02T00:00:00"}) + "\n")
+    # the positive control must fire, or every zero is meaningless (guard-2298)
+    _write(world / "knowledge" / "node.md",
+           "guard-321 is the control; g-a and g-c and g-e are cited here\n")
+    monkeypatch.setattr(mod, "_roots", lambda: (world, meta, repo, agents))
+    monkeypatch.setattr(sys, "argv", ["displaced-id-audit.py", "--json"])
+    mod.main()
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["control_hits"] >= 1
+    by_cls = doc["citations_by_cls"]
+    total = doc["citations_total"]
+    # The per-class counts include the SELF-SITES the audit has always
+    # counted (guardrails.jsonl is a scanned surface): each old id's own
+    # record line cites its id, and each moved record's displaced_from field
+    # cites the old id (the same self-site _full_run documents for g-7).
+    #   UNRELATED g-a: node.md(1) + g-b.displaced_from(1) + g-a's own id(1)
+    #   NEAR-TWIN  g-c: node.md(1) + g-d.displaced_from(1) + g-c's own id(1)
+    #   DANGLING   g-e: node.md(1) + g-f.displaced_from(1) -- no record at
+    #                   g-e, so no self-id site
+    assert by_cls == {"UNRELATED": 3, "NEAR-TWIN": 3, "DANGLING": 2}
+    # the labelled sums == the hand-sum of the raw events, class by class
+    hand = {c: sum(e["citations"] for e in doc["events"] if e["cls"] == c)
+            for c in ("UNRELATED", "NEAR-TWIN", "DANGLING")}
+    assert by_cls == hand
+    assert total == 8 == sum(by_cls.values()) == sum(
+        e["citations"] for e in doc["events"])
+    # OUTCOME 2 (no behaviour change): the TEXT headline still equals
+    # citations_by_cls["UNRELATED"], the UNRELATED-only quantity.
+    monkeypatch.setattr(sys, "argv", ["displaced-id-audit.py"])
+    rc = mod.main()
+    text = capsys.readouterr().out
+    assert rc == 0
+    headline = next(l for l in text.splitlines()
+                    if "STALE CITATIONS OF UNRELATED-CLASS IDS" in l)
+    assert f": {by_cls['UNRELATED']} across" in headline
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

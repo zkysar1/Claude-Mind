@@ -97,6 +97,65 @@ def write_fixture_file(d):
         f"For each repo under {GONE}/ run the build.\n", encoding="utf-8")
 
 
+# --- : the three cc-02 code-row shapes, pinned as controls ----------
+def write_escaped_strip(d):
+    """The closure_evidence row: a character-strip set whose backslash escapes
+    (`\\t:`, `\\u2014:`) the regex read as drive letters. The file must carry
+    the escapes as literal text (backslash + letter), exactly as in the corpus."""
+    (d / "strip.py").write_text(
+        "import re\n"
+        "m = re.match(r'x', s)\n"
+        'rest = (m.group(2) or "").lstrip("*_ \\t:\\u2014\\u2013-")\n',
+        encoding="utf-8")
+
+
+def write_gitbash_tuple(d):
+    """The _runtime_bash row: a candidate tuple iterated by a for-loop whose
+    body probes each candidate for existence. Absence of each entry is the
+    DESIGNED outcome — the loop takes whichever exists."""
+    (d / "resolve.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "for cand in (\n"
+        f'    "{GONE}/git/bin/bash.exe",\n'
+        f'    "{GONE}/git2/bin/bash.exe",\n'
+        "):\n"
+        "    if Path(cand).exists():\n"
+        "        return cand\n",
+        encoding="utf-8")
+
+
+def write_bash_probe(d):
+    """The minio preflight row: the literal's own line carries the bash
+    existence test. The window scorer cannot see this (its marker hints lose
+    to the for-loop scope hint), so the structure must."""
+    (d / "probe.sh").write_text(
+        "for b in minio mc; do\n"
+        f'    [ -x "$STAGE/$b" ] || [ -x "{GONE}/bin/$b" ] || die "missing"\n'
+        "done\n",
+        encoding="utf-8")
+
+
+def write_install_target(d):
+    """The minio install row: the file writes the literal — an install target
+    is absent before install by design. A cp SOURCE (first argument) must NOT
+    count as a self-created target."""
+    (d / "install.sh").write_text(
+        f'run install -o root -g root -m 0755 "$STAGE/$b" "{GONE}/bin/$b"\n'
+        f'cp "{GONE}/src" /tmp/keep\n',
+        encoding="utf-8")
+
+
+def write_vacuous_glob(d):
+    """THE POSITIVE CONTROL ( constraint): a hardcoded glob over a
+    directory that does not exist, silently yielding an empty list. Any change
+    must keep this in active-scope — the whole point of the detector."""
+    (d / "vacuous.py").write_text(
+        f"import glob\n"
+        f'for p in glob.glob("{GONE}/*"):\n'
+        f"    handle(p)\n",
+        encoding="utf-8")
+
+
 # --- tests -------------------------------------------------------------------
 def test_zero_files_is_cannot_check_not_clean(tmp_path):
     """The anti-vacuity property: an empty scan must never read as a clean corpus."""
@@ -240,6 +299,86 @@ def test_verify_learning_still_calls_the_detector():
         "verify-learning lost its hardcoded-scope-detector-wired check -- "
         "this script's only call site is gone, so the vacuity detector has "
         "inherited the vacuity it exists to detect")
+
+
+# --- : structural re-classifications, pinned ------------------------
+def test_backslash_escape_is_not_a_drive_literal(tmp_path):
+    r"""(a) The escape-sequence misparse: `\t:` and `\u2014:` in a strip set
+    read as `t:\` / `u2014:\` drive roots. A backslash before the letter is an
+    escape, not a path — the file must produce NO finding at all."""
+    write_escaped_strip(tmp_path)
+    out, rc = run(tmp_path)
+    assert rc == 0
+    assert out["non_resolving_literals"] == 0, out["findings"]
+
+
+def test_probe_guarded_tuple_is_absence_is_signal(tmp_path):
+    """(b) Candidate tuple iterated by a for-loop whose body probes the
+    variable for existence: absence of each entry is the DESIGNED outcome.
+    Both entries must leave active-scope (they are marker-shaped, not vacuous)."""
+    write_gitbash_tuple(tmp_path)
+    out, rc = run(tmp_path)
+    assert rc == 0
+    assert len(out["findings"]) == 2, out["findings"]
+    for f in out["findings"]:
+        assert f["tier"] == "absence-is-signal", f
+        assert "probe-guarded" in f["why"], f
+
+
+def test_inline_bash_probe_is_absence_is_signal(tmp_path):
+    """(b2) The literal's own line carries `[ -x L ]`: the window scorer sees
+    the for-loop scope hint but the probe's marker hints lose, which is how the
+    cc-02 row read active-scope. The structure must win."""
+    write_bash_probe(tmp_path)
+    out, rc = run(tmp_path)
+    assert rc == 0
+    hit = [f for f in out["findings"] if GONE in f["literal"]]
+    assert len(hit) == 1, out["findings"]
+    assert hit[0]["tier"] == "absence-is-signal", hit[0]
+    assert "inline existence probe" in hit[0]["why"], hit[0]
+
+
+def test_install_target_is_absence_is_signal_but_source_is_not(tmp_path):
+    """(c) A writer line (install/cp/mkdir/...) whose LAST argument is the
+    literal: self-created, absent before install by design. A cp SOURCE — the
+    FIRST argument, the line reads it — must NOT be re-classified by (c)."""
+    write_install_target(tmp_path)
+    out, rc = run(tmp_path)
+    assert rc == 0
+    tgt = [f for f in out["findings"] if f["literal"].endswith("/bin/$b")]
+    assert len(tgt) == 1, out["findings"]
+    assert tgt[0]["tier"] == "absence-is-signal", tgt[0]
+    assert "self-created target" in tgt[0]["why"], tgt[0]
+    src = [f for f in out["findings"] if f["literal"].endswith("/src")]
+    assert len(src) == 1, out["findings"]
+    assert src[0]["tier"] != "absence-is-signal", \
+        "a copy SOURCE is not a self-created target (rule c over-fire)"
+
+
+def test_vacuous_glob_stays_active_scope(tmp_path):
+    """THE POSITIVE CONTROL ( constraint): a hardcoded glob over a
+    non-existent directory that silently yields an empty list MUST still
+    classify as active-scope after the structural rules. This fixture is the
+    unprobed iteration — rule (b) must not fire on it."""
+    write_vacuous_glob(tmp_path)
+    out, rc = run(tmp_path)
+    assert rc == 0
+    hit = [f for f in out["findings"] if GONE in f["literal"]]
+    assert len(hit) == 1, out["findings"]
+    assert hit[0]["tier"] == "active-scope", \
+        f"the vacuity class must survive the new rules: {hit[0]}"
+
+
+def test_structural_rules_do_not_collapse_the_tiers(tmp_path):
+    """The new shapes must ADD discrimination, not collapse the tiers:
+    vacuous stays active-scope while the probe-guarded shape lands
+    absence-is-signal in the SAME corpus (guard-1793, the distinct-tiers
+    aggregate, extended to the structural rules)."""
+    write_vacuous_glob(tmp_path)
+    write_gitbash_tuple(tmp_path)
+    out, _ = run(tmp_path)
+    tiers = {f["tier"] for f in out["findings"]}
+    assert {"active-scope", "absence-is-signal"} <= tiers, sorted(tiers)
 
 
 if __name__ == "__main__":

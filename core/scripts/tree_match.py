@@ -53,6 +53,11 @@ CHANNEL_SCORES = {
     "embedding": 2.5,
     "concept": 2.0,
     "word_prefix": 1.5,
+    # g-379-10: whole-branch inclusion (retrieve.load_tree_nodes, data-gated by
+    # the node mark, not a depth flag). Scored like sibling — it is the same
+    # evidence class (a sibling of a direct match) that the mark makes
+    # available at EVERY depth instead of deep-only.
+    "whole_branch": 1.0,
     "sibling": 1.0,
     "parent": 0.5,
 }
@@ -288,6 +293,19 @@ def _norm_separators(s):
     return "-".join(re.findall(r'[a-z0-9]+', s))
 
 
+def _fold_ies(word):
+    """Fold a plural -ies to its singular -y: probabilities -> probability.
+
+    Strategy 3 compares words by prefix, which already equates token/tokens and
+    model/models, but 'probability' is not a prefix of 'probabilities' (they part
+    at the 11th letter), so a node keyed ...-probabilities was unreachable by the
+    word the user would type (g-379-01 u5: the planted pack node holding the
+    answer was never returned). Callers fold BOTH sides, so the two forms compare
+    equal in either direction. Words of 4 letters or fewer are left alone.
+    """
+    return word[:-3] + "y" if word.endswith("ies") and len(word) > 4 else word
+
+
 # Below this many nodes a bulk listing costs more than the HEADs it saves.
 # Derived from the measurement in `_prefetch_tree_root` below: the listing is
 # 3 requests / 0.9s and a HEAD is ~0.094s (135.1s / 1436), so break-even is
@@ -478,12 +496,13 @@ def _match_nodes(category, nodes, entity_index, concept_index):
     # Aligned with Strategy 4's tokenizer (`re.findall`) for consistency.
     # Node KEYS are still hyphen-separated (the framework convention) so we
     # split them with the same regex — pure hyphen-split was a happy accident.
-    cat_words_4 = {w for w in re.findall(r'[a-z0-9]+', cat_lower) if len(w) >= 4}
+    # Both sides fold a plural -ies to -y (`_fold_ies`): probability/probabilities.
+    cat_words_4 = {_fold_ies(w) for w in re.findall(r'[a-z0-9]+', cat_lower) if len(w) >= 4}
     if cat_words_4:
         for key, node in nodes.items():
             if key in matched_keys:
                 continue
-            key_words = {w for w in re.findall(r'[a-z0-9]+', key.lower()) if len(w) >= 4}
+            key_words = {_fold_ies(w) for w in re.findall(r'[a-z0-9]+', key.lower()) if len(w) >= 4}
             if any(cw.startswith(kw) or kw.startswith(cw)
                    for cw in cat_words_4 for kw in key_words):
                 matched.append((key, node))
@@ -551,6 +570,58 @@ def _include_parents(matched, matched_keys, channels, nodes):
             channels[pk] = "parent"
 
     return matched, matched_keys, channels
+
+
+def _whole_branch_expand(matched, matched_keys, channels, nodes):
+    """g-379-10: whole-branch inclusion — the data carries the instruction.
+
+    A node marked `whole_branch: true` in _tree.yaml opts its subtree into
+    sibling inclusion at EVERY depth, not deep-only. When a direct-channel
+    match sits inside (or IS) a marked node's subtree, the marked node's
+    children join the matched set on the `whole_branch` channel — the pack's
+    answer nodes, whatever node inside the pack the question's words hit. The
+    installer marks the pack branch nodes of born-ready vessels (provision-env
+    store stage), so a pack question that hits ANY one of a pack's nodes
+    returns the whole pack at shallow/medium too — the depth the agent's
+    /respond default uses. Measured 2026-10-11 over the 28 tree-node exam
+    tasks of the two real editions (audit-reports/g-379-01/.../u5): verbatim
+    source-node reach at medium 19/28 -> 28/28, short-query 10/28 -> 23/28,
+    0 removed, added sets within the depth limit.
+
+    Direct channels only — sibling/parent/whole_branch-included nodes do not
+    recursively pull more (same rule as _include_siblings). A node whose own
+    key is marked carries the mark for itself: the walk starts at the match.
+    No marks in the tree -> this function adds nothing (byte-identical
+    retrieval for every pre-existing tree; guard-2201's additive class).
+    """
+    branch_for = {}
+    for key, node in matched:
+        if channels.get(key) not in ("exact_key", "substring", "entity_index",
+                                     "concept", "word_prefix", "embedding"):
+            continue
+        # Cycle-safe like _path_chain / tree.py walk_ancestors: a malformed
+        # parent cycle (or self-parent) must end the walk, not hang retrieval.
+        anc = key
+        seen = set()
+        while anc is not None and anc not in seen:
+            seen.add(anc)
+            anc_node = nodes.get(anc)
+            if anc_node is None:
+                break
+            if anc_node.get("whole_branch"):
+                branch_for[key] = anc
+                break
+            anc = anc_node.get("parent")
+
+    added = []
+    for key in sorted(branch_for):
+        for child in nodes[branch_for[key]].get("children", []):
+            if child != branch_for[key] and child not in matched_keys and child in nodes:
+                matched.append((child, nodes[child]))
+                matched_keys.add(child)
+                channels[child] = "whole_branch"
+                added.append(child)
+    return matched, matched_keys, channels, added
 
 
 def _path_chain(nodes, key, max_hops=20):

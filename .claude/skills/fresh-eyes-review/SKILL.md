@@ -718,6 +718,10 @@ Write the briefing body (from Phase 3) to agents/<agent>/temp/fresh-eyes-{today-
    hyphens for Windows filesystem compatibility)
 ```
 
+Leave scratch files in place (housekeeping collects them) and
+never `rm` a variable path such as `rm -- $S/$f`: the dangerous-rm dialog
+freezes an unattended session (guard-956, rb-13103).
+
 ## Phase 5.5: Self-Assess Decision
 
 Classify the review outcome via the deterministic helper and act on it.

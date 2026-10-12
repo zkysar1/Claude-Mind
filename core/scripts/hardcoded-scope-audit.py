@@ -58,6 +58,38 @@ LITERAL_RX = re.compile(
     r'|/(?:' + _POSIX_ROOTS + r')/[^\s`"\'<>|)*\],;]+'  # posix-rooted form
     r')'
 )
+# A drive-letter match is a LITERAL ONLY if the colon really introduces a path.
+# The regex above cannot see the character before the drive letter, so the tail
+# of a backslash escape — `\t:`, `\u2014:` — reads as `t:\`, `u2014:\` and a
+# character-strip set like `lstrip("*_ \t:\u2014\u2013-")` produced 4 phantom
+# drive roots (, cc-02 row). A backslash before the letter is an
+# escape, not a path: drop the match instead of reporting a literal that is not
+# there.
+_ESCAPED_DRIVE_RX = re.compile(r'\\[A-Za-z]:[\\/]')
+
+# --- structural shape rules (): absence OUTCOMES the line itself ----
+# The 2026-09-24 cc-02 adjudication found the whole code-side active-scope tier
+# non-actionable in three shapes, and the window above cannot see STRUCTURE: the
+# probe and the dereference sit on different lines, the writer and the target
+# sit many lines apart. Applied to SCRIPT files only (never comments), BEFORE
+# the hint scoring:
+#
+# (b2) INLINE PROBE — the literal's own line tests its existence: a bash
+#      `[ -x L ]` / `[ -d L ]` test, or a python `os.path.exists(L)` /
+#      `L.exists()` call. The guard is on the line; absence is the designed
+#      outcome, exactly the marker shape.
+# (b)  PROBE-GUARDED ITERATION — the literal is an entry of a
+#      `for var in (...)` tuple and the loop body probes the VARIABLE for
+#      existence (`Path(var).exists()`, `os.path.exists(var)`, `shutil.which`):
+#      absence is caught or handled by the loop. Unprobed iteration (the
+#      vacuity class) is untouched and still classifies active-scope.
+# (c)  SELF-CREATED TARGET — the file writes the literal with a writer verb
+#      (install / cp / mkdir / tee / ln / touch / mv) on that line: an install
+#      target is absent before install by design.
+_FOR_TUPLE_RX = re.compile(r'\bfor\s+(?P<var>[A-Za-z_]\w*)\s+in\s*\(')
+_BASH_TEST_INLINE_RX = re.compile(r'\[\s*!\s*-[dxefslrwa]\s+"?')
+_PY_PROBE_VAR_RX = r'(?:Path\(\s*{var}\s*\)\s*\.exists\(\s*\))|(?:os\.path\.exists\(\s*{var}\s*\))|(?:{var}\s*\.\s*exists\(\s*\))|(?:shutil\.which\(\s*{var}\s*\))'
+_INSTALL_VERB_RX = re.compile(r'(?<![\w./-])(?:install|cp|mkdir|tee|ln|touch|mv)\b')
 
 # --- context signals. Each is a WEAK signal; the tier is their combination. ---
 # Absence produces a silent empty set -> the vacuity class.
@@ -176,6 +208,62 @@ def _fence_map(lines):
     return out
 
 
+def _structural_script_tier(lit, i, lines):
+    """Shape rules (b)/(b2)/(c) for SCRIPT lines (comments already excluded).
+
+    Each rule fires only when the line (or its loop) OUTCOMES absence of the
+    literal itself, so a hit means the site is marker-shaped, not vacuous.
+    Returns (tier, why) or None (hint scoring decides)."""
+    line = lines[i]
+    elit = re.escape(lit)
+    # (b2) inline probe: THIS line tests the literal's existence.
+    if re.search(r'\[\s*!?\s*-[dxefslra]\s+"?' + elit + r'"?\s*\]', line):
+        return "absence-is-signal", \
+            "inline existence probe on the line — absence is the designed outcome the guard handles (g-374-108 rule b2)"
+    if re.search(r'\b(?:exists|is_file|is_dir|which)\s*\(\s*["\']' + elit, line) \
+            or re.search(r'["\']' + elit + r'["\']\s*\)\s*\.\s*(?:exists|is_file|is_dir)\s*\(', line):
+        return "absence-is-signal", \
+            "inline existence probe on the line — absence is the designed outcome the guard handles (g-374-108 rule b2)"
+    # (c) self-created target: the line WRITES the literal (writer verb before
+    # the literal, literal is the line's last argument — a copy/glob SOURCE is
+    # the first argument and stays with the hint scorer).
+    for vm in _INSTALL_VERB_RX.finditer(line):
+        lm = re.search(re.escape(lit), line[vm.end():])
+        if lm:
+            tail = line[vm.end() + lm.end():].rstrip()
+            if tail and tail[-1] in "\"';&|":
+                tail = tail[:-1].rstrip()
+            if not tail:
+                return "absence-is-signal", \
+                    "self-created target — the file writes this path (install/cp/mkdir/tee/ln/touch/mv); absent before install by design (g-374-108 rule c)"
+    # (b) probe-guarded iteration: the literal is an entry of a
+    # `for var in (...)` tuple and the loop probes VAR for existence.
+    hdr = None
+    for h in range(max(0, i - 8), i + 1):
+        m = _FOR_TUPLE_RX.search(lines[h])
+        if m:
+            hdr = (h, m.group("var"))
+            break
+    if hdr:
+        h, var = hdr
+        esc_var = re.escape(var)
+        probe_rx = re.compile(_PY_PROBE_VAR_RX.format(var=esc_var)
+                              + r'|\[\s*!?\s*-[dxefslra]\s+"?[$\{]?(' + esc_var + r')')
+        close = None
+        for c in range(h, min(len(lines), h + 20)):
+            if ")" in lines[c]:
+                close = c
+                break
+        end = min(len(lines), (close if close is not None else h) + 15)
+        for c in range(h, end):
+            if close is not None and c < close:
+                continue
+            if probe_rx.search(lines[c]):
+                return "absence-is-signal", \
+                    f"probe-guarded iteration — tuple variable {var!r} is existence-probed by the loop; absence is caught (g-374-108 rule b)"
+    return None
+
+
 def _score(line, in_fence, is_script, window, is_fixture):
     if is_fixture:
         return "test-fixture", "under a test path — a non-resolving literal here is usually a deliberate negative fixture"
@@ -223,6 +311,11 @@ def scan(roots):
         is_fixture = _is_test_fixture(path)
         for i, line in enumerate(lines):
             for m in LITERAL_RX.finditer(line):
+                if m.start() > 0 and line[m.start() - 1] == "\\":
+                    # A backslash before the letter is an escape (`\t:`,
+                    # `\u2014:` in a strip set), not a drive root ():
+                    # no literal is present at all, so there is nothing to rank.
+                    continue
                 lit = m.group(1).rstrip(".,;:)")
                 try:
                     resolves = Path(lit).exists()
@@ -230,6 +323,14 @@ def scan(roots):
                     resolves = False
                 if resolves:
                     continue
+                if is_script and not (is_fixture or COMMENT_RX.search(line)):
+                    st = _structural_script_tier(lit, i, lines)
+                    if st:
+                        findings.append({
+                            "file": str(path), "line": i + 1, "literal": lit,
+                            "tier": st[0], "why": st[1], "context": line.strip()[:160],
+                        })
+                        continue
                 window = " ".join(lines[max(0, i - 3):i + 4])
                 tier, why = _score(line, fences[i], is_script, window, is_fixture)
                 findings.append({

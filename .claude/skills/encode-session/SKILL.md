@@ -409,7 +409,13 @@ non-trivial diagnosis) that future readers would benefit from re-reading:
        handoff_to set to <agent>, carrying the FULL add payload inline in its
        description (guard-3670), the pull-first precondition, the grep -c
        confirm, and an idempotency note (the store is append-only; a second
-       add duplicates silently). FILE IT WITH origin_signal "user_directive":
+       add duplicates silently). The pull-first precondition is a structured
+       file_check on the markdown, {"id":"pc-md-pulled","type":"file_check",
+       "path":"agents/<agent>/experience/<experience_id>.md","condition":
+       "exists"}, never command_succeeds with `test -f`: `test` is outside
+       predicate.ALLOWED_COMMAND_PREFIXES, so the goal reads "NOT EVALUABLE
+       (PERMANENT)", the selector never lists it, and the relay strands
+       (g-115-12215, 3 days). FILE IT WITH origin_signal "user_directive":
        a maintain:/investigate:/idea: head routes a new goal to status
        `candidate` (gates/intake_route.py, candidate_tier in
        core/config/aspirations.yaml), which the selector never collects

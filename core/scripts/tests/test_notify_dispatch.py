@@ -5,6 +5,18 @@ double-checks before it happens; the domain supplies only the transport via
 the slot world/scripts/notify-transport.sh. These tests run the real dispatcher
 against a tmp world whose slot is a fake transport that records what it got.
 Fixtures use example.com only; nothing here reaches a real transport.
+
+HERMETIC IDENTITY (g-115-8874; reworked 2026-10-11, g-358-248). The dispatcher
+builds every payload with notify-build-payload.py, which reads
+<project_root>/agents/<agent>/self.md (rc 3 if the file or its '# Self' heading
+is missing). The previous version ran as the host deployment's alpha and bravo
+agents, so on any deployment whose agents/ roster does not hold those names the
+suite failed for a reason that was not a defect in the dispatcher. Now the
+`world` fixture writes a MINIMAL self.md for two fixture-owned names (AGENT_A /
+AGENT_B) into its own tmp root, and every subprocess env, --agent value and
+--builder-arg --project-root points at that fixture -- the suite passes on a
+deployment whose agents/ roster holds neither name, and the assertions measure
+the dispatcher (see the mutation-probe tests below), not a fixture precondition.
 """
 from __future__ import annotations
 
@@ -20,10 +32,21 @@ SCRIPTS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS))
 
 import notify_dispatch as nd  # noqa: E402
-from _frontier_world import requires_frontier_world  # noqa: E402
 
-pytestmark = requires_frontier_world(
-    "it runs as the frontier origin's alpha and bravo agents, whose self.md the payload builder reads")
+# Fixture-owned identity names. Deliberately NOT names from any deployment's
+# roster: the whole point is that the suite must pass where neither exists
+# (). The fixture writes their self.md files; every env/--agent value
+# in this module is derived from these two constants, never a roster literal.
+AGENT_A = "hunit-a"
+AGENT_B = "hunit-b"
+
+# Minimal identity the payload builder accepts: a '# Self' heading followed by a
+# first sentence ending in '.' (extract_self_identity's anchor + sentence match).
+SELF_MD = """\
+# Self
+
+I am {name}, a test identity written by the notify_dispatch fixture.
+"""
 
 FAKE_TRANSPORT = '''#!/usr/bin/env bash
 # fake domain transport: record the payload + env, succeed unless asked to fail
@@ -36,15 +59,22 @@ echo "fake transport accepted"
 
 @pytest.fixture
 def world(tmp_path):
+    # tmp_path doubles as the builder's --project-root: it carries the world
+    # (board/, scripts/) AND the fixture-owned agents/ identity files, so one
+    # fixture owns both and no host agents/ roster is ever consulted.
     (tmp_path / "board").mkdir()
     (tmp_path / "scripts").mkdir()
     (tmp_path / "scripts" / "notify-transport.sh").write_text(FAKE_TRANSPORT)
+    for name in (AGENT_A, AGENT_B):
+        d = tmp_path / "agents" / name
+        d.mkdir(parents=True)
+        (d / "self.md").write_text(SELF_MD.format(name=name))
     return tmp_path
 
 
 def _env(world, **kw):
     e = dict(os.environ)
-    e.update({"MIND_WORLD": str(world), "STORAGE_BACKEND": "local", "MIND_AGENT": "alpha",
+    e.update({"MIND_WORLD": str(world), "STORAGE_BACKEND": "local", "MIND_AGENT": AGENT_A,
               "FAKE_OUT": str(world / "fake"), "USER_EMAIL": "operator@example.com"})
     e.pop("EMAIL_SEND_ALLOW_DUPLICATE", None)
     e.update(kw)
@@ -52,8 +82,15 @@ def _env(world, **kw):
 
 
 def _run(world, *args, stdin=None, **envkw):
-    return subprocess.run([sys.executable, str(SCRIPTS / "notify_dispatch.py"), "--no-mirror-peers", *args],
-                          input=stdin, env=_env(world, **envkw), capture_output=True, text=True, timeout=120)
+    # --builder-arg=--project-root pins the payload builder to the fixture's
+    # agents/ identity (): no host-roster dependency, 0 skipped.
+    # The '=' form is MANDATORY: argparse treats a separate '--project-root'
+    # token as an option flag, not the append value (rc 2, 'expected one
+    # argument'). The dispatcher's own help names the same shape.
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS / "notify_dispatch.py"), "--no-mirror-peers",
+         "--builder-arg=--project-root", f"--builder-arg={world}", *args],
+        input=stdin, env=_env(world, **envkw), capture_output=True, text=True, timeout=120)
 
 
 def _sent(world):
@@ -86,15 +123,15 @@ def test_send_path_calls_slot_with_dispatched_env_and_records(world):
 def test_duplicate_from_another_agent_is_refused_and_recorded_then_override_sends(world):
     assert _run(world, "--category", "decision-needed", "--subject", "Retire the legacy PK? (g-115-6222)", "--message", BODY).returncode == 0
     p = _run(world, "--category", "decision-needed", "--subject", "Your call: retiring the legacy identity PK",
-             "--message", "Bravo here; reads on g-115-6222 say no writer remains. Please decide.", MIND_AGENT="bravo")
+             "--message", "Second agent here; reads on g-115-6222 say no writer remains. Please decide.", MIND_AGENT=AGENT_B)
     assert p.returncode == nd.RC_DUP, p.stderr
-    assert "DUPLICATE" in p.stderr and "alpha" in p.stderr
+    assert "DUPLICATE" in p.stderr and AGENT_A in p.stderr
     assert len(_sent(world)) == 1  # transport NOT called
     rows = _ledger(world)
     assert rows[-1]["rc"] == nd.RC_DUP and rows[-1]["suppressed_duplicate_of"] == rows[0]["id"]
     p = _run(world, "--category", "decision-needed", "--subject", "Your call: retiring the legacy identity PK",
-             "--message", "In addition to alpha's note on g-115-6222: the window closes 2026-09-15.",
-             "--allow-duplicate", "adds the deadline", MIND_AGENT="bravo")
+             "--message", f"In addition to {AGENT_A}'s note on g-115-6222: the window closes 2026-09-15.",
+             "--allow-duplicate", "adds the deadline", MIND_AGENT=AGENT_B)
     assert p.returncode == nd.RC_SENT, p.stderr
     assert len(_sent(world)) == 2
     assert _ledger(world)[-1]["duplicate_override_reason"] == "adds the deadline"
@@ -108,7 +145,7 @@ def test_env_override_is_honoured_like_the_flag(world):
 
 def test_routing_gate_suppresses_status_reports_and_does_not_call_transport(world):
     p = _run(world, "--category", "completion", "--subject", "Completion Report (2h, 3 goals)",
-             "--message", "alpha completed 3 goals: g-1-1, g-1-2, g-1-3. All committed and pushed. Nothing further.", "--dry-run")
+             "--message", "A fleet agent completed 3 goals: g-1-1, g-1-2, g-1-3. All committed and pushed. Nothing further.", "--dry-run")
     assert p.returncode == nd.RC_ROUTED, p.stderr
     assert "SUPPRESSED by routing gate" in p.stderr
     assert _sent(world) == []
@@ -145,7 +182,9 @@ def test_transport_failure_is_rc6_and_recorded_as_failed_not_sent(world):
 
 
 def test_payload_stdin_path_derives_subject_body_category(world):
-    build = subprocess.run([sys.executable, str(SCRIPTS / "notify-build-payload.py"), "--agent", "alpha", "--category", "decision-needed",
+    build = subprocess.run([sys.executable, str(SCRIPTS / "notify-build-payload.py"), "--agent", AGENT_A,
+                            "--project-root", str(world),
+                            "--category", "decision-needed",
                             "--subject", "Your call on g-9-9", "--message", "I decided to keep the bridge in maintenance mode for g-9-9 until Friday; override if you disagree."],
                            capture_output=True, text=True, timeout=60)
     assert build.returncode == 0, build.stderr
@@ -154,7 +193,9 @@ def test_payload_stdin_path_derives_subject_body_category(world):
     rows = _ledger(world)
     assert rows[0]["category"] == "decision-needed" and rows[0]["subject"] == "Your call on g-9-9"
     # and a second, differently-worded ask on the SAME id within the window is a duplicate
-    p2 = _run(world, "--category", "decision-needed", "--subject", "Need your decision: bridge maintenance (g-9-9)", "--message", "Zeta here -- should the bridge stay in maintenance for g-9-9? Please decide.", MIND_AGENT="zeta")
+    p2 = _run(world, "--category", "decision-needed", "--subject", "Need your decision: bridge maintenance (g-9-9)",
+              "--message", "Second fixture identity here -- should the bridge stay in maintenance for g-9-9? Please decide.",
+              MIND_AGENT=AGENT_B)
     assert p2.returncode == nd.RC_DUP
 
 
@@ -191,6 +232,18 @@ def test_wrapper_and_skill_wiring():
     if not skill_path.exists():
         pytest.skip("notify-user is a forged domain skill; a seed plant does not ship it")
     assert "core/scripts/notify-user.sh" in skill_path.read_text(encoding="utf-8")
+
+
+def test_missing_identity_is_a_usage_refusal_not_a_send(world):
+    """ half 2: with no identity file the builder fails loud (rc 3)
+    and the dispatcher refuses with RC_USAGE -- it must never send with an
+    empty/missing sender identity, and the refusal must not be silent."""
+    (world / "agents" / AGENT_A / "self.md").unlink()
+    p = _run(world, "--category", "decision-needed", "--subject", "Your call on asp-9",
+             "--message", "I decided to pause asp-9 for a week because the data source is down; override if you disagree.")
+    assert p.returncode == nd.RC_USAGE, p.stderr
+    assert "self.md" in p.stderr, "the refusal must name the missing identity file"
+    assert _sent(world) == [] and _ledger(world) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -497,7 +550,8 @@ def test_a_crash_in_the_checker_fails_open_and_loud(world, monkeypatch, capsys):
     def boom(*a, **k):
         raise RuntimeError("boom")
     monkeypatch.setattr(nd.data_class, "check", boom)
-    rc = nd.dispatch(agent="alpha", category="decision-needed", subject=_SUBJ, message=f"{BODY} Reach me at {_OWNER}.",
-                     world=world, mirror_peers=False, dry_run=True)
+    rc = nd.dispatch(agent=AGENT_A, category="decision-needed", subject=_SUBJ, message=f"{BODY} Reach me at {_OWNER}.",
+                     world=world, mirror_peers=False, dry_run=True,
+                     builder_args=["--project-root", str(world)])
     assert rc != nd.RC_DATA_CLASS, "a checker crash must never read as a refusal"
     assert "could not run" in capsys.readouterr().err

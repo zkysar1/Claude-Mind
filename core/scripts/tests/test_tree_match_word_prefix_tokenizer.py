@@ -214,6 +214,59 @@ def test_3char_acronym_falls_through_to_substring_if_in_summary():
 
 
 # ---------------------------------------------------------------------------
+# Word-prefix: -ies / -y plural fold ( unit u5)
+# ---------------------------------------------------------------------------
+# A planted pack node keyed n03-scores-to-probabilities was not returned for the
+# query "language-model next-token probability calibration": 'probability' is not
+# a prefix of 'probabilities' (they part at the 11th letter), so Strategy 3
+# skipped it while n01/n02/n12 matched on token/tokens/models. Both directions are
+# pinned, with the sibling words that must stay apart.
+
+def test_singular_y_query_reaches_plural_ies_key():
+    keys = ["n03-scores-to-probabilities", "n01-one-token-at-a-time", "unrelated-thing"]
+    matched, channels = _match("language-model next-token probability calibration", keys)
+    assert "n03-scores-to-probabilities" in matched
+    assert channels["n03-scores-to-probabilities"] == "word_prefix"
+    assert "n01-one-token-at-a-time" in matched  # the matches the old rule made are unchanged
+    assert "unrelated-thing" not in matched
+
+
+def test_plural_ies_query_reaches_singular_y_key():
+    keys = ["agent-capability", "platform-policy", "unrelated-thing"]
+    matched, _ = _match("capabilities policies", keys)
+    assert "agent-capability" in matched
+    assert "platform-policy" in matched
+    assert "unrelated-thing" not in matched
+
+
+def test_ies_fold_does_not_join_unrelated_words():
+    """The fold equates a word with its own plural and nothing else: 'series'
+    folds to 'sery' and 'movies' to 'movy', neither a prefix of a different word."""
+    keys = ["serial-port", "movement-planner", "specific-rule", "unrelated-thing"]
+    matched, _ = _match("series movies species", keys)
+    assert "serial-port" not in matched
+    assert "movement-planner" not in matched
+    assert "specific-rule" not in matched
+    assert "unrelated-thing" not in matched
+
+
+def test_fold_helper_leaves_short_and_singular_words_alone():
+    assert _tm._fold_ies("probabilities") == "probability"
+    assert _tm._fold_ies("cities") == "city"
+    assert _tm._fold_ies("lies") == "lies"  # 4 letters: not folded
+    assert _tm._fold_ies("probability") == "probability"
+    assert _tm._fold_ies("tokens") == "tokens"
+
+
+def test_fold_never_removes_an_existing_match():
+    """A widening is additive (guard-2201): what matched before still matches."""
+    keys = ["memory-lifecycle", "consolidation-window", "task-selection", "workflow-engine", "unrelated-thing"]
+    matched, _ = _match("memory consolidation selection work", keys)
+    assert {"memory-lifecycle", "consolidation-window", "task-selection", "workflow-engine"} <= matched
+    assert "unrelated-thing" not in matched
+
+
+# ---------------------------------------------------------------------------
 # Test runner
 # ---------------------------------------------------------------------------
 

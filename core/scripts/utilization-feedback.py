@@ -565,7 +565,10 @@ def _fetch_diary_text(goal_id):
         return ""
     parts = []
     try:
-        with open(diary_path, "r", encoding="utf-8") as f:
+        # errors="replace": one line cut mid-codepoint must not abort the read — it
+        # falls to the JSONDecodeError skip below (; the contract above is
+        # "empty string on any failure", and UnicodeDecodeError is not an OSError).
+        with open(diary_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
