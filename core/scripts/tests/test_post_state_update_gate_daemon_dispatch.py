@@ -51,7 +51,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 GATE_SH = CORE_SCRIPTS / "post-state-update-gate.sh"
 WM_READ_SH = CORE_SCRIPTS / "wm-read.sh"
-WM_SET_SH = CORE_SCRIPTS / "wm-set.sh"
 
 PROJECT_TMP = SCRIPT_DIR / "_tmp_daemon_dispatch_test"
 # OFF-ROSTER by construction: must never appear in the live team-state
@@ -61,6 +60,7 @@ AGENT = "testagent"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from _bash_helpers import BASH as GIT_BASH  # noqa: E402
+from _wm_cooldown import neutralize_cooldown  # noqa: E402
 
 
 def _to_bash_path(p) -> str:
@@ -141,17 +141,12 @@ def _isolate_wm_cooldown():
     example, from a file that looked correct. See _isolate_wm_cooldown there for
     the full rationale, the measurement that retired the guard-672 constraint,
     and why the save/restore half was deleted rather than hardened.
+
+    The body is shared (_wm_cooldown.neutralize_cooldown, g-374-628-a): it returns
+    quietly where the runtime has no daemon, since the gate's own use of the slot
+    is fail-open there and the cooldown reads null on every case anyway.
     """
-    r = subprocess.run(
-        [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
-        input="null", capture_output=True, text=True, timeout=30,
-        env={**os.environ, "MIND_AGENT": AGENT},
-    )
-    assert r.returncode == 0, (
-        f"could not neutralize {AGENT} fresh_eyes_last_fire "
-        f"(rc={r.returncode} stderr={r.stderr!r}) -- the firing cases below would "
-        f"be non-deterministic, so fail loudly rather than flake"
-    )
+    neutralize_cooldown(AGENT)
     yield
 
 

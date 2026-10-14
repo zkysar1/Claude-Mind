@@ -8,6 +8,7 @@ hard as the classifier itself.
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -135,12 +136,102 @@ def test_sweep_imports_no_mutation_helper(mod):
         assert not hasattr(mod, banned), f"read-only sweep exposes {banned!r}"
 
 
-def test_empty_population_is_refused_not_reported_as_clean(mod, monkeypatch, capsys):
+def test_a_read_that_scanned_no_goals_is_refused_not_reported_as_clean(
+        mod, monkeypatch, capsys):
     """An unreadable queue is NOT a queue with no self-blocked defers."""
-    monkeypatch.setattr(mod, "_load_population", lambda: [])
+    monkeypatch.setattr(mod, "_load_population",
+                        lambda: ([], {"sources_read": 0, "goals_scanned": 0}))
     rc = mod.main([])
     assert rc == 2
     assert "REFUSING" in capsys.readouterr().err
+
+
+# ── empty is not unreadable () ──────────────────────────────────────
+#
+# The sweep used to refuse any queue whose loader returned no DEFERRED goal, so a
+# queue that was read in full and simply holds no deferred goal could never pass,
+# on any box. These tests drive the REAL loader over a tmp store (patching `_paths`,
+# which audit-deferred-defers.py reads at import) rather than hand the sweep a
+# coverage the test wrote: the expectation must come from the OTHER component at
+# runtime (guard-1220). The unreadable cases are the control that the guard still
+# fires; the candidate case is the control that the sweep still finds work in the
+# same harness (guard-4166: a fix whose effect is that something stops appearing
+# needs a positive control that does NOT flip under the mutant).
+
+def _point_loader_at(monkeypatch, tmp_path, world_text):
+    """A tmp world (no agents) for the real loader. `None` writes no queue file."""
+    import _paths  # on sys.path: the `mod` fixture's import of the sweep put it there
+    world = tmp_path / "world"
+    world.mkdir()
+    if world_text is not None:
+        (world / "aspirations.jsonl").write_text(world_text, encoding="utf-8")
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    monkeypatch.setattr(_paths, "WORLD_DIR", world)
+    monkeypatch.setattr(_paths, "agents_root", lambda: agents)
+
+
+def _queue(*goals):
+    return json.dumps({"id": "asp-900", "goals": list(goals)}) + "\n"
+
+
+def test_a_readable_queue_with_no_deferred_goal_is_a_clean_census(
+        mod, monkeypatch, tmp_path, capsys):
+    """Pre-fix this returned 2 on any queue without a deferred goal."""
+    _point_loader_at(monkeypatch, tmp_path, _queue(
+        {"id": "g-1", "title": "a", "status": "pending"},
+        {"id": "g-2", "title": "b", "status": "completed"}))
+    rc = mod.main(["--json"])
+    out = capsys.readouterr()
+    assert rc == 0, out.err
+    d = json.loads(out.out)
+    assert d["population"] == 0
+    assert d["coverage"] == {"sources_read": 1, "goals_scanned": 2}
+    assert d["self_blocked_candidates"] == []
+
+
+def test_the_human_report_of_a_clean_census_says_what_it_scanned(
+        mod, monkeypatch, tmp_path, capsys):
+    _point_loader_at(monkeypatch, tmp_path, _queue({"id": "g-1", "status": "pending"}))
+    assert mod.main([]) == 0
+    out = capsys.readouterr().out
+    assert "deferred population (SSOT loader) : 0" in out
+    assert "scanned (queue files / goals)     : 1 / 1" in out
+
+
+@pytest.mark.parametrize("world_text,why", [
+    (None, "the world dir holds no aspirations.jsonl"),
+    ("", "a zero-byte aspirations.jsonl, the shape of a truncated store"),
+    ("not json\n{also not\n", "every line unparseable"),
+    (json.dumps({"id": "asp-900", "goals": []}) + "\n",
+     "a store with aspirations and no goals: the deliberate conservative boundary, "
+     "indistinguishable from a truncation that kept the aspiration shells"),
+])
+def test_an_unreadable_queue_is_still_refused(
+        mod, monkeypatch, tmp_path, capsys, world_text, why):
+    _point_loader_at(monkeypatch, tmp_path, world_text)
+    rc = mod.main(["--json"])
+    out = capsys.readouterr()
+    assert rc == 2, why
+    assert "REFUSING" in out.err and out.out == "", why
+
+
+def test_the_sweep_still_finds_a_candidate_in_a_readable_queue(
+        mod, monkeypatch, tmp_path, capsys):
+    """Specificity control: same harness, one deferred goal naming no external clearer.
+
+    The sweep's own positive CONTROL string is the input, so the expectation is the
+    classifier's, not this test's.
+    """
+    own_fix = mod.CONTROL[0][0]
+    assert mod.classify(own_fix) == "self_blocked_candidate"
+    _point_loader_at(monkeypatch, tmp_path, _queue(
+        {"id": "g-1", "title": "t", "status": "pending", "defer_reason": own_fix}))
+    rc = mod.main(["--json"])
+    d = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert d["population"] == 1
+    assert [c["goal_id"] for c in d["self_blocked_candidates"]] == ["g-1"]
 
 
 def test_control_regression_refuses_to_report(mod, monkeypatch, capsys):
@@ -249,7 +340,7 @@ def test_population_rows_carry_what_the_classifier_needs(mod):
     Asserts the MINIMUM the classifier needs, so a future widening of the
     loader still passes.
     """
-    pop = mod._load_population()
+    pop, _coverage = mod._load_population()
     if not pop:
         pytest.skip("no deferred goals on this box — nothing to characterise")
     assert all("defer_reason" in r for r in pop)

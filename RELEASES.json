@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.100",
+    "previous_version": "2.12.99",
+    "date": "2026-10-14",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "Release v2.12.100: release-train cut after a 36h stall (g-115-12483); the first tag newer than v2.12.99, which omni waits on to run ZDS's PLAN (msg-20261012-205420-omni-368). Deployment-shaped run (g-358-244) by echo on cc-03 at ref 5cc23f2f3c, scoped to the 210 test files that reference the 28 code files changed since the v2.12.99 cut ref 3d1a461e9e (run-scoped-suite map, 0 unmapped): CONTROL 4/4 seeded probes red, 21 red of 5807 tests, 25 skipped (NOT run), 207 files plus 3 pytest-invisible (2 pass, test_cross_lane_claim.py red). The 6 red files that exist at v2.12.99 were re-run at that tag in the same shape: the same 18 red test ids plus the same invisible red, 0 newly red, 0 fixed; the only reds new at this ref are 2 tests in test_q4_code_scope.py, a file added after v2.12.99 (cause read from q4_provenance_sample.py: with no provenance manifest the sampler returns skipped, not pass). NOT run: the other 1550 test files, which no changed code file maps to, and a FULL shaped run at this tag. Promotion preflight (source a clean worktree at origin/main 5cc23f2f3c, target a fresh Claude-Mind at v2.12.99) exit 2 with 4 line-level files, all SEED_MOTION by promotion-plan-triage (dest byte-equal to the transform of v2.12.99; negative control printed AUTHORED, exit 2), plus one orphan-risk core/scripts/.platform-memo.sh, a gitignored runtime file present at the target and in the live tree and absent only from the fresh worktree. Full-tree domain-leak CLEAN rc 0; MODE-STRIP net test empty; origin/main merged 0 behind before the cut. g-115-12483.",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.99",
     "previous_version": "2.12.98",
     "date": "2026-10-12",

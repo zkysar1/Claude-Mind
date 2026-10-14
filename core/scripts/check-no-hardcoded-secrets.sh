@@ -32,7 +32,9 @@
 #   (default)     Scan STAGED content. This is Gate 8 of the pre-commit chain.
 #   --scan-head   Scan COMMITTED content at HEAD. Audit mode, not a gate.
 #   --scan-untracked  Scan the GITIGNORED surface (agents/*/temp/) by name/size
-#                 SHAPE only — never content. Audit mode, not a gate.
+#                 SHAPE only — never content. Audit mode, not a gate. Two lanes:
+#                 this box's LOCAL mirror (path, size, mode, mtime) and the
+#                 authoritative STORE via `backend-cat.sh list` (path only).
 #
 # WHY --scan-head EXISTS (g-306-105, 2026-08-01). The default mode is
 # DIFF-SCOPED: it reads the staged index and never inspects what is already
@@ -65,6 +67,10 @@
 
 set -eu
 
+# Resolved BEFORE the cd below: a relative ${BASH_SOURCE[0]} stops pointing at
+# this file once the working directory moves to the repo root. Only the
+# --scan-untracked store lane reads it (to find its sibling lister).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(git rev-parse --show-toplevel)"
 cd "$REPO"
 
@@ -113,14 +119,32 @@ esac
 # scratch into the tree. This mode REPORTS. Disposition stays a human-or-agent
 # decision per file.
 #
+# TWO LANES, TWO FIELD SETS (g-374-61). `agents/*/temp/` is an own-cloud
+# read-through-cached surface, so a box holds only what it has materialised: the
+# LOCAL lane below sees a per-box subset (the goal record measured 17 of 187 on
+# one box, 9%). The STORE lane enumerates the authoritative store instead, through
+# `backend-cat.sh list` and NOTHING ELSE. `list` yields entry NAMES, so the store
+# lane can supply the path and no more: no size, no mode, no mtime, and a
+# sub-directory cannot be told from a file. Every report says so rather than
+# padding the missing fields, and the store lane has its own loop and its own
+# verdict, so it can never write a default into a field the local lane's branches
+# read (a size of 0 would otherwise trip EMPTY-CRED-NAME on every store name).
+#
 # Exit 0 = no credential-shaped residue. Exit 1 = hits (audit mode, like
-# --scan-head — never a commit gate). ALLOW_SECRETS_IN_COMMIT does not apply.
+# --scan-head — never a commit gate). Exit 2 = INCONCLUSIVE: the scan could not
+# see the population it exists to see (nothing enumerated, or the store lane was
+# unavailable) and says so; it is never reported as clean.
+# ALLOW_SECRETS_IN_COMMIT does not apply.
 if [[ "$MODE" == "untracked" ]]; then
     # Name shapes that indicate a credential. Anchored on word-ish boundaries so
     # `.last-selector-path` does not match on "sel" and `.fe-ts` does not match
     # on "ts". Extend this list rather than loosening it: a loose pattern here
     # flags every cadence sentinel and the report stops being read.
-    cred_name='(^|[.._-])(tok|tok2|token|pw|passwd|password|secret|secrets|cred|creds|credential|key|apikey|api_key|auth|bearer|session|cookie|jwt|pem|p12|pfx)([._-]|$)'
+    # `session` is deliberately NOT a bare token (g-374-61): it flagged
+    # .current-session-log and .notify-session-143-end.md, live cadence state,
+    # which were 2 of the 7 fleet hits in the measurement. Nothing detectable is
+    # lost: `token` still catches .session-token and `key` .aws-session-key.
+    cred_name='(^|[.._-])(tok|tok2|token|pw|passwd|password|secret|secrets|cred|creds|credential|key|apikey|api_key|auth|bearer|cookie|jwt|pem|p12|pfx)([._-]|$)'
     hits=0
     scanned=0
     report=""
@@ -177,35 +201,159 @@ if [[ "$MODE" == "untracked" ]]; then
         coverage+="    NOT SCANNED HERE (no temp dir on this box — says NOTHING about their residue): ${_absent}"$'\n'
     fi
 
+    # STORE LANE (g-374-61). The authoritative store, enumerated through the
+    # sibling lister's `list` subcommand and NOTHING ELSE: `list` returns entry
+    # NAMES, so there is no code path from here to a byte of any scanned file, and
+    # no size, mode or mtime exists to report. The agent dirs come from
+    # `list agents`; each one's depth-1 names from `list agents/<a>/temp`. A name
+    # is judged on its SHAPE alone by the same cred_name predicate as the local
+    # lane, so a hit is a CANDIDATE, never a confirmed exposure (guard-6993).
+    #
+    # The lister exits 1 both for "empty or absent" (a normal answer: most agent
+    # dirs hold no temp subtree) and for any uncaught error, so rc alone cannot
+    # tell a real absence from a failed listing. Its own message can, and stderr is
+    # read for it: an absence is NAMED on its own line, a failure is NAMED as
+    # unreadable and makes the run INCONCLUSIVE. Neither is folded into a count.
+    store_lister="$SCRIPT_DIR/backend-cat.sh"
+    store_state="ok"
+    store_why=""
+    store_scanned=0
+    store_hits=0
+    store_dirs=0
+    store_rows=""
+    store_absent=""
+    store_unreadable=""
+    store_report=""
+    store_agents=""
+    store_err="$(mktemp 2>/dev/null)" || store_err=""
+    trap 'rm -f "$store_err"' EXIT
+    _store_list() {
+        local _rc=0
+        _sl="$(bash "$store_lister" list "$1" 2>"${store_err:-/dev/null}")" || _rc=$?
+        return "$_rc"
+    }
+    _err_line=""
+    if [[ ! -f "$store_lister" ]]; then
+        store_state="unavailable"
+        store_why="lister not found: ${store_lister}"
+    elif ! _store_list agents || [[ -z "$_sl" ]]; then
+        [[ -n "$store_err" ]] && { IFS= read -r _err_line < "$store_err" || true; }
+        store_state="unavailable"
+        store_why="'backend-cat.sh list agents' failed or returned nothing${_err_line:+ (${_err_line:0:160})}"
+    else
+        store_agents="$_sl"
+    fi
+    if [[ "$store_state" == "ok" ]]; then
+        while IFS= read -r _sa; do
+            [[ -z "$_sa" ]] && continue
+            if ! _store_list "agents/${_sa}/temp"; then
+                if [[ -n "$store_err" ]] && grep -q "backend-cat: empty or absent" "$store_err" 2>/dev/null; then
+                    store_absent+="${store_absent:+, }${_sa}"
+                else
+                    _err_line=""
+                    [[ -n "$store_err" ]] && { IFS= read -r _err_line < "$store_err" || true; }
+                    store_unreadable+="${store_unreadable:+; }${_sa} (${_err_line:0:120}${_err_line:+ }rc!=0, no absence message)"
+                fi
+                continue
+            fi
+            _sd="$(printf '%s\n' "$_sl" | grep '^\.' || true)"
+            _st=$(printf '%s\n' "$_sl" | grep -c . || true)
+            _sn=$(printf '%s\n' "$_sd" | grep -c . || true)
+            store_dirs=$((store_dirs + 1))
+            store_scanned=$((store_scanned + _sn))
+            store_rows+="    ${_sa}: ${_sn} dot-name(s) of ${_st} depth-1 entr$([[ "$_st" -eq 1 ]] && echo y || echo ies)"$'\n'
+            while IFS= read -r _dn; do
+                [[ -z "$_dn" || "$_dn" == ".gitkeep" ]] && continue
+                if printf '%s' "$_dn" | grep -qiE "$cred_name"; then
+                    store_hits=$((store_hits + 1))
+                    store_report+="  CRED-SHAPED agents/${_sa}/temp/${_dn}|path only (store lane)"$'\n'
+                    store_report+="      credential-shaped NAME in the authoritative store: a CANDIDATE judged on name alone, and it may be a directory — disposition from content-free evidence only; do NOT read, echo, or copy the value; a local rm clears neither copy (guard-6870)"$'\n'
+                fi
+            done <<< "$_sd"
+        done <<< "$store_agents"
+    fi
+
+    case "${STORAGE_BACKEND:-}" in
+        "")                store_backend="not identified (STORAGE_BACKEND is unset in this shell; the lister resolves its own)" ;;
+        local|local-files) store_backend="${STORAGE_BACKEND} — the store IS this box's filesystem, so both lanes describe the same files" ;;
+        *)                 store_backend="${STORAGE_BACKEND}" ;;
+    esac
+
     # ANTI-VACUITY. "no credential-shaped residue" is satisfied perfectly by a
     # scan that enumerated NOTHING — a moved temp root, a renamed agents dir, or
     # a find that errored all produce the identical clean exit. A population of
-    # zero is a BROKEN SCAN here, not a clean one (guard-2298).
-    if [[ "$scanned" -eq 0 ]]; then
-        echo "[secret-scanner] --scan-untracked FOUND NO FILES AT ALL under agents/*/temp/." >&2
+    # zero is a BROKEN SCAN here, not a clean one (guard-2298). Applied to the
+    # UNION of the lanes: a box that materialised no temp dotfiles can still scan
+    # the fleet through the store lane, but nothing enumerated in EITHER lane is
+    # broken, and so is a store lane that answered and listed no dot-name at all.
+    if [[ "$scanned" -eq 0 && "$store_scanned" -eq 0 ]]; then
+        echo "[secret-scanner] --scan-untracked FOUND NO DOTFILES AT ALL, in either lane (local agents/*/temp/, or the authoritative store)." >&2
         echo "  That is a broken scan, not a clean one: every agent dir carries a tracked" >&2
-        echo "  .gitkeep, so a live tree always enumerates at least one file. Check the" >&2
-        echo "  temp root and AGENTS_PARENT_DIR before reading this as an all-clear." >&2
+        echo "  .gitkeep, so a live local tree always enumerates at least one file. Check the" >&2
+        echo "  temp root, AGENTS_PARENT_DIR and the store lane before reading this as an all-clear." >&2
+        [[ "$store_state" == "ok" ]] || echo "  Store lane: unavailable (${store_why})." >&2
         exit 2
     fi
 
-    if [[ "$hits" -eq 0 ]]; then
-        echo "[secret-scanner] --scan-untracked CLEAN on THIS BOX: ${scanned} dotfile(s) under agents/*/temp/, none credential-shaped by name."
-        echo "  Coverage (a fleet claim is the union of per-box runs, never one of them):"
-        printf '%s' "$coverage"
-        exit 0
+    total_hits=$((hits + store_hits))
+    inconclusive=""
+    if [[ "$store_state" != "ok" ]]; then
+        inconclusive="the store lane was unavailable (${store_why})"
+    elif [[ -n "$store_unreadable" ]]; then
+        inconclusive="the store lane could not read: ${store_unreadable}"
+    elif [[ "$store_scanned" -eq 0 ]]; then
+        inconclusive="the store lane read ${store_dirs} agent temp dir(s) and found no dot-name in any of them — either none exist or the listing is blind to them"
     fi
 
-    echo "[secret-scanner] --scan-untracked: ${hits} credential-shaped of ${scanned} dotfile(s) under agents/*/temp/ ON THIS BOX"
-    echo "  Coverage (a fleet claim is the union of per-box runs, never one of them):"
-    printf '%s' "$coverage"
-    printf '%s' "$report"
-    echo "  NOTE: metadata only — this mode reads no file content, by construction."
-    echo "  NOTE: this box's view only. agents/<agent>/temp/ is nominally fleet-synced"
-    echo "        (guard-3422) but the synced view is NOT uniform per box (measured"
-    echo "        g-115-9947): a file present here can be absent on a peer and vice"
-    echo "        versa, so a clean run HERE does not clear the fleet."
-    exit 1
+    # The report body, built once for every outcome. The FIELDS block is the
+    # point of the two-lane layout: each lane states what it can supply, so the
+    # path-only store lane is never read as if it carried size, mode and mtime.
+    # Basis for the two field sets: g-374-61 (the lister returns bare entry names;
+    # the local lane find call supplies size, mode and mtime).
+    body="  Fields per surface (a lane never degrades silently into the other's shape):"$'\n'
+    body+="    local lane : path, size, mode, mtime  (find -printf on THIS BOX's materialised mirror)"$'\n'
+    body+="    store lane : path ONLY  (backend-cat.sh list returns entry names: no size, no mode, no mtime, and a directory cannot be told from a file)"$'\n'
+    body+="  Local lane — THIS BOX's mirror only (agents/*/temp/ is a read-through cache): ${scanned} dotfile(s)"$'\n'
+    body+="$coverage"
+    if [[ "$store_state" == "ok" ]]; then
+        body+="  Store lane — authoritative store (backend: ${store_backend}): ${store_scanned} dot-name(s) across ${store_dirs} agent temp dir(s)"$'\n'
+        body+="$store_rows"
+        if [[ -n "$store_absent" ]]; then
+            body+="    NO ENTRIES UNDER temp IN THE STORE (absent or empty — says NOTHING about their residue): ${store_absent}"$'\n'
+        fi
+        if [[ -n "$store_unreadable" ]]; then
+            body+="    UNREADABLE (a listing ERROR, not an absence — their residue was NOT scanned): ${store_unreadable}"$'\n'
+        fi
+        if [[ "$store_scanned" -gt 0 ]]; then
+            body+="  Fleet vs box: the store lane saw ${store_scanned} dot-name(s); this box's local lane scanned ${scanned} ($((scanned * 100 / store_scanned))% of that figure)"$'\n'
+        fi
+    else
+        body+="  Store lane — UNAVAILABLE (${store_why}): the fleet population was NOT scanned; this run covers THIS BOX only."$'\n'
+    fi
+
+    if [[ "$total_hits" -gt 0 ]]; then
+        echo "[secret-scanner] --scan-untracked: ${total_hits} credential-shaped by name (local lane ${hits} of ${scanned}, store lane ${store_hits} of ${store_scanned} dot-name(s))"
+        printf '%s' "$body"
+        printf '%s' "$report"
+        printf '%s' "$store_report"
+        echo "  NOTE: names and metadata only — this mode reads no file content, by construction."
+        echo "  NOTE: the local lane is this box's view only. agents/<agent>/temp/ is nominally"
+        echo "        fleet-synced (guard-3422) but the synced view is NOT uniform per box"
+        echo "        (measured g-115-9947): a file present here can be absent on a peer and"
+        echo "        vice versa, so a clean LOCAL lane does not clear the fleet. The store"
+        echo "        lane is the fleet view, by name."
+        exit 1
+    fi
+
+    if [[ -n "$inconclusive" ]]; then
+        echo "[secret-scanner] --scan-untracked INCONCLUSIVE: ${inconclusive}. This is NOT a clean result." >&2
+        printf '%s' "$body"
+        exit 2
+    fi
+
+    echo "[secret-scanner] --scan-untracked CLEAN: ${store_scanned} dot-name(s) in the authoritative store across ${store_dirs} agent temp dir(s) and ${scanned} on THIS BOX's mirror, none credential-shaped by name."
+    printf '%s' "$body"
+    exit 0
 fi
 
 # ─── Override path (audited) ──────────────────────────────────────────────

@@ -245,7 +245,7 @@ def test_should_encode_requires_env_and_allowlist_together():
     ("world/retrieval-trace-2026-09-05.jsonl", True),
     ("world/retrieval-trace-archive.jsonl", False),
     ("world/retrieval-trace-2026-09-05.jsonl.spool", False),
-    # DEFERRED (inbound cross-deployment writers, see BOARD_PATTERN_DEFERRED):
+    # HELD OUT (range-tail store: an encoded board cannot be tail-pulled, see BOARD_PATTERN_DEFERRED):
     ("world/board/coordination.jsonl", False),
     ("world/board/general.jsonl", False),
     ("world/board/coordination-reads.jsonl", False),
@@ -266,10 +266,13 @@ def test_rel_allowlist_normalizes_backslashes():
 
 
 def test_board_pattern_is_deferred_not_forgotten():
-    """The board is excluded from the FIRST flip because boxes of OTHER
-    deployments write into it with their own (possibly pre-codec) reader.
-    Pin: the pattern exists as a named constant, matches board channels, and
-    is NOT in the live allowlist — so re-admitting it is a deliberate act."""
+    """The board is HELD OUT of the allowlist on purpose (, 2026-10-13):
+    it is a range-tail store (OwnCloudBackend._RANGE_TAIL_STORES) and an encoded
+    object cannot be tail-pulled, so admitting it turns each changed-board pull
+    from a delta into a whole object. Pin: the pattern exists as a named
+    constant, matches board channels, and is NOT in the live allowlist — so
+    re-admitting it is a deliberate act that must first answer the comment above
+    DEFAULT_ALLOWLIST in _owncloud_codec.py."""
     assert codec.BOARD_PATTERN_DEFERRED == "world/board/*.jsonl"
     assert codec.BOARD_PATTERN_DEFERRED not in codec.DEFAULT_ALLOWLIST
     assert codec.rel_allowlisted("world/board/coordination.jsonl",
@@ -278,6 +281,60 @@ def test_board_pattern_is_deferred_not_forgotten():
                                  allowlist=(codec.BOARD_PATTERN_DEFERRED,)) is False
     assert codec.should_encode("world/board/coordination.jsonl", "ayoai-mind",
                                env={"OWNCLOUD_GZIP_STORES": "*"}) is False
+
+
+def _range_tail_clashes(stores, allowlist):
+    """(glob, store) pairs where a gzip-allowlist glob can reach a range-tail store.
+    A PREFIX store (the backend matches rel.startswith(s): a trailing "/" or "-")
+    clashes with any glob whose literal head, the text before its first wildcard,
+    overlaps it, so a NARROW glob (board/coordination-*.jsonl) counts, not only
+    board/*.jsonl. An exact-file store clashes when a glob matches it. Conservative:
+    it can over-report, never under-report."""
+    import re
+    out = []
+    for s in stores:
+        for pat in allowlist:
+            if s.endswith(("/", "-")):
+                head = re.split(r"[*?\[]", pat, maxsplit=1)[0]
+                clash = head.startswith(s) or s.startswith(head)
+            else:
+                clash = codec.rel_allowlisted(s, allowlist=(pat,))
+            if clash:
+                out.append((pat, s))
+    return out
+
+
+def test_gzip_allowlist_and_range_tail_stores_are_disjoint():
+    """ (2026-10-13). The gzip allowlist and OwnCloudBackend._RANGE_TAIL_STORES
+    must not overlap: an encoded object cannot be tail-pulled (_range_tail_pull returns
+    None for it), so allowlisting a range-tail store trades its delta-sized pull for a
+    whole-object pull on every box. If this fails you are about to disable a lever —
+    price both sides first (comment above DEFAULT_ALLOWLIST in _owncloud_codec.py), then
+    change this test on purpose. The tuple is read from the backend's SOURCE, not
+    imported, so this file stays free of boto3 (see the module docstring)."""
+    import ast
+    tree = ast.parse((SCRIPT_DIR / "owncloud_backend.py").read_text(encoding="utf-8"))
+    stores = next((ast.literal_eval(n.value) for n in tree.body
+                   if isinstance(n, ast.Assign)
+                   and any(getattr(t, "id", None) == "_RANGE_TAIL_STORES" for t in n.targets)), None)
+    assert stores is not None, "_RANGE_TAIL_STORES is not a module-level literal in owncloud_backend.py"
+    assert "world/board/" in stores           # positive control: the parse found the store this guards
+    assert _range_tail_clashes(stores, codec.DEFAULT_ALLOWLIST) == []
+
+
+def test_range_tail_clash_check_catches_narrow_and_broad_globs():
+    """Positive control for the pin above. A one-sample version of that pin passed a
+    NARROW board glob silently (fresh-eyes review of g-358-13, 2026-10-13), so the
+    clash finder is pinned too: it must flag every shape of board re-admission and
+    must not flag an unrelated store."""
+    stores = ("world/board/", "world/changelog.jsonl", "world/productivity-snapshots-")
+    base = codec.DEFAULT_ALLOWLIST
+    assert _range_tail_clashes(stores, base) == []
+    assert _range_tail_clashes(stores, base + ("world/aspirations-*.jsonl",)) == []
+    for extra in ("world/board/*.jsonl", "world/board/coordination-*.jsonl",
+                  "world/board/coordination.jsonl", "world/board/[a-z]*.jsonl",
+                  "world/changelog.jsonl", "world/productivity-snapshots-*.jsonl"):
+        assert _range_tail_clashes(stores, base + (extra,)), extra
 
 
 def test_retrieval_trace_admission_is_pinned():

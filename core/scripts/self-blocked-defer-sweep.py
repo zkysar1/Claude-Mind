@@ -90,7 +90,8 @@ if str(SCRIPT_DIR) not in sys.path:
 
 
 def _load_population():
-    """Reuse audit-deferred-defers.load_deferred() — do NOT re-derive it.
+    """Reuse audit-deferred-defers.load_deferred_with_coverage() — do NOT
+    re-derive it. Returns (rows, coverage).
 
     That function owns the population definition (world + every agent
     aspirations.jsonl, non-null defer_reason, TERMINAL_STATUSES excluded) and
@@ -98,12 +99,15 @@ def _load_population():
     silently, and the two counts would disagree with nothing to say which was
     right. Hyphenated filename, hence importlib. Same import locus-sweep.py
     uses, for the same reason.
+
+    Coverage is what lets main() tell an unreadable queue from an empty one;
+    `rows` alone cannot, because both are [].
     """
     path = SCRIPT_DIR / "audit-deferred-defers.py"
     spec = importlib.util.spec_from_file_location("_audit_deferred_defers", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.load_deferred()
+    return mod.load_deferred_with_coverage()
 
 
 # ── the external-clearer families ───────────────────────────────────────────
@@ -241,11 +245,13 @@ def main(argv=None):
                   f"    {b['text']}", file=sys.stderr)
         return 2
 
-    pop = _load_population()
-    if not pop:
-        print("REFUSING: the SSOT loader returned an EMPTY population. That is "
-              "an unreadable queue, NOT a queue with no self-blocked defers.",
-              file=sys.stderr)
+    pop, cov = _load_population()
+    if not cov["goals_scanned"]:
+        print("REFUSING: the SSOT loader scanned ZERO goals across "
+              f"{cov['sources_read']} queue file(s). That is an unreadable or "
+              "truncated queue, NOT a queue with no self-blocked defers. (A "
+              "queue that was read and holds goals, none of them deferred, is "
+              "a clean empty census and is reported as one.)", file=sys.stderr)
         return 2
 
     bands: dict[str, list] = {}
@@ -260,6 +266,7 @@ def main(argv=None):
     if args.json:
         print(json.dumps({
             "population": len(pop),
+            "coverage": cov,
             "in_scope_precondition_unmet": len(in_scope),
             "band_counts": {k: len(v) for k, v in sorted(bands.items())},
             "self_blocked_candidates": [
@@ -272,6 +279,8 @@ def main(argv=None):
         return 0
 
     print(f"deferred population (SSOT loader) : {len(pop)}")
+    print(f"scanned (queue files / goals)     : {cov['sources_read']} / "
+          f"{cov['goals_scanned']}")
     print(f"in scope (precondition_unmet:)    : {len(in_scope)}")
     print()
     for band, rows in sorted(bands.items(), key=lambda x: -len(x[1])):

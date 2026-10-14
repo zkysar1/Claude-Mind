@@ -73,7 +73,46 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-OPEN_STATUSES = {"pending", "in-progress", "blocked"}
+# A probe that files a goal holds a LEASE on its origin_signal (guard-3419): the
+# dedup read is the TAKE, the close-on-clear read is the RELEASE. Both halves read
+# their statuses from the two sets below, so a goal can no longer be filed under
+# one status vocabulary and be invisible to the other ().
+#
+# OPEN_STATUSES -- what the TAKE side treats as a live lease (open_goal_records,
+#   open_goal_exists, _release_train.open_release_goals): every non-terminal
+#   lifecycle status. `candidate` belongs here because Investigate, Idea and
+#   Maintain origins land in the candidate tier (aspirations.yaml
+#   candidate_tier.candidate_origins). Without it a probe never saw an earlier
+#   filing of its signal and filed again: five Investigate goals for one stalled
+#   release tag (v2.12.95: , 12255, 12256, 12258, 12259, filed by five
+#   different agents within 50 minutes), every one still `candidate` when counted
+#   on 2026-10-13.
+#   A LITERAL, not derived from aspirations.TERMINAL_GOAL_STATUSES: this module is
+#   stdlib-only and the watchdog imports it inside a fail-open tick, while importing
+#   aspirations would pull _paths and five sibling modules in at import time. It is
+#   an allow-list on purpose: a status nobody has classified files instead of
+#   suppressing (tree node detector-dedup-lease-without-release). The drift a
+#   literal invites is pinned by tests/test_probe_candidate_tier_lease.py, which
+#   fails when this set stops equalling VALID_GOAL_STATUSES - TERMINAL_GOAL_STATUSES.
+OPEN_STATUSES = {"pending", "in-progress", "blocked", "candidate"}
+
+# RETIRABLE_STATUSES -- what the RELEASE side may close: open AND not yet started.
+#   `in-progress` is live work and `blocked` carries somebody's stated reason, so a
+#   probe leaves both to their owner (guard-1007). `candidate` is unstarted intake
+#   that the selector never lists, so nobody can be working it; leaving it open
+#   would make a candidate-tier lease un-releasable (filed, deduped against, never
+#   closed). The write that retires it is candidate -> skipped, which the intake
+#   transition table allows (gates/candidate_transition.py).
+RETIRABLE_STATUSES = {"pending", "candidate"}
+
+
+def is_retirable(goal: dict) -> bool:
+    """True when a probe's close-on-clear may retire this goal: its status is in
+    RETIRABLE_STATUSES and nobody holds a claim on it. The single predicate the
+    four watchdog close paths share (mirror wedge, git drift, release train,
+    store overcap)."""
+    return goal.get("status") in RETIRABLE_STATUSES and not goal.get("claimed_by")
+
 
 # Capture the freshness-check marker body (everything up to the closing -->).
 _MARKER_RE = re.compile(r"freshness-check:\s*(.*?)(?:-->|$)", re.DOTALL)

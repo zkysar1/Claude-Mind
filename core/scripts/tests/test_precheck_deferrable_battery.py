@@ -248,6 +248,46 @@ def test_unexpected_rc_is_blind_a_spec_rc_is_a_finding_an_ok_rc_is_clean(capsys)
     assert any("REGRESSED" in d for d in names["stalled-goal-ratchet"])
 
 
+def _role_multiplier_audit_rc(monkeypatch, capsys, outcome):
+    """The exit code role-multiplier-coverage-audit.py ACTUALLY returns for `outcome`.
+
+    Read by running the script's own main() with its `audit` stubbed to the outcome,
+    so the expectation comes from the producer at runtime and not from this test's
+    belief about it (guard-1220). The battery's spec for this lane assumed the
+    generic rc 1 = finding; the script exits 2 for MISSING and 1 for ERROR.
+    """
+    ra = _load("role_multiplier_audit_for_battery", "role-multiplier-coverage-audit.py")
+    if outcome == "error":
+        def unreadable(*_a):
+            raise RuntimeError("strategy file unreadable")
+        monkeypatch.setattr(ra, "audit", unreadable)
+    else:
+        monkeypatch.setattr(ra, "audit", lambda *_a: {
+            "active_agents": ["a"], "multiplier_keys": [] if outcome == "missing" else ["a"],
+            "missing": ["a"] if outcome == "missing" else [], "stale": [],
+            "ok": outcome == "ok"})
+    rc = ra.main([])
+    capsys.readouterr()  # drain the script's own report: _run() parses only the battery's
+    return rc
+
+
+@pytest.mark.parametrize("outcome,bucket", [
+    ("ok", "clean"),         # the control: clean under the old mapping too ()
+    ("missing", "finding"),  # pre-fix: BLIND (unexpected rc=2)
+    ("error", "blind"),      # pre-fix: a FINDING (rc=1 was the spec's finding code)
+])
+def test_role_multiplier_audit_exit_codes_land_in_the_bucket_the_script_means(
+        monkeypatch, capsys, outcome, bucket):
+    rc = _role_multiplier_audit_rc(monkeypatch, capsys, outcome)
+    name = "role-multiplier-coverage-audit"
+    rep = _run(capsys, runner=Rec(responses={
+        "role-multiplier-coverage-audit.py": (rc, "", None, f"audit says {outcome}")}))
+    found = {f["name"] for f in rep["findings"]}
+    blind = {b["name"] for b in rep["blind"]}
+    got = "finding" if name in found else "blind" if name in blind else "clean"
+    assert got == bucket, (outcome, rc, rep["findings"], rep["blind"])
+
+
 def test_a_traceback_is_blind_even_when_rc_is_a_finding_code(capsys):
     rep = _run(capsys, runner=Rec(responses={
         "embedded-python-audit.py": (1, "", None, "Traceback (most recent call last):\n  boom")}))

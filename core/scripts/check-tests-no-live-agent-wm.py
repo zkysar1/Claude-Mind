@@ -31,12 +31,25 @@ refinements. Docstrings are excluded structurally here instead.
 Exit 0 = clean. Exit 1 = at least one offender (named on stdout). Exit 2 = the
 roster could not be derived, which fails LOUD rather than passing vacuously: a
 check that cannot see the roster has no opinion and must not report success
-(rb-245 — verify the population before trusting a zero).
+(rb-245 — verify the population before trusting a zero). The same exit covers a
+population that was never opened: an unrecognised argument, a directory that
+does not exist, or a scan that opened no file (g-374-628-a fresh-eyes).
+
+TEST SEAM (g-374-628-a). `--roster a,b` supplies the roster instead of deriving
+it, so a test of the PREDICATE needs no daemon: `live_roster()` reads the
+daemon-backed team-state-read.sh, which a deployment's pytest run (scratch
+RUNTIME_DIR, no spawn from inside a test) cannot reach. The default path is
+unchanged and still exits 2 when the roster cannot be derived. The flag is
+explicit argv, never ambient, and the report prints the roster as INJECTED so a
+run that used it cannot be read as one that derived it. An empty `--roster` is
+refused (exit 2) exactly as an empty derived roster is, and so is a name that
+is not agent-shaped (a path swallowed because the names were left out).
 """
 from __future__ import annotations
 
 import ast
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -296,12 +309,19 @@ def _wm_py_write_call(tree: ast.AST, write_subcommands: set[str]) -> bool:
     return False
 
 
-def analyze(path: Path, roster: set[str], write_subcommands: set[str]) -> list[str]:
-    """Return the live-roster agent names this file binds, if it also writes WM."""
+def analyze(path: Path, roster: set[str],
+            write_subcommands: set[str]) -> tuple[list[str], str | None]:
+    """Return (the live-roster agent names this file binds, if it also writes WM;
+    the isolation mechanism that keeps those writes off them, or None).
+
+    A file that does not parse binds nothing here (pytest cannot collect it
+    either) but still returns the PAIR main() unpacks: the bare `[]` it used to
+    return crashed the whole check with a ValueError (g-374-628-a fresh-eyes).
+    """
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
     except SyntaxError:
-        return []
+        return [], None
     docs = _docstring_nodes(tree)
 
     writes_wm = _wm_py_write_call(tree, write_subcommands)
@@ -361,7 +381,7 @@ def analyze(path: Path, roster: set[str], write_subcommands: set[str]) -> list[s
                     break
 
     if not writes_wm:
-        return [], False
+        return [], None
 
     offenders = sorted(bound & roster)
     if offenders:
@@ -467,10 +487,56 @@ def analyze_shell(path: Path) -> bool:
     )
 
 
+# The accepted argv, stated once so --help and every refusal print the same set
+# (guard-2680: a refusal must enumerate what it accepts, and --help must keep
+# working rather than be caught by the arm that refuses everything else).
+USAGE = (
+    "usage: check-tests-no-live-agent-wm.py [--roster NAME[,NAME...]] [DIR]\n"
+    "  --roster NAMES  use these agent names instead of deriving the live roster\n"
+    "  DIR             scan this directory instead of the testpaths in pytest.ini\n"
+    "  exit 0 clean | 1 offender | 2 the check could not see its population"
+)
+# What an agent name looks like, so a path or flag that --roster swallowed
+# because the names were left out is refused instead of becoming the roster.
+AGENT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
 def main(argv: list[str]) -> int:
-    explicit_dir = Path(argv[1]) if len(argv) > 1 else None
+    args = list(argv[1:])
+    if "-h" in args or "--help" in args:
+        print(USAGE)
+        return 0
+    injected_roster: set[str] | None = None
+    if "--roster" in args:
+        i = args.index("--roster")
+        names = {n.strip() for n in args[i + 1].split(",")} - {""} if i + 1 < len(args) else set()
+        del args[i:i + 2]
+        if not names:
+            print("FAIL: --roster named no agent")
+            print("  An empty roster would make this check vacuous; it must not report success.")
+            return 2
+        malformed = sorted(n for n in names if not AGENT_NAME_RE.fullmatch(n))
+        if malformed:
+            print(f"FAIL: --roster names that do not look like agent names: {malformed}")
+            print("  A path or flag taken as the roster would scan against nobody.")
+            return 2
+        injected_roster = names
+    # Whatever is left must be at most ONE directory. The hand-parse took args[0]
+    # as the directory and dropped the rest, so a mistyped flag, the `--roster=a`
+    # form or a second directory became (or hid behind) the scan target, and the
+    # check printed `scanned: 0` then PASS (-a fresh-eyes).
+    stray = [a for a in args if a.startswith("-")] or args[1:]
+    if stray:
+        print(f"FAIL: unrecognised argument(s): {stray}")
+        print(USAGE)
+        return 2
+    explicit_dir = Path(args[0]) if args else None
+    if explicit_dir is not None and not explicit_dir.is_dir():
+        print(f"FAIL: {explicit_dir} is not a directory")
+        print("  A directory that does not exist holds nothing to check; that must not read as PASS.")
+        return 2
     try:
-        roster = live_roster()
+        roster = injected_roster if injected_roster is not None else live_roster()
     except Exception as exc:
         print(f"FAIL: could not derive the live roster — {exc}")
         print("  A check that cannot see its population must not report success.")
@@ -545,7 +611,8 @@ def main(argv: list[str]) -> int:
         if (d / name).exists() and not analyze_shell(d / name)
     ]
 
-    print(f"roster ({len(roster)}, derived at check time): {sorted(roster)}")
+    roster_origin = "INJECTED by --roster, NOT derived" if injected_roster is not None else "derived at check time"
+    print(f"roster ({len(roster)}, {roster_origin}): {sorted(roster)}")
     print(f"scanned: {scanned} python file(s) across {len(scan_dirs)} declared testpath(s): "
           + ", ".join(
               f"{d.relative_to(PROJECT_ROOT) if PROJECT_ROOT in d.parents or d == PROJECT_ROOT else d}={n}"
@@ -561,6 +628,13 @@ def main(argv: list[str]) -> int:
           f"and write WM, but the write cannot reach it ({detail})")
     print(f"shell-scanned: {shell_scanned} file(s), "
           f"{shell_exempted} matching but allowlisted to an owning goal")
+    if scanned == 0 and shell_scanned == 0:
+        # PASS over a population nobody opened is the vacuous green this module
+        # exists to prevent: an empty directory, or a declared testpath holding no
+        # test file, printed `scanned: 0` then PASS (-a fresh-eyes).
+        print("FAIL: the scan opened no file, so there was nothing to check")
+        print("  A check that saw an empty population has no opinion and must not report success.")
+        return 2
     # Every failing class is REPORTED, then one verdict. An early return per
     # class would hide the others behind whichever happened to be checked
     # first — a report narrower than its own population, which is the defect

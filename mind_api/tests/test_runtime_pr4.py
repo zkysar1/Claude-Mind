@@ -209,6 +209,56 @@ def test_sparks_candidates_only(running_daemon):
     assert data[0]["id"] == "sq-c01"
 
 
+def _post(port: int, path: str, query: dict = None, body: bytes = b"",
+          *, agent: str = "alpha"):
+    qs = urllib.parse.urlencode(query) if query else ""
+    url = (f"http://127.0.0.1:{port}{path}?{qs}" if qs
+           else f"http://127.0.0.1:{port}{path}")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if agent:
+        req.add_header("X-Mind-Agent", agent)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, resp.read().decode("utf-8")
+
+
+def test_spark_summary_marks_retired(running_daemon):
+    """: a retired question must NOT read as live in --summary.
+
+    The marker-less print was the defect: seven misreads in five days across
+    four agents (goal progress_note; rb-12011). Retire a complete question
+    via the tested set-field path, then the summary line must carry the
+    status marker while active lines stay unmarked.
+    """
+    _, port = running_daemon
+    # Append a valid record first (the seed sq-001 lacks `category`, which
+    # required_fields rejects on a set-field merge).
+    status, body = _post(port, "/v1/store/append", {"store": "spark-questions"},
+                         json.dumps({"id": "sq-100", "type": "question",
+                                     "status": "active", "text": "t100",
+                                     "category": "probe", "yield_rate": 0,
+                                     "times_asked": 0, "sparks_generated": 0}).encode())
+    assert status == 200
+
+    status, body = _post(port, "/v1/store/set-field",
+                         {"store": "spark-questions",
+                          "id": "sq-100", "field": "status",
+                          "value": "retired"})
+    assert status == 200
+
+    _, body = _get(port, "/v1/spark-questions/read", {"summary": "1"})
+    lines = body.splitlines()
+    sq100_lines = [l for l in lines if l.startswith("sq-100:")]
+    assert len(sq100_lines) == 1
+    assert "[RETIRED]" in sq100_lines[0]
+    # active questions stay unmarked; candidates keep their existing marker
+    sq001_lines = [l for l in lines if l.startswith("sq-001:")]
+    assert len(sq001_lines) == 1
+    assert "[RETIRED]" not in sq001_lines[0]
+    assert "[yield=" in sq001_lines[0]
+    assert any("[CANDIDATE]" in l for l in lines)
+
+
 # ---------------------------------------------------------------------------
 # Experience
 # ---------------------------------------------------------------------------

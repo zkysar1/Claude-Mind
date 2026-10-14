@@ -219,6 +219,52 @@ def test_missing_status_is_kept_not_dropped(tmp_path, monkeypatch):
     assert ids == {"g-3-1"}
 
 
+# ---- load_deferred_with_coverage(): the reader says what it did not see ------
+#
+# `load_deferred()` returns only the deferred goals, so "the queue was read and
+# nothing in it is deferred" and "the queue was not read" are the same [] (guard-4093).
+# The coverage half is what lets a caller refuse the second without refusing the
+# first; the self-blocked sweep used `not rows` for that and refused every queue that
+# held no deferred goal ().
+
+
+def _coverage_from(monkeypatch, world):
+    monkeypatch.setattr(MOD, "WORLD_DIR", world)
+    monkeypatch.setattr(MOD, "_enumerate_agents", lambda: [])
+    return MOD.load_deferred_with_coverage()
+
+
+def test_coverage_counts_every_goal_scanned_not_only_the_deferred_ones(tmp_path, monkeypatch):
+    """Positive control: the denominator moves with goals that are NOT deferred.
+
+    A coverage that counted only the returned rows would read 1 here and be the very
+    blind spot the bare list has.
+    """
+    world = _write_world(tmp_path, [
+        _goal("g-4-1", "pending"),                           # deferred, live: a row
+        _goal("g-4-2", "completed"),                         # deferred, terminal: scanned
+        {"id": "g-4-3", "title": "t", "status": "pending"},  # not deferred: scanned
+    ])
+    rows, cov = _coverage_from(monkeypatch, world)
+    assert [r["goal_id"] for r in rows] == ["g-4-1"]
+    assert cov == {"sources_read": 1, "goals_scanned": 3}
+
+
+def test_a_world_dir_with_no_queue_file_reads_nothing(tmp_path, monkeypatch):
+    """The unreadable half: no file is a coverage of zero, not an empty-but-read queue."""
+    world = tmp_path / "world"
+    world.mkdir()
+    rows, cov = _coverage_from(monkeypatch, world)
+    assert rows == [] and cov == {"sources_read": 0, "goals_scanned": 0}
+
+
+def test_load_deferred_is_the_rows_half_of_the_coverage_variant(tmp_path, monkeypatch):
+    """Callers of the old API (locus-sweep, this audit's own main) keep their list."""
+    world = _write_world(tmp_path, [_goal("g-5-1", "pending"), _goal("g-5-2", "skipped")])
+    rows, _cov = _coverage_from(monkeypatch, world)
+    assert rows and _load_from(monkeypatch, world) == rows
+
+
 def test_terminal_match_tolerates_case_and_whitespace(tmp_path, monkeypatch):
     world = _write_world(tmp_path, [
         _goal("g-4-1", "  Completed "),

@@ -1066,3 +1066,88 @@ def test_no_loss_of_detection_for_local_home_referents():
     assert _classify(_goal(blocker_ref="g-404-99"))["verdict"] == "dangling_ref"
     assert _classify_bsrc(_goal(blocker_ref="pq-nope"),
                           pq_complete=True)["verdict"] == "dangling_ref"
+
+
+# ── The colon branch must stop claiming ids it cannot justify () ──
+#
+# The addendum (2026-09-04, omni, cc-06) re-derived the finding from scratch on
+# ZDS and found the cross-world predicate wrong in BOTH directions: the @
+# branch () already catches every live cross-world ref in the census,
+# while the COLON branch was admitting ids that are not cross-world referents
+# at all — a type=resource URL that entered purely because 'https:' contains a
+# colon, and a type=infrastructure host:path pair that entered for the same
+# reason. Both were reported external_unresolvable, whose guidance is "read it
+# via the cross-world transport, never repoint or remove it" — an instruction
+# aimed at a URL.
+#
+# The fix keys on the scheme/-path exclusion the addendum prescribes: a string
+# carrying '://' or '/' cannot be the documented '<world>:<goal-id>' shape, so
+# the colon branch declines it and it falls through to 'opaque' (a shape this
+# reader does not understand). KEYED THAT WAY DELIBERATELY, not on a strict
+# goal-id shape: the census includes a live @-form cross-world ref whose id is
+# NOT goal-shaped (lodestar-scheduled-function-pattern), and a goal-id-shape
+# key would demote it to 'unresolved' — the quieter failure that produces no
+# flag at all. The six rows below are the addendum's live ZDS census, pinned in
+# both directions so neither regression can return.
+
+_URL_EXT = "https://zacharykysar.com/lp/lodestar-intro"
+_HOSTPATH_EXT = "originating-box:PROJECT_ROOT/world"
+_AT_FORM_NON_GOAL_ID = "lodestar-scheduled-function-pattern@ayoai-fleet"
+
+
+def test_colon_branch_rejects_a_url():
+    """CORRECTION 1. A URL is not a cross-world referent. Pre-fix, 'https:'
+    alone routed it into the cross-world branch and it was reported
+    external_unresolvable."""
+    mod = _import()
+    assert mod._cross_world_ref(_URL_EXT) is None, (
+        "a URL scheme must not be read as a deployment qualifier")
+    resolved, _why, basis = mod._resolve_blocker_ref(
+        "dict", {"type": "resource", "external_id": _URL_EXT}, None, {}, {}, NOW)
+    assert (resolved, basis) == (None, "opaque"), (resolved, basis)
+
+
+def test_colon_branch_rejects_a_host_path_pair():
+    """The twin case: 'host:ROOT/world' carries a colon AND a path separator;
+    it is a local-path reference (measured type=infrastructure on ZDS), not a
+    deployment qualifier. Same over-claim, same wrong bucket."""
+    mod = _import()
+    assert mod._cross_world_ref(_HOSTPATH_EXT) is None
+    resolved, _why, basis = mod._resolve_blocker_ref(
+        "dict", {"type": "infrastructure", "external_id": _HOSTPATH_EXT},
+        None, {}, {}, NOW)
+    assert (resolved, basis) == (None, "opaque"), (resolved, basis)
+
+
+def test_documented_colon_form_stays_cross_world():
+    """NO-LOSS-OF-DETECTION for the '<world>:<goal-id>' spelling the branch was
+    written for. The exclusion targets '://' and '/' only, and the documented
+    shape carries neither — a tightening that swallowed this row would have
+    silenced the original g-115-3659 population it already protected."""
+    mod = _import()
+    assert mod._cross_world_ref("ayoai-mind:g-115-8370") == "ayoai-mind:g-115-8370"
+    resolved, _why, basis = mod._resolve_blocker_ref(
+        "dict", {"type": "partner-response",
+                 "external_id": "ayoai-mind:g-115-8370"},
+        None, {}, {}, NOW)
+    assert (resolved, basis) == (None, "external_unresolvable"), (resolved, basis)
+
+
+def test_at_form_cross_world_rows_keep_their_countable_bucket():
+    """The three @-form rows of the addendum census, including the one whose
+    id is NOT goal-shaped (CORRECTION 2's live case). The @ branch normalises
+    whatever ref shape precedes the '@', so all three stay in the countable
+    external_unresolvable bucket — none may drift to 'dangling' nor to
+    'unresolved' (the quieter failure that raises no flag)."""
+    mod = _import()
+    for ext, canonical in (
+        ("g-115-8370@ayoai-mind", "ayoai-mind:g-115-8370"),
+        ("g-115-4173@ayoai-mind", "ayoai-mind:g-115-4173"),
+        (_AT_FORM_NON_GOAL_ID,
+         "ayoai-fleet:lodestar-scheduled-function-pattern"),
+    ):
+        assert mod._cross_world_ref(ext) == canonical, ext
+        resolved, _why, basis = mod._resolve_blocker_ref(
+            "dict", {"type": "partner-response", "external_id": ext},
+            None, {}, {}, NOW)
+        assert (resolved, basis) == (None, "external_unresolvable"), (ext, basis)

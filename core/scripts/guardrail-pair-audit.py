@@ -120,7 +120,14 @@ STOPWORDS = {
 
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 # First clause = up to the first strong break. Falls back to the whole rule.
-CLAUSE_BREAK_RE = re.compile(r"[.;:]|\s+--\s+|\s+—\s+")
+# '.' is a break only at whitespace/EOT (): a file-extension dot is
+# ALWAYS followed by [a-z0-9] (aspirations-query.sh), so it stays inside the
+# file name, while a sentence-ending dot is followed by a space or end. The old
+# `[.;:]` split at the first dot anywhere, cutting 'aspirations-query.sh --goal
+# field ...' to the bare stem 'aspirations-query' — 129 of 144 first-clause-only
+# findings (measured 2026-10-08 over 7,135 active guardrails) compared a bare
+# file stem against another bare stem instead of the rule's real head.
+CLAUSE_BREAK_RE = re.compile(r"[;:]|\.(?!\S)|\s+--\s+|\s+—\s+")
 # Pair form of guardrail-protocol-conflict-check.py's RECONCILED_RE ():
 # a LINE starting `reconciled: guard-NNN <reason>`. See the module docstring.
 RECONCILED_PAIR_RE = re.compile(

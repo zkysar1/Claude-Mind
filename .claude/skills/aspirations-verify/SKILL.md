@@ -358,14 +358,14 @@ file artifact; skip otherwise.
 - Else the pre-flight runs the sampler, `q4-provenance-sample.sh`, over each
   `--artifact`. You do NOT choose which claims it checks — that is the point.
   Add `--source-file` when the goal cites a source the artifact must be faithful to.
+  A code artifact (`.py .sh .java .js .ts .lua .luau`) is sampled on its comments
+  and docstrings only, so its FAIL is fixed in a comment (g-115-11480).
 - `q4` FAIL (a sampled claim is uncited, decoratively cited, or reversed against
-  its source) → `all_passed = false`, status → pending; the pre-flight appends
-  each finding to sensory_buffer as a `verification_gap`. SKIPPED is **not a
-  pass**; never count it as evidence. No override flag, by design.
+  its source) → `all_passed = false`, status → pending. SKIPPED is **not a
+  pass**; never count it as evidence. No override flag and no adjudicated close.
 - **On Q4 assessed**, the pre-flight records BOTH keys, `phase_progress.q4_passed`
   and `q4_verdict` (pass | fail | skipped), and the diary line.
-  Why the sample is scripted, its three traps (worker `--session-id`, `cat`-read
-  files, the bool that cannot hold `skipped`):
+  Why, the traps and the code scope:
   `core/config/rationale/verify-check-unevaluatable.md` § Q4.
 
 ### Standard Checks

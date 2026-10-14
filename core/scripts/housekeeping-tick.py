@@ -63,7 +63,9 @@ LANES
      `shadow`: shadow arms DELETERS, and this lane only copies (see the
      docstring on run_lane_d). Self-throttled on its own sub-stamp at
      transcript_archive_interval_hours (default 12 — the owner's 1-2x/day);
-     set that key to 0 to turn the archiver off.
+     set that key to 0 to turn the archiver off. Gated by TWO stamps: that
+     per-binding one (primary) and a MACHINE stamp in core/logs/, because the
+     archive's effect is per machine (g-374-79).
 
 One JSONL record per EXECUTED tick → core/logs/housekeeping-<agent>.jsonl
 (not-due ticks write nothing). Self-gating via
@@ -76,7 +78,9 @@ Two callers, one interval: iteration-close productivity-check (autonomous
 boxes) and sessionstart-orchestrator (assistant boxes — this box's whole
 backlog accrued because it never reaches iteration-close). A lost stamp race
 between simultaneous session starts double-runs an idempotent dry-run/find —
-harmless, accepted, documented.
+harmless, accepted, documented. Lane D's MACHINE stamp,
+core/logs/housekeeping-tick-machine-state.json, is a third file: box-local,
+gitignored, read by bound and unbound callers alike (see _machine_state_path).
 
 FAIL-OPEN at every layer; the CLI always exits 0. Guards honored: guard-580
 (bash via _runtime_bash.bash_cmd), guard-420 (tolerant timestamp parse),
@@ -140,6 +144,8 @@ OPEN_STATUSES = ("pending", "in-progress", "blocked")
 LANE_A_TIMEOUT = int(os.environ.get("HK_LANE_A_TIMEOUT") or 300)
 LANE_D_TIMEOUT = int(os.environ.get("HK_LANE_D_TIMEOUT") or 1800)
 LANE_E_TIMEOUT = int(os.environ.get("HK_LANE_E_TIMEOUT") or 120)
+# Lane D's MACHINE-scoped last-fire stamp (); see _machine_state_path.
+MACHINE_STATE_NAME = "housekeeping-tick-machine-state.json"
 
 DEFAULTS = {
     "interval_hours": 6,
@@ -221,6 +227,34 @@ def _state_path() -> Path:
     # be misread as the bound file (guard-2586). Mirrors _log_path()'s
     # `housekeeping-unbound.jsonl` so the stamp sits beside the log it gates.
     return SCRIPT_DIR.parent / "logs" / "housekeeping-tick-state-unbound.json"
+
+
+def _machine_state_path(state_path: Path | None = None) -> Path:
+    """Lane D's MACHINE-scoped last-fire stamp. Never None, never synced.
+
+    Lane D archives transcripts/<machine>/, so its effect is a property of the
+    BOX. `_state_path()` cannot gate it alone: it is per AGENT when bound and
+    per box only when unbound, so the several clocks of one box (each agent's
+    bound clock plus the unbound one) each archived once per interval
+    (g-374-79). That stamp stays the PRIMARY gate; this is the additional layer
+    at the effect's own scope, read by every caller shape (guard-718, guard-6523).
+
+    core/logs/ is gitignored and outside every governed root, so the stamp is
+    box-local: a SHARED stamp gating a BOX-LOCAL effect is satisfied by any one
+    box and never fires on the rest (guard-2585). Absolute via SCRIPT_DIR
+    (guard-552).
+
+    An overridden per-binding stamp (explicit `state_path`, else HK_STATE_PATH)
+    pins this one beside it, so a test or operator that redirects the one can
+    never write the real other. Lane E deliberately does not use it: its
+    docstring makes that lane per-box and redundant on purpose.
+    """
+    pinned = state_path
+    if pinned is None and os.environ.get("HK_STATE_PATH"):
+        pinned = Path(os.environ["HK_STATE_PATH"])
+    if pinned is not None:
+        return pinned.with_name(MACHINE_STATE_NAME)
+    return SCRIPT_DIR.parent / "logs" / MACHINE_STATE_NAME
 
 
 def load_state(p: Path | None) -> dict:
@@ -625,6 +659,19 @@ def run_lane_d(cfg: dict, state_path: Path | None = None,
 
     A timeout or a failed spawn deliberately does NOT stamp: an unreachable
     backend should retry at the next tick, not wait out the full interval.
+
+    TWO STAMPS (g-374-79). The archive's effect is per MACHINE, but the
+    per-binding stamp above is per agent when bound and per box when unbound,
+    so one box's several clocks each ran it once per interval. That stamp
+    stays the PRIMARY gate and keeps its answer shape; a MACHINE stamp
+    (`_machine_state_path`, core/logs/, box-local) is an additional noop layer
+    behind it, answered as {"verdict": "not-due", "scope": "machine", ...}.
+    This function is the sole writer of both, and a failed attempt writes
+    neither. RESIDUAL RACE, stated rather than claimed away: ticks that all
+    pass both gates before the first one stamps still each archive — one extra
+    run per overlapping tick, never a loop, and not locked (the same accepted
+    exposure as the per-binding stamp). A machine-stamp save that fails leaves
+    the per-binding gate in force and reports `machine_stamp: "unwritten"`.
     """
     interval = float(cfg.get("transcript_archive_interval_hours") or 0)
     if interval <= 0:
@@ -637,6 +684,15 @@ def run_lane_d(cfg: dict, state_path: Path | None = None,
         parsed = parse_naive_iso(str(last))
         if parsed is not None and (now - parsed).total_seconds() < interval * 3600:
             return {"verdict": "not-due", "last": last,
+                    "interval_hours": interval}
+    # The MACHINE layer, behind the per-binding gate above: same predicate,
+    # the stamp at the effect's own scope. Read-only here; the writer is below.
+    msp = _machine_state_path(state_path)
+    mlast = load_state(msp).get("last_transcript_archive")
+    if mlast:
+        parsed = parse_naive_iso(str(mlast))
+        if parsed is not None and (now - parsed).total_seconds() < interval * 3600:
+            return {"verdict": "not-due", "scope": "machine", "last": mlast,
                     "interval_hours": interval}
     if archive_cmd is None and os.environ.get("PYTEST_CURRENT_TEST"):
         # Same chokepoint idiom the daemon-spawn paths use (): a
@@ -677,6 +733,15 @@ def run_lane_d(cfg: dict, state_path: Path | None = None,
         fresh = load_state(sp)
         fresh["last_transcript_archive"] = now.strftime("%Y-%m-%dT%H:%M:%S")
         save_state(sp, fresh)
+    # The MACHINE stamp: same moment, same re-read idiom. save_state swallows a
+    # failed write, so read it back — a throttle that cannot persist degrades to
+    # "run", and that must show in the record rather than stay silent (rb-11208).
+    stamp = now.strftime("%Y-%m-%dT%H:%M:%S")
+    mfresh = load_state(msp)
+    mfresh["last_transcript_archive"] = stamp
+    save_state(msp, mfresh)
+    if load_state(msp).get("last_transcript_archive") != stamp:
+        out["machine_stamp"] = "unwritten"
     return out
 
 def run_lane_e(cfg: dict, state_path: Path | None = None,

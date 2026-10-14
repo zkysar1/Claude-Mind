@@ -546,6 +546,34 @@ def test_each_gate_is_called_the_way_the_skill_called_it(tmp_path):
                                               "--source-file", a]
 
 
+def test_a_fold_is_graded_on_what_it_wrote_once_the_baseline_reaches_the_sampler(tmp_path):
+    """, guard-2285: the sampler's --authored-against was accepted by its CLI
+    and passed by no caller, so a fold's carried text still FAILED Q4 on the one path a
+    folder closes by. Control first (guard-2421): the same fold unscoped must FAIL, or
+    the scoped result below proves nothing."""
+    authored = ("Acme Corporation reported revenue of 4.2 billion in 2024,\n"
+                "per https://example.invalid/actually-fetched.\n")
+    fold = art(tmp_path, "fold.md", UNCITED + "\n\n\n" + authored)
+    base = art(tmp_path, "baseline.md", UNCITED)
+    control = run(Harness(tmp_path), [fold])["results"]["q4"]
+    assert control["state"] == "FAIL"
+    assert "--authored-against" in control["remedy"], "the refusal must name the way out"
+    h = Harness(tmp_path)
+    q4 = run(h, [fold], authored_against=base)["results"]["q4"]
+    assert q4["state"] != "FAIL", q4
+    argv = {n: a_[2:] for n, a_, _ in h.calls}
+    assert argv["q4-provenance-sample.sh"][-2:] == ["--authored-against", base]
+
+
+def test_a_baseline_with_two_artifacts_is_an_error_and_not_a_whole_file_grade(tmp_path):
+    """The sampler's refusal (rc 2) must surface as ERROR, the one state that is not a pass."""
+    a, b = art(tmp_path, "a.md", UNCITED), art(tmp_path, "b.md", UNCITED)
+    r = run(Harness(tmp_path), [a, b], authored_against=art(tmp_path, "baseline.md", UNCITED))
+    q4 = r["results"]["q4"]
+    assert (q4["state"], r["rc"]) == ("ERROR", 4), q4
+    assert any("exactly one" in f for f in q4["findings"]), q4
+
+
 @pytest.mark.parametrize("args", [["--source", "world"], ["--goal", "g-1-1", "--evidence", "x"]])
 def test_usage_errors_exit_2_and_never_run_a_check(args):
     p = subprocess.run([sys.executable, str(CORE_SCRIPTS / "verify-preflight.py"), *args],

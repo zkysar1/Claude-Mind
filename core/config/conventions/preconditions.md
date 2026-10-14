@@ -246,6 +246,21 @@ streak-contraction artifact the predicate exists to eliminate.
 files and exclude per-iteration agent-state commits (`agents/**`) that would
 otherwise keep the gate permanently open in PROJECT_ROOT.
 
+**Authoring a landing gate (`after_ref: iso:` plus `paths`).** The count is a
+path-limited `git log --format=%cI -- <paths>` run WITHOUT `--full-history`, so
+history simplification prunes merge commits and the dates compared are the
+committer dates of the content commits that touched `paths`. The same change can
+reach the target branch as a DIFFERENT commit than the one whose time you copied
+into the cutoff, with its own committer date, and a cutoff later than that date
+never clears: the goal stays gated with nothing in the selector to say why
+(`guard-4426`). Measured 2026-10-13 (g-353-161): the cutoff `iso:2026-10-12T17:21:03`
+was the worker commit's time; the change had landed on main as another commit
+committed 17:20:25, 38 s earlier, and the later reducer merge was pruned from the
+count, so the gate stayed closed for 16 h until the cutoff moved to 17:20:00. Set
+the cutoff before the work began, not at a commit's own time, and before storing
+the gate run `git -C <repo> log --format=%cI -- <paths>` and confirm the
+landing's date falls after it (`guard-5121`).
+
 **Safety:** no field is interpolated into a shell — `git log` runs with an argv
 list (`shell=False`), so `repo`/`paths`/`author`/`grep` cannot inject. Non-git
 `repo`, git errors, unresolvable cutoffs, and missing cutoff source all fail

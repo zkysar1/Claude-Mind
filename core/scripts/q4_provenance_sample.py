@@ -66,6 +66,12 @@ sample. The coverage counts in the result (`artifacts_read`, `artifacts_missing`
 `clusters_total`) exist so that substitution is visible to the reader rather
 than silent.
 
+A CODE ARTIFACT IS SAMPLED ON ITS COMMENTS AND DOCSTRINGS ONLY (g-115-11480,
+q4_code_scope): code lines never reach the detector, so a clean verdict on a code
+file says nothing about its string literals. `code_scoped` in the result carries
+kept_lines and total_lines per artifact so the narrowing is visible, and an empty
+scoped sample reports `skipped` with the scoping named, never `pass`.
+
 WHY DIRECTION IS A SEPARATE CHECK FROM `source_fidelity`, and not a widening of
 it. `close-review-verdict.source_fidelity` diffs `goal_close_risk_tier
 .named_entities`, which is deliberately NARROW — id-shaped tokens (g-NNN,
@@ -98,6 +104,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from ground_truth_citation import PARTIAL, analyze, iter_clusters  # noqa: E402
+from q4_code_scope import scope_code  # noqa: E402
 
 DEFAULT_SAMPLE_N = 5
 
@@ -541,6 +548,21 @@ def expressible_predicate(session_id: Optional[str] = None) -> Optional[Callable
     return _expressible
 
 
+def _code_scope_note(result: dict) -> str:
+    """The sentence naming code scoping in a skip reason, or "" when none applied.
+
+    Same duty as the authored-scope wording: a scoped-empty sample and a clean one
+    are the two answers most easily confused, so the narrowing has to name itself.
+    """
+    if not result["code_scoped"]:
+        return ""
+    return (" Code artifact(s) were sampled on their comments and docstrings only "
+            "(%s), so their code lines were not examined (g-115-11480)."
+            % ", ".join("%s: %d of %d line(s) kept"
+                        % (d["artifact"], d["kept_lines"], d["total_lines"])
+                        for d in result["code_scoped"]))
+
+
 def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
         session_id: Optional[str] = None, source_text: Optional[str] = None,
         authored_ranges: Optional[dict] = None) -> dict:
@@ -569,6 +591,7 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
         "findings": [],
         "unadjudicable_count": 0,
         "authored_scoped": [],
+        "code_scoped": [],
         "direction": None,
         "verdict": "skipped",
         "skip_reason": None,
@@ -582,6 +605,15 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
             result["artifacts_missing"].append(str(a))
             continue
         result["artifacts_read"].append(str(a))
+        # CODE SCOPE (). A code artifact is graded on its comments and
+        # docstrings, never on its code lines; any other suffix passes through
+        # byte for byte. Line numbers survive, so the authored scope below composes.
+        code = scope_code(a, text)
+        if code is not None:
+            text = code.text
+            result["code_scoped"].append(
+                {"artifact": str(a), "language": code.language,
+                 "kept_lines": code.kept_lines, "total_lines": code.total_lines})
         # AUTHORED SCOPE (class 5, ). `--artifact` means "a produced
         # artifact", but for a code-change goal the produced thing is a HUNK, not
         # the whole long-lived file -- so on any established file the sampler
@@ -655,7 +687,11 @@ def run(goal_id: str, artifacts, n: int = DEFAULT_SAMPLE_N,
                 "produced, so this is NOT a statement about the rest of the "
                 "file and NOT a pass (guard-1760)."
                 % ", ".join("%s: %d line(s)" % (d["artifact"], d["authored_lines"])
-                            for d in result["authored_scoped"]))
+                            for d in result["authored_scoped"])) + _code_scope_note(result)
+        elif result["code_scoped"]:
+            result["skip_reason"] = (
+                "no entity-bearing fact clusters in the artifact(s)."
+                + _code_scope_note(result) + " This is NOT a pass (guard-1760).")
         else:
             result["skip_reason"] = "no entity-bearing fact clusters in the artifact(s)"
     elif retrieved is None:

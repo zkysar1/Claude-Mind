@@ -55,7 +55,7 @@ The LLM NEVER reads or edits experience JSONL files directly. All operations go 
 | `experience-read.sh --archive` | Archived records | — |
 | `experience-read.sh --meta` | Metadata | — |
 | `experience-add.sh` | Validate + append record | JSON |
-| `experience-update-field.sh <id> <field> <value>` | Update single field (dot notation for nested) | — |
+| `experience-update-field.sh <id> <field> <value>` | Update one top-level field. A dotted name is refused (`dotted_field_rejected`); to change part of a list or object, pass the whole new value with `--value-file` | — |
 | `experience-archive.sh` | Sweep old/low-utility to archive | — |
 | `experience-meta-update.sh <field> <value>` | Update metadata | — |
 

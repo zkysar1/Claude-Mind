@@ -114,17 +114,28 @@ _LEGACY_TRUTHY = {"1", "true", "yes", "on"}
 # the segmented stores are included so a future writer flip on those stores
 # does not need a second edit here.
 #
-# `world/board/*.jsonl` (8.6% of GET egress) is DELIBERATELY ABSENT for now.
-# The board is the one store that boxes of OTHER deployments write INTO
-# (peer-board-post: 139 inbound posts since 2026-06-02), and they do it with
-# THEIR checkout's backend — a whole-object RMW that reads the current board
-# through their `_refresh`. A peer box that predates the codec would pull the
-# gzip bytes raw, parse nothing, and its merge/append would then re-PUT a
-# board holding only its own record (merge_append_only_jsonl drops unparseable
-# lines LOUDLY but still drops them). Env-scoping the flag protects the
-# outbound direction (we never encode a peer's store); this exclusion protects
-# the inbound one until Claude-Mind and ZDS-Mind carry the reader. Add the
-# pattern back in the SAME change that records those two attestations.
+# `world/board/*.jsonl` is DELIBERATELY ABSENT — a decision since 2026-10-13
+# (g-358-13), not a wait for attestations: both downstream readers are
+# attested and the pattern still stays out. The property it protects: a
+# changed board is refreshed by pulling only the bytes appended since the last
+# pull (OwnCloudBackend._range_tail_pull, g-358-17; the board is in
+# _RANGE_TAIL_STORES), and an encoded object cannot be tail-pulled — the tail
+# of a gzip stream is not a suffix of the plaintext mirror. Admitting the board
+# would turn every pull of a changed board, on every box, from a delta into a
+# whole object (measured 2026-10-13: a last-record tail is 342 B against
+# 164,174 B for the gzip of that day's coordination segment) to save about
+# 0.55 GB of PUT per 24 h, 1.1% of the fleet total, on a path with no
+# per-byte egress charge since the own-cloud cutover. Re-open only when the
+# board's measured PUT cost outweighs the pull cost its encoding adds, and
+# measure both first; the standing trigger is the g-358-183 U9 re-census of
+# coordination PUT bytes against its 200 MB target. If it reads NOT MET, price
+# an object-size lever that keeps plain objects before gzip (g-358-253, sub-day
+# rotation of the board segments: a board PUT re-sends the whole segment, so
+# segment size is the lever; PUT side priced 2026-10-13, read side not
+# measured). Figures: g-358-13 progress_note, marker
+# bravo-cc05-20261013-it324-decision-hold-board-gzip. Secondary, and not the
+# reason: a pre-codec peer posting into an encoded board fails LOUD (its strict
+# utf-8 read raises before any PUT).
 DEFAULT_ALLOWLIST = (
     "world/aspirations.jsonl",
     "world/reasoning-bank.jsonl",
@@ -142,10 +153,10 @@ DEFAULT_ALLOWLIST = (
     "meta/gate-firings.jsonl",
     "meta/gate-firings-*.jsonl",         # date segments (GATE_FIRINGS_SEGMENTED)
 )
-# The board pattern, kept as a named constant so the follow-up that re-admits
-# it (after downstream reader attestation) is a one-token change here and a
-# one-line change in the allowlist tuple — and so a test can pin that it is
-# currently NOT admitted.
+# The board pattern, kept as a named constant so a test can pin that it is
+# currently NOT admitted, and so a re-admission (see the decision above) is a
+# deliberate, reviewed one-line change in the allowlist tuple rather than a
+# rediscovery.
 BOARD_PATTERN_DEFERRED = "world/board/*.jsonl"
 
 

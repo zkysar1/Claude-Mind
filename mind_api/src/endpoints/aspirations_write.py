@@ -2739,6 +2739,73 @@ def _file_routing_audit_investigate(ctx, goal: Dict[str, Any]) -> Optional[str]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+# The escape line names a GOAL id, so the id grammar here must be the goal-id
+# grammar itself — a narrower copy (e.g. g-\d+-\d+) would silently fail the
+# rule-2 escape for a suffixed id (g-NNN-NNN-a — hyphen + ONE letter, per
+# _GOAL_ID_RE) or a cross-world id, and reroute a filing that was allowed to
+# stay. Derive it from _GOAL_ID_RE (strip the anchors) rather than retyping
+# it, so the two cannot drift (guard-742/547 class). The trailing \b keeps a
+# word character glued to the outcome number (…outcome 3y) from matching:
+# the prescribed line ends at the number.
+_CLOSING_SET_ESCAPE_RE = re.compile(
+    r"WHICH CLOSING-SET OUTCOME THIS UNBLOCKS:\s*"
+    + _GOAL_ID_RE.pattern[1:-1]
+    + r"\s+outcome\s+\d+\b",
+    re.I,
+)
+
+
+def _closing_lane_routing(asp, goal) -> Optional[str]:
+    """ file-time routing check (guard-7084): a lane that carries a
+    non-empty closing_set takes strays for the whole life of the freeze, and
+    only the sweep finds them — by which point some are already completed
+    in-lane and drew the lane's strategic_focus boost (the dilution the
+    closing protocol's GOVERNANCE clause forbids; measured 32 non-set goals
+    in asp-326 in 33h, 9 completed before the 24h sweep). So membership is
+    tested at the moment work is FILED, not only at sweep time.
+
+    A filing into such a lane is closing work if — and only if — it IS a
+    closing-set member (its final id, explicit or allocated, is in the set),
+    or it carries guard-7084 rule 2's escape line naming the closing-set
+    outcome it unblocks. A lane with a closing_set but no
+    ``follow_on_aspiration`` field is NOT one this gate routes for: there is
+    nowhere named to move the filing to, and refusing it would wed every
+    filing against the lane with no remedy — so it is a no-op (the
+    sweep-time check keeps covering it).
+
+    This endpoint is ADD only: aspirations-move-goals.py re-homes existing
+    goals without routing through it, so a move can never be refused here —
+    the moves exclusion the goal requires.
+
+    Domain-free by construction (core names no lane): the lane is keyed on
+    the generic ``closing_set`` field and the target is the lane's own
+    ``follow_on_aspiration`` field, which the world fills. A Pattern B hook
+    slot would not fit here: a slot is a convention file a caller LOADS, and
+    the daemon has no convention-loading path in a write endpoint.
+
+    Returns the follow-on asp_id when the filing must be rerouted, else
+    None (the filing may stay in ``asp``). The re-match that a rerouted
+    filing passes against the follow-on lane is guaranteed to terminate:
+    the follow-on lane (the park lane) carries no closing_set of its own,
+    so the check is a no-op there; a follow-on lane that did carry one is a
+    world config error the caller sees as a second reroute, not a loop.
+    """
+    closing_set = asp.get("closing_set")
+    if not isinstance(closing_set, list) or not closing_set:
+        return None
+    follow_on = asp.get("follow_on_aspiration")
+    if not isinstance(follow_on, str) or not follow_on:
+        return None
+    if goal.get("id") in closing_set:
+        return None
+    text = " ".join(
+        str(goal.get(k) or "") for k in ("title", "description")
+    )
+    if _CLOSING_SET_ESCAPE_RE.search(text):
+        return None
+    return follow_on
+
+
 def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
     import sys  # local-import convention (this module imports sys per-function)
     from ..server import Response
@@ -2897,6 +2964,35 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
                     + _archived_aspiration_hint(base_dir, asp_id))
             asp_idx, asp = found
 
+            #  file-time routing check, evaluated INSIDE the lock
+            # after the target is found so a closing_set written
+            # concurrently is not missed (the same reason the uniqueness
+            # guard below sits here rather than in the pre-lock pipeline).
+            # A reroute is REWRITTEN, not refused: the filing lands in the
+            # follow-on lane it would have been swept to within 24h anyway,
+            # and the success body + a warnings[] entry (re-emitted to
+            # stderr by aspirations-add-goal.sh) are loud enough that a
+            # caller cannot mistake it for a filing in the lane it named
+            # (outcome 2). A hard refusal would drop the goal in the
+            # callers that ignore the wrapper's exit code — the spark
+            # handlers and the fixed-target detectors are exactly the leak
+            # this goal closes. The goal record itself is NOT stamped:
+            # routing is a fact about WHERE the filing landed, not about
+            # the goal, and the response carries it.
+            _follow_on = _closing_lane_routing(asp, goal)
+            _closing_lane_origin = None
+            if _follow_on is not None:
+                if _find_aspiration(items, _follow_on) is None:
+                    return Response.error(
+                        400, "closing_lane_no_follow_on",
+                        f"closing lane {asp_id} routes new work to "
+                        f"{_follow_on}, which is not in {source}; the "
+                        f"filing is REFUSED, not lost — fix the lane's "
+                        f"follow_on_aspiration or file it elsewhere")
+                _closing_lane_origin = asp_id
+                asp_idx, asp = _find_aspiration(items, _follow_on)
+                asp_id = _follow_on
+
             if "id" not in goal:
                 goal["id"] = _allocate_goal_id(asp)
             # Uniqueness guard (): a caller-supplied id can collide
@@ -3043,6 +3139,19 @@ def add_goal(ctx) -> "Response":  # type: ignore[name-defined]
     # reordering the pipeline (advisories run early on purpose: they must not
     # depend on allocation succeeding). Applies to every advisory, not just the
     # verification-outcomes one, because they all share the placeholder.
+    # : a rerouted filing MUST be loud. The wrapper re-emits
+    # warnings[] to stderr, so this line reaches the caller even when the
+    # HTTP 200 body is only skimmed — and it names the lane the caller
+    # asked for, the lane the goal landed in, and the reason (outcome 2).
+    if _closing_lane_origin is not None:
+        warnings = list(warnings or [])
+        warnings.append(
+            f"CLOSING-LANE REROUTE (g-353-161 / guard-7084): filed into "
+            f"{_closing_lane_origin}, a lane with a frozen closing_set; "
+            f"goal {goal.get('id', '<unassigned>')} is not a closing-set "
+            f"member and carries no rule-2 'WHICH CLOSING-SET OUTCOME "
+            f"THIS UNBLOCKS: <goal-id> outcome <n>' line — REROUTED to the "
+            f"follow-on lane {asp_id} (not {_closing_lane_origin})")
     if warnings:
         _gid = goal.get("id")
         if _gid:

@@ -300,7 +300,7 @@ def test_plain_objects_round_trip_unchanged(cloud):
 # because every allowlisted store is merge-registered and gate-firings' handler
 # (merge_append_only_jsonl) is a plain line union — the simplest to reason
 # about. Lines are timestamped so the union's chronological sort is stable.
-# (world/board/*.jsonl is NOT allowlisted in this first flip — see
+# (world/board/*.jsonl is NOT allowlisted — it is a range-tail store, see
 # _owncloud_codec.BOARD_PATTERN_DEFERRED — which the test below pins.)
 # ============================================================================
 def _rec(i):
@@ -372,8 +372,9 @@ def test_writer_flag_on_leaves_non_allowlisted_store_plain(cloud, gzip_on):
 
 
 def test_writer_leaves_board_plain_in_first_flip(cloud, gzip_on):
-    """Board channels stay PLAIN even with the flag on for this env: peer
-    deployments write into them with their own reader (BOARD_PATTERN_DEFERRED)."""
+    """Board channels stay PLAIN even with the flag on for this env: they are
+    range-tail stores and an encoded object cannot be tail-pulled
+    (BOARD_PATTERN_DEFERRED)."""
     b = _backend(cloud)
     p = cloud["root"] / "world" / "board" / "coordination.jsonl"
     b.write_bytes(p, V1)

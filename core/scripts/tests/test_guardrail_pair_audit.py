@@ -192,6 +192,104 @@ def test_first_clause_score_is_polarity_stripped(tmp_path, capsys):
     assert row["class"] == "contradiction"
 
 
+# ---------------------------------------------------------------------------
+# File-name-protected clause break (): the old CLAUSE_BREAK_RE
+# `[.;:]` split at the FIRST dot anywhere, so a rule opening with a file name
+# lost its head: 'aspirations-query.sh --goal-field <field> <value> reads ...'
+# first-claused to the bare stem 'aspirations-query' (1 subject token). Over
+# 7,135 active guardrails (2026-10-08, HEAD f0d70db) that cut 129 of 144
+# first-clause-only findings to bare-stem comparisons. The break must stay at
+# '.' + whitespace/EOT — a file-extension dot is always followed by [a-z0-9] —
+# and every other break class (; : -- —) and every sentence-opening head must
+# come out byte-identical to before.
+# ---------------------------------------------------------------------------
+
+# Two file-opening rules whose BARE STEMS are identical (the old scorer saw a
+# 1.0 first-clause match) but whose real heads diverge (fc 0.44 < 0.6 floor).
+# Whole-rule Jaccard is 0.45 under both scorers, so ONLY the head can report
+# them — which is exactly the false positive the fix removes.
+Q1 = {"id": "guard-9001", "category": "framework", "status": "active",
+      "rule": ("aspirations-query.sh returns a LIGHTWEIGHT PROJECTION of the "
+               "goal store fields")}
+Q2 = {"id": "guard-9002", "category": "framework", "status": "active",
+      "rule": ("aspirations-query.sh returns a six-field projection; use "
+               "--goal-status to filter")}
+
+
+def test_first_clause_keeps_file_name_whole():
+    # The reported incident shape (goal-selector.sh / aspirations-query.sh
+    # heads) and the EOT shape: the extension dot never breaks.
+    assert mod.first_clause("aspirations-query.sh --goal-field x y") == \
+        "aspirations-query.sh --goal-field x y"
+    assert mod.first_clause("Always run run-full-suite.sh") == \
+        "Always run run-full-suite.sh"
+    assert mod.first_clause("Always use foo.py") == "Always use foo.py"
+    # The file stays in the head even mid-rule, before a later sentence break.
+    assert mod.first_clause("Never probe foo.sh while the daemon is hot. "
+                            "Keep probes bounded.") == \
+        "Never probe foo.sh while the daemon is hot"
+
+
+def test_file_opening_rule_heads_carry_at_least_three_subject_tokens():
+    # Outcome 1's bar: rules opening with aspirations-query.sh /
+    # goal-selector.sh yield heads of >=3 subject tokens, not a bare stem.
+    for rule in (
+        Q1["rule"],
+        "goal-selector.sh select emits its chosen top pick at index 0",
+        "experience-add.sh requires id AND type AND category AND summary",
+    ):
+        head_tokens = mod.subject_tokens(mod.first_clause(rule))
+        assert len(head_tokens) >= 3, (rule, head_tokens)
+    # The old regex cut these to <=2 tokens: pin the incident value.
+    import re as _re
+    old_re = _re.compile(r"[.;:]|\s+--\s+|\s+—\s+")
+    old_head = old_re.split(Q1["rule"], maxsplit=1)[0].strip()
+    assert mod.subject_tokens(old_head) == {"aspirations-query"}
+
+
+def test_sentence_opening_heads_are_byte_unchanged():
+    # The fix must not move a single byte of a head that contains no file
+    # name: sentence-end dot, colon, -- and — breaks all behave as before.
+    cases = {
+        "Always use the canonical wrapper before probing.":
+            "Always use the canonical wrapper before probing",
+        "Read guard-920 before closing. Cite it.":
+            "Read guard-920 before closing",
+        "Exit codes: 1 means refused.":
+            "Exit codes",
+        "Always do x -- and never y":
+            "Always do x",
+        "Always do x — never y":
+            "Always do x",
+    }
+    for rule, expected in cases.items():
+        assert mod.first_clause(rule) == expected, (rule,
+                                                    mod.first_clause(rule))
+
+
+def test_bare_stem_pair_reported_under_old_scorer_gone_under_new(tmp_path, capsys, monkeypatch):
+    # End-to-end: the identical-stem pair IS the old false positive. Under the
+    # old CLAUSE_BREAK_RE both first-clause to 'aspirations-query' (fc 1.0)
+    # and the pair is reported; under the fixed break their real heads score
+    # 0.44 < 0.6 and the pair is gone. The old scorer is reproduced through
+    # the SAME production split, only the pattern text is the old one.
+    import re as _re
+    world = _world(tmp_path, [Q1, Q2])
+    new = _run_json(capsys, world)
+    assert new["findings_total"] == 0, new["findings"]
+
+    # guard-6701: never mutate the live file — swap the pattern object on the
+    # loaded module, let pytest restore it. The production first_clause() is
+    # what applies it (guard-4323).
+    monkeypatch.setattr(mod, "CLAUSE_BREAK_RE",
+                        _re.compile(r"[.;:]|\s+--\s+|\s+—\s+"))
+    old = _run_json(capsys, world)
+    assert old["findings_total"] == 1, old["findings"]
+    row = old["findings"][0]
+    assert {row["a_id"], row["b_id"]} == {"guard-9001", "guard-9002"}
+    assert row["first_clause_similarity"] == 1.0
+
+
 def test_skipped_pairs_reported_beside_skipped_buckets(tmp_path, capsys):
     # Five members of one category sharing a template: every shared
     # discriminative token (len>=4, non-stopword, non-polarity) becomes its

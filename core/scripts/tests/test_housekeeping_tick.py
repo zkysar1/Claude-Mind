@@ -1071,3 +1071,206 @@ def test_unbound_lane_d_is_due_again_after_the_interval(monkeypatch, tmp_path):
                           now=now + dt.timedelta(hours=13))
 
     assert later["verdict"] == "ok"
+
+
+# ── Lane D: the MACHINE stamp () ────────────────────────────────────
+#
+# Lane D's effect is per machine; the per-binding stamp is per agent (bound) or
+# per box (unbound), so one box's several clocks each archived once per interval.
+# These tests drive the REAL resolvers (SCRIPT_DIR and AGENT_DIR redirected, no
+# injected stamp path) so the property under test is the one production has.
+
+def _counting_archive(payload: dict, counter: Path) -> list:
+    """_stub_archive that also appends one byte to `counter` per spawn.
+
+    Counts archives instead of inferring them from verdicts: a gate that
+    returned `ok` twice and a gate that spawned twice are different bugs.
+    """
+    return [sys.executable, "-c",
+            f"import json; open({str(counter)!r}, 'a').write('x'); "
+            f"print(json.dumps({payload!r}))"]
+
+
+def _clock(monkeypatch, tmp_path, agent):
+    """Point HK at one clock of a single box: a bound agent, or None = unbound.
+
+    SCRIPT_DIR is redirected so every clock shares tmp_path/logs, the way every
+    clock on a real box shares core/logs/ (guard-1039: no production paths).
+    """
+    monkeypatch.delenv("HK_STATE_PATH", raising=False)
+    monkeypatch.setattr(HK, "SCRIPT_DIR", tmp_path / "scripts")
+    monkeypatch.setattr(HK, "AGENT_DIR",
+                        None if agent is None else str(tmp_path / "agents" / agent))
+
+
+def test_two_clocks_of_one_box_archive_once_per_interval(monkeypatch, tmp_path):
+    """Goal check 1: the bound and unbound `_state_path()` branches, one interval.
+
+    Two agents' bound clocks and the unbound clock of ONE box, no injected stamp
+    path. Each had its own empty per-binding stamp, so before the machine stamp
+    all three archived (up to N bound + 1 unbound). Counted by spawn.
+    """
+    counter = tmp_path / "spawns"
+    cmd = _counting_archive(RECEIPT, counter)
+    now = dt.datetime(2026, 10, 13, 12, 0, 0)
+
+    _clock(monkeypatch, tmp_path, "alpha")
+    first = HK.run_lane_d(DCFG, archive_cmd=cmd, now=now)
+    _clock(monkeypatch, tmp_path, "bravo")
+    second = HK.run_lane_d(DCFG, archive_cmd=cmd, now=now + dt.timedelta(hours=1))
+    _clock(monkeypatch, tmp_path, None)
+    third = HK.run_lane_d(DCFG, archive_cmd=cmd, now=now + dt.timedelta(hours=2))
+
+    assert first["verdict"] == "ok"
+    for later in (second, third):
+        assert later["verdict"] == "not-due" and later["scope"] == "machine"
+        assert later["interval_hours"] == 12
+    assert counter.read_text() == "x", "exactly one archive spawn for the box"
+
+
+def test_per_binding_gate_stays_primary_and_keeps_its_answer_shape(tmp_path):
+    """A fresh per-binding stamp answers FIRST, in the shape callers already read.
+
+    The machine layer is additional (guard-718). Pinning the exact dict, with no
+    `scope` key and the PRIMARY's `last` even when the machine stamp differs, is
+    what stops a refactor folding the two into one answer and dropping the
+    primary gate.
+    """
+    sp = tmp_path / "s.json"
+    sp.write_text(json.dumps({"last_transcript_archive": "2026-10-13T09:00:00"}),
+                  encoding="utf-8")
+    (tmp_path / HK.MACHINE_STATE_NAME).write_text(
+        json.dumps({"last_transcript_archive": "2026-10-13T08:00:00"}),
+        encoding="utf-8")
+    counter = tmp_path / "spawns"
+
+    out = HK.run_lane_d(DCFG, state_path=sp,
+                        archive_cmd=_counting_archive(RECEIPT, counter),
+                        now=dt.datetime(2026, 10, 13, 12, 0, 0))
+
+    assert out == {"verdict": "not-due", "last": "2026-10-13T09:00:00",
+                   "interval_hours": 12.0}
+    assert not counter.exists()
+
+
+def test_machine_stamp_alone_gates_when_the_per_binding_stamp_is_empty(tmp_path):
+    sp = tmp_path / "s.json"                    # never written: a clock that has not archived
+    (tmp_path / HK.MACHINE_STATE_NAME).write_text(
+        json.dumps({"last_transcript_archive": "2026-10-13T09:00:00"}),
+        encoding="utf-8")
+    counter = tmp_path / "spawns"
+
+    out = HK.run_lane_d(DCFG, state_path=sp,
+                        archive_cmd=_counting_archive(RECEIPT, counter),
+                        now=dt.datetime(2026, 10, 13, 12, 0, 0))
+
+    assert out == {"verdict": "not-due", "scope": "machine",
+                   "last": "2026-10-13T09:00:00", "interval_hours": 12.0}
+    assert not counter.exists()
+    assert not sp.exists(), "the read-only gate must not create the per-binding stamp"
+
+
+@pytest.mark.parametrize("age_minutes,due", [(12 * 60 - 1, False), (12 * 60, True)])
+def test_machine_stamp_expires_at_the_interval(tmp_path, age_minutes, due):
+    """Positive control: the machine throttle must EXPIRE, on the primary's `<`."""
+    now = dt.datetime(2026, 10, 13, 12, 0, 0)
+    stamp = (now - dt.timedelta(minutes=age_minutes)).strftime("%Y-%m-%dT%H:%M:%S")
+    (tmp_path / HK.MACHINE_STATE_NAME).write_text(
+        json.dumps({"last_transcript_archive": stamp}), encoding="utf-8")
+
+    out = HK.run_lane_d(DCFG, state_path=tmp_path / "s.json",
+                        archive_cmd=_stub_archive(RECEIPT), now=now)
+
+    assert (out["verdict"] == "ok") is due
+
+
+def test_a_run_writes_both_stamps_and_the_machine_one_carries_a_single_key(tmp_path):
+    sp = tmp_path / "s.json"
+    sp.write_text(json.dumps({"last_run": "keep-me"}), encoding="utf-8")
+
+    out = HK.run_lane_d(DCFG, state_path=sp, archive_cmd=_stub_archive(RECEIPT),
+                        now=dt.datetime(2026, 10, 13, 12, 0, 0))
+
+    assert out["verdict"] == "ok" and "machine_stamp" not in out
+    per_binding = json.loads(sp.read_text(encoding="utf-8"))
+    machine = json.loads((tmp_path / HK.MACHINE_STATE_NAME).read_text(encoding="utf-8"))
+    assert per_binding == {"last_run": "keep-me",
+                           "last_transcript_archive": "2026-10-13T12:00:00"}
+    assert machine == {"last_transcript_archive": "2026-10-13T12:00:00"}, \
+        "one gate reads this file; a second riding on it is a deliberate change (rb-11211)"
+
+
+@pytest.mark.parametrize("shape", ["timeout", "unparseable", "spawn-error"])
+def test_a_failed_attempt_stamps_neither_scope(tmp_path, monkeypatch, shape):
+    cmds = {"timeout": [sys.executable, "-c", "import time; time.sleep(20)"],
+            "unparseable": [sys.executable, "-c", "print('not json')"],
+            "spawn-error": ["/no/such/binary-xyz"]}
+    monkeypatch.setattr(HK, "LANE_D_TIMEOUT", 1)
+    sp = tmp_path / "s.json"
+
+    out = HK.run_lane_d(DCFG, state_path=sp, archive_cmd=cmds[shape])
+
+    assert out["verdict"] == shape
+    assert not sp.exists() and not (tmp_path / HK.MACHINE_STATE_NAME).exists(), \
+        "an unreachable backend must retry at the next tick, on either clock"
+
+
+def test_an_unwritable_machine_stamp_is_reported_not_silent(tmp_path, monkeypatch):
+    """save_state swallows a failed write; the read-back is what makes it visible."""
+    blocker = tmp_path / "a-file"
+    blocker.write_text("x", encoding="utf-8")   # a FILE where a directory is needed
+    monkeypatch.setattr(HK, "_machine_state_path",
+                        lambda state_path=None: blocker / HK.MACHINE_STATE_NAME)
+    sp = tmp_path / "s.json"
+
+    out = HK.run_lane_d(DCFG, state_path=sp, archive_cmd=_stub_archive(RECEIPT))
+
+    assert out["verdict"] == "ok"
+    assert out["machine_stamp"] == "unwritten"
+    assert json.loads(sp.read_text(encoding="utf-8"))["last_transcript_archive"], \
+        "the per-binding gate stays in force when the machine layer cannot persist"
+
+
+def test_machine_state_path_is_box_local_whatever_the_binding(monkeypatch, tmp_path):
+    """Goal check 2: the layer must not depend on world-synced or per-agent state."""
+    expected = tmp_path / "logs" / "housekeeping-tick-machine-state.json"
+
+    for agent in (None, "alpha", "bravo"):
+        _clock(monkeypatch, tmp_path, agent)
+        monkeypatch.setenv("MIND_AGENT", agent or "")
+        p = HK._machine_state_path()
+        assert p == expected, f"the {agent!r} clock resolved a different stamp"
+        assert p.is_absolute()
+        if agent:
+            assert tmp_path / "agents" / agent not in p.parents, \
+                "never inside an agent dir: those travel with the agent store"
+    assert expected.name != "housekeeping-tick-state-unbound.json"
+
+
+def test_machine_state_path_follows_a_pinned_per_binding_stamp(monkeypatch, tmp_path):
+    """A test or operator that redirects the one stamp can never write the real other."""
+    monkeypatch.setattr(HK, "SCRIPT_DIR", tmp_path / "scripts")
+    monkeypatch.setenv("HK_STATE_PATH", str(tmp_path / "env" / "s.json"))
+
+    assert HK._machine_state_path() == tmp_path / "env" / HK.MACHINE_STATE_NAME
+    assert HK._machine_state_path(tmp_path / "arg" / "s.json") == \
+        tmp_path / "arg" / HK.MACHINE_STATE_NAME, "an explicit state_path outranks the env"
+
+    monkeypatch.delenv("HK_STATE_PATH")
+    assert HK._machine_state_path() == tmp_path / "logs" / HK.MACHINE_STATE_NAME
+
+
+def test_each_stamp_has_exactly_one_writer():
+    """Goal outcome 3 (guard-155): the performer of the action is the sole writer.
+
+    Counts non-comment assignments to the key across the whole module, then pins
+    them to run_lane_d. A third writer (a tick-side pre-stamp, say) would let a
+    stamp lie about whether the archive ran.
+    """
+    import inspect
+    import re
+    pat = re.compile(r'^(?!\s*#).*?(\w+)\["last_transcript_archive"\]\s*=(?!=)', re.M)
+    whole = pat.findall((SCRIPT_DIR / "housekeeping-tick.py").read_text(encoding="utf-8"))
+    in_lane = pat.findall(inspect.getsource(HK.run_lane_d))
+    assert sorted(whole) == sorted(in_lane) == ["fresh", "mfresh"], \
+        f"expected one writer per stamp, both in run_lane_d; got {whole} / {in_lane}"

@@ -399,5 +399,169 @@ def test_json_citation_sums_reconcile(tmp_path, monkeypatch, capsys):
     assert f": {by_cls['UNRELATED']} across" in headline
 
 
+# ---- : the after-displacement split --------------------------------
+# The re-id stamps no displacement timestamp and record lines are MUTABLE
+# (progress notes / field appends; completed/defer writes do not even bump
+# last_modified), so existing data proves only a LOWER bound per pair:
+#   L = max(created of the record now at the old id, the moved record's created)
+# A dated citation C classifies pre iff C < L; otherwise ambiguous; undated if
+# the citing line has no creation stamp; and post is 0 BY CONSTRUCTION (it
+# would need the unstamped moment D -- the follow-up goal's job). Prose/code
+# surfaces are undatable, so their citations read undated from the where list.
+
+def _split_world(tmp_path, monkeypatch):
+    """Hermetic world pinning the split.
+
+    One displacement g-1 -> g-2, both records present, so
+    L = max(2026-01-01, 2026-01-02) = 2026-01-02. Citations of the old id
+    (the main pass counts raw text matches, so a record AT the old id cites
+    it through its own `id` field -- the self-site the pre-existing _full_run
+    test documents):
+      * self-site (g-2's own displaced_from, guardrails, created == L) -> ambiguous
+      * g-1's own `id` field (guardrails, created 2026-01-01 < L)      -> pre
+      * p-1 (pipeline, created 2025-12-01 < L)                         -> pre
+      * asp-1 (created 2026-01-05 > L)                                 -> ambiguous (never post)
+      * asp-2 (no created_at)                                          -> undated
+      * a torn line citing g-1                                         -> undated
+      * knowledge/node.md (prose surface)                              -> undatable -> undated
+    Total 7 = 2 pre + 0 post + 2 ambiguous + 3 undated.
+    """
+    mod = _load()
+    world, meta, repo, agents = (tmp_path / n for n in
+                                 ("world", "meta", "repo", "agents"))
+    world.mkdir()
+    meta.mkdir()
+    repo.mkdir()
+    _write(world / "guardrails.jsonl",
+           json.dumps({"id": "g-2", "rule": "zebra migration rule",
+                       "displaced_from": "g-1",
+                       "created": "2026-01-02T00:00:00"}) + "\n"
+           + json.dumps({"id": "g-1", "rule": "quiet harbor rule",
+                         "created": "2026-01-01T00:00:00"}) + "\n")
+    _write(world / "pipeline.jsonl",
+           json.dumps({"id": "p-1", "title": "cites g-1 and guard-321",
+                       "created": "2025-12-01T00:00:00"}) + "\n")
+    _write(world / "aspirations.jsonl",
+           json.dumps({"id": "asp-1", "title": "goal citing g-1",
+                       "created_at": "2026-01-05T00:00:00"}) + "\n"
+           + json.dumps({"id": "asp-2", "title": "undated cite of g-1"}) + "\n"
+           + "g-1 on a torn line\n")
+    _write(world / "knowledge" / "node.md",
+           "the node cites g-1 in prose\n")
+    monkeypatch.setattr(mod, "_roots",
+                        lambda: (world, meta, repo, agents))
+    return mod
+
+
+def _buckets(s):
+    return (s["pre"], s["post"], s["ambiguous"], s["undated"])
+
+
+def test_split_buckets_hinge_and_sum_invariant(tmp_path, monkeypatch, capsys):
+    """The split re-buckets the existing total: buckets sum to citations, the
+    where-sum invariant still holds, and the hinge carries the lower bound."""
+    mod = _split_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["displaced-id-audit.py", "--json"])
+    assert mod.main() == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["control_hits"] >= 1   # the regex is not broken
+    ev = [e for e in doc["events"] if e["old"] == "g-1"]
+    assert len(ev) == 1
+    ev = ev[0]
+    s = ev["split"]
+    assert _buckets(s) == (2, 0, 2, 3)
+    assert s["hinge"] == {"lower": "2026-01-02 00:00:00",
+                          "source": "lower-bound"}
+    assert sum(s[b] for b in ("pre", "post", "ambiguous", "undated")) \
+        == ev["citations"]
+    assert ev["citations"] == 7
+    assert sum(_where_counts(ev["where"])) == ev["citations"]
+    assert "line_total_mismatch" not in s and "bucket_sum_mismatch" not in s
+
+
+def test_post_is_never_claimed_from_existing_data(tmp_path, monkeypatch,
+                                                  capsys):
+    """A citing record created after the lower bound is ambiguous, NEVER
+    post: the displacement moment is unstamped and record lines are mutable,
+    so proven-post is unprovable from existing data (that is the follow-up)."""
+    mod = _split_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["displaced-id-audit.py", "--json"])
+    mod.main()
+    doc = json.loads(capsys.readouterr().out)
+    for ev in doc["events"]:
+        assert ev["split"]["post"] == 0
+
+
+def test_split_classifies_per_event_on_a_shared_old_id(tmp_path, monkeypatch,
+                                                       capsys):
+    """One old id displaced by TWO events (measured live: rb-001 and
+    guard-1861 are each claimed by >1 record): the SAME dated citation is
+    split against each event's OWN lower bound, not one averaged hinge.
+    A record created 2026-01-31 is pre for the event whose L is 2026-02-03
+    and ambiguous for the event whose L is 2026-01-03."""
+    mod = _load()
+    world, meta, repo, agents = (tmp_path / n for n in
+                                 ("world", "meta", "repo", "agents"))
+    world.mkdir()
+    meta.mkdir()
+    repo.mkdir()
+    _write(world / "guardrails.jsonl",
+           json.dumps({"id": "g-6", "rule": "alpha lumen rule",
+                       "displaced_from": "g-5",
+                       "created": "2026-01-03T00:00:00"}) + "\n"
+           + json.dumps({"id": "g-7", "rule": "beta quiver rule",
+                       "displaced_from": "g-5",
+                       "created": "2026-02-03T00:00:00"}) + "\n")
+    _write(world / "pipeline.jsonl",
+           json.dumps({"id": "p-1", "title": "cites g-5 and guard-321",
+                       "created": "2026-01-31T00:00:00"}) + "\n")
+    monkeypatch.setattr(mod, "_roots",
+                        lambda: (world, meta, repo, agents))
+    monkeypatch.setattr(sys, "argv", ["displaced-id-audit.py", "--json"])
+    assert mod.main() == 0
+    doc = json.loads(capsys.readouterr().out)
+    ev = {e["new"]: e for e in doc["events"] if e["old"] == "g-5"}
+    assert set(ev) == {"g-6", "g-7"}
+    # Every line citing g-5 counts for EVERY event on the shared id (the main
+    # pass counts raw matches): g-6's own self-site (01-03), g-7's own
+    # self-site (02-03), and p-1 (01-31) -- three citations each.
+    #   g-6: L=01-03  -> 01-03, 01-31, 02-03 all >= L  => (0 pre, 3 amb)
+    #   g-7: L=02-03  -> 01-03 and 01-31 <  L, 02-03 = L => (2 pre, 1 amb)
+    # Same dated citation, different buckets per event: the per-event hinge is
+    # doing the work, not one averaged bound.
+    assert _buckets(ev["g-6"]["split"]) == (0, 0, 3, 0)
+    assert _buckets(ev["g-7"]["split"]) == (2, 0, 1, 0)
+
+
+def test_split_undatable_prose_and_missing_stamp(tmp_path, monkeypatch,
+                                                 capsys):
+    """Citations on prose/code surfaces and on stamp-less record lines are
+    undated/undatable -- never forced into pre (and never post)."""
+    mod = _split_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["displaced-id-audit.py", "--json"])
+    mod.main()
+    doc = json.loads(capsys.readouterr().out)
+    ev = [e for e in doc["events"] if e["old"] == "g-1"][0]
+    s = ev["split"]
+    # 1 (node.md prose) + 1 (asp-2, no created_at) + 1 (torn line)
+    assert s["undated"] == 3
+    assert "tree:node.md(1)" in ev["where"]
+
+
+def test_split_text_summary_is_additive(tmp_path, monkeypatch, capsys):
+    """The text summary gains the SPLIT section; the pre-existing lines are
+    still there and the per-id rows now carry their split + hinge."""
+    mod = _split_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "argv", ["displaced-id-audit.py"])
+    assert mod.main() == 0
+    out = capsys.readouterr().out
+    assert "SPLIT OF OLD-ID CITATIONS VS DISPLACEMENT TIME" in out
+    assert "2 pre | 0 post | 2 ambiguous | 3 undated" in out
+    # the pre-existing per-class and stale-citation lines are untouched
+    assert "UNRELATED" in out or "DANGLING" in out
+    assert "STALE CITATIONS OF UNRELATED-CLASS IDS" in out
+    assert "*** SPLIT INCONSISTENCY" not in out
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

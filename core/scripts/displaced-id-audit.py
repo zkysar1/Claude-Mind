@@ -96,6 +96,100 @@ def _created(rec: dict):
     return None
 
 
+# ---- : the after-displacement split --------------------------------
+
+# The collision-reid merge stamps ONLY `displaced_from` + a new `id` on the
+# loser; it writes NO displacement timestamp (measured 2026-10-12, this goal),
+# and it preserves the moved record's `created` while NOT bumping `last_modified`.
+# So the moment of displacement D is not on the record.
+#
+# What existing data CAN prove, per pair, is a LOWER bound:
+#   L = max(created of the record now at the OLD id, the moved record's created)
+# because neither record could have collided before both existed, so D >= L.
+# A citation dated C then classifies:
+#   C <  L  -> proven PRE-displacement (legitimate when written)
+#   else    -> ambiguous (C is between L and D; D is unknown)
+#   C missing -> undated
+#
+# What it CANNOT prove is "post". Proven post would need C > D. No field marks
+# D, and the tempting proxy -- the earliest dated record citing the NEW id --
+# is UNSOUND: record lines are mutable (progress notes, field appends; _merge_goal's
+# own docstring: completed/defer writes do not even bump last_modified), so a
+# record's `created` bounds its CREATION, not when a given mention was appended.
+# Forcing such citations into `post` would manufacture false-broken rows in a
+# read-only work list. Therefore `post` is computed but is 0 by construction
+# until a follow-up stamps `displaced_at` at the re-id site (filed from this
+# goal); the bucket stays in the output so that fix fills it without a reshuffle.
+#
+# Prose/code surfaces carry no per-citation date, so their citations are
+# `undated` (undatable), never forced into a bucket. The split is ADDITIVE: the
+# existing per-class citation totals and the where-sum invariant are unchanged.
+SPLIT_BUCKETS = ("pre", "post", "ambiguous", "undated")
+
+
+def _stamp_key(stamp: str):
+    """Order ISO-8601 UTC stamps without a datetime dependency.
+
+    The store stamps are naive-UTC `YYYY-MM-DDTHH:MM:SS` (the framework's
+    timestamp posture), which sort lexicographically. A trailing `Z` or an
+    offset, if ever present, would break that, so normalise to the bare form.
+    Returns None for an unparseable stamp so the caller treats it as undated.
+    """
+    if not isinstance(stamp, str):
+        return None
+    s = stamp.strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    # drop an explicit UTC offset (+00:00 / -05:30): stamps are naive-UTC here
+    for m in ("+", "-"):
+        i = s.rfind(m, 10)   # after the date's first '-'
+        if i > 0 and s[i:].replace(":", "").isdigit():
+            s = s[:i]
+            break
+    if not re.match(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}", s):
+        return None
+    return s.replace("T", " ")
+
+
+def _classify(cite_stamp, lower):
+    """One dated citation against a pair's lower bound (see module header).
+
+    `lower` is the displacement's LOWER bound (normalised, or None). A missing
+    citation stamp is `undated`; only C < lower is proven `pre` -- everything
+    at or after lower is `ambiguous` (the displacement moment is unknown), and
+    `post` is never claimed from existing data (it would need the moment D,
+    which is not stamped anywhere).
+    """
+    if cite_stamp is None:
+        return "undated"
+    if lower is not None and cite_stamp < lower:
+        return "pre"
+    return "ambiguous"
+
+
+def _hinge(r, occ_meta):
+    """(lower, source) for one displacement event.
+
+    lower = max(created of the record now at the OLD id, the moved record's own
+    created) -- both had to exist before the collision could resolve, so the
+    displacement is no earlier than this. It is a LOWER bound only: the moment
+    D itself is not stamped anywhere (the re-id writes no displaced_at), so
+    nothing here can prove a citation POST. When both creation stamps are
+    missing there is no usable bound and every dated citation reads ambiguous.
+    """
+    cand = []
+    oldm = occ_meta.get(r["old"])
+    if isinstance(oldm, dict):
+        oc = _stamp_key(oldm.get("created"))
+        if oc:
+            cand.append(oc)
+    nc = _stamp_key(r.get("new_created"))
+    if nc:
+        cand.append(nc)
+    lower = max(cand) if cand else None
+    return (lower, "lower-bound" if lower else "none: no creation stamps")
+
+
 def _toks(s: str) -> set:
     return set(re.findall(r"[a-z0-9]{4,}", (s or "").lower()))
 
@@ -378,6 +472,7 @@ def main() -> int:
         + r"|" + re.escape(CONTROL_ID) + r")\b")
 
     ctrl = nfiles = nbytes = 0
+    rec_files = []        # record-surface files: the only lines with a stamp
     for label, p, rel in surfaces(world, repo, agents):
         try:
             t = p.read_text(encoding="utf-8", errors="replace")
@@ -386,8 +481,75 @@ def main() -> int:
         nfiles += 1
         nbytes += len(t)
         ctrl += cite_file(t, big, by_old, label, rel)
+        if label == "records":
+            rec_files.append((rel, p))
     for r in real:
         r["where"] = sorted(set(r["where"]))
+
+    # ---- : the after-displacement split (ADDITIVE) ----------------
+    # One read over the RECORD surfaces -- the only lines that carry a
+    # creation stamp, hence the only lines that can DATE a citation.
+    # Prose/code surfaces have no per-citation date, so their citations
+    # land in `undated` straight from the where list. Classification is
+    # PER-EVENT: a shared old id cited by several displacement events is
+    # split against each event's own lower bound, not one averaged hinge.
+    for r in real:
+        r["split"] = {b: 0 for b in SPLIT_BUCKETS}
+    for r in real:
+        lo, src = _hinge(r, _occ_meta)
+        r["split"]["hinge"] = {"lower": lo, "source": src}
+    lines = []                     # (stamp-or-None, old_counts)
+    line_total = Counter()         # (rel, old_id) -> citations seen line-by-line
+    for rel, p in rec_files:
+        try:
+            t = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in t.splitlines():
+            olds = big.findall(line)
+            if not olds:
+                continue           # no candidate id in this line at all
+            rec = None
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    rec = obj
+            except Exception:
+                rec = None         # torn line: its citations are undated
+            stamp = _stamp_key(_created(rec)) if rec is not None else None
+            oc = Counter(o for o in olds if o != CONTROL_ID)
+            if not oc:
+                continue           # only the control id hit
+            for tok in oc:
+                line_total[(rel, tok)] += oc[tok]
+            lines.append((stamp, oc))
+    for stamp, oc in lines:
+        for tok, n in oc.items():
+            for r in by_old.get(tok, ()):
+                r["split"][_classify(stamp, r["split"]["hinge"]["lower"])] += n
+    # Undatable surfaces: every citation on a non-record surface file.
+    for r in real:
+        for w in r["where"]:
+            lbl = w.split(":", 1)[0]
+            m = re.search(r"\((\d+)\)$", w)
+            if m and lbl != "records":
+                r["split"]["undated"] += int(m.group(1))
+    # Loud on any disagreement: the line-by-line sum must equal the file-text
+    # count per (file, old id), and the four buckets must sum to citations.
+    for r in real:
+        for w in r["where"]:
+            m = re.match(r"records:([^(:]+)\((\d+)\)$", w)
+            if not m:
+                continue
+            rel, total = m.group(1), int(m.group(2))
+            if line_total.get((rel, r["old"]), 0) != total:
+                r["split"]["line_total_mismatch"] = (
+                    "{}: {} (where) vs {} (line pass)".format(
+                        rel, total, line_total.get((rel, r["old"]), 0)))
+        s = r["split"]
+        if sum(s[b] for b in SPLIT_BUCKETS) != r["citations"]:
+            s["bucket_sum_mismatch"] = "{} != {}".format(
+                sum(s[b] for b in SPLIT_BUCKETS), r["citations"])
 
     bad = sorted((r for r in real if r["cls"] == "UNRELATED" and r["citations"]),
                  key=lambda r: -r["citations"])
@@ -442,13 +604,34 @@ def main() -> int:
                   "old id never moved; measured 0/6 on live UNRELATED, so "
                   "verify before treating their citations as correct)"
                   .format(cand))
+    # : the after-displacement split. ADDITIVE: everything above it is
+    # byte-unchanged. Prose/code surfaces carry no per-citation date, so their
+    # citations read undated; the per-event split and hinge are in --json.
+    agg = Counter()
+    for r in real:
+        for b in SPLIT_BUCKETS:
+            agg[b] += r["split"][b]
+    print("\n  SPLIT OF OLD-ID CITATIONS VS DISPLACEMENT TIME: "
+          + " | ".join("{} {}".format(agg[b], b) for b in SPLIT_BUCKETS)
+          + "\n     (a bound is a bound, not the moment: the re-id stamps no "
+            "displaced_at; prose/code surfaces are undatable => undated)")
+    for r in real:
+        s = r["split"]
+        for k in ("line_total_mismatch", "bucket_sum_mismatch"):
+            if k in s:
+                print("     *** SPLIT INCONSISTENCY {} -> {}: {}".format(
+                    r["old"], r["new"], s[k]))
     print("\n  STALE CITATIONS OF UNRELATED-CLASS IDS: {} across {} ids".format(
         sum(r["citations"] for r in bad), len(bad)))
     for r in bad:
+        h = r["split"]["hinge"]
         print("\n  {} -> {}   {} citations".format(
             r["old"], r["new"], r["citations"]))
         print("     cited text expects : {!r}".format(r["moved"][:74]))
         print("     but now resolves to: {!r}".format(r["now_at_old_id"][:74]))
+        print("     split: {}   (hinge {} L={})".format(
+            " | ".join("{} {}".format(r["split"][b], b) for b in SPLIT_BUCKETS),
+            h["source"], h["lower"] or "-"))
         print("     in: " + ", ".join(r["where"][:6]))
     if a.all:
         for cls in ("NEAR-TWIN", "DANGLING"):
