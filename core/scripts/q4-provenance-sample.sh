@@ -2,7 +2,8 @@
 # q4-provenance-sample.sh — Q4 close-time entity-fact provenance sampling ().
 #
 #   bash core/scripts/q4-provenance-sample.sh --goal <goal-id> --artifact <path> [--artifact <path>...] \
-#        [-n N] [--session-id <sid>] [--source-file <path>] [--json]
+#        [-n N] [--session-id <sid>] [--source-file <path>] [--json] \
+#        [--authored-since <ref> | --authored-against <baseline-copy>]
 #
 # Exit 0 = pass or skipped (read the verdict — they are NOT the same answer).
 # Exit 1 = at least one sampled claim is uncited, decoratively cited, or reversed

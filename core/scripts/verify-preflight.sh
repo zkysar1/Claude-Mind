@@ -2,7 +2,7 @@
 # verify-preflight.sh — a goal's mechanical verify checks in ONE call ().
 #
 #   bash core/scripts/verify-preflight.sh --goal <goal-id> --source <world|agent> \
-#        [--artifact <file>]... [--source-file <path>] \
+#        [--artifact <file>]... [--source-file <path>] [--authored-against <baseline-copy>] \
 #        [--claim "<file-state claim>" --evidence "<in-turn Read/ls output>"] \
 #        [--override-positive-state "<why>"] [--summary-file <path>] [--no-write] [--json]
 #

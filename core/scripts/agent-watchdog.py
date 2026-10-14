@@ -2017,10 +2017,11 @@ class MirrorWedgeProbe(Probe):
             MUST read the key from that one builder: they are the take and the
             release of a single lease (guard-3419), and a key they disagree on
             is a goal that can be filed and never closed.
-          - status == pending AND no claimed_by -- never yank work a partner (or
-            this agent) has started. guard-1007: route via the board instead.
-            An in-progress goal is therefore left open BY DESIGN; its owner
-            closes it, and this method reports that rather than forcing it.
+          - pf.is_retirable: status pending or candidate AND no claimed_by -- never
+            yank work a partner (or this agent) has started. guard-1007: route
+            via the board instead. An in-progress goal is therefore left open BY
+            DESIGN; its owner closes it, and this method reports that rather than
+            forcing it.
         Fail-open throughout: a close failure degrades to a stale goal, which is
         the status quo ante, and must never kill the tick.
         """
@@ -2038,7 +2039,7 @@ class MirrorWedgeProbe(Probe):
                 gid = g.get("id")
                 if not gid:
                     continue
-                if g.get("status") != "pending" or g.get("claimed_by"):
+                if not pf.is_retirable(g):
                     held.append(f"{gid}:{g.get('status')}"
                                 f"{'/claimed' if g.get('claimed_by') else ''}")
                     continue
@@ -3398,9 +3399,10 @@ class GitDriftProbe(Probe):
         """Release the lease this probe took (guard-3419).
 
         Two narrowing guards, both deliberate: origin_signal equality means only
-        goals THIS probe filed on THIS box can match, and pending-and-unclaimed
-        means work someone has started is never yanked out from under them
-        (guard-1007 — route via the board instead). Closed as `skipped`, never
+        goals THIS probe filed on THIS box can match, and pf.is_retirable
+        (pending or candidate, unclaimed) means work someone has started is
+        never yanked out from under them (guard-1007 — route via the board
+        instead). Closed as `skipped`, never
         `completed`: no investigation happened, the condition resolved.
 
         Deliberately NOT gated on self.fired. `fired` lives in
@@ -3423,7 +3425,7 @@ class GitDriftProbe(Probe):
                 gid = g.get("id")
                 if not gid:
                     continue
-                if g.get("status") != "pending" or g.get("claimed_by"):
+                if not pf.is_retirable(g):
                     held.append(f"{gid}:{g.get('status')}"
                                 f"{'/claimed' if g.get('claimed_by') else ''}")
                     continue
@@ -3755,8 +3757,9 @@ class ReleaseTrainProbe(Probe):
     def _retire_release_goals(self, goals: list, reason: str) -> dict:
         """Release the leases whose stall is over (guard-3419).
 
-        Pending-and-unclaimed only — work someone has started is never yanked
-        out from under them (guard-1007). Closed as `skipped`, never
+        Pending-or-candidate and unclaimed only (pf.is_retirable) — work someone
+        has started is never yanked out from under them (guard-1007). Closed as
+        `skipped`, never
         `completed`: no release work happened FROM the goal, the condition
         resolved. The note is written BEFORE the status, so a partial failure
         leaves an open goal carrying a true sentence. Deliberately NOT gated on
@@ -3766,12 +3769,13 @@ class ReleaseTrainProbe(Probe):
         closed, held = [], []
         try:
             import _release_train as rt
+            import pointer_freshness as pf
             from _runtime_bash import BASH as _bash
             for g in goals:
                 gid = g.get("id")
                 if not gid:
                     continue
-                if g.get("status") != "pending" or g.get("claimed_by"):
+                if not pf.is_retirable(g):
                     held.append(f"{gid}:{g.get('status')}"
                                 f"{'/claimed' if g.get('claimed_by') else ''}")
                     continue
@@ -4114,8 +4118,8 @@ class DependencyFunnelProbe(Probe):
         Reads the queues directly rather than trusting `self.fired`: the flag
         lives in box-local, ephemeral tick state, and a goal filed by an
         earlier episode (or another box) must still be retirable here.
-        Pending-and-unclaimed only — work someone has started is never yanked
-        out from under them (guard-1007).
+        Pending-or-candidate and unclaimed only — work someone has started is
+        never yanked out from under them (guard-1007).
         """
         try:
             from _paths import WORLD_DIR, agents_root
@@ -5044,7 +5048,7 @@ class StoreOvercapProbe(Probe):
 
         GitDriftProbe._close_drift_goal's three narrowing guards, for the same
         reasons (guard-3437): origin_signal EQUALITY, so only goals this probe
-        family filed can match; pending-and-unclaimed, so work someone has
+        family filed can match; pending-or-candidate-and-unclaimed, so work someone has
         started is never yanked out from under them (guard-1007); and `skipped`,
         never `completed`, because no investigation happened. The outcome_note
         goes in BEFORE the status, so a partial failure leaves an open goal
@@ -5078,7 +5082,7 @@ class StoreOvercapProbe(Probe):
                 gid = g.get("id")
                 if not gid:
                     continue
-                if g.get("status") != "pending" or g.get("claimed_by"):
+                if not pf.is_retirable(g):
                     held.append(f"{gid}:{g.get('status')}"
                                 f"{'/claimed' if g.get('claimed_by') else ''}")
                     continue

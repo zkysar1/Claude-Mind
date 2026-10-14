@@ -495,6 +495,18 @@ def _cross_world_ref(rid):
         ref, world = ref.strip(), world.strip()
         return "%s:%s" % (world, ref) if ref and world else None
     if ":" in s:
+        # A bare ':' is NOT evidence of a deployment qualifier: URL schemes
+        # ('https://...') and host:path pairs ('originating-box:ROOT/world')
+        # share the character and both entered this branch on the strength of
+        # it, getting reported external_unresolvable ( addendum,
+        # measured on ZDS 2026-09-04 — a type=resource URL and a
+        # type=infrastructure local path, neither a cross-world referent). The
+        # documented '<world>:<goal-id>' form carries neither '/' nor '://',
+        # so rejecting those two shapes cannot touch it, while the rejected ids
+        # fall through to 'opaque' (a shape this reader does not understand),
+        # which is the honest bucket for them.
+        if "://" in s or "/" in s:
+            return None
         return s
     return None
 

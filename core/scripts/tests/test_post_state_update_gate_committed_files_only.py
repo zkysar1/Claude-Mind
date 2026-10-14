@@ -53,7 +53,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 CORE_SCRIPTS = SCRIPT_DIR.parent
 GATE_SH = CORE_SCRIPTS / "post-state-update-gate.sh"
 WM_READ_SH = CORE_SCRIPTS / "wm-read.sh"
-WM_SET_SH = CORE_SCRIPTS / "wm-set.sh"
 
 # Project-local tempdir; the OS tempdir under C:\Users\... is unreachable from
 # this environment's bash (mountpoint mismatch). Mirrors the sibling
@@ -62,6 +61,7 @@ PROJECT_TMP = SCRIPT_DIR / "_tmp_committed_scope_test"
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from _bash_helpers import BASH as GIT_BASH  # noqa: E402
+from _wm_cooldown import neutralize_cooldown  # noqa: E402
 
 # Synthetic fixture paths. Committed (this-agent) vs uncommitted (partner WIP).
 COMMITTED = [
@@ -189,17 +189,12 @@ def _isolate_wm_cooldown():
     (`except Exception: pass`, no `finally`), so a crash between neutralize and
     restore destroyed the real list permanently and silently. The neutralize is
     kept for determinism and now ASSERTS rather than swallowing.
+
+    The body is shared (_wm_cooldown.neutralize_cooldown, g-374-628-a): it returns
+    quietly where the runtime has no daemon, since the gate's own use of the slot
+    is fail-open there and the cooldown reads null on every case anyway.
     """
-    r = subprocess.run(
-        [GIT_BASH, _to_bash_path(WM_SET_SH), "fresh_eyes_last_fire"],
-        input="null", capture_output=True, text=True, timeout=30,
-        env={**os.environ, "MIND_AGENT": AGENT},
-    )
-    assert r.returncode == 0, (
-        f"could not neutralize {AGENT} fresh_eyes_last_fire "
-        f"(rc={r.returncode} stderr={r.stderr!r}) -- the firing cases below would "
-        f"be non-deterministic, so fail loudly rather than flake"
-    )
+    neutralize_cooldown(AGENT)
     yield
 
 

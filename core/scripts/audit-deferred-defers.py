@@ -447,13 +447,23 @@ TERMINAL_STATUSES = frozenset({
 })
 
 
-def load_deferred() -> list:
-    """Return list of dicts {src, agent, asp_id, goal_id, defer_reason,
-    defer_set_at, participants, title, status}.
+def load_deferred_with_coverage() -> tuple:
+    """Return (rows, coverage): the deferred goals, and what the read covered.
 
-    Terminal-status goals are excluded — see TERMINAL_STATUSES."""
+    `rows` is a list of dicts {src, agent, asp_id, goal_id, defer_reason,
+    defer_set_at, participants, title, status}. Terminal-status goals are
+    excluded — see TERMINAL_STATUSES.
+
+    `coverage` is {sources_read, goals_scanned}: the queue files walked, and
+    EVERY goal examined, deferred or not. A bare list cannot tell "the queue was
+    read and nothing in it is deferred" from "the queue was not read" -- both are
+    [] -- so a caller that must refuse the second cannot do it from `rows`
+    (guard-4093: the reader's return type has to be able to say what it did not
+    see)."""
     out = []
     sources = []
+    sources_read = 0
+    goals_scanned = 0
     world = WORLD_DIR if WORLD_DIR.is_dir() else None
     if world is not None:
         sources.append(("world", None, world / "aspirations.jsonl"))
@@ -463,6 +473,7 @@ def load_deferred() -> list:
     for src, agent_name, path in sources:
         if not path.is_file():
             continue
+        sources_read += 1
         for line in path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
@@ -472,6 +483,7 @@ def load_deferred() -> list:
             except json.JSONDecodeError:
                 continue
             for g in a.get("goals", []):
+                goals_scanned += 1
                 dr = g.get("defer_reason")
                 if not dr:
                     continue
@@ -488,7 +500,12 @@ def load_deferred() -> list:
                     "participants": g.get("participants"),
                     "status": g.get("status"),
                 })
-    return out
+    return out, {"sources_read": sources_read, "goals_scanned": goals_scanned}
+
+
+def load_deferred() -> list:
+    """The deferred goals alone — see load_deferred_with_coverage()."""
+    return load_deferred_with_coverage()[0]
 
 
 # ---- Output ---------------------------------------------------------------

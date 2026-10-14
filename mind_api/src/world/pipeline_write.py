@@ -616,6 +616,60 @@ def _stamp_resolution_provenance(rec: Dict[str, Any], agent: str) -> None:
         rec["resolved_at"] = datetime.now().isoformat(timespec="seconds")
 
 
+#: The resolution clock (). Writer-stamped, do not supply — and now
+#: ENFORCED, not just documented (pipeline.md): a caller value on either field
+#: is refused on every write path, because a forged clock moves a resolution
+#: between the digest windows that count on `resolved_at` ().
+_RESOLUTION_CLOCK_FIELDS = ("resolved_at", "resolved_by")
+
+
+def _clock_comparable(value: Any) -> Any:
+    """A clock value in the form the in-lock mismatch checks compare.
+
+    `None` (absent or explicit null) stays `None` — `_parse_value` would not
+    accept it. Otherwise the value is normalized the way `_normalize_record`
+    normalizes a value (its value map runs `_parse_value` per key), because
+    the stored form is what a PREVIOUS normalization produced; comparing the
+    raw query value to the stored one would false-positive on a format
+    round-trip (`5` stored, `"5"` resupplied). Unparseable shapes pass
+    through unchanged.
+    """
+    if value is None:
+        return None
+    try:
+        return _parse_value(value)
+    except (ValueError, TypeError):
+        return value
+
+
+def _refusal_for_writer_stamped_fields(fields) -> str | None:
+    """Why the write carries caller values of the writer-owned clock, or None.
+
+    Checks the caller's SUPPLIED keys only — what is already on the record is
+    the writer's own earlier stamp and never the caller's business. Call this
+    BEFORE any merge loop applies the fields to the record: the
+    `_stamp_resolution_provenance` chokepoint fills only ABSENT values, so a
+    value that survived into the merge wins silently (the pre-fix defect,
+    first-person instance g-001-02 occ45).
+
+    The update-field override (`override_reason`) is NOT a caller-supplied
+    value of the fields; it is handled by `update_field` after this helper
+    returns None, so the reason stays an audited repair, not a write.
+    """
+    supplied = [f for f in _RESOLUTION_CLOCK_FIELDS if f in fields]
+    if not supplied:
+        return None
+    return (
+        f"The record's resolution clock is writer-stamped; a caller value for "
+        f"{', '.join(supplied)} is refused. Back-dating belongs in "
+        f"`outcome_date` — the caller's date-only field — and the writer "
+        f"stamps the full-second `resolved_at` / `resolved_by` itself when the "
+        f"record is resolved. If a stored clock is genuinely wrong, correct it "
+        f"through pipeline-update-field.sh <id> <field> <value> "
+        f"--override-reason '<why>' — the override refuses without a reason "
+        f"and records it in outcome_detail (g-115-10788).")
+
+
 # ---------------------------------------------------------------------------
 # Record lookup
 # ---------------------------------------------------------------------------
@@ -716,6 +770,18 @@ def move(ctx) -> "Response":  # type: ignore[name-defined]
         if not isinstance(merge_data, dict):
             return Response.error(400, "invalid_body",
                                   "body must be a JSON object")
+
+        # Writer-stamped clock guard (). BEFORE the merge loop: the
+        # loop applies every supplied key to the record, and the resolution
+        # stamp below it only fills ABSENT values, so a caller-supplied
+        # resolved_at/resolved_by used to win and be stored as given (pipeline.md
+        # calls the fields "Writer-stamped (do not supply)" — this makes the
+        # prose true). Refusing, like _terminal_transition_refusal, writes
+        # nothing: the lock has not been taken, so the record on disk is
+        # untouched.
+        refusal = _refusal_for_writer_stamped_fields(merge_data)
+        if refusal is not None:
+            return Response.error(400, "writer_stamped_field_forbidden", refusal)
 
     live_path, archive_path, base_dir = _resolve_paths(ctx)
     meta_path = base_dir / "pipeline-meta.json"
@@ -860,6 +926,15 @@ def add(ctx) -> "Response":  # type: ignore[name-defined]
     if not isinstance(rec, dict):
         return Response.error(400, "invalid_body", "body must be a JSON object")
 
+    # Writer-stamped clock guard (). The add-at-stage=resolved path
+    # runs `_stamp_resolution_provenance` on this caller dict and it fills only
+    # ABSENT values — the same hole as the move merge, one line earlier.
+    if rec.get("stage") == "resolved":
+        refusal = _refusal_for_writer_stamped_fields(rec)
+        if refusal is not None:
+            return Response.error(400, "writer_stamped_field_forbidden",
+                                  refusal)
+
     if "stage" not in rec:
         rec["stage"] = "discovered"
     rec = _normalize_record(rec)
@@ -970,6 +1045,15 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
     if not isinstance(rec, dict):
         return Response.error(400, "invalid_body", "body must be a JSON object")
 
+    # Writer-stamped clock guard (), the whole-record path, runs
+    # IN-LOCK where the stored record is visible — this path alone carries a
+    # legitimate resupply: rb-2239's repair of a multi-field-corrupt record
+    # resends the WHOLE record, writer stamp included, and byte-identical
+    # clock values are a round-trip, not a rewrite. Any DEVIATION from the
+    # stored value is a forged rewrite and is refused. (The guard cannot run
+    # before the probe: the stored value is what "unchanged" means, and a
+    # 404-on-missing-id must beat any other refusal.)
+
     rec = _normalize_record(rec)
 
     try:
@@ -1007,6 +1091,33 @@ def update(ctx) -> "Response":  # type: ignore[name-defined]
             if found is None:
                 return Response.error(404, "record_not_found",
                                       f"Record {rec_id} not found")
+            stored = found[1]
+
+            # Writer-stamped clock guard (), whole-record path.
+            # Tolerates the rb-2239 round-trip (every resupplied clock value
+            # identical to the stored stamp) and refuses anything else: a
+            # deviation is a forged rewrite, and a DROP of a stored clock is
+            # the same class — a replacement that omits the field erases the
+            # writer's stamp silently. Both are refused; the only rewrite
+            # path is the audited update-field override.
+            clock_mismatch = [
+                f for f in _RESOLUTION_CLOCK_FIELDS
+                if _clock_comparable(rec.get(f)) != _clock_comparable(stored.get(f))
+            ]
+            if clock_mismatch:
+                return Response.error(
+                    400, "writer_stamped_field_forbidden",
+                    f"The record's resolution clock is writer-stamped; the "
+                    f"replacement differs from the stored value for "
+                    f"{', '.join(clock_mismatch)} (stored: "
+                    f"{', '.join(repr(stored.get(f)) for f in clock_mismatch)}"
+                    f") — resending an UNCHANGED record (rb-2239 repair) is "
+                    f"fine, changing or dropping the clock is refused. "
+                    f"Correct a genuinely wrong stored clock through "
+                    f"pipeline-update-field.sh <id> <field> <value> "
+                    f"--override-reason '<why>' (audited in outcome_detail, "
+                    f"g-115-10788).")
+
             idx = found[0]
             items[idx] = rec
             written_rec.update(rec)
@@ -1096,6 +1207,37 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
             # boundary.
             #
             # NARROWED TO THE TRANSITION, NOT THE FIELD (guard-1080). The
+            # Writer-stamped clock guard (). update-field has no
+            # field whitelist, so this is the path that could rewrite the
+            # clock AFTER the writer stamped it (the occ45 correction ran
+            # here). Refuse without an override reason; WITH one, the write
+            # is allowed and AUDITED — the reason is appended to
+            # outcome_detail, so a later reader can see the value was not
+            # writer-stamped. The refusal fires before the stage guard on
+            # purpose: a forged stage write and a forged clock are separate
+            # refusals, and the clock one must hold even when the stage
+            # transition itself is legal.
+            # The NO-OP is not a rewrite: resending the stored value (a
+            # round-trip fetch->edit->send) changes nothing and is tolerated
+            # without an override. A CHANGE to the clock still requires one.
+            clock_changes = field in _RESOLUTION_CLOCK_FIELDS and (
+                _clock_comparable(value) != _clock_comparable(rec.get(field)))
+            if clock_changes:
+                override_reason = (
+                    ctx.query.get("override_reason") or "").strip()
+                if not override_reason:
+                    return Response.error(
+                        400, "writer_stamped_field_forbidden",
+                        f"`{field}` is writer-stamped; update-field refuses "
+                        f"to CHANGE it without an override reason (resending "
+                        f"the stored value is fine). The writer owns the "
+                        f"resolution clock, because the digest windows count "
+                        f"resolutions on it (g-115-10706). If the stored "
+                        f"value is genuinely wrong, pass "
+                        f"--override-reason '<why the stored clock is wrong "
+                        f"and this value is right>' — the reason is appended "
+                        f"to outcome_detail so the override is auditable "
+                        f"(g-115-10788).")
             # caller enumeration: ZERO scripted writers of `stage` through
             # update-field anywhere in the tree (.sh/.py/SKILL.md/.yaml), and
             # ZERO tests. But ad-hoc agent use is real and LEGITIMATE and is
@@ -1105,6 +1247,16 @@ def update_field(ctx) -> "Response":  # type: ignore[name-defined]
             # (journal 2026-07-12, exp--resolution-survives-writeblock).
             # That is a FORWARD move and stays legal here, exactly as
             # resolved -> archived stays legal in move().
+            # The override write is allowed; make it auditable before the
+            # value lands (). outcome_detail is the free-text
+            # narrative field the record already carries, and an append keeps
+            # whatever is there. Only a CHANGE is audited: a no-op resupply
+            # carries no new value to attribute.
+            if field in _RESOLUTION_CLOCK_FIELDS and clock_changes:
+                rec["outcome_detail"] = (
+                    (str(rec.get("outcome_detail") or "").rstrip() + "\n"
+                     + f"[override_reason g-115-10788: {override_reason}]")
+                    .lstrip())
             if field == "stage":
                 refusal = _terminal_transition_refusal(
                     str(rec.get("stage") or ""), str(value))

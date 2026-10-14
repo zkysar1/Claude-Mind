@@ -68,6 +68,14 @@ def table(tmp_path):
     return str(p)
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_precheck_policy(monkeypatch):
+    """An UNSET ambient switch is not hermetic (rb-5428): a box whose environment
+    already carries the skip policy would turn every verdict pin below into `skip`.
+    A pin that wants the policy sets it itself."""
+    monkeypatch.delenv(io_mod._PRECHECK_SKILL_POLICY_ENV, raising=False)
+
+
 def make_runner(responses, record=None):
     """(argv, timeout) -> (rc, stdout, elapsed_ms, err). `responses` is keyed on
     the script name (argv[0]); the default is a clean empty battery report.
@@ -406,6 +414,105 @@ def test_an_all_blocked_queue_makes_the_precheck_skill_required(tmp_path, capsys
         tmp_path,
         {**_stamp(1), "goal-selector.sh": (0, json.dumps(ALL_BLOCKED_PAYLOAD), None)}, capsys)
     assert v["verdict"] == "required" and any("blocked" in r for r in v["reasons"]), v
+
+
+# --- configuration can decline the load, and says what it overrode () -----
+#
+# The policy is DATA that every tree reads alike. A first version keyed the skip on an
+# identity variable (MIND_AGENT) and would have fired on every promoted Mind: the seed
+# export renames MIND_ to MIND_ and the staging hook stamps the result on every Bash
+# call (rb-11257, guard-5584). The pins below hold that mistake out as well as the
+# policy in.
+
+def test_the_skip_policy_declines_the_load_over_every_doubt(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    monkeypatch.setenv(io_mod._PRECHECK_SKILL_POLICY_ENV, "skip")
+    found = {"findings": [{"name": "x-gate", "detail": "sentinel set"}], "blind": []}
+    v = _precheck_verdict(
+        tmp_path, {**_stamp(io_mod._PRECHECK_SKILL_MAX_AGE_MIN + 40),
+                   "precheck-sentinel-battery.sh": (0, json.dumps(found), None)}, capsys)
+    assert v["verdict"] == "skip" and v["policy"] == "skip", v
+    assert io_mod._PRECHECK_SKILL_POLICY_ENV in v["reasons"][0], v
+    assert "finding" in v["reasons"][1] and "the skill last ran" in v["reasons"][1], v
+
+
+def test_a_clean_entry_under_the_skip_policy_names_the_policy_and_no_doubts(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    monkeypatch.setenv(io_mod._PRECHECK_SKILL_POLICY_ENV, "skip")
+    v = _precheck_verdict(tmp_path, _stamp(5), capsys)
+    assert v["verdict"] == "skip" and v["policy"] == "skip", v
+    assert len(v["reasons"]) == 1 and "declined by configuration" in v["reasons"][0], v
+
+
+@pytest.mark.parametrize("value", ["SKIP", "  skip  ", "Skip"])
+def test_the_skip_policy_ignores_case_and_padding(tmp_path, capsys, monkeypatch, value):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    monkeypatch.setenv(io_mod._PRECHECK_SKILL_POLICY_ENV, value)
+    v = _precheck_verdict(tmp_path, _stamp(io_mod._PRECHECK_SKILL_MAX_AGE_MIN + 15), capsys)
+    assert v["verdict"] == "skip" and v["policy"] == "skip", v
+
+
+@pytest.mark.parametrize("value", ["true", "1", "never", "skip-it"])
+def test_a_value_that_is_not_the_defined_policy_is_named_and_loads_the_skill(
+        tmp_path, capsys, monkeypatch, value):
+    """A typo must be visible, not a quiet fallback: this entry is clean with a fresh
+    stamp, the one state that would otherwise skip."""
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    monkeypatch.setenv(io_mod._PRECHECK_SKILL_POLICY_ENV, value)
+    v = _precheck_verdict(tmp_path, _stamp(1), capsys)
+    assert v["verdict"] == "required" and "policy" not in v, v
+    assert any(io_mod._PRECHECK_SKILL_POLICY_ENV in r and repr(value) in r
+               for r in v["reasons"]), v
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_an_unset_or_blank_policy_leaves_the_earned_verdict_exactly_as_it_was(
+        tmp_path, capsys, monkeypatch, value):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    if value is not None:
+        monkeypatch.setenv(io_mod._PRECHECK_SKILL_POLICY_ENV, value)
+    fresh = _precheck_verdict(tmp_path, _stamp(5), capsys)
+    assert fresh["verdict"] == "skip", fresh
+    assert set(fresh) == {"verdict", "reasons", "stamp_age_min", "max_age_min"}, fresh
+    assert "entry clean and complete" in fresh["reasons"][0], fresh
+    stale = _precheck_verdict(
+        tmp_path, _stamp(io_mod._PRECHECK_SKILL_MAX_AGE_MIN + 15), capsys)
+    assert stale["verdict"] == "required" and "policy" not in stale, stale
+
+
+def test_no_identity_variable_can_stand_in_for_the_policy(tmp_path, capsys, monkeypatch):
+    """The mistake this policy replaced. MIND_AGENT is every promoted Mind's agent
+    name, so nothing about an agent, session, harness or deployment name may change
+    the verdict (rb-11257: the framework does not detect which one runs it)."""
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    for name in ("MIND_AGENT", "MIND_AGENT", "MIND_SID", "MIND_SID",
+                 "ZAKCODE_SESSION", "CLAUDECODE"):
+        monkeypatch.setenv(name, "x")
+    stale = _precheck_verdict(
+        tmp_path, _stamp(io_mod._PRECHECK_SKILL_MAX_AGE_MIN + 15), capsys)
+    assert stale["verdict"] == "required" and "policy" not in stale, stale
+    fresh = _precheck_verdict(tmp_path, _stamp(5), capsys)
+    assert fresh["verdict"] == "skip" and "policy" not in fresh, fresh
+
+
+def test_the_policy_name_survives_the_seed_rename_unchanged():
+    """Dev, staging and production must spell the knob alike. The seed export renames
+    MIND_ identifiers to MIND_ (rule G2), so a name carrying either prefix would be
+    two names, and a recipe written against one would set nothing on the other."""
+    name = io_mod._PRECHECK_SKILL_POLICY_ENV
+    assert "AYOAI" not in name and "MIND_" not in name, name
+
+
+def test_a_policy_skip_is_printed_above_an_imperative_that_forbids_the_load(
+        tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("BODY_ROLE", "reducer")
+    monkeypatch.setenv(io_mod._PRECHECK_SKILL_POLICY_ENV, "skip")
+    io_mod.run(runner=make_runner(_stamp(120)), md_path=_wired_table(tmp_path))
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.strip()]
+    printed = [l for l in lines if l.startswith("[iteration-open] PRECHECK-SKILL: skip")]
+    assert printed and io_mod._PRECHECK_SKILL_POLICY_ENV in printed[0], lines
+    assert "do NOT load Skill(aspirations-precheck)" in lines[-1], lines[-1]
 
 
 def test_a_verdict_that_raises_is_required_and_names_the_exception(

@@ -330,7 +330,11 @@ _FINDS: dict = {
     "l1-skew-cadence": {"text": (r"\S",), "ok_rcs": (1,)},
     "narrative-clobber-audit": {"text": (r"CLOBBERED=[1-9]",), "rcs": (1,)},
     "recurring-precondition-sweep": {"text": (r"skipped_on_error=[1-9]",)},
-    "role-multiplier-coverage-audit": {"rcs": (1,)},
+    # the script's own contract is 0 OK / 2 MISSING / 1 ERROR (its header): MISSING is
+    # the finding, and an ERROR (a config it could not read) is a lane that did not
+    # run, so it falls through to `unexpected rc` BLIND. The generic `(1,)` had the
+    # two backwards (: a real MISSING printed as BLIND).
+    "role-multiplier-coverage-audit": {"rcs": (2,)},
     "scar-tissue-cadence": {"text": (r"^\s*\[scar-tissue-check\](?!.*noop)",)},
     "stalled-goal-ratchet": {"text": (r"(?i)regress",), "rcs": (1,)},
     "unchecked-write-ratchet": {"text": (r"(?i)regress",), "rcs": (1,)},

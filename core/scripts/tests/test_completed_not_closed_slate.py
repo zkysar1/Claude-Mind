@@ -514,11 +514,19 @@ def test_record_hold_omits_note_sha_when_note_unreadable(tmp_path):
 # message (guard-2319).
 
 def _seed_holds(m, ledger, gid, n, *, sha=None):
-    """Append n holds for gid directly, bypassing record_hold's digest logic."""
+    """Append n holds for gid directly, bypassing record_hold's digest logic.
+
+    `held_at` is derived from the clock (ascending, the last seed one hour old),
+    never a fixed date: record_hold prunes every entry older than
+    _HOLD_LEDGER_RETENTION_DAYS by the REAL clock, so seeds dated 2026-08-20 were
+    pruned by the very write each test makes once they passed 30 days (2026-09-19)
+    and the ledger kept one hold instead of n+1 (g-115-10538)."""
     import json as _j
+    base = datetime.now()
     with open(ledger, "a", encoding="utf-8") as fh:
         for i in range(n):
-            rec = {"goal_id": gid, "held_at": "2026-08-20T0%d:00:00" % i,
+            rec = {"goal_id": gid,
+                   "held_at": (base - timedelta(hours=n - i)).strftime("%Y-%m-%dT%H:%M:%S"),
                    "reason": "prior", "agent": "alpha", "sid": "abc"}
             if sha:
                 rec["note_sha"] = sha

@@ -102,10 +102,13 @@ PathLike = Union[str, os.PathLike]
 # GET we would have done anyway. Correctness never depends on this list (the
 # md5 equality below is an exact proof either way); cost does.
 #
-# These two are the stores no other g-358 lever can reach. gzip (g-358-11)
-# cannot touch world/board/* — it must stay PLAINTEXT until Claude-Mind and
-# ZDS-Mind carry the gzip reader, because peers write INTO our board with their
-# own checkout's backend (BOARD_PATTERN_DEFERRED). Sharding (g-358-12) is the
+# gzip (g-358-11) does not compose with these stores, and a pin keeps the codec
+# allowlist off every one of them
+# (test_gzip_allowlist_and_range_tail_stores_are_disjoint). For the board it is
+# held out on purpose (g-358-13, 2026-10-13): an encoded object
+# cannot take this tail path, so admitting the board would turn a delta-sized
+# pull into a whole-object pull on every box (_owncloud_codec's comment above
+# DEFAULT_ALLOWLIST carries the figures). Sharding (g-358-12) is the
 # lever for aspirations, not for an append log. Encoded (gz) objects are
 # excluded by construction: the tail of a gzip stream is not a suffix of the
 # plaintext, so `_codec_head_plain_md5(head) is None` is a REQUIRED guard, not

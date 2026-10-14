@@ -87,6 +87,9 @@ within _PRECHECK_SKILL_MAX_AGE_MIN says `skip`; anything else, and every doubt,
 says `required` (what the digest did unconditionally before). The stamp is the
 skill's OWN output (the consolidation_health slot, one writer), never a step
 anyone has to remember. Reducer-side only: a worker Body runs no precheck.
+Configuration can also decline the load: ITERATION_OPEN_PRECHECK_SKILL=skip says
+`skip` whatever the entry found and names the doubts it overrode. It is a policy and
+never an identity, so every tree reads it alike (rb-11257); unset, it changes nothing.
 
 Output (guard-424 fail-loud-on-stderr; guard-614 structured on every exit path):
   default -- a per-STAGE rc table first (so a stage that did not run is visible),
@@ -600,6 +603,16 @@ def _coverage(rows):
 _PRECHECK_SKILL_MAX_AGE_MIN = 30
 _PRECHECK_SKILL_STAMP_SLOT = "consolidation_health"
 
+# CONFIGURATION CAN DECLINE THE LOAD (). A deployment whose window cannot
+# afford ~34k tokens for residue it never runs sets this to `skip`; the verdict then
+# says so and prints the doubts it overrode. It is a POLICY, never an identity: no
+# value says which harness or deployment is running, so every tree reads it the same
+# way (rb-11257). The name carries no MIND_/MIND_ prefix, so the seed export's G2
+# rename leaves it alone and dev, staging and production spell it identically
+# (guard-5584) -- a pin holds that. Unset, the verdict above is unchanged byte for
+# byte; a value other than `skip` is named as a doubt and the skill loads.
+_PRECHECK_SKILL_POLICY_ENV = "ITERATION_OPEN_PRECHECK_SKILL"
+
 
 def _precheck_skill_stamp_age(runner, now=None):
     """Minutes since the skill last reached its Phase 0.5, as (age, None). A stamp
@@ -627,9 +640,10 @@ def _precheck_skill_stamp_age(runner, now=None):
     return age, None
 
 
-def _precheck_skill_verdict(report, runner, now=None):
+def _precheck_skill_verdict(report, runner, now=None, env=None):
     """Is Skill(aspirations-precheck) due this iteration? `skip` only when nothing
-    in this entry needs the skill AND the skill's own last run is recent."""
+    in this entry needs the skill AND the skill's own last run is recent -- or when
+    configuration declines the load (_PRECHECK_SKILL_POLICY_ENV)."""
     due = []
     cov = report.get("coverage")
     if not cov:
@@ -650,12 +664,23 @@ def _precheck_skill_verdict(report, runner, now=None):
         due.append(no_stamp)
     elif age > _PRECHECK_SKILL_MAX_AGE_MIN:
         due.append(ran)
-    return {
+    import os
+    policy = ((env if env is not None else os.environ).get(_PRECHECK_SKILL_POLICY_ENV)
+              or "").strip()
+    if policy and policy.lower() != "skip":
+        due.append("%s=%r is not a defined policy (only 'skip' is)"
+                   % (_PRECHECK_SKILL_POLICY_ENV, policy))
+    out = {
         "verdict": "required" if due else "skip",
         "reasons": due or ["entry clean and complete; " + ran],
         "stamp_age_min": None if age is None else round(age, 1),
         "max_age_min": _PRECHECK_SKILL_MAX_AGE_MIN,
     }
+    if policy.lower() == "skip":
+        out.update(verdict="skip", policy="skip", reasons=[
+            "%s=skip: the load is declined by configuration" % _PRECHECK_SKILL_POLICY_ENV
+        ] + (["doubts it overrides (%d): %s" % (len(due), "; ".join(due[:3]))] if due else []))
+    return out
 
 
 def _emit(report, as_json):

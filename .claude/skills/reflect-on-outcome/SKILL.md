@@ -161,10 +161,10 @@ IF hypothesis record has `experience_ref` field:
 
 ## Step 1.5: Point-in-Time Belief Reconstruction (bi-temporal reader, g-306-36 / rb-335)
 
-Rationale (WHY `--as-of`, the control, belief scope): `core/config/rationale/reflect-on-outcome.md`
+Rationale (WHY --as-of): `core/config/rationale/reflect-on-outcome.md`
 
 ```
-T = hypothesis.created
+T = hypothesis.formed_at or hypothesis.formed_date
 Bash: retrieve.sh --category "{hypothesis.category}" --as-of "{T}" --read-only
 Bash: the SAME call WITHOUT --as-of  # the CONTROL (guard-3788)
 # Zero as-of beside a non-empty control = artifact; report it, no Step-5 antecedent.

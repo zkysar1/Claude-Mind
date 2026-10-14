@@ -17,11 +17,42 @@ Optional: `outcome_detail`, `outcome_date`, `reflected_date`, `reflected_by`, `v
 
 ID format: `YYYY-MM-DD_slug` (regex: `^\d{4}-\d{2}-\d{2}_[a-z0-9-]+$`)
 
-Writer-stamped (do not supply): `resolved_at`, `resolved_by`. `_stamp_resolution_provenance`
-(`mind_api/src/world/pipeline_write.py:599-615`) sets them once at resolution and never
-overwrites them, but ONLY on a move INTO `resolved` (`:782-799`) or an add at stage `resolved`
-(`:887`). A record that reaches `archived` without passing through `resolved` is never stamped
-(see Coverage below).
+Writer-stamped, do not supply, ENFORCED: `resolved_at`, `resolved_by`.
+`_stamp_resolution_provenance` (`mind_api/src/world/pipeline_write.py:600`)
+sets them once at resolution and never overwrites them, but ONLY on a move INTO
+`resolved` (`:847`) or an add at stage `resolved` (`:944`). A record that
+reaches `archived` without passing through `resolved` is never stamped (see
+Coverage below).
+
+The "do not supply" is enforced, not just documented (g-115-10788, 2026-10-13).
+The pre-fix posture had a hole on every write path: the stamp fills only
+ABSENT values and runs AFTER the caller merge applies every supplied key
+(`_refusal_for_writer_stamped_fields`, `:626`, records the first-person
+instance — g-001-02 occ45 stored a hand-built `05:55:00` against a write at
+`~05:38` and had to be corrected afterwards). Now:
+
+- **move INTO `resolved`** carrying a caller `resolved_at` / `resolved_by` in
+  the merge → `400 writer_stamped_field_forbidden`, nothing written. Back-date
+  in `outcome_date` instead (the caller's date-only field) — the writer stamps
+  the full-second clock itself.
+- **add at `stage=resolved`** carrying either field → same 400, nothing written.
+- **update (whole record)** re-supplying either field → same 400 (the
+  replacement overwrites the writer's stamp — the third hole).
+- **update-field** refuses a `resolved_at` / `resolved_by` write without
+  `--override-reason '<why>'`; with a reason the write lands and the reason is
+  appended to the record's `outcome_detail`
+  (`[override_reason g-115-10788: ...]`), so a later reader can see the value
+  was not writer-stamped. That is the audit trail for correcting a genuinely
+  wrong stored clock (the occ45 case); it is the ONLY path that may rewrite the
+  clock, and the reason is what makes it auditable. Every other field is
+  unaffected — `outcome_date` stays caller-writable (the window math above
+  depends on callers supplying it).
+
+The refusal fires BEFORE the record lock on move/add (the merge loop never
+runs) and before the stage guard on update-field, so a forged clock and a
+forged stage transition are separate refusals. The digest windows in the next
+section count resolutions on `resolved_at` (g-115-10706), which is why a
+caller-forged clock on that field matters.
 
 ## Resolution Timestamps: Key Windows on `resolved_at`
 

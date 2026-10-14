@@ -19,6 +19,7 @@ measured control. Pass it explicitly only to inspect another session.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import os
 import subprocess
@@ -53,6 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
                          "REF (a git ref/sha), so a code-change goal is graded on the "
                          "hunk it produced rather than on lines earlier commits wrote. "
                          "Omit for the previous whole-file behaviour.")
+    ap.add_argument("--authored-against", default=None, metavar="BASELINE",
+                    help="the non-git twin of --authored-since: scope the sample to "
+                         "the lines the single --artifact ADDS relative to BASELINE, "
+                         "a file copy of that artifact as it stood before this goal "
+                         "wrote to it (a fold's byte-verified pre-fold copy). Text "
+                         "BASELINE already holds is carried, not authored, and is not "
+                         "graded; an edited line counts as authored.")
     ap.add_argument("--json", action="store_true",
                     help="emit the full result as JSON instead of the summary")
     return ap
@@ -61,6 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     session_id = args.session_id or os.environ.get("MIND_SID") or None
+
+    # One artifact, one baseline: pairing several by position would be a guess,
+    # and a wrong pairing scopes the sample to the wrong lines. Checked before
+    # either scope runs, so the refusal never depends on which one fails first.
+    if args.authored_against and (args.authored_since or len(args.artifact) != 1):
+        print("q4-provenance-sample: --authored-against takes exactly one "
+              "--artifact and cannot be combined with --authored-since",
+              file=sys.stderr)
+        return 2
 
     source_text = None
     if args.source_file:
@@ -95,6 +112,22 @@ def main(argv=None) -> int:
                 return 2
             authored_ranges[str(a)] = added_line_numbers(out.stdout)
 
+    if args.authored_against:
+        a = args.artifact[0]
+        try:
+            base = Path(args.authored_against).read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            cur = Path(a).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            # Fail-loud for the same reason as --authored-since: whole-file
+            # grading would hand back the verdict the caller asked to narrow.
+            print("q4-provenance-sample: --authored-against: cannot read %s: %s"
+                  % (exc.filename or a, exc), file=sys.stderr)
+            return 2
+        # n=0: no context lines, so every '+' body line is a real addition.
+        diff = "\n".join(difflib.unified_diff(base, cur, lineterm="", n=0))
+        authored_ranges = {str(a): added_line_numbers(diff)}
+
     result = run(args.goal, args.artifact, n=args.sample_n,
                  session_id=session_id, source_text=source_text,
                  authored_ranges=authored_ranges)
@@ -108,6 +141,9 @@ def main(argv=None) -> int:
               f"manifest={result['provenance_manifest']}")
         for m in result["artifacts_missing"]:
             print(f"  UNREADABLE ARTIFACT: {m}")
+        for d in result["code_scoped"]:
+            print(f"  code artifact sampled on comments and docstrings only: "
+                  f"{d['artifact']} ({d['kept_lines']} of {d['total_lines']} lines kept)")
         if result["skip_reason"]:
             print(f"  skipped: {result['skip_reason']}")
         for f in result["findings"][:10]:

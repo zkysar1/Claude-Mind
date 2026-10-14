@@ -17,6 +17,7 @@ keeps its own semantics and its own ledger rows:
                     unit's claim (a warning when not, never a refusal)
   positive-state    positive-state-gate.py --claim --evidence    (only with --claim)
   q4                q4-provenance-sample.sh --goal --artifact... --json    (only with --artifact)
+                    [--authored-against BASELINE: grade only what ONE artifact adds to it]
   q1                derived: the table passed, every artifact exists, and
                     positive-state did not fail
 
@@ -326,18 +327,26 @@ def check_positive_state(claim: Optional[str], evidence: str, override: Optional
     return unreadable("positive-state", rc, out, err)
 
 
-def check_q4(goal_id: str, paths: List[str], source_file: Optional[str], run: Runner) -> dict:
+def check_q4(goal_id: str, paths: List[str], source_file: Optional[str], run: Runner,
+             authored_against: Optional[str] = None) -> dict:
     if not paths:
         return verdict("q4", SKIPPED, "no artifact file to sample (not evidence)")
     argv = bash_cmd(SCRIPT_DIR / "q4-provenance-sample.sh", "--goal", goal_id,
                     *[x for p in paths for x in ("--artifact", p)], "--json",
-                    *(["--source-file", source_file] if source_file else []))
+                    *(["--source-file", source_file] if source_file else []),
+                    *(["--authored-against", authored_against] if authored_against else []))
     rc, out, err = run(argv, None)
     d = parse_json(out)
     v = d.get("verdict") if isinstance(d, dict) else None
     if v not in ("pass", "fail", "skipped") or (rc == 1) != (v == "fail"):
         return unreadable("q4", rc, out, err, why=f", verdict {v!r}")
     counts = f"{d.get('sampled_count')}/{d.get('clusters_total')} cluster(s)"
+    # A code artifact is sampled on comments and docstrings only (): say so
+    # beside the count, or a clean line reads as coverage of code that was never looked at.
+    code = d.get("code_scoped") or []
+    if code:
+        counts += (f"; {len(code)} code artifact(s) sampled on comments and docstrings only "
+                   f"({sum(c['kept_lines'] for c in code)} of {sum(c['total_lines'] for c in code)} lines kept)")
     extra = [f"unreadable artifact: {m}" for m in d.get("artifacts_missing") or []]
     if v == "fail":
         found = [f"L{f.get('start_line')}-{f.get('end_line')} {f.get('kind')}: {f.get('detail')}"
@@ -354,7 +363,10 @@ def check_q4(goal_id: str, paths: List[str], source_file: Optional[str], run: Ru
                        "or cat, sed or head in Bash, never counts. For a file too big to Read whole, "
                        "a slash-joined word that is not a citation, or a source you never opened: "
                        "tag the line, reword it, or drop it. direction-contradiction: correct the "
-                       "claim to what its source says. No override, by design", verdict=v, counts=counts)
+                       "claim to what its source says. Text this goal CARRIED rather than wrote "
+                       "(a fold, an edit of an untracked file) is not yours to fix: re-run with "
+                       "--authored-against <copy of the one artifact from before the edit>. "
+                       "No override, by design", verdict=v, counts=counts)
     if v == "skipped":
         return verdict("q4", SKIPPED, f"skipped, NOT a pass: {d.get('skip_reason')}", extra,
                        verdict=v, counts=counts)
@@ -444,7 +456,7 @@ def record(results: Dict[str, dict], w: Writer) -> None:
 
 def preflight(goal_id: str, source: str, artifacts: List[str], *, source_file=None, claim=None,
               evidence="", override_ps=None, summary_file=None, write=True,
-              run: Runner = run_script) -> dict:
+              authored_against=None, run: Runner = run_script) -> dict:
     results: Dict[str, dict] = {}
     results["checks"] = check_structured(goal_id, run)
     results["closure-evidence"] = check_closure_evidence(goal_id, source, summary_file, run)
@@ -454,7 +466,8 @@ def preflight(goal_id: str, source: str, artifacts: List[str], *, source_file=No
     checkpoint = cp if isinstance(cp, dict) else {}
     results["artifact"] = check_artifacts(artifacts, *claim_time(checkpoint, goal_id))
     results["positive-state"] = check_positive_state(claim, evidence, override_ps, run)
-    results["q4"] = check_q4(goal_id, results["artifact"]["data"].get("paths") or [], source_file, run)
+    results["q4"] = check_q4(goal_id, results["artifact"]["data"].get("paths") or [], source_file, run,
+                             authored_against)
     results["q1"] = derive_q1(results["closure-evidence"], results["artifact"], results["positive-state"])
     wrote, failures, held = [], [], ["every write (--no-write)"]
     if write:
@@ -497,6 +510,10 @@ def main(argv=None) -> int:
                     help="a file this goal produced (repeatable): Q1 checks it exists and warns if it "
                          "predates this unit's claim, Q4 samples it")
     ap.add_argument("--source-file", default=None, help="Q4: the source the artifact must be faithful to")
+    ap.add_argument("--authored-against", default=None, metavar="BASELINE",
+                    help="Q4, for a fold or an edit of a file git does not track: a copy of the ONE "
+                         "--artifact as it stood before this goal wrote to it. Text BASELINE already "
+                         "holds is carried, not authored, and is not graded")
     ap.add_argument("--claim", default=None, help="Q1: a file-state claim for the positive-state gate")
     ap.add_argument("--evidence", default="", help="the in-turn Read/ls output that backs --claim")
     ap.add_argument("--override-positive-state", default=None, help="justification for a false positive")
@@ -515,7 +532,7 @@ def main(argv=None) -> int:
     r = preflight(args.goal, args.source, args.artifact, source_file=args.source_file,
                   claim=args.claim, evidence=args.evidence,
                   override_ps=args.override_positive_state, summary_file=args.summary_file,
-                  write=not args.no_write)
+                  write=not args.no_write, authored_against=args.authored_against)
     print(json.dumps(r, ensure_ascii=False, indent=2) if args.json else render(r))
     return r["rc"]
 

@@ -26,17 +26,22 @@ Output:
     stderr: warning on failure
     exit 0 always (fail-open — never block iteration-close)
 
-Locks: uses _fileops.acquire_lock on aspirations.jsonl.lock — same primitive
-the existing cmd_update / cmd_add_goal paths use.
+Write path: _fileops.locked_modify_jsonl, the primitive every other update path
+uses (lock, refresh, canonical json.dumps(ensure_ascii=True), fenced backend PUT).
+g-358-202: this script used to re-read the local file and os.replace it with
+json.dumps(ensure_ascii=False) records. The composite writer's split() refuses
+such a body (its round trip is the ensure_ascii=True form), so the sync push of
+that file went out as one whole 32 MB object, the daily "flip", flag or no flag.
+Every flip since 2026-10-10 differs from the version before it by exactly one
+sessions_active += 1.
 """
-import json
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _paths import WORLD_DIR, AGENT_DIR  # type: ignore
-from _fileops import acquire_lock, release_lock  # type: ignore
+from _fileops import locked_modify_jsonl  # type: ignore
 
 
 def main():
@@ -55,54 +60,20 @@ def main():
         )
         sys.exit(0)
 
-    lock = target.with_suffix(".lock")
-    try:
-        acquire_lock(lock)
-        # surrogatepass preserves any lone surrogates already in the file
-        # (Windows-origin jsonl content occasionally carries them); without
-        # it, the round-trip read+write fails on a "can't encode character"
-        # error. ensure_ascii=False on dump keeps Unicode untouched —
-        # combined with surrogatepass on write the existing data is preserved.
-        with target.open("r", encoding="utf-8", errors="surrogatepass") as f:
-            lines = f.read().splitlines()
-        out = []
-        found = False
-        new_val = None
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                asp = json.loads(stripped)
-            except Exception:
-                out.append(stripped)
-                continue
+    new_val = []
+
+    def _bump(items):
+        new_val.clear()  # the modifier re-runs on a fenced-write retry
+        for asp in items:
             if asp.get("id") == asp_id:
                 asp["sessions_active"] = int(asp.get("sessions_active", 0)) + 1
-                new_val = asp["sessions_active"]
-                found = True
-            # CRITICAL: ensure_ascii=False is load-bearing — paired with
-            # errors="surrogatepass" on read (L66) and write (L93) to round-trip
-            # Unicode untouched. ensure_ascii=True would silently re-encode every
-            # non-ASCII char in pass-through aspirations on every increment call.
-            out.append(json.dumps(asp, ensure_ascii=False))
-        if found:
-            # Atomic write: write to .tmp first, fsync, then os.replace.
-            # If we wrote directly to target with mode='w' and the encode
-            # failed mid-write, the file would be truncated — exactly the
-            # failure mode that destroyed bravo/aspirations.jsonl in the
-            # initial run of this script before surrogatepass was added.
-            # Always use atomic rename for jsonl writes.
-            tmp = target.with_suffix(target.suffix + ".tmp")
-            with tmp.open("w", encoding="utf-8", errors="surrogatepass", newline="") as f:
-                f.write("\n".join(out) + "\n")
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp, target)
-            print(f"sessions_active incremented for {asp_id} -> {new_val}")
+                new_val.append(asp["sessions_active"])
+        return items
+
+    try:
+        locked_modify_jsonl(target, _bump)
+        if new_val:
+            print(f"sessions_active incremented for {asp_id} -> {new_val[-1]}")
         else:
             print(
                 f"aspirations-increment-sessions-active: {asp_id} not found in {target}",
@@ -113,11 +84,6 @@ def main():
             f"aspirations-increment-sessions-active: error for {asp_id}: {e}",
             file=sys.stderr,
         )
-    finally:
-        try:
-            release_lock(lock)
-        except Exception:
-            pass
 
     sys.exit(0)
 

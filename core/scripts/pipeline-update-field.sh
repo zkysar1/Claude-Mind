@@ -25,12 +25,15 @@ source "$CORE_ROOT/scripts/_argv_strict.sh"
 # fresh-eyes F-002). These were two copies until the review: the helper's own
 # comment asserted they came from one, which was simply false, and two strings
 # that must agree are the drift surface the refusal exists to remove.
-_ACCEPTED_FLAGS="--value-file <path> | --value-stdin"
+_ACCEPTED_FLAGS="--value-file <path> | --value-stdin | --override-reason <reason>"
 
 # --- Parse args -----------------------------------------------------------
 REC_ID=""
 FIELD=""
 VALUE=""
+# The audited repair flag (). The daemon refuses a resolved_at /
+# resolved_by write without it and records it in outcome_detail when it lands.
+OVERRIDE_REASON=""
 # Read by argv_strict_resolve_value below. This parser sets them itself because
 # it does not call argv_strict_parse.
 ARGV_VALUE_FILE=""
@@ -59,6 +62,14 @@ while [[ $# -gt 0 ]]; do
             ARGV_VALUE_FILE="${1#--value-file=}"; shift;;
         --value-stdin)
             ARGV_VALUE_STDIN=1; shift;;
+        --override-reason)
+            if [ $# -lt 2 ]; then
+                printf '%s: --override-reason requires a reason\n' "$(basename "$0")" >&2
+                exit 2
+            fi
+            OVERRIDE_REASON="$2"; shift 2;;
+        --override-reason=*)
+            OVERRIDE_REASON="${1#--override-reason=}"; shift;;
         -*)
             # REFUSE (). This wrapper is named identically to the four
             # *-update-field siblings that DID adopt the strict parser, so it read
@@ -87,11 +98,26 @@ if [ -z "$REC_ID" ] || [ -z "$FIELD" ] || [ -z "$VALUE" ]; then
     exit 1
 fi
 
+# An EMPTY override reason is the same as none: the daemon would refuse it
+# (it strips before checking), so fail here with a message instead of a 400.
+if [ -n "$OVERRIDE_REASON" ] && [ -z "${OVERRIDE_REASON//[[:space:]]/}" ]; then
+    printf '%s: --override-reason was given but is blank; give the reason or drop the flag\n' \
+        "$(basename "$0")" >&2
+    exit 2
+fi
+
 # --- Daemon path ----------------------------------------------------------
 # shellcheck disable=SC1091
 source "$CORE_ROOT/scripts/_runtime.sh"
 
 QUERY="id=$(rt_url_encode "$REC_ID")&field=$(rt_url_encode "$FIELD")&value=$(rt_url_encode "$VALUE")"
+# Forward the audited override only when present (): for a
+# resolved_at/resolved_by write the daemon requires it and records it in
+# outcome_detail; for every other field the daemon ignores it, so an absent
+# flag is the zero-impact default.
+if [ -n "$OVERRIDE_REASON" ]; then
+    QUERY="$QUERY&override_reason=$(rt_url_encode "$OVERRIDE_REASON")"
+fi
 
 rc=0
 RESPONSE="$(rt_call POST /v1/pipeline/update-field \

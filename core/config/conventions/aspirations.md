@@ -496,6 +496,36 @@ without overriding near-term urgency (3/2/1) or `priority` weight. Omitting `dea
 leaves scoring byte-identical to the pre-g-318-04 behavior (the inherited value is
 `None`, so `remaining` is `None` and `deadline_urgency` is 0).
 
+## Aspiration-Level `follow_on_aspiration` Field (g-353-161)
+
+An aspiration that carries a non-empty `closing_set` MAY additionally carry an
+optional top-level `follow_on_aspiration` field — the id of the lane where new
+work for this domain belongs after the set froze (the protocol's follow-on
+lane). Core keys the file-time routing check on the two GENERIC fields only —
+`closing_set` + `follow_on_aspiration` — and names no lanes; which lane is the
+follow-on is a world decision recorded on the lane itself.
+
+```yaml
+closing_set: ["g-326-01", ...]        # the frozen set (world-filled; see the closing protocol)
+follow_on_aspiration: "asp-NNN"       # optional; the lane the routing gate moves new filings to
+```
+
+**Consumption (daemon `add_goal`, g-353-161):** when a goal is filed into an
+aspiration that has BOTH a non-empty `closing_set` AND a `follow_on_aspiration`,
+the filing is closing work only if it IS a closing-set member or it carries the
+guard-7084 rule-2 escape line
+(`WHICH CLOSING-SET OUTCOME THIS UNBLOCKS: <goal-id> outcome <n>` in its title
+or description). Any other filing is REROUTED — the goal is created in the
+follow-on lane, the response is 200 with a loud `CLOSING-LANE REROUTE` warning
+naming both lanes, and `aspirations-add-goal.sh` re-emits that warning to
+stderr. If the follow-on lane does not exist in the store the filing is
+REFUSED with 400 `closing_lane_no_follow_on` (the goal is not lost; the lane's
+field or the target is wrong). A lane with a `closing_set` but NO
+`follow_on_aspiration` is outside the gate: there is no destination named, so
+the check is a no-op and the sweep-time enforcement keeps covering it. Moves
+(`aspirations-move-goals.py`) never route through `add_goal` and are therefore
+never refused by the gate.
+
 ## Self-Generated Aspirations: `supply_evidence` and the aspiration-supply gate
 
 An aspiration the agent invents for itself — the all-blocked B2 → create-aspiration

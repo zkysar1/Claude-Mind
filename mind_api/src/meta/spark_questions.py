@@ -63,7 +63,15 @@ def read(ctx) -> "Response":  # type: ignore[name-defined]
             if rec.get("type") == "question":
                 yr = rec.get("yield_rate", 0.0) or 0.0
                 ta = rec.get("times_asked", 0) or 0
-                lines.append(f"{rec_id}: {truncated} [yield={yr:.2f}, asked={ta}]")
+                # : a non-active question must read as non-active.
+                # Without a marker, retired questions print exactly like live
+                # ones — measured seven misreads in five days across four
+                # agents (goal progress_note; rb-12011).
+                status = rec.get("status") or "active"
+                if status == "active":
+                    lines.append(f"{rec_id}: {truncated} [yield={yr:.2f}, asked={ta}]")
+                else:
+                    lines.append(f"{rec_id}: {truncated} [{status.upper()}] [yield={yr:.2f}, asked={ta}]")
             else:
                 lines.append(f"{rec_id}: {truncated} [CANDIDATE]")
         return plain_lines(lines)

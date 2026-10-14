@@ -113,6 +113,26 @@ policy, and copying inherits it silently). The hazard suppression normally guard
 — a traceback on stderr — is closed at its SOURCE instead: `main()` is wrapped so
 any exception exits 0.
 
+## The close-time sampler (Q4) and what it samples (g-115-11480)
+
+The same analyzer has a second consumer: `q4_provenance_sample.py` (g-357-44) draws a
+scripted sample of an artifact's clusters at verify time and resolves each cluster's
+citations against the session provenance manifest. What it samples, per artifact:
+
+| artifact | sampled text |
+|---|---|
+| a suffix in `q4_code_scope.py` (`.py .sh .bash .java .js .mjs .cjs .ts .tsx .jsx .lua .luau`) | its comments and docstrings only; code lines are blanked and line numbers kept. A `# ` comment is kept but draws no finding (the analyzer reads it as a heading), so in python only docstrings can and in shell nothing can |
+| any other suffix | the whole text, unchanged |
+
+`--authored-since REF` narrows the sample further to the lines the artifact adds
+relative to REF, and the two scopes compose. The result's `code_scoped` lists
+`{artifact, language, kept_lines, total_lines}` for each scoped artifact; an empty
+scoped sample is `skipped`, never `pass`, with the scoping named in `skip_reason`;
+`verify-preflight` prints the kept-line count on its `q4` line. A Q4 FAIL has no
+override and no adjudicated close. The reasoning, the measurements and the rejected
+alternative: `core/config/rationale/verify-check-unevaluatable.md` § "Q4 on code
+artifacts".
+
 ## Files
 
 | path | role |

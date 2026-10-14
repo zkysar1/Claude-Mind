@@ -45,6 +45,21 @@ above. Measured 2026-08-14 (echo, cc-03): category `npc-believability` returned
 22/40 at `--depth medium` and 0/0 with `--as-of 2026-08-09T15:14:56`, while
 guard-120 (created 2026-04-15, still active) proves records existed at T.
 
+**A NON-ZERO AS-OF SET IS STILL A SUBSET, AND ITS ABSENCES ARE NOT AVAILABILITY
+(g-376-98, 2026-10-13).** `retrieve.py` skips the embedding blend and the
+relevance split of the universal cap when `as_of` is set (the `if as_of_dt is
+None:` guards around `_embedding_blend` and `_universal_relevance_split`), so the
+as-of read is the relevance-only list set against a control that also carries
+the blend. Measured on a promotion-train category at `--as-of 2026-10-05T08:25:54`:
+32 reasoning-bank entries and 16 guardrails against 70 and 48 in the control. Of
+the 40 control-only reasoning-bank entries 32 were created before T, and of the
+32 control-only guardrails 31 were, among them a guardrail created eight days
+before T. Read availability off the record's own `created` against T, never off
+set membership (guard-2363: a difference between two capped retrievals is an
+artifact of the cap). Pipeline records carry no `created`, so T is `formed_at`
+(on 995 of 2115 resolved and archived records, measured 2026-10-13), with
+`formed_date`, date-only, on all 2115.
+
 **ENFORCEMENT CLASS, stated rather than implied (guard-399 amendment 2).** Both
 lines are LLM-elected, so pairing them REDUCES two elections to one — it does not
 make the control unconditional. Prose and a `Bash:` line are the same enforcement
