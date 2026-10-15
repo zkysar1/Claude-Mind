@@ -59,8 +59,6 @@ WHAT IT REFUSES, and why each refusal is a real failure someone hit
   - a projected/absent/ambiguous read            -> nothing is composed
   - a non-text field (dict/list)                 -> guard-2444 nested-parent
                                                     replace drops sibling keys
-  - a composed value starting with { or [        -> the wrapper's parse_value
-                                                    would JSON-decode it
   - an unknown flag                              -> _argv_strict, exit 2
 
 IDEMPOTENCY
@@ -652,7 +650,16 @@ def rotate_oversize(goal_id: str, field: str, source: str, pre: str) -> str:
 
 
 def compose(pre: str, text: str, marker: str) -> str:
-    """PRE + blank line + text + sentinel. Empty PRE yields no leading blank."""
+    """PRE + blank line + text + sentinel. Empty PRE yields no leading blank.
+
+    The sentinel line also keeps the result from ever parsing as JSON, and main() relies
+    on that (g-115-9103). The update wrapper decodes a value that opens with '{' or '['
+    and stores an object when the decode succeeds. The last line here is
+    "[appended:<marker>]": its '[' starts a line, so it is structural (a raw newline
+    cannot sit inside a JSON string), and the 'a' after it opens no JSON token, so the
+    decode always fails and the wrapper keeps the text. Keep the last line non-JSON;
+    test_goal_field_append.py section 4b pins it.
+    """
     return (pre + "\n\n" if pre else "") + text + "\n" + sentinel_for(marker)
 
 
@@ -797,14 +804,11 @@ def main(argv=None) -> int:
 
     new = compose(pre, text, args.marker)
 
-    # The wrapper's parse_value JSON-decodes any value that starts with { or [
-    # (aspirations-update-goal.sh:134). A composed value that starts with one
-    # would be stored as a parsed object rather than the text we built.
-    if new[:1] in ("{", "["):
-        _die(RC_VALUE_SHAPE,
-             "composed value starts with '{' or '[' — the update wrapper would JSON-decode it "
-             "rather than store it as text. Prefix the field's existing content or the appended "
-             "text so it does not begin with a JSON opener.")
+    # NO FIRST-CHARACTER CHECK HERE (). The update wrapper JSON-decodes a value
+    # that opens with '{' or '[', but compose() ends every value with a non-JSON sentinel
+    # line (see its docstring), so the decode always fails and the text is stored as built.
+    # The check that stood here refused every note already opening with a bracket and
+    # stopped no bad write. verify_post() below checks what was stored.
 
     # PRE-WRITE RE-READ (the compare half of a compare-and-swap) — .
     # read_goal() above and the write below are two separate subprocess

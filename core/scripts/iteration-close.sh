@@ -1115,6 +1115,55 @@ _append_recent_completion() {
         --value "{\"goal_id\":\"$GOAL_ID\",\"completed_by\":\"$AGENT\",\"completed_at\":\"$NOW_ISO\",\"key_finding\":\"$key_finding\"}" || echo "[iteration-close] WARN: team-state-update recent_completions failed for $GOAL_ID" >&2
 }
 
+# ─── Owed-close sentinel (g-115-11905) ──────────────────────────────────────
+# `--phase verify` marks a deep non-recurring goal completed BEFORE its spark,
+# state-update and learning-gate run, and nothing durable named those owed steps:
+# a compaction in that window re-selected a new goal and the closed one ended with
+# no encoding (g-374-415). do_verify writes ONE sentinel naming the goal and the
+# steps; do_state_update clears it once it lands; the entry battery lists it.
+# Why it clears at state-update and not at the spark, the refusal rule, and the
+# limits: core/config/rationale/owed-close-sentinel.md
+#
+# Both are NON-FATAL: the status write is the close and the sentinel is the net
+# behind it (g-115-7663). The decisions come from the pure helper, which is fed the
+# slot value on stdin; the wm I/O stays here because a python process must not
+# spawn the wm wrappers (rb-225 / rb-247).
+_write_close_owed_sentinel() {
+    local _slot_json _verdict _payload
+    _slot_json="$(bash "$SCRIPT_DIR/wm-read.sh" pending_close_owed --json 2>/dev/null || true)"
+    _verdict="$(printf '%s' "$_slot_json" \
+                | python3 "$(_winpath "$SCRIPT_DIR/close-owed-sentinel.py")" check-write --goal "$GOAL_ID" 2>/dev/null || true)"
+    if [[ "$_verdict" == refuse:* ]]; then
+        # guard-2104: the payload is derived from ONE close, so an unconditional
+        # write would silently cancel the other goal's obligation.
+        echo "[iteration-close] REFUSING to overwrite pending_close_owed: the slot holds an UNCONSUMED owed close for ${_verdict#refuse:} and this close is $GOAL_ID. guard-2104 — overwriting would cancel ${_verdict#refuse:}'s obligation with nothing reporting it. Leaving it intact; finish ${_verdict#refuse:}'s close first. $GOAL_ID's owed close rides this stdout imperative and the postcompact CLOSE OWED banner." >&2
+        return 0
+    fi
+    _payload="$(python3 "$(_winpath "$SCRIPT_DIR/close-owed-sentinel.py")" payload \
+                    --goal "$GOAL_ID" --source "$SOURCE" --outcome "$OUTCOME" \
+                    --started-at "$NOW_ISO" --summary "${SUMMARY:-}" 2>/dev/null || true)"
+    if [[ -z "$_payload" ]]; then
+        echo "[iteration-close] WARN: could not build pending_close_owed payload for $GOAL_ID (non-fatal)" >&2
+        return 0
+    fi
+    printf '%s' "$_payload" | bash "$SCRIPT_DIR/verified-wm-set.sh" pending_close_owed >/dev/null 2>&1 \
+        || echo "[iteration-close] WARN: pending_close_owed sentinel write did not verify for $GOAL_ID (non-fatal — the stdout imperative and the postcompact banner remain)" >&2
+}
+
+_clear_close_owed_sentinel() {
+    local _slot_json _verdict
+    _slot_json="$(bash "$SCRIPT_DIR/wm-read.sh" pending_close_owed --json 2>/dev/null || true)"
+    _verdict="$(printf '%s' "$_slot_json" \
+                | python3 "$(_winpath "$SCRIPT_DIR/close-owed-sentinel.py")" check-clear --goal "$GOAL_ID" 2>/dev/null || true)"
+    case "$_verdict" in
+        clear)
+            echo null | bash "$SCRIPT_DIR/verified-wm-set.sh" pending_close_owed >/dev/null 2>&1 \
+                || echo "[iteration-close] WARN: pending_close_owed clear did not verify for $GOAL_ID (non-fatal — the entry battery keeps listing it until it is cleared by hand)" >&2 ;;
+        keep:*)
+            echo "[iteration-close] pending_close_owed left set: it names ${_verdict#keep:}, not $GOAL_ID. That goal's close is still owed." >&2 ;;
+    esac
+}
+
 # ─── Shared helper: probe whether GOAL_ID is a recurring goal ───────────────
 # Reads the goal record from the source aspirations file; echoes "true"/"false".
 # Fail-open: any probe error → "false" (treat as non-recurring; the caller's own
@@ -1715,6 +1764,17 @@ do_verify() {
             update_cmd+=(--outcome-note-file "$OUTCOME_NOTE_FILE")
         fi
         "${update_cmd[@]}"
+        # Owed-close sentinel (g-115-11905): the write above made this goal
+        # completed BEFORE its spark, state-update and learning-gate ran, so name
+        # those steps durably NOW. Sited here and not beside the stdout imperative
+        # ~600 lines below, because everything between is bookkeeping that can
+        # abort the phase (g-115-7663) and an abort past this point must not cost
+        # the sentinel. Reducer, deep, non-recurring, not a drain: a worker Body
+        # runs no state-update (its spark is the Phase 3.5 capture) and a drained
+        # goal is another session's unit, so the slot would never clear for either.
+        if [[ "$GOAL_STATUS" == "completed" && "$OUTCOME" == "deep" && -z "$DRAIN" && "${BODY_ROLE:-}" != "worker" ]]; then
+            _write_close_owed_sentinel
+        fi
         # completed_date: NO separate stamp here (g-358-36). The daemon's 6a
         # cascade (g-115-5069, aspirations_write.py) auto-stamps
         # completed_date inside the status write itself whenever the field is
@@ -3082,6 +3142,15 @@ print(sha)
     _checkpoint_update "$GOAL_ID" --set "outcome_class=$OUTCOME"
 
     _checkpoint_refresh state_update "$GOAL_ID"
+
+    # Owed-close sentinel (g-115-11905): state-update has landed, so the close is
+    # no longer owed from here. Sited on the checkpoint's own phase_completed stamp
+    # so the two durable records cannot disagree, and gated like the write in
+    # do_verify (the spark sentinel's gate; $_su_is_recurring is set above).
+    # Only THIS goal's payload is removed.
+    if [[ "$OUTCOME" == "deep" && "$_su_is_recurring" != "true" ]]; then
+        _clear_close_owed_sentinel
+    fi
 
     # Step 8.78 Post-State-Update Gate (g-248-17, rb-428 pattern).
     # Script-without-caller drift fix: the gate itself (post-state-update-gate.sh)

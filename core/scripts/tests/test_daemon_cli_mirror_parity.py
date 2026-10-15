@@ -259,8 +259,16 @@ def _compiled_regex_pattern(mod: ast.Module, name: str) -> str:
                     and isinstance(call.args[0], ast.Constant)
                     and isinstance(call.args[0].value, str)):
                 return call.args[0].value
+            if (isinstance(call, ast.Attribute) and isinstance(call.value, ast.Name)
+                    and call.value.id == "goal_id_patterns"):
+                # : the literal now lives in core/scripts/goal_id_patterns.py and
+                # both twins alias the SAME compiled object. Compare the pattern the alias
+                # names; a hand-typed literal restored on one side still differs from it.
+                import goal_id_patterns
+                return getattr(goal_id_patterns, call.attr).pattern
             raise AssertionError(
-                f"{name!r} is not a `re.compile(<string literal>)` assignment; "
+                f"{name!r} is not a `re.compile(<string literal>)` or "
+                "`goal_id_patterns.<NAME>` assignment; "
                 "this extractor must be widened before it can compare the pair"
             )
     raise AssertionError(f"module-level assignment {name!r} not found")

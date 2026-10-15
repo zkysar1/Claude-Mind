@@ -884,7 +884,13 @@ RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capt
                          # leave the slot (batch-micro writeback) and the
                          # array_limit (30) caps the population, so a carried pending
                          # set stays live without growing unbounded.
-                         "micro_hypotheses"}
+                         "micro_hypotheses",
+                         # : an owed close (verify landed, state-update has
+                         # not) is a standing obligation, not session bookkeeping; a
+                         # consolidation-time reset between the two would drop it
+                         # silently. The slot is also in memory-pipeline.yaml
+                         # protected_slots, or maintenance evicts it after 120 min.
+                         "pending_close_owed"}
 
 def _is_cadence_tracker(slot_name):
     """True if slot name matches a cadence-tracker pattern — do not evict.

@@ -31,6 +31,18 @@
 #                                            core/scripts/peer_board_post.py
 #                                            core/scripts/outbound_data_class.py
 #                                            core/scripts/env.py
+#                                            core/scripts/goal_id_patterns.py
+#
+#      goal_id_patterns.py added 2026-10-13 (, worker Body alpha). The
+#      shared goal-id pattern module: mind_api/src/endpoints/aspirations_write.py
+#      and mind_api/src/endpoints/experience_write.py import it at module top, so
+#      the daemon holds it in-process while its own path was not in the pathspec.
+#      A commit touching ONLY goal_id_patterns.py would have diffed clean,
+#      post-commit skipped the restart, and the daemon kept serving the OLD goal-id
+#      grammar — the exact generation-brake shape this goal exists to stop (a stale
+#      copy of the SEQUENCE fragment is where a bound comes back). Caught by
+#      test_daemon_import_surface.py in the scoped run that landed the wiring. The
+#      seventh instance of guard-7548's shape.
 #
 #      peer_surface.py added 2026-08-14 (): board_write.py's post
 #      handler now imports suspected_routing_tags from it for the routing-tag
@@ -233,6 +245,7 @@ DAEMON_PATHSPEC=(
     core/scripts/peer_board_post.py
     core/scripts/outbound_data_class.py
     core/scripts/env.py
+    core/scripts/goal_id_patterns.py
 )
 
 # --print-pathspec: emit the boundary, one entry per line, exit 0. For consumers

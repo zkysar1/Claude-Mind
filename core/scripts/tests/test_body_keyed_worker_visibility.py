@@ -329,6 +329,22 @@ def test_partner_in_flight_probe_skips_null_body_rows(tmp_path, monkeypatch):
 # ── 5. worker close clears the body row ─────────────────────────────────────
 
 
+@pytest.fixture
+def resident_bravo(monkeypatch, tmp_path):
+    """bravo is a RESIDENT agent for the test: its dir exists.
+
+    clear_body_row asks `_paths.agent_dir` (imported at call time) whether the agent is resident.
+    Against the checkout that answers from the dev origin's tracked agent dirs, so a deployment-
+    shaped checkout has no bravo, the call returns `not-resident`, and the test asserts a branch
+    other than the one it names (rb-12992). Pinned on the module the function imports from, not
+    on the environment (rb-13019, rb-3643).
+    """
+    import _paths
+
+    (tmp_path / "bravo").mkdir()
+    monkeypatch.setattr(_paths, "agent_dir", lambda name: tmp_path / name)
+
+
 def test_clear_body_row_requires_sid():
     """No SID means no row was ever written, so there is nothing to clear — and
     an unkeyed clear must never be attempted."""
@@ -336,7 +352,7 @@ def test_clear_body_row_requires_sid():
     assert wc.clear_body_row("bravo", "") == "no-sid"
 
 
-def test_clear_body_row_targets_this_sid(monkeypatch):
+def test_clear_body_row_targets_this_sid(monkeypatch, resident_bravo):
     seen = {}
 
     def fake_call(method, path, query=None, **kw):
@@ -362,7 +378,7 @@ def test_clear_body_row_targets_this_sid(monkeypatch):
     assert "value" not in seen["query"]
 
 
-def test_clear_body_row_fails_open(monkeypatch):
+def test_clear_body_row_fails_open(monkeypatch, resident_bravo):
     def boom(*a, **k):
         raise RuntimeError("daemon down")
 

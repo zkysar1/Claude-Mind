@@ -324,6 +324,63 @@ def test_the_floor_yields_to_a_prior_hoist(monkeypatch):
     assert rows == before
 
 
+def test_the_floor_yields_to_a_directive_pick_the_scorer_already_holds(monkeypatch):
+    """, on the measured shape: a directive-lane row with the highest
+    score, a reducer-only row below it, 4 live workers, the reducer role.
+
+    The strategic-focus floor reports a pick the scorer already put at index 0 as
+    `honored_by_merit` and returns no pick, so a caller reading only the pick
+    passed prior_hoist_fired=False and the policy displaced the directive's goal
+    with a lower-scoring reducer-only row (16.0 under 9.91 on 2026-10-14). This
+    chains the REAL strategic floor into the REAL reducer floor, with the call
+    site's own terms."""
+    monkeypatch.setattr(gs, "load_strategic_focus",
+                        lambda: {"aspirations": {"asp-376"}, "weight": 1.0})
+    team = _team_state(*[("a", f"s{i}", 1) for i in range(4)])
+
+    def pool():
+        return [
+            {"goal_id": "g-376-1", "aspiration_id": "asp-376", "score": 16.0,
+             "recurring": False, "skill": None, "executable_by_role": None,
+             "intended_agent": "either", "title": "a directive-lane goal"},
+            {"goal_id": "g-001-1", "aspiration_id": "asp-001", "score": 9.9,
+             "recurring": True, "skill": None, "executable_by_role": "reducer",
+             "intended_agent": "either", "title": "a reducer-only goal"},
+        ]
+
+    rows = pool()
+    sf_pick, sf_status = gs.apply_strategic_focus_floor(rows, "echo")
+    assert sf_pick is None and sf_status["honored_by_merit"] is True
+    picked, status = _floor(
+        monkeypatch, body_role=None, sid=SID, running_sid=SID, team_state=team,
+        rows=rows,
+        prior_hoist=(sf_pick is not None
+                     or bool(sf_status.get("honored_by_merit"))))
+    assert picked is None and status["yielded"] is True
+    assert rows[0]["goal_id"] == "g-376-1", "the directive's goal keeps index 0"
+
+    # CONTROL (guard-2421, guard-1655): the pre-fix argument read only the pick.
+    # On the same pool the same floor then displaces the directive's goal, so a
+    # green arm above is the fix at work and not an inert floor.
+    rows = pool()
+    sf_pick, _ = gs.apply_strategic_focus_floor(rows, "echo")
+    picked, status = _floor(
+        monkeypatch, body_role=None, sid=SID, running_sid=SID, team_state=team,
+        rows=rows, prior_hoist=(sf_pick is not None))
+    assert picked is not None and picked["goal_id"] == "g-001-1"
+    assert rows[0]["goal_id"] == "g-001-1"
+
+
+def test_the_call_site_hands_honored_by_merit_to_the_policy():
+    """The composition above is built from the call site's terms, so it cannot
+    see the call site drift. Pin the wiring itself: the reducer-only floor's
+    yield argument must read the strategic-focus floor's `honored_by_merit`
+    (g-115-10696)."""
+    src = (CORE_SCRIPTS / "goal-selector.py").read_text(encoding="utf-8")
+    start = src.index("apply_reducer_only_floor(\n            scored, AGENT_DIR")
+    assert '_sf_floor_status.get("honored_by_merit")' in src[start:start + 400]
+
+
 def test_no_reducer_only_row_in_the_pool_is_inert_not_an_error(monkeypatch):
     rows = _rows(("g-1-1", None, None), ("g-2-2", None, "worker"))
     before = [dict(r) for r in rows]

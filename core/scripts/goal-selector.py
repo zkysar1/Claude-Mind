@@ -7121,7 +7121,8 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     Fail-open throughout: never raises, never blocks selection.
     """
     status = {"lanes": [], "pool_lane_rows": 0, "claimable": 0,
-              "picked": None, "yielded_to_drain_lane": False}
+              "picked": None, "yielded_to_drain_lane": False,
+              "honored_by_merit": False}
     if not agent_name or not scored:
         return None, status
     try:
@@ -7150,6 +7151,14 @@ def apply_strategic_focus_floor(scored, agent_name, drain_lane_fired=False):
     # Already honored: the scorer's own top eligible pick is lane work.
     mine = [s for s in scored if _strategic_focus_claimable(s, agent_name)]
     if mine and mine[0].get("aspiration_id") in lanes:
+        # This branch makes no move, so it raises no hoist event: `picked` stays
+        # None and a later floor that reads only the pick cannot tell a directive
+        # already holding index 0 from no directive at all. Say whether the honor
+        # is real. It is real only when the top row is a NOMINEE, i.e. it passes
+        # the exclusion filter the hoist applies, so a recurring sweep that merely
+        # sits in a lane's aspiration does not stand in for the directive
+        # ().
+        status["honored_by_merit"] = any(mine[0] is n for n in nominees)
         return None, status
 
     # Highest PRIORITY nominee, score breaking ties (). This was
@@ -8212,11 +8221,18 @@ def cmd_select(args):
     # (LIFECYCLE_DISPOSITIONS["select"]: "there is no worker-specific selection
     # logic and there must not be one" — none is added; the asymmetry is entirely
     # on the reducer side, which is the direction the directive asks for).
+    # A directive pick the scorer already holds at index 0 needed no move, so the
+    # strategic-focus floor reports it as `honored_by_merit` and not as `_sf_pick`.
+    # The policy yields to it exactly as it yields to a pick that was moved: the
+    # precedence above is about the directive holding the slot, not about how it
+    # got there (). `_sf_floor_status` is pre-bound `{}`, so a floor
+    # error still means "no hoist".
     try:
         _ro_pick, _ro_status = apply_reducer_only_floor(
             scored, AGENT_DIR,
             prior_hoist_fired=(_lane_pick is not None or _sf_pick is not None
-                               or _od_pick is not None))
+                               or _od_pick is not None
+                               or bool(_sf_floor_status.get("honored_by_merit"))))
         emit_reducer_only_floor_banner(_ro_pick, _ro_status)
     except Exception as e:  # pragma: no cover - defensive; policy must never block
         print(f"[goal-selector] reducer-only floor error "

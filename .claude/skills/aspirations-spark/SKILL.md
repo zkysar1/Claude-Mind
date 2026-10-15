@@ -1586,13 +1586,13 @@ When sq-018 fires after goal completion:
        one-at-a-time and singletons keep per-check provenance sharpest.
        (15 is UNCHANGED, but what it judges is not. It was calibrated against the
        WIDE population — observed 26, 30, 38, 45 — and that justification died with
-       the wide driver. It now judges the true lane, which has never been measured
-       above ~12 and read 1 on 2026-08-09. So this branch is DORMANT by design: it
-       fires only if genuine check-proposals ever accumulate to 15, which has not
-       happened once. That is the intended outcome, not a dead gate — every firing
-       of the consolidation branch to date was driven entirely by non-members, so a
-       branch that no longer fires on them has stopped being wrong, not stopped
-       working. Do NOT lower the threshold to make it fire again: nobody has
+       the wide driver. It now judges the true lane. CORRECTED 2026-10-14T11:06
+       (bravo, g-353-04; guard-5609): this paragraph called the branch DORMANT
+       ("never above ~12, 15 not reached once"). The lane re-climbed: 22 on
+       2026-09-24, 24 on 2026-09-29, 24 on 2026-10-14, each with an open drain
+       (g-115-5920), so the ELIF DRAIN_GOAL branch below is the LIVE path and
+       LANE_DEPTH above 15 is expected, not a broken probe. Do NOT retune the
+       threshold on this evidence: nobody has
        measured what depth of REAL check-proposals is worth batching, and 8 was
        calibrated against a third population that is not this one either. If it
        needs re-calibrating, measure first.

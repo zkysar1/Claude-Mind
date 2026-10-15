@@ -279,6 +279,11 @@ working_memory_pruning:
     # bypass update_modified; ). Without protection, wm-prune evicts
     # mid-session and Phase -0.5 reinitializes counters/streaks every iteration.
     - loop_state
+    # pending_close_owed () — an owed close is written once at verify and
+    # has no producer that re-arms it, so wm-prune's scalar eviction would null it
+    # after evict_threshold_minutes (120) even while the close is still owed.
+    # RESET_SURVIVING_SLOTS in wm.py and wm_write.py covers the other cleanup path.
+    - pending_close_owed
 
 micro_hypothesis_consolidation:
   description: >

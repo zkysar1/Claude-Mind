@@ -50,8 +50,8 @@ REDUCER-ONLY. The lanes' apply forms mutate shared reclaim state and the budget 
 state file is agent-wide and syncable, so a worker Body gets an explicit SKIPPED report
 (never a clean one). Same ruling as iteration-open._meter and precheck-medium-battery.
 
-THE METER IS TOUCHED FROM ONE THREAD. `meter check` / `meter executed` are
-read-modify-write on one JSON file, so a parallel lane calling them would lose records.
+THE METER IS TOUCHED FROM ONE THREAD (g-115-8001). `meter check` / `meter executed`
+are read-modify-write on one JSON file, so a parallel lane calling them would lose records.
 Every meter call happens on the scheduler (main) thread; workers only run subprocesses.
 
 Every lane's stdin is /dev/null. A hand-runner's `while read ... done < table` loop let
@@ -61,16 +61,48 @@ a row in `lanes[]`, and the report self-checks attempted-vs-registered, so a ski
 is a visible missing row rather than a quiet gap.
 
 Output (guard-424 fail-loud-on-stderr; guard-614 structured on EVERY exit path):
-  default -- one human line per lane with a finding, blind, dropped or held, then:
+  default -- one human line per lane with a finding, blind, dropped or held, then the
+      signature diff (g-115-12183): lanes whose signature CHANGED since the previous
+      apply print first (prev -> now), unchanged lanes follow as one-line rows, then:
       [deferrable-battery] N finding / M lanes (mode=apply, completeness=complete, ...)
   --json  -- {checked_at, mode, status, completeness, lanes_registered, budget_s, jobs,
               elapsed_ms, findings, blind, dropped, held, uninterpreted, executed,
-              lanes, skipped?, error?}
+              lanes, witness_failed, sigs, sig_diff, prev_checked_at?, skipped?, error?}
 
 `status` and `completeness` stay ORTHOGONAL (guard-4093): `status` is whether anything
 was found; `completeness` is whether every lane that was supposed to run was seen. A lane
 with no finding spec is listed under `uninterpreted` with its signature and is NEVER
 counted as clean.
+
+PERSISTED BESIDE ITS PRECHECK-END RECORD (g-115-12183, residual of g-115-8001). Every
+completed run appends ONE `deferrable-battery-end` row to the SAME
+`<agent>/session/precheck-drops.jsonl` the meter's `precheck-end` summary lives in
+(fleet-synced per session-manifest.yaml — readable from another box; append-only, so it
+OUTLIVES the next apply, unlike the per-agent /tmp report iteration-open clobbers). The
+row carries the dropped / blind / held lanes WITH reasons, the executed names, the
+`witness_failed` names and every lane's signature (`sigs`). WHY EACH FIELD:
+
+* `witness_failed` -- the third shortfall class. The meter's `executed` op is a
+  read-modify-write on the one-shot state file, so a witness call made after `end`
+  unlinked it (or one that otherwise failed) was ALWAYS swallowed: `_meter` returned
+  None, `_record` discarded it, and the lane still landed in `executed`. The meter's
+  `tail_executed` then read lower than the battery's `executed` for no visible reason,
+  and `sweeps_dropped=0` read as healthy beside it. The battery must record the
+  witness outcome PER LANE, because the state file is gone by the time `end` tallies.
+* `sigs` -- the persisted last signature per lane (the follow-up g-115-8001's progress
+  note named as not built). The NEXT apply reads the newest earlier `deferrable-battery-
+  end` row from that same log and prints changed lanes first, unchanged lanes as
+  one-line rows: a standing finding is a diff, not a repetition.
+* the CLASSIFIER (classify_shortfall) reads stored data ALONE -- a `precheck-end` row
+  plus the newest `deferrable-battery-end` row -- and explains any apply where
+  tail_considered > tail_executed and sweeps_dropped == 0 (the 2026-10-07T01:08:22
+  shape: 53 considered, 22 executed, 0 dropped) as over-budget drops, BLIND lanes or
+  unwitnessed executions. It cannot see the meter's state file: that is the point.
+
+A SKIPPED worker report appends NOTHING (nothing ran, and the state file must stay the
+reducer's to witness). A crashed `main()` path appends NOTHING either: a partial run's
+half-written row would poison the next apply's changed-first comparison, and fail-open
+already printed the structured report.
 
 Fail-open: any error prints the structured report (also to stderr) and exits 0. The
 battery must never block the loop -- an entry gate that can refuse entry is worse than
@@ -410,13 +442,97 @@ def _is_worker_body(env=None):
 
 def _meter(action, runner, sweep=None):
     """Call the budget meter; None means RUN (a meter that cannot be reached must never
-    silently disable a lane). Called ONLY from the scheduler thread -- the state file is
-    one JSON document updated read-modify-write."""
+    silently disable a lane). Called ONLY from the scheduler thread (g-115-8001)
+    -- the state file is one JSON document updated read-modify-write (g-115-12183).
+
+    `check` only. The `executed` witness goes through `_witness_executed`, which does
+    NOT swallow a failed call: a swallowed witness is how a lane that ran reads as
+    unwitnessed in the meter's tally (g-115-12183)."""
     argv = [_METER, action] + ([sweep] if sweep else [])
     _res = runner(argv, 30)
     if _res[2] is not None:
         return None
     return (_res[1] or "").strip() or None
+
+
+_END_EVENT = "deferrable-battery-end"
+
+
+def _agent_session_dir(env=None):
+    """The bound agent's session/ dir (None when unresolvable).
+
+    The meter wrapper resolves the same dir from _paths.sh's `$AGENT_DIR`, but that
+    variable is NOT exported (shell-only, _paths.sh header), so a child python cannot
+    read it. This is the sanctioned twin: the MIND_AGENT_DIR override first (the
+    test seam _paths.py honours), then _paths.py's bound-agent resolution -- the same
+    fallback precheck-gap-check.py uses to find this very log."""
+    e = env if env is not None else os.environ
+    override = (e.get("MIND_AGENT_DIR") or "").strip()
+    if override:
+        return Path(override) / "session"
+    try:
+        from _paths import AGENT_DIR as _PD  # type: ignore
+        if _PD:
+            return Path(_PD) / "session"
+    except Exception:
+        pass
+    return None
+
+
+def _drop_log_path(env=None):
+    """The fleet-synced drop log the meter and this battery share (None when
+    unresolvable): `<agent>/session/precheck-drops.jsonl`, same construction as the
+    meter's DROP_LOG (aspirations-precheck-budget-meter.sh)."""
+    sd = _agent_session_dir(env)
+    return None if sd is None else sd / "precheck-drops.jsonl"
+
+
+def _state_file_path(env=None):
+    """The meter's one-shot state file, same construction as the meter's
+    STATE_FILE (`$AGENT_DIR/session/precheck-budget-state.json`)."""
+    sd = _agent_session_dir(env)
+    return None if sd is None else sd / "precheck-budget-state.json"
+
+
+def _witness_executed(runner, lane_name, env=None):
+    """Witness one completed lane in the meter WITHOUT swallowing the outcome.
+
+    Returns (ok, why). The meter's `executed` arm is fail-open by design -- it exits 0
+    even when it did nothing (no state file, a disabled meter, an unreadable state, a
+    failed write; aspirations-precheck-budget-meter.sh `executed` arm) -- so rc alone
+    cannot say the witness landed. This function verifies the LANDING, not the call:
+    it reads the meter's one-shot state file and requires an appended
+    `decision: executed` row for this sweep. Any missing link counts as FAILED,
+    because in every case the lane ran but the meter's `tail_executed` will not carry
+    it -- the shape the 2026-10-07T01:08:22 tally hid (tail_considered above
+    tail_executed with sweeps_dropped 0, the shortfall unexplained).
+    Scheduler-thread only, like every meter call from this battery.
+    A worker Body never gets here: the battery is skipped before any lane runs."""
+    argv = [_METER, "executed", lane_name]
+    _res = runner(argv, 30)
+    if _res[2] is not None:
+        return False, f"meter call failed ({_res[2]})"
+    if _res[0] != 0:
+        return False, f"meter call exited rc={_res[0]}"
+    sf = _state_file_path(env)
+    if sf is None:
+        return False, "meter state file path unresolvable -- no bound agent"
+    if not sf.is_file():
+        return False, ("meter state file absent -- the witness was a no-op "
+                       "(the meter window was never opened or already closed)")
+    try:
+        state = json.loads(sf.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return False, f"meter state file unreadable ({exc})"
+    if not isinstance(state, dict) or state.get("disabled"):
+        return False, "meter is disabled -- the witness was a no-op"
+    landed = any(isinstance(s, dict) and s.get("sweep") == lane_name
+                 and s.get("decision") == "executed"
+                 for s in state.get("sweeps", []))
+    if not landed:
+        return False, ("meter appended no executed record for this sweep "
+                       "(state unreadable or write failed inside the meter)")
+    return True, ""
 
 
 # --- judging one lane's result ------------------------------------------------
@@ -487,7 +603,7 @@ def _spec_details(spec, payload):
 def _judge_cadence(payload):
     """The cadence battery's own report: each FIRED ritual is a finding that names the
     skill to dispatch, and an escalation is a louder one. The SKILL dispatch loop keeps
-    ownership of the invocation (the battery's own design)."""
+    ownership of the invocation (the battery's own design, g-115-8001)."""
     out = []
     for e in payload.get("fired") or []:
         if isinstance(e, dict):
@@ -606,6 +722,29 @@ def _emit(report, as_json):
     if report.get("skipped"):
         print(f"[deferrable-battery] SKIPPED — {report['skipped']}")
         return
+    # Signature diff, CHANGED FIRST (): a standing finding is a diff, not a
+    # repetition. Changed lanes (new / gone / value changed) print first; unchanged
+    # lanes follow as one-line rows in registry order.
+    sigs = report.get("sigs") or {}
+    if sigs:
+        _PH = {l["name"]: l["phase"] for l in LANES}
+        diff = report.get("sig_diff") or []
+        prev_at = report.get("prev_checked_at")
+        print(f"\nSIGNATURES ({'prev ' + prev_at if prev_at else 'first apply — no previous record'}):")
+        if diff:
+            print(f"  CHANGED ({len(diff)}):")
+            for c in diff:
+                ph = _PH.get(c["name"], "?")
+                if c.get("prev") is None:
+                    print(f"    + {c['name']} (phase {ph}) new — {c['now']}")
+                elif c.get("now") is None:
+                    print(f"    - {c['name']} (phase {ph}) gone — was: {c['prev']}")
+                else:
+                    print(f"    ~ {c['name']} (phase {ph}): {c['prev']} => {c['now']}")
+        changed_names = {c["name"] for c in diff}
+        for l in LANES:
+            if l["name"] in sigs and l["name"] not in changed_names:
+                print(f"    = {l['name']} (phase {l['phase']}) {sigs[l['name']]}")
     n_find = len(report.get("findings", []))
     n_reg = report.get("lanes_registered", 0)
     mode, comp = report.get("mode"), report.get("completeness")
@@ -625,6 +764,162 @@ def _emit(report, as_json):
         print(f"[deferrable-battery] {n_find} finding / {n_reg} lanes ({tail})")
 
 
+# --- the persisted end record + the signature diff () -----------------
+def _newest_battery_end(drop_log):
+    """The newest `deferrable-battery-end` row in the drop log, or None.
+
+    File order is append order for this event (one writer: this battery, on the
+    reducer). Corrupt lines are skipped, not fatal -- the log also carries the
+    meter's rows, which are not this shape."""
+    if drop_log is None or not drop_log.is_file():
+        return None
+    newest = None
+    try:
+        with drop_log.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(rec, dict) and rec.get("event") == _END_EVENT:
+                    newest = rec
+    except OSError:
+        return None
+    return newest
+
+
+def _sig_diff(prev_sigs, now_sigs):
+    """Lanes whose signature changed since the previous apply, in registry order
+    (added/removed lanes sorted after). `prev: None` marks a lane with no previous
+    signature (first apply after this record lands), which is a CHANGE worth
+    printing first, not an unchanged row."""
+    prev = prev_sigs or {}
+    names = [l["name"] for l in LANES if l["name"] in now_sigs or l["name"] in prev]
+    names += sorted((set(now_sigs) | set(prev)) - set(names))
+    return [{"name": n, "prev": prev.get(n), "now": now_sigs.get(n)}
+            for n in names if prev.get(n) != now_sigs.get(n)]
+
+
+def _persist_battery_end(report, env, errors):
+    """Append this run's end record to the fleet-synced drop log (None-safe).
+
+    Fail-open like everything else in this file: an unreadable/unwritable log is an
+    ERROR LINE in the report, never a raised exception or a blocked loop. The record
+    is the classifier's input (classify_shortfall) and the next apply's diff base, so
+    it is written ONLY for a run that got to a verdict (never for a skipped worker
+    report, never for a crashed main())."""
+    path = _drop_log_path(env)
+    if path is None:
+        return None
+    sigs = {r["name"]: r["sig"] for r in report["lanes"] if r.get("sig") is not None}
+    rec = {
+        "ts": int(time.time() * 1000),
+        "event": _END_EVENT,
+        "checked_at": report["checked_at"],
+        "mode": report["mode"],
+        "status": report["status"],
+        "completeness": report["completeness"],
+        "budget_s": report.get("budget_s"),
+        "elapsed_ms": report.get("elapsed_ms"),
+        "executed": report["executed"],
+        "executed_count": len(report["executed"]),
+        "witness_failed": report["witness_failed"],
+        "dropped": report["dropped"],
+        "blind": report["blind"],
+        "held": report["held"],
+        "sigs": sigs,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        errors.append(f"drop-log persist: {exc}")
+    return rec
+
+
+def classify_shortfall(end_row, battery_row):
+    """Explain a precheck-end row from STORED DATA ALONE ( outcome 2).
+
+    The 2026-10-07T01:08:22 shape -- tail_considered above tail_executed with
+    sweeps_dropped 0 -- read as healthy for a week because the shortfall had no
+    durable home. Every lane in that gap is one of three things, each pinned by a
+    field this battery persists:
+      * `over-budget drop` -- it asked the meter, got `run`, and the battery's own
+        wall budget ran out before it started (never witnessed; in `dropped`,
+        reason `over budget`);
+      * `BLIND` -- it started but could not be read to a verdict (never witnessed;
+        in `blind`);
+      * `unwitnessed execution` -- it ran to completion and was read, but its
+        `meter executed` witness failed (in `witness_failed`).
+    Held lanes are NOT part of the shortfall: they never asked the meter, so they are
+    in neither tail_considered nor tail_executed.
+
+    The tail also carries the MEDIUM battery and any digest lanes, which this record
+    does not cover. `battery_considered` is the battery's OWN share (executed plus
+    the four unwitnessed classes). `exhausted` is the conservation identity across
+    the TWO INDEPENDENTLY WRITTEN STORES -- the meter's end row and this battery's
+    record: tail_considered - tail_executed must equal the number of lanes the
+    battery reports as considered-but-unwitnessed (unwitnessed + blind + over-budget
+    dropped + meter-decided dropped). When it does not, the remainder is the
+    medium/digest side's share (or a witness the meter itself lost) -- `exhausted`
+    stays False and `residual` names it, never guesses it.
+    """
+    out = {
+        "tail_considered": None, "tail_executed": None, "sweeps_dropped": None,
+        "shortfall": None,
+        "over_budget_dropped": [], "blind": [], "unwitnessed": [],
+        "battery_record": "absent", "battery_considered": None,
+        "exhausted": False,
+    }
+    if not isinstance(end_row, dict):
+        out["error"] = "no precheck-end row"
+        return out
+    tc = end_row.get("tail_considered")
+    te = end_row.get("tail_executed")
+    sd = end_row.get("sweeps_dropped")
+    out.update(tail_considered=tc, tail_executed=te, sweeps_dropped=sd)
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (tc, te, sd)):
+        out["error"] = "the precheck-end row is missing a tail count"
+        return out
+    out["shortfall"] = tc - te
+    if not isinstance(battery_row, dict):
+        # No battery record: the deferrable stage did not persist this apply (it did
+        # not run, or ran before this record existed). The shortfall is UNEXPLAINED
+        # from stored data -- which is itself the verdict to surface.
+        out["error"] = ("no deferrable-battery-end row for this apply -- the battery "
+                        "did not run (or predates this record); the shortfall is "
+                        "unexplained from stored data")
+        return out
+    out["battery_record"] = "present"
+    over = [d["name"] for d in battery_row.get("dropped", [])
+            if isinstance(d, dict) and "over budget" in str(d.get("reason", ""))]
+    blind = [b["name"] for b in battery_row.get("blind", []) if isinstance(b, dict)]
+    unwit = [w["name"] for w in battery_row.get("witness_failed", [])
+             if isinstance(w, dict)]
+    out.update(over_budget_dropped=over, blind=blind, unwitnessed=unwit)
+    executed = battery_row.get("executed_count")
+    if not isinstance(executed, int) or isinstance(executed, bool):
+        out["error"] = "the battery record is missing executed_count"
+        return out
+    # The battery-side four-way split: every lane that asked the meter either
+    # executed-and-witnessed, executed-without-a-witness, started-but-blind, or was
+    # dropped over budget. (Meter-decided drops are the meter's `sweeps_dropped`,
+    # already read from the end row; a battery record that carries any of them is
+    # counted in battery_considered too, so the identity below still holds.)
+    meter_dropped = sum(1 for d in battery_row.get("dropped", [])
+                        if isinstance(d, dict) and "over budget" not in str(d.get("reason", "")))
+    out["battery_considered"] = executed + len(unwit) + len(blind) + len(over) + meter_dropped
+    # Conservation identity across the two independently written stores: the end
+    # row's shortfall equals the battery's considered-but-unwitnessed count.
+    out["residual"] = (tc - te) - (len(unwit) + len(blind) + len(over) + meter_dropped)
+    out["exhausted"] = out["residual"] == 0
+    return out
+
+
 def run(as_json=False, apply=False, runner=None, only=None, skip=None, budget_s=None,
         jobs=None, save_dir=None, clock=time.monotonic, env=None) -> int:
     """Run every registered deferrable lane the meter allows; report what happened.
@@ -639,7 +934,7 @@ def run(as_json=False, apply=False, runner=None, only=None, skip=None, budget_s=
         "checked_at": _now_iso(), "mode": "apply" if apply else "dry_run",
         "lanes_registered": len(LANES), "budget_s": budget, "jobs": n_jobs,
         "findings": [], "blind": [], "dropped": [], "held": [], "uninterpreted": [],
-        "executed": [], "lanes": [],
+        "executed": [], "lanes": [], "witness_failed": [], "sigs": {}, "sig_diff": None,
     }
     if _is_worker_body(env):
         report["skipped"] = ("worker Body — the deferrable tier is reducer-side (its apply "
@@ -709,10 +1004,16 @@ def run(as_json=False, apply=False, runner=None, only=None, skip=None, budget_s=
             return
         # The lane ran to completion and was read: THIS is when the execution record is
         # earned (guard-399 witness corollary) -- a blind or dropped lane did not execute.
+        # The witness OUTCOME is kept, not swallowed: a failed witness is the
+        # `unwitnessed execution` class the classifier names (), and it is
+        # still an execution (the lane ran) -- it only lacks the meter's record of it.
         if lane["meter_name"]:
-            _meter("executed", runner, lane["meter_name"])
+            ok, why = _witness_executed(runner, lane["meter_name"], env)
+            if not ok:
+                report["witness_failed"].append({"name": lane["name"], "why": why})
         report["executed"].append(lane["name"])
         row["sig"] = verdict["sig"]
+        report["sigs"][lane["name"]] = verdict["sig"]
         report["lanes"].append(row)
         if verdict["detail"]:
             item = {"name": lane["name"], "phase": lane["phase"], "detail": verdict["detail"]}
@@ -748,12 +1049,23 @@ def run(as_json=False, apply=False, runner=None, only=None, skip=None, budget_s=
             report["blind"].append({"name": n, "phase": "?", "reason": "no result recorded"})
 
     report["elapsed_ms"] = int((clock() - t_start) * 1000)
+    # Changed-first signature diff (): the previous apply's signatures are
+    # the newest earlier `deferrable-battery-end` row in the same log (file order is
+    # append order for this event -- one writer, the reducer). A log with no earlier
+    # row is a FIRST apply: every lane with a signature is new, and new is a change,
+    # so it prints first.
+    prev = _newest_battery_end(_drop_log_path(env))
+    if prev is not None:
+        report["prev_checked_at"] = prev.get("checked_at")
+    report["sig_diff"] = _sig_diff((prev or {}).get("sigs") or {}, report["sigs"])
     # guard-4093: two ORTHOGONAL fields. A held, dropped, blind or uninterpreted lane is a
-    # lane we did not fully see, so each degrades completeness.
+    # lane we did not fully see, so each degrades completeness. Computed BEFORE the
+    # persist so the end record carries the SAME verdict the report prints.
     report["completeness"] = ("partial" if (
         report["blind"] or report["dropped"] or report["uninterpreted"]
         or any(not h.get("standing") for h in report["held"])) else "complete")
     report["status"] = "findings" if report["findings"] else "clean"
+    _persist_battery_end(report, env, errors)
     if errors:
         report["error"] = "lane_errors: " + "; ".join(errors)
     _emit(report, as_json)
@@ -784,6 +1096,7 @@ def main() -> int:
         rep = {"checked_at": _now_iso(), "mode": "apply" if args.apply else "dry_run",
                "lanes_registered": len(LANES), "findings": [], "blind": [], "dropped": [],
                "held": [], "uninterpreted": [], "executed": [], "lanes": [],
+               "witness_failed": [], "sigs": {}, "sig_diff": None,
                "completeness": "partial", "status": "clean",
                "error": f"battery_failed: {exc}"}
         _emit(rep, args.json)

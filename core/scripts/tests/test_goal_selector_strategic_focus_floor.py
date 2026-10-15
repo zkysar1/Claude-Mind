@@ -161,6 +161,60 @@ def test_floor_noop_when_top_eligible_pick_is_already_lane_work(monkeypatch):
     assert scored[0]["goal_id"] == "g-368-1"
 
 
+def test_already_honored_by_a_nominee_is_reported_as_honored_by_merit(monkeypatch):
+    """. The already-honored branch moves nothing, so `picked` stays
+    None and a later floor that reads only the pick cannot tell a directive that
+    already holds index 0 from no directive at all. The reducer-only floor
+    displaced exactly that pick (22.33 under 6.12 on 2026-09-27, per the goal's
+    progress_note). The status now says so."""
+    _pin_lanes(monkeypatch)
+    scored = [
+        _row("g-368-1", "asp-368", 12.0),
+        _row("g-115-1", "asp-115", 11.6),
+    ]
+    picked, status = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert picked is None
+    assert status["honored_by_merit"] is True
+
+
+def test_honored_by_merit_needs_a_nominee_not_lane_membership(monkeypatch):
+    """A recurring sweep sitting in a lane's aspiration passes the 'top row is
+    lane work' test but is excluded from nomination (clause ii), so it must not
+    stand in for a directive that nothing is honoring."""
+    _pin_lanes(monkeypatch)
+    scored = [
+        _row("g-368-7", "asp-368", 12.0, recurring=True),
+        _row("g-368-9", "asp-368", 9.0),
+        _row("g-115-1", "asp-115", 8.0),
+    ]
+    _, status = gs.apply_strategic_focus_floor(scored, "alpha")
+    assert status["claimable"] == 1          # the nominee exists, below the sweep
+    assert status["honored_by_merit"] is False
+
+
+def test_honored_by_merit_is_false_on_every_path_that_is_not_an_honor(monkeypatch):
+    """The key is always present and defaults False: a hoist (the pick carries
+    the signal then), a drain-lane yield, an empty pool and a missing directive."""
+    _pin_lanes(monkeypatch)
+    hoisted = [_row("g-115-1", "asp-115", 11.6), _row("g-368-9", "asp-368", 6.27)]
+    picked, status = gs.apply_strategic_focus_floor(hoisted, "alpha")
+    assert picked is not None and status["honored_by_merit"] is False
+
+    yielded = [_row("g-001-8", "asp-001", 9.0, recurring=True),
+               _row("g-368-9", "asp-368", 6.27)]
+    _, status = gs.apply_strategic_focus_floor(
+        yielded, "alpha", drain_lane_fired=True)
+    assert status["honored_by_merit"] is False
+
+    _, status = gs.apply_strategic_focus_floor([], "alpha")
+    assert status["honored_by_merit"] is False
+
+    _pin_lanes(monkeypatch, lanes=set())
+    _, status = gs.apply_strategic_focus_floor(
+        [_row("g-368-1", "asp-368", 12.0)], "alpha")
+    assert status["honored_by_merit"] is False
+
+
 def test_floor_does_not_nominate_a_recurring_lane_goal(monkeypatch):
     """Clause (ii), : swapping a routine sweep for a routine sweep
     cannot honor a directive whose premise is that product work outranks

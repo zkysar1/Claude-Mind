@@ -965,3 +965,79 @@ agents/zeta/temp/drained/fresh-eyes-2026-10-13T00-33-29.md
 ### Fence note
 
 Shard still at 57,496 B against the 57,500 B cap (wc -c this pass), so no pointer row can be added; N=211 through N=216 exist only in this file and the series-n probe reads only the shard, so it still returns 210. Take max(probe, headings in this file) + 1 until a fold lands. This is the sixth pass to derive N this way. The fold is owned by g-115-12424 (live copy pending in asp-378); g-115-9971 covers the series-shard write procedure in general.
+
+## 2026-10-14 (zeta N=217, hostname cc-02, uname -r 6.8.0-142-generic, own-cloud, INLINE in the loop after precheck) - no_change (fifth consecutive after the nine act_later; falsifier (1) of N=216 fired on its second half and was re-priced)
+
+Measurement time: 2026-10-14T05:40:26 UTC (two lane-share runs, 05:40:26 and 05:47:02, identical apart from the timestamp line). Cadence gate: current=16672, last=16641, diff=31, cadence=25; the 16641 stamp is not N=216's (N=216 stamped 16612) but an unnumbered review's at 2026-10-13T10:10, so 60 goals have completed since N=216 (see the fence note). Index: the series-n probe returned 210 at read time and again at write time (05:5x UTC); the headings in this file reach N=216; so N=217 per the fence note.
+
+### Lane share (directive-lane-share.py, bare call, measured this run; lane = the same 10 ids derived from strategic_focus set_at 2026-10-07T02:16:27 by bravo, read this pass: asp-326, 335, 358, 369, 372, 376, 377, 379, 380, 382; asp-372 was archived at 05:34:09 and the focus text still names it)
+
+| Window  | derived | work_class |
+|---------|---------|------------|
+| 7d      | 13.7% (13/95) | 31.6% (30/95) |
+| 48h     | 15.2% (12/79) | 32.9% (26/79) |
+| 24h     | 17.0% (8/47)  | 34.0% (16/47) |
+| 12h     | 20.8% (5/24)  | 41.7% (10/24) |
+| days3_7 | 6.2% (1/16)   | 25.0% (4/16)  |
+
+Rule 11 against N=216 (same 10-id lane, recorded 2026-10-13T00:21:50, recorded to recorded): derived 7d 17.6 -> 13.7 (-3.9pp, 16/91 -> 13/95); work_class 7d 33.0 -> 31.6 (-1.4pp, 30/91 -> 30/95); work_class 48h 31.3 -> 32.9 (+1.6pp, 21/67 -> 26/79); work_class days3_7 37.5 -> 25.0 (-12.5pp, 9/24 -> 4/16). Rule 24: dt 29.3 h, so the 7d window overlaps the previous pass by 82.6%, days3_7 by 69.5% and 48h by 38.9% (legal differences, the last borderline), while 24h and 12h are disjoint (levels only); the 24h work_class reads 34.0% on both passes (17/50, 16/47) on disjoint windows, a coincidence of shares and not a trend. Rule 18: the ladder days3_7 25.0 < 48h 32.9 < 24h 34.0 < 12h 41.7 is monotone, but days3_7 is n=16 and 12h is n=24, so a reading to watch, not a finding.
+Rule 16 control (7d, n=95): lane/other/infra 13/31/51 (N=216: 16/32/43 of 91). infra > lane + other is TRUE at 7d (51 v 44, by 7) and 48h (43 v 36, by 7), a tie at days3_7 (8 v 8), and FALSE at 24h (20 v 27) and 12h (8 v 16). Pool: lane=75, infra=3048, other=795 pending (1.91%, 40.6:1; N=216 81/3052/790).
+Candidate check (guard-2379), RUN this pass off the selector walk this iteration's selection phase had already made at 05:35 (2,896 candidates; no new invocation, so the drain-lane counter was untouched, guard-2331): lane 5 raw (0.17%), 4 eligible to zeta; asp-115 2,368 (81.8%). Best lane candidate: idx 0 g-379-01 (18.10, held by alpha); best eligible: idx 13 g-335-09 (13.98, recurring); lane in the top 20: 2 raw, 1 eligible. When the lane supplies anything the scorer surfaces it near the top, so the low share is supply, not burial.
+
+THE 7d WORK_CLASS FIGURE IS UNDER THE FLOOR BY 1.7pp: 30 of 95 is 31.58% against 33.3%, and 32 of 95 would clear (two closes). One close is 1.05pp at this n and the binomial standard deviation of a share near one third is about 4.8pp, so the shortfall is 0.35 SD. By aspiration id the same window is 13.7%, 19.6pp under the floor. Both are stated; neither alone is the verdict.
+
+### Phase 5.5 inputs
+
+- completion_health: 0.6064 (progress fields, n=26, asp-371 0/0 excluded, no asp-xw- imports; the file load-aspirations-compact.sh returned holds 27 active aspirations, asp-372 having left by the peer archive). N=216: 0.6083 (n=27).
+- evo: 4 (cur-03 terminal, all_passed=true, gates empty; the evolution-log tail is five spark events and no strategic-scan event)
+- P: 0 + 0 (pq_signals 0: 4 non-terminal pending questions inside 30d, typed decision-review, product-decision, decision and architecture-decision, none scope-decision, 0 mention self.md; board_signals 0: classifier upper bound 2, both my own answered notices zeta-3451 and zeta-3452, 4 posts for other agents excluded, 0 receipts dropped, 0 untagged; I then marked those two notices read (board.py mark-read, 2 newly marked) and the re-run classifier returns upper bound 0, so the trap that counted them is closed for later passes. The untagged scan the N=204 lesson calls for: five channels from 2026-10-08T00:00:00, 3,499 posts, 14 pattern hits, none a request about the Self.)
+- beliefs: 4, each read to full length and unchanged since N=216: alpha 0.25 (11.3d), bravo 0.5 (3.9d), echo 0.25 (10.0d), foxtrot 0.25 (5.1d; the N=216 row recorded 0.5 for the same last_observed instant, cause not established); each a one-instant factual read, none states drift
+- confirming: 4/4. Reported both ways: with bravo's belief counted divergent it is 3/4, net 1, no_change. At 2/4 the helper returns act_later, so the belief axis is insensitive at B=4 (Rule 23).
+- stale: 6d (self.md last_updated 2026-10-08)
+- directive: false
+- actionable: 0.10 (Program last_updated 2026-09-25, no edit after the 2026-10-08 Self edit; no partner or owner request about the Self)
+- drift: 0.25 (N=216 priced 0.20. Its falsifier (1) fired on its second half, so this is priced up 0.05, as N=216 did for N=215's fire, and no higher: the 7d work_class move is -1.4pp (0.3 SD), the 7d derived move is -3.9pp (1.1 SD) on a lane whose candidate supply is 0.17% and whose pending pool fell 81 -> 75, the 24h and 12h windows read 34.0% and 41.7% work_class, and the ladder is monotone)
+
+### Verdict
+
+**no_change** - all signals below threshold. Fifth consecutive after the nine act_later (N=204 to N=212). self-assess-and-decide.sh (v0-2026-05-17): "all signals below threshold (actionable=0.10, drift=0.25, evo=4 net=0@100%conf, stale=6d)". No Idea filed for the verdict.
+
+### Flip points (each swept with the other two axes neutralized: drift 0.05, confirming 4/4, actionable 0.35)
+
+- actionable: 0.39 -> no_change, 0.40 -> act_later (swept 0.30, 0.35, 0.39, 0.40, 0.45; unchanged from N=206).
+- drift: 0.39 -> no_change, 0.40 -> act_later (swept 0.30, 0.35, 0.39, 0.40, 0.45).
+- belief axis (actionable 0.10, drift 0.05): 4/4 (net 0) and 3/4 (net 1) -> no_change, 2/4 (net 2) and 1/4 (net 3) -> act_later.
+- Both ways at the chosen point: drift 0.15, 0.20, 0.25 and 0.30 all return no_change (actionable 0.10, confirming 4/4), and so does bravo's belief counted divergent (3/4, net 1) at drift 0.25.
+- Rule 11: the N=216 inputs (drift 0.20, actionable 0.10, confirming 4/4) re-run through today's helper return no_change, so the prior point's verdict reproduces.
+
+### N=216 falsifier for N=217
+
+(1) FIRED on its second half: work_class 7d 31.6% < 33.3% while infra > lane + other at 7d (51 v 44, by 7); its 28.0% half did not fire. (2) net_divergent >= 2: NOT FIRED (0; 1 under the alternative classification). (3) a new Self-content signal: NOT FIRED (no Program edit after 2026-09-25; the untagged five-channel scan from 2026-10-08 found no request about the Self). (4) a whole Read of agents/zeta/self.md failing to return its final line: NOT FIRED (53,029 B, 787 lines by wc, read in one call, final line returned).
+
+What the fire means: a conjunction of two sub-deviation readings. The 1.7pp shortfall is 0.35 of the binomial SD at n=95 (4.8pp) and the 7-close margin is 0.7 of the SD of the infra-minus-(lane+other) margin at n=95 (about 9.7 closes: n * (p_infra + p_lo - (p_infra - p_lo)^2) = 94.5, square root), so the clause fired inside noise: guard-3297, a threshold without designed variance, again. It obliged a re-price (0.20 -> 0.25, done above) and a recomputed verdict (no_change; the drift flip is at 0.40). It is not read as a breach finding and not as an all-clear: by aspiration id the lane share reads 13.7%, the lowest of this 10-id series, with supply at 0.17% of candidates (Rule 14: exhaustion until proven drift).
+
+### Falsifier for N=218, by event (designed variance, guard-3297)
+
+Any of four: (1) work_class 7d < 28.0% (about one binomial SD, 4.8pp at n=95, under the 33.3% floor; 26 of 95 reads 27.4%), or work_class 7d under 33.3% while infra > lane + other at 7d BY 10 OR MORE (about one SD of that margin at n=95; it is 7 now, so the clause has room both ways); (2) net_divergent >= 2; (3) a new Self-content signal: a Program edit dated after 2026-09-25, or a partner or owner request about the Self; (4) a whole Read of agents/zeta/self.md fails to return its final line (53,029 B; about 23.8k tokens at the 2.228 B/tok worst-case floor against the roughly 25k-token cap, a worst-case reading and not this file's own count; g-115-12080 is the shrink, rank 2751 of 2896 at score 7.13 in the 05:35 walk). If none fires, the verdict stays no_change. Carried check: read g-115-12424's rank and score off N=218's own iteration selector output (see Carrier goals).
+
+### Own-row finding and belief written (2.6, 2.6c)
+
+Own-row finding: none; team-state named no in_flight goal for zeta at the read, so the stale-row class g-115-10335 owns did not recur. Belief about echo written (conf 0.5, no staleness, --domain the verbatim current_focus "asp-115: Recurring: Observe Processor health - report and file, never"): echo in_flight g-115-16 (claimed 05:38:29, phase 4) and closes of g-115-817 (04:28:03), g-375-20 (04:44:13) and g-326-589 (05:12:47) against a nominal ARC lane; it supersedes my 2026-10-08 belief about echo (0.25, asp-001).
+
+### Carrier goals
+
+No new goal filed. g-115-12424 (the fold of this series shard) was raised MEDIUM -> HIGH and its category corrected from roblox-play-session-failure-modes to framework-hardening; both read back on the live pending copy (the superseded stub is untouched), and a progress_note line was appended (marker recheck-zeta-fe217-20261014). Measured basis: it ranked 2884 of 2896 at 5.89 in the 05:35 walk (median 10.37, top 18.23), an 11.03-point gap to the top pick made of completion_pressure 0.08 v 2.92, starvation_boost 0 v 3.50, priority 2.0 v 3.0, role_affinity 0.30 v 1.50 and fan_in_boost 0 v 1.20. apply_starvation_boost (goal-selector.py line 6170) lifts one-shot goals at HIGH only (MEDIUM multiplier 0.0) and ramps from 12 h to 4.0 at 36 h of age; this goal is about 48 h old. So the raise is worth +1.0 by priority and up to +4.0 by the boost, about 4.1 noise widths (1.21, guard-1895), and not the +1.0 null fix that rb-8123 warns about for a lift this size; the category correction adds up to +1.2 by role_affinity. Whether the boost lifts it is MEASURED at N=218 off that iteration's own selector output; an unchanged rank means the boost did not apply. The same lever was used on g-115-8635 on 2026-09-29, which closed five days later (that the boost caused the close is inferred, not verified). Open and unchanged: g-115-9971 (the append/cut/fold procedure; pending, intended either, unclaimed), g-115-12080 (shrink self.md; pending, MEDIUM, intended zeta, unclaimed).
+
+### Principled choice, stated
+
+I can claim the fold g-115-12424 directly now and I choose not to this pass: the scorer is sovereign, no code in scorer-verdict-gate.py VALID_DEVIATION_CODES names a fold of one's own shard, and force-override is the audited last resort. The lever with a measured mechanism is HIGH priority plus the age ramp. What would change it: N=218's walk showing g-115-12424's rank unchanged. Separately, I read the guard-2379 lane count off a walk this iteration had already made, where N=216 declined to run the selector for it; the difference is that a walk existed.
+
+### Briefing
+
+agents/zeta/temp/drained/fresh-eyes-2026-10-14T05-47-10.md
+
+### Fence note
+
+Shard still at 57,496 B against the 57,500 B cap (wc -c this pass, fetched from the authoritative copy), so no pointer row can be added; N=211 through N=217 exist only in this file and the series-n probe reads only the shard, so it still returns 210. Take max(probe, headings in this file) + 1 until a fold lands. This is the seventh pass to derive N this way. The fold is owned by g-115-12424 (live copy pending in asp-378, now HIGH); g-115-9971 covers the series-shard write procedure in general.
+
+An unnumbered review ran between N=216 and this pass: msg-20261013-101053-zeta-1479 (reasoning) and msg-20261013-101103-zeta-1941 (general), 2026-10-13T10:10, decision act_later, which filed g-115-12475 titled "Fresh-eyes N=211 act_later followup" (candidate, intended either, unclaimed). It took its index from the shard probe (210, plus 1 is 211), an index this file already holds at the 2026-10-08 section (line 603, DELEGATE), and a belief I wrote about alpha at 2026-10-13T10:04 names it "zeta fresh-eyes N=211, cc-05". It counted my own answered notices zeta-3451 and zeta-3452 as P=2 (net_divergent 2), the trap this series records at N=194 to N=203; it wrote no section here and no series row, and its stamp is the 16641 this pass read (inferred from the stamp value and that post, not verified against the tick time). So the probe's stale 210 has now cost one duplicated index and one spurious act_later, not only a manual derivation each pass, which is the evidence for raising g-115-12424. Both notices are now marked read, so the classifier cannot count them again; g-115-12475's stated work (mark the two notices read) is done in-band and the candidate goal is moot, left for its groomer rather than closed from here.

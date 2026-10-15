@@ -63,6 +63,46 @@ def _write_fails_after_modifier(path, modifier_fn, initial=None):
 _fileops.locked_modify_yaml = _write_fails_after_modifier
 '''
 
+# THE RATCHET'S INPUT MUST COME FROM THIS FIXTURE TOO. A ratchet that finds nothing to measure
+# prints `skipped` and returns before the write, so the shim above never fires and the test pins
+# nothing. Three members read their input from outside the temp world: the live goal queue behind
+# aspirations-query.sh, and the checkout's own agent dirs. Only the dev origin has those; a
+# deployment-shaped checkout has no daemon, no goals and no agent dirs (rb-12992). Each input is
+# pinned where the script reads it, on the module object the script imports (rb-13019), and only
+# for the stems that need it, so the other members keep running their real readers.
+_QUERY_ROWS = '''
+import json, subprocess
+_real_run = subprocess.run
+
+def _run(cmd, *a, **k):
+    cmd = list(cmd)
+    if any(str(c).endswith("aspirations-query.sh") for c in cmd) and "--goal-status" in cmd:
+        rows = [{"id": "g-1-1", "source": "world", "status": "pending", "title": "t",
+                 "verification": {"checks": ["a prose check"]}}]
+        if cmd[cmd.index("--goal-status") + 1] != "pending":
+            rows = []
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(rows), "")
+    return _real_run(cmd, *a, **k)
+
+subprocess.run = _run
+'''
+
+_AGENT_DIRS = '''
+import os
+from pathlib import Path
+import _paths
+
+_agents = Path(os.environ["RATCHET_AGENTS_ROOT"])
+_paths.agents_root = lambda: _agents
+'''
+
+# stem -> the extra sitecustomize source that gives that ratchet something to measure
+SEAMS = {
+    "goal-field-census-ratchet": _QUERY_ROWS,
+    "verification-check-validity-ratchet": _QUERY_ROWS,
+    "experience-orphan-ratchet": _AGENT_DIRS,
+}
+
 
 def _world(tmp: Path) -> Path:
     world = tmp / "world"
@@ -81,6 +121,16 @@ def _world(tmp: Path) -> Path:
     return world
 
 
+def _agents(tmp: Path) -> Path:
+    """One agent holding two traces and an index row for one of them: what the orphan ratchet measures."""
+    agent = tmp / "agents" / "a1"
+    (agent / "experience").mkdir(parents=True)
+    for name in ("exp-1", "exp-2"):
+        (agent / "experience" / f"{name}.md").write_text("# trace\n", encoding="utf-8")
+    (agent / "experience.jsonl").write_text(json.dumps({"id": "exp-1"}) + "\n", encoding="utf-8")
+    return tmp / "agents"
+
+
 @pytest.mark.parametrize("stem,argv", FAMILY, ids=[s for s, _ in FAMILY])
 def test_failed_persist_never_reports_the_computed_verdict(stem, argv):
     script = SCRIPTS / f"{stem}.py"
@@ -91,11 +141,13 @@ def test_failed_persist_never_reports_the_computed_verdict(stem, argv):
         meta.mkdir()
         shim = tmp / "shim"
         shim.mkdir()
-        (shim / "sitecustomize.py").write_text(SITECUSTOMIZE, encoding="utf-8")
+        (shim / "sitecustomize.py").write_text(SITECUSTOMIZE + SEAMS.get(stem, ""),
+                                               encoding="utf-8")
 
         env = os.environ.copy()
         env["MIND_WORLD"] = str(_world(tmp))
         env["MIND_META"] = str(meta)
+        env["RATCHET_AGENTS_ROOT"] = str(_agents(tmp))
         env["STORAGE_BACKEND"] = "local"     # guard-955: never touch the real store
         env["RATCHET_SCRIPTS_DIR"] = str(SCRIPTS)
         env["PYTHONPATH"] = str(shim) + os.pathsep + env.get("PYTHONPATH", "")

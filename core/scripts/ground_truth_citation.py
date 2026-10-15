@@ -43,6 +43,8 @@ from __future__ import annotations
 import re
 from typing import Iterable, NamedTuple
 
+import goal_id_patterns  # : single source for the goal-id grammar (ONE SEQUENCE fragment, guard-1161)
+
 # ─── what counts as an ENTITY ────────────────────────────────────────────────
 # Two or more consecutive Capitalized words ("Acme Corporation"), a bare year, a
 # number carrying a unit, or a currency amount. Single capitalized words are
@@ -74,7 +76,7 @@ _ASSERTION_PATTERNS = (_COPULA, _REPORTING, _COMPARISON)
 # purpose -- see the module docstring.
 _URL = re.compile(r"https?://[^\s<>()\[\]]+")
 _BOARD_MSG = re.compile(r"\bmsg-\d{8}-\d{6}-[a-z0-9]+-\d+\b")
-_GOAL_ID = re.compile(r"\bg-\d{3}-\d+\b")  # seq is open-ended: guard-1161
+_GOAL_ID = goal_id_patterns.GOAL_ID_IN_TEXT  # seq is open-ended: guard-1161 — the literal lives in goal_id_patterns.py ()
 # The framework's OWN durable rule ids (). A line whose only citation
 # was `guard-2024` reported `missing-citation` -- so citing the governing rule
 # for a disposition read as UNCITED, which is the alarm direction: the author

@@ -192,7 +192,13 @@ RESET_SURVIVING_SLOTS = {"journal_cluster_summaries", "spark_capture", "exp_capt
                          # drops the derived total_all_time by the carried count at
                          # every session end. THIS copy is the live runtime path:
                          # the mirror must carry the member or the fix stays dead.
-                         "micro_hypotheses"}
+                         "micro_hypotheses",
+                         # : an owed close (verify landed, state-update has
+                         # not) is a standing obligation, not session bookkeeping.
+                         # THIS copy is the live runtime path (POST /v1/wm/reset): a
+                         # wm.py-only edit would leave it droppable by the reset that
+                         # actually runs.
+                         "pending_close_owed"}
 
 #  — mirror of wm.py. Ordered tuple, deliberately NOT ARRAY_SLOTS: that
 # set contains non-capture members, so it is the wrong thing to iterate when the

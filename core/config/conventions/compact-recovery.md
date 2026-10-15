@@ -232,6 +232,34 @@ the owner's diary and the anchor keeps STALE ANCHOR.
 
 ---
 
+## Durable Records That Narrate Earlier Steps
+
+A compaction leaves claims, not evidence: the summary says what a source said, what was read
+when and what a count was, and only a tool result in THIS context shows it still holds
+(`verify-before-assuming.md`, "Post-Insertion Verification" 3). A durable record (evidence file,
+knowledge node, goal note) that narrates earlier steps stays a draft until each such sentence is
+traced, and nothing cites it before:
+
+1. List the sentences that assert a quote, a count and what it counts, a read and when, a
+   negative ("no log line was read") or the state of something outside the repo.
+2. Name the output in this context that states each. None: re-read the source this turn, cut
+   the sentence, or tag it unverified.
+3. Read the named sources in one parallel batch, then Edit. Re-reading the draft proves nothing:
+   it reads as you meant it.
+
+Measured on the session transcript (g-115-12539; rows between `compact_boundary` and the write,
+guard-6730), two cases. An evidence file: a correction pass made 14 edits in 57 seconds and
+changed or removed no figure; the defects sat in the words around the figures: a paraphrase
+presented as a quotation, a list headed "all fields" that left one out, read order and timing,
+negatives no source backed. A knowledge node: "a third X" with no record behind the ordinal. The
+first write came 32 minutes after one boundary and 2 minutes before the next, the second 13
+minutes after one. Not established: that a summary was the source of any of them, so this is not
+a post-compaction ritual; run it on any record that narrates earlier steps. The probe that
+settles the mechanism is replaying one case with the pass applied and counting the defects. The
+same shape without a compaction: rb-12990.
+
+---
+
 ## Execution Diary Integration
 
 The execution diary (`agents/<agent>/session/execution-diary.jsonl`) is an append-only breadcrumb

@@ -102,6 +102,11 @@ TIER_NAMES = {0: "intended_agent", 1: "role_top_class", 2: "hash_partition"}
 #: update-goal refusals that mean "the goal moved under you", not a fault
 STALE_REFUSALS = ("candidate_transition_forbidden", "invalid_status_transition",
                   "field_shrink_blocked")
+#: A candidate's filer can stamp outcome_class at intake (relay filings do). Alone it is
+#: not a close: candidate -> completed is forbidden, so no completion landed on the row.
+#: Any of these beside it means a close did write, and the sweep guard's refusal stands.
+CLOSE_STAMPS = ("completed_by", "completed_by_sid", "completed_at", "completed_date",
+                "verify_verdict", "verified_at", "outcome_note")
 
 
 class GroomError(Exception):
@@ -525,7 +530,13 @@ def cmd_verdict(args):
     if provenance == PROV_LOCAL_MIRROR:  # a plumbing fault, not a stale bite (guard-5093)
         raise GroomError(RC_ERROR, f"{goal_id}: store of record unreachable; the local "
                                    f"mirror cannot prove the goal is still a candidate")
-    why = stale_candidate_reason(goal, provenance, open_statuses=("candidate",))
+    # An intake-stamped outcome_class alone made every verdict, keep included, exit 4 on
+    # that id; mask it only when no close stamp stands beside it (, it332).
+    view = goal
+    if (goal and goal.get("status") == "candidate" and goal.get("outcome_class")
+            and not any(goal.get(f) for f in CLOSE_STAMPS)):
+        view = {k: v for k, v in goal.items() if k != "outcome_class"}
+    why = stale_candidate_reason(view, provenance, open_statuses=("candidate",))
     if why:
         raise GroomError(RC_STALE, f"{goal_id}: {why}")
 

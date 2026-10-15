@@ -60,6 +60,13 @@ exit 2 as a work list, not a blocker override prompt:
   exit 2 by design, so an EMPTY work list does not clear the gate. Set it only
   with the reconcile ledger written and cited in the PR body — measured v2.12.5
   and v2.12.47 (2026-09-02), both with zero unexplained residue.
+- **A fresh-worktree source lists `core/scripts/.platform-memo.sh` under ORPHAN RISK; it is not drift.**
+  It is the deployment-owned runtime file (untracked and ignored at `.gitignore:110` in the
+  frontier and in the dest; present in the live frontier checkout and the persistent dest
+  checkout), so a worktree of `origin/main` never has it and the preflight counts it as
+  target-only (exit 2). Confirm with `git check-ignore -v`, then copy it from the live
+  checkout into the tag worktree before the hop (measured v2.12.100, 2026-10-14; guard-5253:
+  a detached worktree inherits only tracked content).
 - **Triage the whole flagged population mechanically.** `promotion-plan-triage.sh`
   parses lines of the form `<path>  (N dest-only line(s))`, so for a preflight DRIFT
   build a flag log from the preflight's own REVIEW list plus its line-level files and
@@ -110,6 +117,15 @@ or an unowned-residue goal. The probe must run as its own early leg on the
 pristine tree — as an explicit arg next to a directory that contains it, pytest
 7.4.4 collects it twice and the late pass reads a suite-dirtied tree (g-358-244,
 rerun-2 void; pinned by `test_two_leg_split_keeps_the_probe_out_of_the_directory_collection`).
+
+**A/B the reds against the previous tag, and only with files that exist there.** To read a red
+against the base, re-run the red files at `--ref <previous tag>` and diff the red ids.
+`deployment-shaped-run.py` hands pytest every named `.py` before it checks the ref has it
+(`missing` is computed afterwards), so ONE test file added since the tag makes pytest exit 4
+"file or directory not found" with a junit of 0 cases, and every file then lands in the
+pytest-invisible half: a void run (measured v2.12.100, 2026-10-14, `test_q4_code_scope.py`). Partition first (`git cat-file -e <tag>:<path>` per red file): a red
+file ABSENT at the tag is new in this release, has no baseline, and its owner goal is the
+attribution; the files present at the tag get the A/B.
 
 ### Who cuts, and WHEN (g-373-82, decided 2026-09-15 — this was previously unowned)
 

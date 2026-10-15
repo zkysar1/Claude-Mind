@@ -21,8 +21,10 @@ Tests:
      projection reads as projected; a record carrying an unprojected canary
      does not.
   4. Refusals through main(), with the subprocess layer stubbed: a projected
-     read, a non-text (dict) field, and a composed value that opens with a JSON
-     bracket. None of these reach a write.
+     read and a non-text (dict) field. Neither reaches a write.
+  4b. A value that opens with '{' or '[' is appended as text (g-115-9103): the
+     compose invariant that keeps it from ever parsing as JSON, and the append
+     through a store that decodes the way the real encoders do.
   5. The shell wrapper's argv contract: an unknown flag and a missing
      positional both exit 2 rather than sliding a token into the value slot.
 
@@ -34,6 +36,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import random
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +50,7 @@ if str(CORE_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(CORE_SCRIPTS))
 
 from _runtime_bash import bash_cmd  # noqa: E402  (guard-580/581: never bare "bash")
+from aspirations import parse_value  # noqa: E402  (the encoder the update wrapper mirrors)
 
 
 def _load():
@@ -251,15 +255,6 @@ def test_non_text_field_is_refused(monkeypatch, capsys):
     assert "not text" in err and "guard-2444" in err
 
 
-def test_composed_value_opening_with_a_json_bracket_is_refused(monkeypatch, capsys):
-    # aspirations-update-goal.sh parse_value JSON-decodes any value starting
-    # with { or [, so it would be stored as an object rather than as our text.
-    _stub_read(monkeypatch, {"goal_id": "g-1", "priority": "MEDIUM", "outcome_note": None})
-    with pytest.raises(SystemExit) as exc:
-        GFA.main(["g-1", "outcome_note", "m1", '{"looks": "like json"}'])
-    assert exc.value.code == GFA.RC_VALUE_SHAPE
-
-
 def test_empty_text_is_refused_before_any_read(monkeypatch):
     def fake_run(argv, **kw):
         raise AssertionError("nothing should be read for an empty append")
@@ -278,6 +273,139 @@ def test_matching_marker_is_a_no_op(monkeypatch, capsys):
     assert GFA.main(["g-1", "outcome_note", "m1", "text"]) == GFA.RC_OK
     out = json.loads(capsys.readouterr().out)
     assert out["changed"] is False
+
+
+# ── 4b. A bracket-led value is appended as text () ─────────────────
+#
+# main() used to refuse any composed value that began with '{' or '['. The update
+# wrapper does JSON-decode such a value and would store an object, but only when
+# the value IS valid JSON, and compose() ends every value with the sentinel line,
+# which never is. So the refusal stopped no bad write; it made every note that
+# already began with a bracket (the "[closure-evidence]" notes among them)
+# unappendable for good. The store below decodes the way the real encoders do, so
+# a regression that let a value through as an object shows up as an object.
+
+def _decoding_store(monkeypatch, *, pre, field="outcome_note"):
+    """Fake store whose write decodes the value the way the real encoders do.
+
+    aspirations-update-goal.sh and aspirations.parse_value both json.loads a value
+    that starts with '{' or '[' and keep the text only when that raises. The fake in
+    _concurrent_store stores stdin verbatim, so it could never show a value turning
+    into an object.
+    """
+    store = {"goal_id": "g-1", "priority": "MEDIUM", field: pre}
+
+    def fake_run(argv, **kw):
+        joined = " ".join(str(a) for a in argv)
+        if "aspirations-query.sh" in joined:
+            return _Res(stdout=json.dumps([dict(store)]))
+        if "aspirations-update-goal.sh" in joined:
+            store[field] = parse_value(kw["input"])
+            return _Res(stdout=json.dumps(dict(store)))
+        raise AssertionError(f"unexpected subprocess: {joined}")
+
+    monkeypatch.setattr(GFA, "_run", fake_run)
+    return store
+
+
+def test_the_decoding_store_does_turn_a_json_value_into_an_object(monkeypatch):
+    # Positive control: without it the append tests below would pass against a fake
+    # that could never produce the hazard they exist to rule out.
+    store = _decoding_store(monkeypatch, pre="old")
+    GFA._run(["aspirations-update-goal.sh"], input='{"a": 1}')
+    assert store["outcome_note"] == {"a": 1}
+
+
+@pytest.mark.parametrize("pre", [
+    "[closure-evidence] SUPERSEDES a prior-occurrence note",
+    '{"closure": 1} then prose',
+    "[1, 2, 3]",  # existing text that is itself valid JSON
+    '["a", "b"] and more',
+])
+def test_a_note_already_opening_with_a_bracket_can_be_appended_to(monkeypatch, pre):
+    store = _decoding_store(monkeypatch, pre=pre)
+    assert GFA.main(["g-1", "outcome_note", "m1", "a later correction"]) == GFA.RC_OK
+    got = store["outcome_note"]
+    assert isinstance(got, str), f"the append was stored as {type(got).__name__}, not text"
+    assert got.startswith(pre) and "a later correction" in got
+    assert GFA.has_sentinel_line(got, GFA.sentinel_for("m1"))
+
+
+@pytest.mark.parametrize("text", [
+    '{"looks": "like json"}',  # the input the old refusal test used
+    "[1, 2, 3]",
+    '["a", "b"]',
+    "[closure-evidence] a first note",
+])
+def test_text_opening_with_a_bracket_on_an_empty_field_is_stored_as_text(monkeypatch, text):
+    store = _decoding_store(monkeypatch, pre=None)
+    assert GFA.main(["g-1", "outcome_note", "m1", text]) == GFA.RC_OK
+    got = store["outcome_note"]
+    assert isinstance(got, str), f"the append was stored as {type(got).__name__}, not text"
+    assert got.startswith(text) and GFA.has_sentinel_line(got, GFA.sentinel_for("m1"))
+
+
+#: Fragments that between them reach every JSON token class, including the characters
+#: the sentinel line could be taken for part of: a quote, a bracket, a comma, a newline.
+_JSONISH = ["[", "]", "{", "}", '"', ",", ":", "\n", "\\", " ", "0", "1", "a", "true",
+            "null", "[]", "{}", '"a"', "[appended:x]"]
+_MARKERS = ["m1", "x", 'q"', '"]', "a]", "}", "1", "a b", "true"]
+
+
+def _fragments(rng, low, high):
+    return "".join(rng.choice(_JSONISH) for _ in range(rng.randint(low, high)))
+
+
+def test_compose_never_yields_a_value_the_update_wrapper_would_decode():
+    """The invariant that makes a first-character check unnecessary: whatever PRE, text
+    and marker are, the composed value is not valid JSON, so the encoders keep it as
+    text (compose() says why). Fuzzed over fragments of every JSON token class, plus the
+    edge cases the argument turns on."""
+    rng = random.Random(9103)
+    cases = [
+        ("", '["a', 'x"]'),      # a string the marker's quote seems to close; it holds a raw newline
+        ("", "[1, 2]", "m1"),    # valid JSON text, then the sentinel as extra data
+        ("[1,", "2]", "m1"),     # PRE and text that only together make an array
+        ("[", "]", "m1"),
+        ("{}", "{}", "m1"),
+        ('{"closure": 1}', "later", "m1"),
+        ("", "[", "]"),
+    ]
+    cases += [(_fragments(rng, 0, 8), _fragments(rng, 1, 8), rng.choice(_MARKERS))
+              for _ in range(20000)]
+
+    decoded, parse_alone = [], 0
+    for pre, text, marker in cases:
+        assert GFA.wrapped_marker_refusal(marker) is None, marker
+        out = GFA.compose(pre, text, marker)
+        try:
+            json.loads(out)
+            decoded.append(out)
+        except json.JSONDecodeError:
+            pass
+        if parse_value(out) != out:
+            decoded.append(out)
+        # The same inputs WITHOUT the sentinel line, for the positive control below.
+        try:
+            json.loads((pre + "\n\n" if pre else "") + text)
+            parse_alone += 1
+        except json.JSONDecodeError:
+            pass
+    assert not decoded, f"compose() built a value the encoders would decode: {decoded[:3]!r}"
+    # Positive control: some of these inputs ARE valid JSON until the sentinel is added, so
+    # the zero above was the sentinel's doing and not a corpus that never reached JSON.
+    assert parse_alone >= 20, parse_alone
+
+
+def test_if_compose_ever_built_a_json_value_the_write_fails_loudly(monkeypatch):
+    # The invariant above is what keeps a note from being replaced by an object. This pins
+    # what is left if it ever breaks: verify_post() sees the object that was stored and the
+    # script dies, rather than reporting a success.
+    _decoding_store(monkeypatch, pre="old note")
+    monkeypatch.setattr(GFA, "compose", lambda pre, text, marker: '{"a": 1}')
+    with pytest.raises(SystemExit) as exc:
+        GFA.main(["g-1", "outcome_note", "m1", "text"])
+    assert exc.value.code == GFA.RC_VERIFY_FAILED
 
 
 # ── 5. The shell wrapper's argv contract ────────────────────────────────────

@@ -130,6 +130,8 @@ import re
 import subprocess
 import sys
 from datetime import datetime
+
+import goal_id_patterns  # : single source for the goal-id grammar (ONE SEQUENCE fragment, guard-1161)
 from typing import Any, Dict, List, Optional, Set
 
 _DEFAULT_PER_ITERATION = 3
@@ -143,7 +145,7 @@ _NOTE_HEAD_CHARS = 240
 # Named because it is now read in three places (holder_of, the undrainable
 # sub-count in build_slate, and the render line that explains it).
 _UNATTRIBUTED = "(unattributed)"
-_GOAL_ID_RE = re.compile(r"\bg-\d{3}-\d+\b")  # seq is open-ended: guard-1161
+_GOAL_ID_RE = goal_id_patterns.GOAL_ID_IN_TEXT  # seq is open-ended: guard-1161 — the literal lives in goal_id_patterns.py ()
 
 
 def _load_config() -> Dict[str, Any]:

@@ -10,6 +10,7 @@ import importlib.util
 import json
 import re
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -50,20 +51,77 @@ def _clean_output(lane):
 
 
 class Rec:
-    """A thread-safe injected runner recording every call."""
+    """A thread-safe injected runner recording every call ().
 
-    def __init__(self, responses=None, meter="run"):
+    It ALSO emulates the budget meter's one-shot state file, faithfully, so the
+    `executed` witness (g-115-12183) can be tested against the meter's real
+    semantics: `check` opens the window and appends the permission row;
+    `executed` appends ONLY while the window is open (the meter's fail-open no-op
+    is exit 0 with no row otherwise); `end` unlinks the window. Without this the
+    witness's landing check would read a file no test ever wrote.
+    """
+
+    def __init__(self, responses=None, meter="run", agent_dir=None):
         self.responses, self.meter, self.calls = responses or {}, meter, []
+        self.agent_dir = Path(agent_dir) if agent_dir else None
         self._lock = threading.Lock()
+        self._window_open = False
+
+    @property
+    def state_file(self):
+        if self.agent_dir is None:
+            return None
+        (self.agent_dir / "session").mkdir(parents=True, exist_ok=True)
+        return self.agent_dir / "session" / "precheck-budget-state.json"
+
+    def _meter(self, argv):
+        with self._lock:
+            if argv[1] == "check":
+                m = self.meter(argv[2]) if callable(self.meter) else self.meter
+                sf = self.state_file
+                if sf is not None:
+                    if not self._window_open:
+                        sf.write_text(json.dumps({
+                            "disabled": False, "start_ms": 0, "cap_ms": 90000,
+                            "zone": "fresh", "zone_drop_rules": {}, "sweeps": []}),
+                            encoding="utf-8")
+                        self._window_open = True
+                    if sf.is_file():
+                        state = json.loads(sf.read_text(encoding="utf-8"))
+                        state.setdefault("sweeps", []).append(
+                            {"sweep": argv[2], "tier": "deferrable",
+                             "decision": m, "reason": "test"})
+                        sf.write_text(json.dumps(state), encoding="utf-8")
+                else:
+                    self._window_open = False
+                return 0, m + "\n", None, ""
+            if argv[1] == "executed":
+                sf = self.state_file
+                if sf is None or not sf.is_file():
+                    return 0, "", None, ""  # the meter's fail-open no-op
+                try:
+                    state = json.loads(sf.read_text(encoding="utf-8"))
+                except Exception:
+                    return 0, "", None, ""
+                if not isinstance(state, dict) or state.get("disabled"):
+                    return 0, "", None, ""
+                state.setdefault("sweeps", []).append(
+                    {"sweep": argv[2], "tier": "deferrable",
+                     "decision": "executed", "reason": "lane-completed"})
+                sf.write_text(json.dumps(state), encoding="utf-8")
+                return 0, "", None, ""
+            if argv[1] == "end":
+                sf = self.state_file
+                if sf is not None and sf.is_file():
+                    sf.unlink()
+                self._window_open = False
+            return 0, "", None, ""
 
     def __call__(self, argv, timeout):
         with self._lock:
             self.calls.append((threading.get_ident(), list(argv), timeout))
         if argv[0] == db._METER:
-            if argv[1] == "check":
-                m = self.meter(argv[2]) if callable(self.meter) else self.meter
-                return 0, m + "\n", None, ""
-            return 0, "", None, ""
+            return self._meter(argv)
         if argv[0] in self.responses:
             r = self.responses[argv[0]]
             return r(argv) if callable(r) else r
@@ -73,9 +131,20 @@ class Rec:
         return {c[1][0]: c[1] for c in self.calls if c[1][0] != db._METER}
 
 
+def _fresh_agent_dir():
+    """A throwaway agent dir so the persisted end record () lands in
+    temp, never in a live agent's session/. MIND_AGENT_DIR is the override seam
+    _paths.py and the battery both honour (guard-2985)."""
+    d = Path(tempfile.mkdtemp(prefix="deferrable-battery-test-"))
+    (d / "session").mkdir()
+    return d
+
+
 def _run(capsys, **kw):
     kw.setdefault("runner", Rec())
-    kw.setdefault("env", {})
+    env = dict(kw.get("env") or {})
+    env.setdefault("MIND_AGENT_DIR", str(_fresh_agent_dir()))
+    kw["env"] = env
     db.run(as_json=True, **kw)
     return json.loads(capsys.readouterr().out)
 
@@ -331,7 +400,8 @@ def test_an_uninterpreted_lane_is_listed_and_never_reads_as_clean(capsys, monkey
     rep = _run(capsys, apply=True)
     assert [u["name"] for u in rep["uninterpreted"]] == ["locus-sweep"]
     assert rep["completeness"] == "partial"
-    db.run(as_json=False, apply=True, runner=Rec(), env={})
+    db.run(as_json=False, apply=True, runner=Rec(),
+           env={"MIND_AGENT_DIR": str(_fresh_agent_dir())})
     out = capsys.readouterr().out
     assert "UNINTERPRETED: locus-sweep" in out and "NOT clean" in out
 
@@ -348,8 +418,10 @@ def test_cadence_fires_are_findings_that_name_the_skill_to_dispatch(capsys):
 
 
 def test_a_finding_is_a_finding_in_the_human_line_too(capsys):
-    db.run(as_json=False, apply=True, env={}, runner=Rec(responses={
-        "abandoned-claim-check.sh": (0, "  RELEASABLE g-1-1 claimed_by=a\n", None, "")}))
+    db.run(as_json=False, apply=True,
+           env={"MIND_AGENT_DIR": str(_fresh_agent_dir())},
+           runner=Rec(responses={
+               "abandoned-claim-check.sh": (0, "  RELEASABLE g-1-1 claimed_by=a\n", None, "")}))
     out = capsys.readouterr().out
     assert "▸ FINDING: abandoned-claim-check (phase 0.5b.23)" in out
     assert "1 finding / " in out
@@ -360,6 +432,305 @@ def test_save_dir_keeps_each_lanes_raw_output(capsys, tmp_path):
          save_dir=str(tmp_path))
     assert (tmp_path / "locus-sweep.out").read_text(encoding="utf-8") == '{"population": 1}'
     assert (tmp_path / "locus-sweep.err").read_text(encoding="utf-8") == "w"
+
+
+# -- the persisted end record + the signature diff () -----------------
+
+def _drop_rows(agent_dir):
+    log = Path(agent_dir) / "session" / "precheck-drops.jsonl"
+    assert log.is_file(), "the battery persisted no deferrable-battery-end row"
+    return [json.loads(ln) for ln in log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+def test_a_clean_run_persists_its_end_record_beside_the_precheck_tail(capsys, tmp_path):
+    """Outcome 1: dropped/BLIND/held (names AND reasons) plus the battery's own
+    executed count survive in a durable, fleet-synced store (precheck-drops.jsonl
+    is in test_owncloud_sync's synced ephemeral list), readable from another
+    box (g-115-12183)."""
+    ag = tmp_path / "alpha"
+    rec = Rec(agent_dir=ag)
+    rep = _run(capsys, apply=True, runner=rec, env={"MIND_AGENT_DIR": str(ag)})
+    rows = [r for r in _drop_rows(ag) if r.get("event") == db._END_EVENT]
+    assert len(rows) == 1
+    row = rows[0]
+    # the meter's own rows coexist in the same log; the battery row is filterable
+    assert row["checked_at"] == rep["checked_at"]
+    assert row["mode"] == "apply" and row["status"] == "clean" and row["completeness"] == "complete"
+    assert row["executed"] == rep["executed"]
+    assert row["executed_count"] == len(rep["executed"])
+    assert row["witness_failed"] == []
+    # dropped/blind/held carry names and reasons, held keeps its standing flag
+    assert row["held"] == [{"name": "repo-hygiene-sweep", "phase": BY_NAME["repo-hygiene-sweep"]["phase"],
+                            "reason": BY_NAME["repo-hygiene-sweep"]["hold"], "standing": True}]
+    assert row["dropped"] == [] and row["blind"] == []
+    # every lane that ran carries its signature, and the diff against NOTHING is
+    # the FIRST apply: every signed lane is new
+    assert set(row["sigs"]) == set(rep["sigs"]) and row["sigs"]
+    assert all(c["prev"] is None for c in rep["sig_diff"])
+    assert {c["name"] for c in rep["sig_diff"]} == set(row["sigs"])
+    assert "prev_checked_at" not in rep
+
+
+def test_a_meter_drop_and_a_blind_lane_land_in_the_end_record_with_reasons(capsys, tmp_path):
+    ag = tmp_path / "alpha"
+    rec = Rec(agent_dir=ag, meter=lambda lane: "drop" if lane == "locus-sweep" else "run",
+              responses={"phantom-goal-audit.py": (0, "not json at all", None, "")})
+    rep = _run(capsys, apply=True, runner=rec, env={"MIND_AGENT_DIR": str(ag)})
+    row = next(r for r in _drop_rows(ag) if r.get("event") == db._END_EVENT)
+    assert [d["name"] for d in row["dropped"]] == ["locus-sweep"]
+    assert all("budget meter returned drop" == d["reason"] for d in row["dropped"])
+    assert [b["name"] for b in row["blind"]] == ["phantom-goal-audit"]
+    assert row["blind"][0]["reason"].startswith("unparseable output")
+    # the drop log already carried the meter's drop decision; the battery record
+    # is the stage-level companion, not a duplicate of it
+    assert row["executed_count"] == len(rep["executed"])
+
+
+def test_an_over_budget_drop_and_a_witness_failure_are_each_their_own_class(capsys, tmp_path):
+    """The 2026-10-07 shape () had three classes and only one
+    (over-budget) had a home: meter-decided drops. The other two --
+    battery-over-budget and the swallowed witness -- now persist with reasons
+    (g-115-12183)."""
+    ag = tmp_path / "alpha"
+    now = [0.0]
+
+    def eat(argv):
+        now[0] += 1000
+        return 0, _clean_output(BY_SCRIPT[argv[0]]), None, ""
+
+    rec = Rec(agent_dir=ag, responses={"pending-questions-sweep.sh": eat})
+
+    def broken(argv, timeout):
+        # a broken meter: rc=0 but it never appends (the fail-open no-op)
+        if argv[0] == db._METER and argv[1] == "executed":
+            return 0, "", None, ""
+        return rec(argv, timeout)
+
+    rep = _run(capsys, apply=True, runner=broken, env={"MIND_AGENT_DIR": str(ag)},
+               clock=lambda: now[0], budget_s=100)
+    row = next(r for r in _drop_rows(ag) if r.get("event") == db._END_EVENT)
+    over = {d["name"] for d in row["dropped"] if "over budget" in d["reason"]}
+    assert "stalled-goal-ratchet" in over, row["dropped"]
+    # every lane that ran completed but its witness never landed
+    assert {w["name"] for w in row["witness_failed"]} == set(row["executed"])
+    assert all("appended no executed record" in w["why"] for w in row["witness_failed"])
+    # it still counts as executed -- the lane RAN; it only lacks the meter's record
+    assert row["executed_count"] == len(row["executed"])
+    # the report's error line does not hide behind a clean status
+    assert rep["status"] == "clean" and row["completeness"] == "partial"
+
+
+def test_the_witness_uses_landing_not_exit_code(tmp_path, monkeypatch):
+    """rc=0 with a no-op is FAILED: the meter's fail-open arms (no state, disabled,
+    bad state, write failure) all exit 0, and in each the lane ran but
+    tail_executed will not carry it."""
+    ag = tmp_path / "alpha"
+    ag.joinpath("session").mkdir(parents=True)
+    state = ag / "session" / "precheck-budget-state.json"
+    state.write_text(json.dumps({"disabled": False, "sweeps": []}), encoding="utf-8")
+    env = {"MIND_AGENT_DIR": str(ag)}
+
+    def call(rec):
+        return db._witness_executed(rec, "locus-sweep", env)
+
+    assert call(Rec(agent_dir=ag)) == (True, "")  # window open: the row lands
+
+    state.unlink()
+    ok, why = call(Rec(agent_dir=ag))
+    assert not ok and "state file absent" in why
+
+    state.write_text(json.dumps({"disabled": True, "sweeps": []}), encoding="utf-8")
+    ok, why = call(Rec(agent_dir=ag))
+    assert not ok and "disabled" in why  # the meter's own no-op arm
+
+    state.write_text("{corrupt", encoding="utf-8")
+    ok, why = call(Rec(agent_dir=ag))
+    assert not ok and "unreadable" in why
+
+    monkeypatch.setattr(db, "_state_file_path", lambda env=None: None)
+    ok, why = call(Rec(agent_dir=ag))
+    assert not ok and "unresolvable" in why
+
+
+def test_classify_shortfall_explains_the_2026_10_07_shape_from_stored_data_alone():
+    """Outcome 2: tail_considered above tail_executed with sweeps_dropped 0 must be
+    classified from the two stored rows alone, and each class is pinned by name."""
+    # the 2026-10-07T01:08:22 shape: 53 considered, 22 executed, 0 dropped
+    end = {"event": "precheck-end", "tail_considered": 53, "tail_executed": 22,
+           "sweeps_dropped": 0}
+    battery = {
+        "event": db._END_EVENT, "executed": ["m1", "m2", "m3"], "executed_count": 3,
+        "witness_failed": [{"name": "locus-sweep", "why": "x"}],
+        "dropped": [{"name": "stalled-goal-ratchet", "reason": "over budget (400s) — not started"}],
+        "blind": [{"name": "phantom-goal-audit", "reason": "unparseable output"}],
+        "held": [{"name": "repo-hygiene-sweep", "reason": "held lane", "standing": True}],
+    }
+    out = db.classify_shortfall(end, battery)
+    assert out["shortfall"] == 31 and out["battery_record"] == "present"
+    assert out["over_budget_dropped"] == ["stalled-goal-ratchet"]
+    assert out["blind"] == ["phantom-goal-audit"]
+    assert out["unwitnessed"] == ["locus-sweep"]
+    # the classes name every considered-but-unwitnessed lane; the held lane is NOT
+    # one of them (it never asked the meter)
+    assert out["residual"] == 31 - 3 and out["exhausted"] is False
+    assert out["battery_considered"] == 3 + 1 + 1 + 1  # executed + each class, no held
+
+    # an EXHAUSTED row: the three classes account for the whole shortfall
+    end2 = {"tail_considered": 3, "tail_executed": 0, "sweeps_dropped": 0}
+    out2 = db.classify_shortfall(end2, battery)
+    assert out2["shortfall"] == 3 and out2["exhausted"] is True and out2["residual"] == 0
+
+    # the meter's own drops are a fourth, already-named class: they count too
+    end3 = {"tail_considered": 5, "tail_executed": 0, "sweeps_dropped": 2}
+    battery3 = dict(battery, dropped=battery["dropped"] + [
+        {"name": "a", "reason": "budget meter returned drop"},
+        {"name": "b", "reason": "budget meter returned drop"}])
+    out3 = db.classify_shortfall(end3, battery3)
+    assert out3["exhausted"] is True  # 2 meter-drops + 3 battery classes = 5
+
+
+def test_classify_shortfall_never_counts_held_lanes_and_never_guesses_the_residual():
+    end = {"tail_considered": 5, "tail_executed": 4, "sweeps_dropped": 0}
+    battery = {"event": db._END_EVENT, "executed": ["m"], "executed_count": 4,
+               "witness_failed": [], "dropped": [], "blind": [],
+               "held": [{"name": "h", "reason": "r", "standing": False}] * 3}
+    out = db.classify_shortfall(end, battery)
+    assert out["shortfall"] == 1 and out["exhausted"] is False
+    assert out["unwitnessed"] == [] and out["blind"] == [] and out["over_budget_dropped"] == []
+    # the residual is the MEDIUM/digest side's share (or a meter-lost witness) --
+    # named, not guessed
+    assert out["residual"] == 1
+
+    # a battery record that never ran: the shortfall is UNEXPLAINED, and that is
+    # the verdict, not a guess ()
+    out2 = db.classify_shortfall(end, None)
+    assert out2["battery_record"] == "absent" and "unexplained" in out2["error"]
+
+
+def test_classify_shortfall_rejects_rows_without_a_tail_count():
+    out = db.classify_shortfall({"event": "precheck-end"}, {"event": db._END_EVENT})
+    assert out["error"] == "the precheck-end row is missing a tail count"
+    out = db.classify_shortfall({"tail_considered": 1, "tail_executed": 0, "sweeps_dropped": 0},
+                                {"event": db._END_EVENT})  # no executed_count key
+    assert "missing executed_count" in out["error"]
+
+
+def _reset_log_to_first_end_row(agent_dir):
+    """The log is append-only in production; a test may rewind its OWN fixture.
+    Truncates to the first end row INCLUSIVE so the next run's diff base is it."""
+    log = Path(agent_dir) / "session" / "precheck-drops.jsonl"
+    lines = log.read_text(encoding="utf-8").splitlines(keepends=True)
+    keep = next(i for i, ln in enumerate(lines)
+                if json.loads(ln).get("event") == db._END_EVENT)
+    log.write_text("".join(lines[:keep + 1]), encoding="utf-8")
+
+
+def test_sig_diff_prints_changed_lanes_first_and_unchanged_as_one_line_rows(capsys, tmp_path):
+    """Outcome 3: lane signatures persist, and the stage prints changed lanes
+    first (new / gone / value changed), unchanged lanes as one-line rows."""
+    ag = tmp_path / "alpha"
+    env = {"MIND_AGENT_DIR": str(ag)}
+    changed = {"verdict": "CHANGED", "files_scanned": 99, "roots_skipped": ["x"],
+               "tier_counts": {"active-scope": 0}}
+    # apply 1: a known baseline
+    _run(capsys, apply=True, env=env)
+    row1 = next(r for r in _drop_rows(ag) if r.get("event") == db._END_EVENT)
+
+    # apply 2 (JSON): one lane's value changes, cadence-battery is skipped (gone)
+    rep2 = _run(capsys, apply=True, env=env, skip={"cadence-battery"},
+                runner=Rec(responses={"hardcoded-scope-audit.py":
+                                      (0, json.dumps(changed), None, "")}))
+    assert rep2["prev_checked_at"] == row1["checked_at"]
+    diff = {c["name"]: c for c in rep2["sig_diff"]}
+    # changed: value change; gone: the skipped lane; everything else unchanged
+    assert "hardcoded-scope-audit" in diff and diff["hardcoded-scope-audit"]["prev"] is not None
+    assert diff["hardcoded-scope-audit"]["now"] != diff["hardcoded-scope-audit"]["prev"]
+    assert "cadence-battery" in diff and diff["cadence-battery"]["now"] is None
+    unchanged = set(row1["sigs"]) - {"hardcoded-scope-audit", "cadence-battery"}
+    assert unchanged and unchanged.isdisjoint(diff.keys())
+
+    # rewind to the baseline so the HUMAN render below diffs against row1
+    _reset_log_to_first_end_row(ag)
+
+    # the human output: the CHANGED block before the = rows, one line each
+    db.run(as_json=False, apply=True, env=env, skip={"cadence-battery"},
+           runner=Rec(responses={"hardcoded-scope-audit.py":
+                                 (0, json.dumps(changed), None, "")}))
+    out = capsys.readouterr().out
+    ci = out.index("  CHANGED (2):")
+    first_eq = out.index("    = ")
+    assert ci < first_eq  # changed lanes print FIRST
+    assert "  ~ hardcoded-scope-audit" in out
+    assert "  - cadence-battery" in out
+    for name in unchanged:
+        line = next(ln for ln in out.splitlines()
+                    if ln.startswith(f"    = {name} ("))
+        assert line == f"    = {name} (phase {BY_NAME[name]['phase']}) {row1['sigs'][name]}"
+
+    # apply 3 (human, nothing changed since the previous row): no CHANGED block
+    db.run(as_json=False, apply=True, env=env, skip={"cadence-battery"},
+           runner=Rec(responses={"hardcoded-scope-audit.py":
+                                 (0, json.dumps(changed), None, "")}))
+    out3 = capsys.readouterr().out
+    assert "  CHANGED (" not in out3
+    assert out3.count("    = ") == len(row1["sigs"]) - 1  # every lane but the gone one
+
+    # apply 4 (human, full set): the returned cadence-battery is a NEW lane,
+    # printed first as a change, the rest as one-line rows. Same `changed`
+    # response as apply 3, so hardcoded-scope-audit is NOT a second change and
+    # the diff is exactly the returned lane.
+    db.run(as_json=False, apply=True, env=env,
+           runner=Rec(responses={"hardcoded-scope-audit.py":
+                                 (0, json.dumps(changed), None, "")}))
+    out4 = capsys.readouterr().out
+    assert "  CHANGED (1):" in out4
+    assert "+ cadence-battery (phase" in out4
+    assert out4.index("+ cadence-battery") < out4.index("    = ")
+    assert out4.count("    = ") == len(row1["sigs"]) - 1
+
+
+def test_first_apply_prints_every_signed_lane_as_new(capsys, tmp_path):
+    ag = tmp_path / "alpha"
+    env = {"MIND_AGENT_DIR": str(ag)}
+    db.run(as_json=False, apply=True, env=env, runner=Rec())
+    out = capsys.readouterr().out
+    assert "SIGNATURES (first apply — no previous record):" in out
+    assert "  CHANGED (" in out  # and every new lane is a changed lane
+    assert "+ cadence-battery (phase 0.5e) new —" in out  # a new lane is printed first
+    # the JSON report for a SECOND, fresh log: every diff entry is new (prev None)
+    ag2 = tmp_path / "beta"
+    rep = _run(capsys, apply=True, env={"MIND_AGENT_DIR": str(ag2)})
+    assert {c["name"] for c in rep["sig_diff"]} == set(rep["sigs"])
+    assert all(c["prev"] is None and c["now"] is not None for c in rep["sig_diff"])
+
+
+def test_a_worker_body_skips_and_persists_nothing(capsys, tmp_path):
+    ag = tmp_path / "alpha"
+    rep = _run(capsys, runner=Rec(), env={"BODY_ROLE": "worker", "MIND_AGENT_DIR": str(ag)})
+    assert "worker Body" in rep["skipped"]
+    assert not (ag / "session" / "precheck-drops.jsonl").exists()
+    assert rep["sig_diff"] is None
+
+
+def test_an_unwritable_drop_log_is_an_error_line_not_a_crash(capsys, tmp_path, monkeypatch):
+    """Fail-open: persist failure is an ERROR LINE (), never a
+    raised exception and never a blocked loop; the report still carries the
+    full stage result."""
+    ag = tmp_path / "alpha"
+    env = {"MIND_AGENT_DIR": str(ag)}
+    # point the log at a path whose parent cannot be created (a file, not a dir):
+    # persist hits OSError, the run continues
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(db, "_drop_log_path",
+                        lambda env=None: blocker / "precheck-drops.jsonl")
+    rep = _run(capsys, apply=True, runner=Rec(), env=env)
+    assert "error" in rep and "drop-log persist" in rep["error"]
+    # the run itself is intact: every lane accounted for, verdicts unaffected
+    assert {r["name"] for r in rep["lanes"]} == set(BY_NAME)
+    assert rep["status"] == "clean"
+    # the diff base read is equally fail-open: a missing log means first apply
+    assert "prev_checked_at" not in rep
 
 
 # -- the real runner ------------------------------------------------------------

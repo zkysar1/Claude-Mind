@@ -28,7 +28,7 @@
 # until a pull brings them. A DRIFT from check 2 sets 1, which outranks 3.
 #
 # Usage: bash core/scripts/mirror-integrity-check.sh [--since <iso>] [--no-drift]
-#   --since   session_start override (default: wm-read.sh session_start)
+#   --since   window-start override (default: this session's started_at, from its binding)
 #   --no-drift  skip check 2 (streak verdict only — the cheap entry probe)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -71,9 +71,13 @@ esac
 
 # ── 2. per-session edited-node drift read-back ─────────────────────────────────
 if [ "$DRIFT" = 1 ]; then
-    [ -n "$SINCE" ] || SINCE="$(bash "$SCRIPT_DIR/wm-read.sh" session_start 2>/dev/null | tr -d '\r"')"
+    # THIS session's own start, from its binding — never the agent-wide WM session_start,
+    # which is whatever the last seeding left: weeks old here, it listed 113 nodes (2 of
+    # them this session's) against 7 from the binding (). No fallback to it:
+    # an unreadable binding is BLIND, not silently the stale window.
+    [ -n "$SINCE" ] || SINCE="$(bash "$SCRIPT_DIR/session-binding-read.sh" "${MIND_SID:-}" --field started_at 2>/dev/null | tr -d '\r"')"
     if [ -z "$SINCE" ] || [ "$SINCE" = "null" ]; then
-        echo "mirror-integrity: session_start unset — per-session drift check BLIND (not clean; guard-1947)"
+        echo "mirror-integrity: no started_at readable for SID '${MIND_SID:-EMPTY}' — per-session drift check BLIND (not clean; guard-1947)"
         [ "$RC" = 0 ] && RC=2
     else
         TREE="$WORLD_PATH/knowledge/tree"

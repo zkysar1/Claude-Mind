@@ -468,6 +468,42 @@ def test_mirror_integrity_check_gives_pull_failing_its_own_exit_code(
     assert marker in proc.stdout, proc.stdout
 
 
+def _integrity_run(tmp_path, *args, sid):
+    """The REAL mirror-integrity-check.sh against induced-healthy state files. Neither
+    caller below reaches a node HEAD, so nothing leaves the box."""
+    (tmp_path / "owncloud-conflict-streaks.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "owncloud-pull-errors.json").write_text(
+        json.dumps({"errors": 0, "error_paths": []}), encoding="utf-8")
+    env = dict(os.environ, RUNTIME_DIR=str(tmp_path), STORAGE_BACKEND="own-cloud",
+               MIND_SID=sid)
+    return subprocess.run(
+        bash_cmd(SCRIPTS / "mirror-integrity-check.sh", *args),
+        capture_output=True, text=True, env=env, cwd=str(SCRIPTS.parents[1]),
+        timeout=120)
+
+
+@pytest.mark.parametrize("sid", ["00000000-0000-4000-8000-000000000000", ""])
+def test_integrity_window_comes_from_the_session_binding_not_the_wm_slot(tmp_path, sid):
+    """. The default window was the agent-wide WM session_start, which a
+    worker's fork leaves weeks old: a SID with no binding got 'OK, 111 nodes checked'
+    from that slot. An unreadable binding is now BLIND (rc 2, guard-1947), never a
+    fallback to the stale window."""
+    proc = _integrity_run(tmp_path, sid=sid)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "no started_at readable for SID" in proc.stdout, proc.stdout
+    assert "session nodes read back" not in proc.stdout, proc.stdout
+
+
+def test_integrity_explicit_since_still_overrides_the_binding(tmp_path):
+    """Positive control for the test above: the same unbound SID with --since goes
+    through the listing path (a far-future window holds no nodes) and is clean, so
+    the BLIND verdict above comes from the missing binding and not from the harness."""
+    proc = _integrity_run(tmp_path, "--since", "2099-01-01T00:00:00",
+                          sid="00000000-0000-4000-8000-000000000000")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "0 tree nodes attributed to this session" in proc.stdout, proc.stdout
+
+
 P = {"verdict": "pull-failing", "wedged_count": 0, "files": {},
      "pull_error_count": 1, "pull_errors": [{"path": "world/deep.md"}]}
 
