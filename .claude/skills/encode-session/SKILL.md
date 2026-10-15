@@ -750,7 +750,7 @@ Did the chat-session changes touch framework files where regressions need a chec
    # mtime sweep sound under own-cloud. It reuses the boolean detector's own
    # attribution function rather than reimplementing it, so the two cannot
    # drift apart.
-   Bash: sess=$(bash core/scripts/wm-read.sh session_start 2>/dev/null)
+   Bash: sess=$(bash core/scripts/session-binding-read.sh "$MIND_SID" --field started_at 2>/dev/null)
    Bash: py -3 core/scripts/tree-edit-since.py "$sess" --list
    # rc 0 = attributable nodes on stdout, one relative path per line.
    # rc 1 = none. Nodes another session stamped are counted out and reported
@@ -763,10 +763,9 @@ Did the chat-session changes touch framework files where regressions need a chec
    # in a new place: a probe covering half the surface reading as coverage of
    # all of it. Say "tree nodes"; never "world files".
    #
-   # AN UNSET session_start MEANS BLIND, NOT CLEAN (guard-1947 — the class
-   # Phase 1 already names). Empty $sess = the probe could not run, so the
-   # tree half falls back to in-context memory exactly like conventions do.
-   # Report it as BLIND; it is not evidence that nothing was encoded.
+   # $sess = THIS session's own start (its binding), not the agent-wide WM
+   # session_start (weeks old here: 113 nodes listed vs 7, g-115-12539).
+   # EMPTY $sess = BLIND, NOT CLEAN (guard-1947): fall back to in-context memory.
    IF no framework files changed AND the tree list is empty:
      Print: "encode-session: no framework files changed, no tree nodes encoded this session — no verify-learning candidates."
      SKIP rest of Lane 5.
@@ -1036,7 +1035,7 @@ Bash: bash core/scripts/iteration-push.sh
 #    to itself (tree-edit-since.py) against the authoritative object and
 #    re-reads the streak verdict AFTER the flush has had its chance. On rc=1
 #    (DRIFT or WEDGED), check WHOSE each named node is before repairing: the
-#    list also carries every UNSTAMPED node edited since session_start (the
+#    list also carries every UNSTAMPED node edited since the session start (the
 #    no-stamp fail-open, tree-edit-since.py docstring). A node is yours only
 #    if `grep -m1 -E '^\s*session:' <node>` prints this $MIND_SID. Yours → an
 #    "ENCODED tree:<key>" line printed above was FALSE — repair now (rb-9443

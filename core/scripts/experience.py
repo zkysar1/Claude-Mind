@@ -21,6 +21,7 @@ reconfigure_stdio()
 
 from _paths import PROJECT_ROOT, WORLD_DIR, AGENT_DIR, AGENTS_PARENT_DIR
 from _jsonl_helpers import set_nested_field
+import goal_id_patterns  # noqa: E402  # : single source for the goal-id grammar (ONE SEQUENCE fragment, guard-1161)
 
 # Per-agent experience stores (agent directory)
 LIVE_PATH = AGENT_DIR / "experience.jsonl" if AGENT_DIR else None
@@ -299,11 +300,8 @@ def validate_record(rec):
 # exactly what happened to the  `xw-` widening, lost for months until
 #  found the two had diverged under a comment claiming they were
 # "lifted VERBATIM". A green core-side test proves nothing about the write path.
-# goal SEQUENCE is open-ended (guard-1161). Keep this comment on its OWN line:
-# mind_api/tests/test_experience_read_goal_derivation.py pins the two copies as
-# byte-identical with a `$`-anchored source-literal match, so a TRAILING comment
-# here silently unmatches the line and reads as "the copies diverged again".
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d+|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
+# goal SEQUENCE is open-ended (guard-1161).
+GOAL_ID_IN_EXP_ID_RE = goal_id_patterns.GOAL_ID_IN_EXP_ID  # : the literal now lives in goal_id_patterns.py; the daemon twin imports the SAME object, so byte-identity holds by construction (the source-literal pin in test_experience_read_goal_derivation.py became an identity pin)
 
 
 def derive_goal_id_from_id(rec_id):

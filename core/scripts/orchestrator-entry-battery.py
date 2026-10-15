@@ -151,6 +151,38 @@ ENTRY_CHECKS = [
             "compact-restore-slots.sh — idempotent, stale-skip deletes)"
         ),
     },
+    # . A deep non-recurring goal that `--phase verify` marked completed
+    # but whose close never reached state-update. The dispatch text IS the protocol:
+    # there is no SKILL.md phase body, so the always-loaded loop skill does not grow
+    # (hot-path ratchet). The close order and the one-shot state-update flags live in
+    # aspirations/SKILL.md PER-ITERATION OBLIGATIONS and iteration-close-digest.md.
+    # Listed BEFORE pending_phase_6_spark because it is the wider obligation and the
+    # spark is one of its steps. Why the slot clears at state-update and not at the
+    # spark: core/config/rationale/owed-close-sentinel.md
+    {
+        "name": "pending_close_owed",
+        "kind": "wm_slot",
+        "slot": "pending_close_owed",
+        "phase": "-0.5c.3",
+        "skill_section": (
+            "owed close (no SKILL.md phase body; this text is the protocol): the goal in the payload was "
+            "VERIFIED (status completed) but its close never reached state-update. Finish it BEFORE "
+            "selecting a new goal, and never execute that goal again. (1) Process state first: run "
+            "`bash core/scripts/proc-match.sh iteration-close` and `bash core/scripts/proc-match.sh "
+            "recurring-close`, each as its own command. rc 0 = a close is still running: wait for it and "
+            "start no phase it will run (rb-1906, guard-2638); rc 1 = none is alive and the owed phases "
+            "are yours (started_at is when verify began). (2) Spark: skip it if spark_fired_session "
+            "already holds the goal, else Skill(aspirations-spark). (3) `iteration-close.sh --phase "
+            "state-update --goal <goal_id> --source <source> --outcome deep` (one-shot quality flags: "
+            "iteration-close-digest.md § STATE-UPDATE); it clears this slot itself, and only when it "
+            "lands. Then learning-gate and productivity-check. A pending_phase_6_spark line for the same "
+            "goal means state-update STARTED but has not landed (still running per (1), or it died): it "
+            "is not done. State-update is not idempotent (guard-5303): if `bash core/scripts/"
+            "execution-diary.sh read --goal <goal_id> --json` shows a phase-8-state-update phase_end "
+            "after the verify, it already ran, so clear by hand instead: `echo null | bash "
+            "core/scripts/verified-wm-set.sh pending_close_owed`, and note why in the diary (guard-3306)"
+        ),
+    },
     {
         "name": "pending_phase_6_spark",
         "kind": "wm_slot",

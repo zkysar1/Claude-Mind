@@ -67,7 +67,7 @@ def _empty_wm(tmp_path):
 
 def test_clean_run_no_actionable(fake_state_dir, tmp_path, capsys):
     rep = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path))
-    assert rep["checks"] == len(oeb.ENTRY_CHECKS) == 6
+    assert rep["checks"] == len(oeb.ENTRY_CHECKS) == 7
     assert rep["actionable"] == []
     assert "error" not in rep
 
@@ -113,7 +113,7 @@ def test_no_agent_binding_fails_open(tmp_path, capsys, monkeypatch):
 
 def test_human_output_footer(fake_state_dir, tmp_path, capsys):
     out = _run(capsys, agent="testagent", wm_path=_empty_wm(tmp_path), as_json=False)
-    assert "all 6 entry checks clean" in out
+    assert "all 7 entry checks clean" in out
     assert "always-run entry calls" in out
     assert "idle-tick.sh (-0.5e)" in out
 

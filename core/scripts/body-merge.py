@@ -111,6 +111,14 @@ REDUCER_WINS_KEYS = frozenset(
     {"active_context", "archived_context", "session_id", "session_start"}
 )
 
+# Slots only the REDUCER ever writes or clears (). _merge_value's absence
+# rule returns the Body's value whenever the reducer's is None, so a Body that forked
+# while such a slot was set would re-deliver it after the reducer cleared it, and the
+# slot is reset- and prune-protected, so that copy would never go away. merge_wm's
+# slot loop skips these names: the reducer's value stands, None included.
+# Why: core/config/rationale/owed-close-sentinel.md
+REDUCER_AUTHORITATIVE_SLOTS = frozenset({"pending_close_owed"})
+
 _ISO_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 _PENDING_STATE = "closed-pending-merge"
 _MERGED_STATE = "merged"
@@ -311,6 +319,8 @@ def merge_wm(reducer: dict, body: dict, baseline: dict | None = None,
         return prior if isinstance(prior, list) else None
 
     for sk, b_val in b_slots.items():
+        if sk in REDUCER_AUTHORITATIVE_SLOTS:
+            continue
         if sk in r_slots:
             m_slots[sk] = _merge_value(sk, r_slots[sk], b_val, base_slots.get(sk),
                                        extra_seen=_watermark_for(sk))

@@ -92,6 +92,8 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
+import goal_id_patterns  # : single source for the goal-id grammar (ONE SEQUENCE fragment, guard-1161); reachable via the same core/scripts sys.path entry the daemon and the blocker-create CLI wrapper install (rb-3868)
+
 __all__ = [
     "evaluate",
     "own_artifact_tokens",
@@ -113,7 +115,7 @@ BIND_WINDOW = 160
 
 # The sequence is a growing counter, so it carries no upper bound (guard-1161):
 # an id this rejects falls through to evaluate()'s no-op ALLOW, unchecked.
-_GOAL_ID_RE = re.compile(r"^g-\d{3}-\d+$")
+_GOAL_ID_RE = goal_id_patterns.GOAL_ID_PLAIN  # seq is open-ended: guard-1161 — the literal lives in goal_id_patterns.py (). Deliberately NARROWER than the canonical validators on purpose, not a copy: this gate must skip the letter-suffix (g-NNN-NN-a) and cross-world (g-xw-...) shapes (see  / the 2026-10-06 note on ).
 _CC_TYPES = r"(?:feat|fix|chore|docs|refactor|test|tests|perf|build|ci|revert|style)"
 # A PR ref: "PR #528", "PR 528", "pull request #528", ".../pull/528", or a bare
 # "#528" (two digits minimum, so list ranks like "#1" never count).

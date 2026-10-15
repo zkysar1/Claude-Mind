@@ -1,5 +1,16 @@
 [
   {
+    "version": "2.12.101",
+    "previous_version": "2.12.100",
+    "date": "2026-10-15",
+    "breaking": false,
+    "cross_world": false,
+    "summary": "v2.12.101: 31 framework commits past v2.12.100. Deployment-shaped gate: CONTROL 4/4; pytest solo-controlled 61 red of 934 (23 skipped), full-suite 116 red of 29154 (581 skipped, 55 order-dependent); all 61 standing (identical to v2.12.100 A/B). Invisible 5 red of 83 (1 skipped), all standing. New reds: 0. Preflight exit 2 reconciled (ORPHAN=SEED_MOTION test_co_invest_alignment.sh, CLOBBER=gitignored .platform-memo.sh). Mode-strip fix: completed-not-closed-slate.py exec bit restored (332cdfd7d7). Origin/main gap: data-only (strategic-scan-readings.md + agent state).",
+    "upgrade_recipe": null,
+    "rollback_recipe": null,
+    "min_source": null
+  },
+  {
     "version": "2.12.100",
     "previous_version": "2.12.99",
     "date": "2026-10-14",

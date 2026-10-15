@@ -152,20 +152,31 @@ def test_reader_reuses_the_writers_helper_object():
 
 
 def test_the_two_regex_copies_are_still_identical():
-    """Pins the invariant experience_write.py's comment asserts. If this fails,
-    the writer and the core-side helper have diverged again — which is exactly
-    how the bare-id shape went underivable before g-115-7028."""
-    import re
+    """Pins the invariant experience_write.py's comment asserts: the daemon (the
+    live write path) and the core-side helper must never disagree about which
+    ids name a goal — the exact divergence that left the bare-id shape
+    underivable until g-115-7028.
+
+    g-353-140: both twins now alias the SAME compiled object from
+    core/scripts/goal_id_patterns.py, so the invariant is OBJECT IDENTITY, not
+    byte equality of two hand-typed literals. This fails if anyone restores a
+    hand-typed literal on one side only (an alias that is no longer the shared
+    object). The behavioural coverage of the shape itself lives in
+    test_goal_id_five_digit_seq.py::test_experience_goal_id_derive_both_twins."""
+    import sys
     from pathlib import Path
     repo = Path(__file__).resolve().parent.parent.parent
-    pat = re.compile(r"^GOAL_ID_IN_EXP_ID_RE = re\.compile\((.+)\)$", re.M)
-    found = {}
-    for rel in ("core/scripts/experience.py",
-                "mind_api/src/endpoints/experience_write.py"):
-        m = pat.search((repo / rel).read_text(encoding="utf-8"))
-        assert m, f"{rel}: GOAL_ID_IN_EXP_ID_RE not found"
-        found[rel] = m.group(1)
-    assert len(set(found.values())) == 1, f"copies diverged: {found}"
+    core_scripts = str(repo / "core" / "scripts")
+    if core_scripts not in sys.path:
+        sys.path.insert(0, core_scripts)
+    import experience  # core/scripts/experience.py — the CLI twin
+    import goal_id_patterns  # the module that owns the literal
+    from mind_api.src.endpoints import experience_write  # the daemon twin (live path)
+    assert experience_write.GOAL_ID_IN_EXP_ID_RE is experience.GOAL_ID_IN_EXP_ID_RE, (
+        "daemon twin is not the same object as the core-side twin — a hand-typed "
+        "literal was restored on one side")
+    assert experience.GOAL_ID_IN_EXP_ID_RE is goal_id_patterns.GOAL_ID_IN_EXP_ID, (
+        "core-side twin is not the shared object — a hand-typed literal was restored")
 
 
 if __name__ == "__main__":

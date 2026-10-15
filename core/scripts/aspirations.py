@@ -27,6 +27,7 @@ from _gate_log import log as _gate_log
 from _goal_census import derive_progress as _derive_progress  # B9-deep census-augmented progress body, shared with the merge path ()
 from _goal_census import all_evicted_ids as _all_evicted_ids  #  mint-site tombstone awareness
 import _decomposed_dependents  #  — shared with the daemon's update_goal
+import goal_id_patterns  # : single source for the goal-id grammar (ONE SEQUENCE fragment, guard-1161)
 
 # Default paths point to world/ (collective task queue).
 # Overridden to agent/ at runtime when --source agent is passed.
@@ -322,7 +323,7 @@ def _emit_description_length_warning(goal, source):
 
 VALID_SCOPES = {"sprint", "project", "initiative"}
 ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (companion to GOAL_ID_RE xw branch below)
-GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d+(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # SEQUENCE IS OPEN-ENDED (guard-1161) — it is a growing counter and every bound on it expired in production:  (2026-05-19),  (2026-09-15), each a fleet-wide filing outage. Do NOT re-bound it. The ASPIRATION half stays \d{3} (different axis, nowhere near a ceiling); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+GOAL_ID_RE = goal_id_patterns.GOAL_ID_ANCHORED  # SEQUENCE IS OPEN-ENDED (guard-1161) — it is a growing counter and every bound on it expired in production:  (2026-05-19),  (2026-09-15), each a fleet-wide filing outage. Do NOT re-bound it. The ASPIRATION half stays \d{3} (different axis, nowhere near a ceiling); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever). The literal now lives in goal_id_patterns.py (); the daemon twin imports the SAME object, so the two cannot diverge.
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # The width at and above which a sequence crossing is worth announcing. Below
@@ -1545,7 +1546,7 @@ def _file_unblock_under_existing_lock(items: list, original_goal_id: str,
     # any goal carrying an evicted id.
     live_ids = [g.get("id", "") for g in target_asp.get("goals", [])]
     for gid in live_ids + _all_evicted_ids(target_asp):
-        match = re.match(r"^g-\d{3}-(\d+)", gid)  # OPEN-ENDED, and load-bearing (guard-2414):
+        match = goal_id_patterns.MINT_SEQ_RE.match(gid)  # OPEN-ENDED, and load-bearing (guard-2414):
         # a capped capture on a LONGER id does not fail, it reads the leading digits as a
         # smaller number — `(\d{2,5})` on  returns 10000, so max+1 re-mints a
         # live id onto the shared store. The bound here must never be narrower than
@@ -2189,7 +2190,7 @@ def cmd_update_goal(args):
                         for gid in _rw_live_ids + _all_evicted_ids(_rw_target):
                             # OPEN-ENDED (guard-1161/guard-2414): a capped capture
                             # on a longer id silently re-mints a live id.
-                            m = re.match(r"^g-\d{3}-(\d+)", gid)
+                            m = goal_id_patterns.MINT_SEQ_RE.match(gid)
                             if m:
                                 _rw_max_seq = max(_rw_max_seq,
                                                   int(m.group(1)))

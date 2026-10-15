@@ -31,12 +31,19 @@ REPO = SCRIPTS.parent.parent
 sys.path.insert(0, str(SCRIPTS))
 
 import outbound_data_class as odc  # noqa: E402
+from _paths import enumerate_agent_confs  # noqa: E402
 from _runtime_bash import bash_cmd  # noqa: E402
 
 CHECKER = SCRIPTS / "outbound_data_class.py"
 BOARD_POST = SCRIPTS / "board-post.sh"
 OWNER = "operator@example.com"
 SHAPED = "o***@e***.com"
+# The checker imports _paths, which warns on stderr when MIND_AGENT names an agent this checkout has
+# no local-paths.conf for. The dev origin holds alpha; a deployment-shaped checkout holds another roster
+# (rb-12992). So the identity handed to the CLI is the first one the tree under test holds (rb-3643). A
+# checkout holding none keeps the old literal, which leaves that case where it was, not a collection error.
+_CONFS = enumerate_agent_confs()
+AGENT = _CONFS[0].parent.name if _CONFS else "alpha"
 
 
 def _j(*parts):
@@ -199,7 +206,7 @@ def _cli(tmp_path, text, *args, env_extra=None):
     env = dict(os.environ)
     env.update({"STORAGE_BACKEND": "local", "MIND_META": str(tmp_path / "meta"),
                 "MIND_WORLD": str(tmp_path / "world"), "GATE_LOG_ALLOW_PYTEST": "1",
-                "MIND_AGENT": "alpha", "USER_EMAIL": OWNER})
+                "MIND_AGENT": AGENT, "USER_EMAIL": OWNER})
     env.update(env_extra or {})
     return subprocess.run([sys.executable, str(CHECKER), "--surface", "unit", *args], input=text,
                           env=env, capture_output=True, text=True, timeout=60)
@@ -260,7 +267,7 @@ def test_override_writes_one_ledger_row_with_the_justification_redacted(tmp_path
     just = row["justification"]
     assert just == "doc example <redacted:len=20>, not live"
     assert row["override_token"] == hashlib.sha1(just.encode()).hexdigest()[:12]
-    assert row["gate"] == odc.GATE_ID and row["agent"] == "alpha"
+    assert row["gate"] == odc.GATE_ID and row["agent"] == AGENT
     ctx = row["context"]
     assert (ctx["surface"], ctx["classes"], ctx["kinds"], ctx["finding_count"]) == (
         "unit", ["credential"], ["AWS access key id"], 1) and len(ctx["body_sha12"]) == 12

@@ -104,6 +104,7 @@ from _goal_fields import (  # noqa: E402
 # across subsystems. A fresh literal here would make that worse.
 from _goal_census import TERMINAL_STATUSES as _TERMINAL_STATUSES  # noqa: E402
 import _aspirations_resurrection as _resurrection  # noqa: E402  # archive-sweep resurrection predicate SSOT (2026-08-16)
+import goal_id_patterns  # noqa: E402  # : single source for the goal-id grammar (ONE SEQUENCE fragment, guard-1161)
 import _decomposed_dependents  # noqa: E402  #  — shared with the CLI's cmd_update_goal
 from gates.origin_signal import evaluate as _origin_signal_eval  # noqa: E402
 from gates.intake_route import apply as _intake_route_apply, load_config as _intake_route_config  # noqa: E402  # 
@@ -308,7 +309,7 @@ _VALID_GOAL_STATUSES = {
 # never named this file — which is precisely why the literal drifted unowned.
 _TERMINAL_GOAL_STATUSES = _CENSUS_TERMINAL_STATUSES
 _ASP_ID_RE = re.compile(r"^asp-(\d{3}|xw-\d{8}T\d{6})$")  # asp-xw-<ts> cross-world ids (mirrors aspirations.py::ASP_ID_RE; companion to _GOAL_ID_RE xw branch below)
-_GOAL_ID_RE = re.compile(r"^g-(\d{3}-\d+(-[a-z])?|xw-\d{8}T\d{6}-\d{2})$")  # SEQUENCE IS OPEN-ENDED (guard-1161) — mirrors aspirations.py::GOAL_ID_RE. It is a growing counter and every bound on it expired in production:  (2026-05-19),  (2026-09-15), each a fleet-wide filing outage. Do NOT re-bound it. The ASPIRATION half stays \d{3} (different axis); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever)
+_GOAL_ID_RE = goal_id_patterns.GOAL_ID_ANCHORED  # SEQUENCE IS OPEN-ENDED (guard-1161) — the daemon twin of aspirations.py::GOAL_ID_RE. It is a growing counter and every bound on it expired in production:  (2026-05-19),  (2026-09-15), each a fleet-wide filing outage. Do NOT re-bound it. The ASPIRATION half stays \d{3} (different axis); g-xw-<ts>-NN cross-world ids ( made them selector-visible but the update/close path still rejected them -> stuck at 0/1 forever). The literal now lives in goal_id_patterns.py (): CLI and daemon import the SAME object, so the two cannot diverge. The .pattern consumer below (docstring build) stays valid.
 
 
 def _goals_field_problem(value) -> "str | None":
@@ -1618,7 +1619,7 @@ def _allocate_goal_id(asp: Dict[str, Any]) -> str:
     max_seq = 0
     live_ids = [g.get("id", "") for g in asp.get("goals", [])]
     for gid in live_ids + _all_evicted_ids(asp):
-        m = re.match(r"^g-\d{3}-(\d+)", gid)  # OPEN-ENDED, and load-bearing (guard-2414):
+        m = goal_id_patterns.MINT_SEQ_RE.match(gid)  # OPEN-ENDED, and load-bearing (guard-2414):
         # a capped capture on a LONGER id does not fail, it reads the leading digits as a
         # smaller number — `(\d{2,5})` on  returns 10000, so max+1 re-mints a
         # live id onto the shared store. Must never be narrower than _GOAL_ID_RE.

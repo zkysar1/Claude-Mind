@@ -81,7 +81,9 @@ def _real_derivation_source():
     rx = re.search(r"^GOAL_ID_IN_EXP_ID_RE = .*$", src, re.M)
     fn = re.search(r"^def derive_goal_id_from_id\(rec_id\):.*?(?=^\S)", src, re.M | re.S)
     assert rx and fn, "could not extract the derivation from experience.py"
-    return "import re\n" + rx.group(0) + "\n\n" + fn.group(0)
+    # : the extracted line aliases goal_id_patterns.GOAL_ID_IN_EXP_ID, so the stub needs
+    # the import (and the pure-stdlib module itself, copied in by the root fixture).
+    return "import re\nimport goal_id_patterns\n" + rx.group(0) + "\n\n" + fn.group(0)
 
 
 @pytest.fixture()
@@ -90,6 +92,7 @@ def root(tmp_path):
     scripts = tmp_path / "core" / "scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(SCRIPTS / "experience-add.sh", scripts / "experience-add.sh")
+    shutil.copy2(SCRIPTS / "goal_id_patterns.py", scripts / "goal_id_patterns.py")
     (scripts / "experience.py").write_text(_real_derivation_source(), encoding="utf-8")
     (scripts / "_runtime.sh").write_text(RUNTIME_STUB, encoding="utf-8")
     (scripts / "aspirations-query.sh").write_text(QUERY_STUB, encoding="utf-8")

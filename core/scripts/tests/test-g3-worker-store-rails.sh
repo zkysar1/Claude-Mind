@@ -114,14 +114,18 @@ touch "$PROOT/agents/zeta/sessions/SID-TEST/working-memory.yaml"
 g=$(cd "$PROOT" && MIND_SID=SID-TEST bash -c "$PRED")
 echo "G worker  (body-WM present): $g  expect=worker"
 
-# Fail-open: an unset MIND_SID must never classify a reducer as a worker, which
-# would silently turn /stop into a no-op on the box that owns the state.
-h=$(cd "$PROOT" && bash -c "$PRED")
-echo "H unset MIND_SID:           $h  expect=reducer-or-single"
+# Fail-closed (, guard-6178): an unset MIND_SID is a THIRD answer. `worker` would turn
+# /stop into a no-op on the box that owns the state, and `reducer-or-single` would let a blind /stop
+# write the agent-wide stop-requested a worker must not touch. The variable is removed here with
+# `env -u` because the answer used to depend on the launch shape: run-invisible-suites.sh scrubs
+# MIND_SID () while a direct run on an agent box inherits its live SID, and that ambient
+# value gave `reducer-or-single` for a case that was never unset (rb-5428, rb-12992).
+h=$(cd "$PROOT" && env -u MIND_SID bash -c "$PRED")
+echo "H unset MIND_SID:           $h  expect=indeterminate"
 
 echo "---"
 if [ "$a" -ge 1 ] && [ "$b" -eq 0 ] && [ "$d" -ge 1 ] && [ "$e" -eq 0 ] \
    && [ "$f" = "reducer-or-single" ] && [ "$g" = "worker" ] \
-   && [ "$h" = "reducer-or-single" ]; then
+   && [ "$h" = "indeterminate" ]; then
     echo "VERDICT: PASS (writers: reducer appends, worker skips; /stop: worker short-circuits before stop-requested)"; exit 0
 else echo "VERDICT: FAIL (a=$a b=$b d=$d e=$e f=$f g=$g h=$h)"; exit 1; fi

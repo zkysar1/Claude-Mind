@@ -61,6 +61,7 @@ from ..agent_paths import assert_not_cruft
 
 from _fileops import _atomic_write_with_fallback, _validate_no_surrogates  # noqa: E402
 from storage_backend import get_backend  # noqa: E402  # s5c: own-cloud read freshness
+import goal_id_patterns  # noqa: E402  # : single source for the goal-id grammar (ONE SEQUENCE fragment, guard-1161); pure stdlib, daemon-import-safe (no _paths pull, unlike experience.py)
 
 # --- Constants lifted verbatim from experience.py -------------------------
 
@@ -204,11 +205,8 @@ def _atomic_write_jsonl(path: Path, items: List[Dict[str, Any]]) -> None:
 # the one that actually runs at write time; the core-side copy only fires on
 # core-side touches. Keep the two literally identical; see the experience.py
 # comment for the 220-record measurement and the guard-2353 discriminating row.
-# goal SEQUENCE is open-ended (guard-1161). Keep this comment on its OWN line:
-# test_experience_read_goal_derivation.py pins this line and its core twin as
-# byte-identical with a `$`-anchored source-literal match, so a TRAILING comment
-# here silently unmatches the line and reads as "the copies diverged again".
-GOAL_ID_IN_EXP_ID_RE = re.compile(r"^exp-(g-(?:\d{3}-\d+|xw-\d{8}T\d{6}-\d{2}))(?:-|$)")
+# goal SEQUENCE is open-ended (guard-1161).
+GOAL_ID_IN_EXP_ID_RE = goal_id_patterns.GOAL_ID_IN_EXP_ID  # : the literal now lives in goal_id_patterns.py; this daemon copy and the core-side twin import the SAME object, so byte-identity holds by construction (the source-literal pin in test_experience_read_goal_derivation.py became an identity pin)
 
 
 def _derive_goal_id_from_id(rec_id):

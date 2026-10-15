@@ -102,9 +102,18 @@ is a pass, not an exhaustive audit — note what was NOT swept (no silent
 caps).
 
 ```
-L1 DUPLICATES: title-similarity over pending goals (bounded ≤30 pairs/run).
-   Proposal shape: close loser via skip with outcome_note naming the keeper
-   + a run stamp (sprint-YYYY-MM-DD). Known-twin pairs from prior runs first.
+L1 DUPLICATES: title-similarity over pending goals (bounded ≤30 pairs/run)
+   is a TEMPLATE-FAMILY CENSUS, never a closure proposal (guard-6395: it
+   flags auto-filer families and misses true twins). A pair becomes a
+   closure candidate only after reading BOTH records: same mechanism or
+   subject, same origin_signal. For goals auto-filed from an external
+   signal, read the SOURCE ARTIFACT of each (the alert, the email, the log
+   row): different artifacts are different goals under one title and take
+   a different disposition (stale-skip naming each event, or a
+   consolidating goal), never "duplicate of <keeper>".
+   Proposal shape (true duplicates only): close loser via skip with
+   outcome_note naming the keeper + a run stamp (sprint-YYYY-MM-DD).
+   Known-twin pairs from prior runs first.
 
 L2 ROUTING: intended_agent not in live roster (dead agents, 'any',
    deployment names) → re-route; role-pin violations (an agent's self.md
@@ -171,7 +180,11 @@ FOR each proposed change (canonical scripts ONLY — never edit stores):
   4. Ledger EVERY write (OK/FAIL + note) to a JSONL in the session scratch
      dir (agents/<agent>/sessions/<SID>/scratch/). Retry lock-contention
      FAILs once; document unresolved FAILs in the plan.
-  5. Every closure's outcome_note names where the work lives now.
+  5. Every closure's outcome_note names where the work lives now, is
+     written in the SAME apply step as the status change, and is read back
+     from the record: a ledger note is not a store note, and a closure with
+     no outcome_note in the store fails this phase (guard-2852: the note,
+     not the status field, is the account a later reader believes).
 ```
 
 ## Phase 5: Publish
@@ -190,6 +203,12 @@ FOR each proposed change (canonical scripts ONLY — never edit stores):
    # NO JSON payload form — the script's json-body guard REFUSES one
    # (guard-1036/guard-1531; the prior JSON-shaped example here failed rc=1 on
    # 2026-09-11 and cost the run a turn).
+   # NOT SWEPT section (required when any lane was skipped): one line per
+   # lane. Name its population ONLY by the producing tool's own category
+   # keys and total, copied from its output after opening one record of
+   # each category (`by_category {a: 62, b: 14}` of `total 76`), never by
+   # your own word ("identical", "stale"): the next firing inherits the
+   # word, not the evidence (guard-5259, rb-8611).
 
 3. Coordination heads-up when writes touched other agents' lanes or claims:
    what closed, what moved, what each agent should pick up next. Routing
@@ -229,6 +248,11 @@ here.
 - The recurring goal (world queue, asp-353 lineage) fires this skill in
   standard mode. Interval management belongs to the recurring goal's fields,
   not this skill.
+- A lane skipped for time is named in the plan WITH its count (Phase 5
+  step 2 says how) and leads the next firing; a lane skipped twice running
+  is itself the finding (reclaim-routed-work.md rule 6). When a worker
+  agent runs the pass, its brief carries guard-6395 and the Phase 4 write
+  rules, and the caller re-reads every closure from the store (guard-6737).
 - Depth escalation (--ultra) is a USER decision per the Workflow opt-in
   policy. When the backlog has visibly drifted (dup candidates > ~50,
   directive defeated, portfolio inversion), SAY SO in the plan and suggest

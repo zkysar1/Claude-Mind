@@ -329,6 +329,24 @@ def test_a_stale_bite_never_writes(daemon):
     assert d.calls == []
 
 
+def test_an_intake_stamped_outcome_class_alone_is_not_a_close(daemon):
+    """ it332: relay filings stamp outcome_class at intake and the sweep guard
+    read it as a close, so every verdict (keep included) on that id exited 4. Alone it
+    passes; beside a close stamp or a live claim the refusal stands."""
+    d = daemon([{"id": "asp-200", "status": "active", "goals": [
+        _goal("g-200-01", outcome_class="deep"),
+        _goal("g-200-02", outcome_class="deep"),
+        _goal("g-200-03", outcome_class="deep", completed_by="agent-b"),
+        _goal("g-200-04", outcome_class="deep", outcome_note="closed elsewhere"),
+        _goal("g-200-05", outcome_class="deep", claimed_by="agent-b", claimed_by_sid="sid-1")]}])
+    assert verdict("--goal", "g-200-01", "--verdict", "keep") == 0
+    assert verdict("--goal", "g-200-02", "--verdict", "promote", "--evidence", "x") == 0
+    assert d.asps[0]["goals"][1]["status"] == "pending"
+    for gid in ("g-200-03", "g-200-04", "g-200-05"):
+        assert verdict("--goal", gid, "--verdict", "keep") == groom.RC_STALE, gid
+    assert [c for c in d.calls if c[1] in ("g-200-03", "g-200-04", "g-200-05")] == []
+
+
 def test_invalid_arguments_are_refused_before_any_write(daemon, monkeypatch):
     d = daemon([{"id": "asp-200", "status": "active", "goals": [
         _goal("g-200-01"), _goal("g-200-02", status="completed"), _goal("g-200-03", status="pending")]}])
